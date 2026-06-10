@@ -34,6 +34,10 @@ const REDRAW_HARD_CAP: Duration = Duration::from_millis(33);
 /// 绝对兜底：强制渲染时刻若恰处于 DEC 2026 同步区间会小步顺延等
 /// 帧完成，但等待不超过该时长（防应用卡死在 BSU 画面冻结）。
 const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
+/// 光标位置防抖：光标在新位置驻留满该时长才更新绘制位置。
+/// TUI（如 codex）常把光标短暂显示在重绘的临时位置、隔一会儿才
+/// 移回输入框，两次写入间隙不可预测，唯有按驻留时长滤波才稳。
+const CURSOR_STABLE: Duration = Duration::from_millis(16);
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
 ///
@@ -75,6 +79,11 @@ struct AppState {
     redraw_hard_at: Option<Instant>,
     /// 绝对兜底时刻：超过后即使在同步区间内也渲染。
     redraw_abs_at: Option<Instant>,
+    /// 最近观察到的光标态 (行, 列, 可见) 及其驻留起点。
+    cursor_seen: (usize, usize, bool),
+    cursor_seen_since: Instant,
+    /// 实际绘制中的光标态（驻留满 CURSOR_STABLE 才跟随 cursor_seen）。
+    cursor_displayed: (usize, usize, bool),
     /// 鼠标最近一次的窗口内像素位置。
     mouse_pos: (f64, f64),
     /// 左键按住拖选中。
@@ -197,6 +206,9 @@ impl App {
             redraw_at: None,
             redraw_hard_at: None,
             redraw_abs_at: None,
+            cursor_seen: (0, 0, true),
+            cursor_seen_since: Instant::now(),
+            cursor_displayed: (0, 0, true),
             mouse_pos: (0.0, 0.0),
             selecting: false,
             selection: None,
@@ -260,9 +272,16 @@ impl ApplicationHandler<PtyWake> for App {
                     .window
                     .set_title(&format!("Lumen — {}", state.term.title()));
             }
+            // 跟踪光标驻留：位置/可见性一变就重置驻留计时。
+            let now = Instant::now();
+            let g = state.term.grid();
+            let cur = (g.cursor.row, g.cursor.col, g.cursor.visible);
+            if cur != state.cursor_seen {
+                state.cursor_seen = cur;
+                state.cursor_seen_since = now;
+            }
             // 静默合帧：每批数据都把渲染时刻往后推，数据流停了才画
             // （见 about_to_wait）；硬上限自首批起算，保障刷新率。
-            let now = Instant::now();
             state.redraw_at = Some(now + REDRAW_DEBOUNCE);
             if state.redraw_hard_at.is_none() {
                 state.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
@@ -314,6 +333,10 @@ impl ApplicationHandler<PtyWake> for App {
                 let (rows, cols) = state.renderer.grid_size();
                 state.term.resize(rows, cols);
                 let _ = state.pty.resize(rows as u16, cols as u16);
+                // 尺寸变化会夹紧光标位置，立即同步防抖状态。
+                let g = state.term.grid();
+                state.cursor_seen = (g.cursor.row, g.cursor.col, g.cursor.visible);
+                state.cursor_displayed = state.cursor_seen;
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -437,7 +460,24 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::RedrawRequested => {
                 state.term.grid_mut().take_dirty();
-                if let Err(e) = state.renderer.render(&state.term, state.selection.as_ref()) {
+                // 光标防抖：新位置驻留满 CURSOR_STABLE 才跟随；未满时
+                // 保持画旧位置，并安排驻留期满后补画一帧。
+                let now = Instant::now();
+                if now.duration_since(state.cursor_seen_since) >= CURSOR_STABLE {
+                    state.cursor_displayed = state.cursor_seen;
+                } else if state.cursor_displayed != state.cursor_seen {
+                    let at = state.cursor_seen_since + CURSOR_STABLE;
+                    state.redraw_at = Some(state.redraw_at.map_or(at, |x| x.min(at)));
+                }
+                let cursor = state
+                    .cursor_displayed
+                    .2
+                    .then_some((state.cursor_displayed.0, state.cursor_displayed.1));
+                if let Err(e) =
+                    state
+                        .renderer
+                        .render(&state.term, state.selection.as_ref(), cursor)
+                {
                     error!("渲染失败: {e:#}");
                 }
             }

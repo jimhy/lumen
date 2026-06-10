@@ -165,8 +165,17 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// 渲染一帧。`selection` 为当前鼠标选区（绝对行号定位）。
-    pub fn render(&mut self, term: &Terminal, selection: Option<&Selection>) -> Result<()> {
+    /// 渲染一帧。
+    ///
+    /// `selection` 为当前鼠标选区（绝对行号定位）；`cursor` 为要绘制的
+    /// 光标屏幕坐标（None 不画）——由上层做位置防抖后传入，不直接读
+    /// grid 光标，避免把 TUI 重绘期间的临时停留位画上屏。
+    pub fn render(
+        &mut self,
+        term: &Terminal,
+        selection: Option<&Selection>,
+        cursor: Option<(usize, usize)>,
+    ) -> Result<()> {
         use wgpu::CurrentSurfaceTexture;
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -236,22 +245,23 @@ impl Renderer {
         }
         // 光标：跟随底部时绘制在可视区对应行（半透明块，文字仍可见）；
         // 落在宽字符上时画两格宽。
-        let cursor = grid.cursor;
-        let cursor_view_row = grid.display_offset() + cursor.row;
-        if cursor.visible && cursor_view_row < rows {
-            let on_wide = grid
-                .row(cursor.row)
-                .cells()
-                .get(cursor.col)
-                .is_some_and(|c| c.flags.contains(CellFlags::WIDE));
-            instances.push(rect::RectInstance {
-                pos: [
-                    pad + cursor.col as f32 * cw,
-                    pad + cursor_view_row as f32 * ch,
-                ],
-                size: [if on_wide { cw * 2.0 } else { cw }, ch],
-                color: self.theme.cursor.to_linear_f32(0.55),
-            });
+        if let Some((cur_row, cur_col)) = cursor {
+            let cursor_view_row = grid.display_offset() + cur_row;
+            if cur_row < rows && cur_col < cols && cursor_view_row < rows {
+                let on_wide = grid
+                    .row(cur_row)
+                    .cells()
+                    .get(cur_col)
+                    .is_some_and(|c| c.flags.contains(CellFlags::WIDE));
+                instances.push(rect::RectInstance {
+                    pos: [
+                        pad + cur_col as f32 * cw,
+                        pad + cursor_view_row as f32 * ch,
+                    ],
+                    size: [if on_wide { cw * 2.0 } else { cw }, ch],
+                    color: self.theme.cursor.to_linear_f32(0.55),
+                });
+            }
         }
         self.rects.prepare(
             &self.device,
