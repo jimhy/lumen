@@ -18,6 +18,8 @@ pub use wgpu;
 /// 字号（逻辑像素）与行高倍率。
 const FONT_SIZE: f32 = 15.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.35;
+/// 内容区与窗口边缘的内边距（逻辑像素，随 DPI 缩放）。
+const PADDING: f32 = 10.0;
 
 /// 终端渲染器。持有 GPU 资源与字体系统。
 pub struct Renderer {
@@ -39,6 +41,8 @@ pub struct Renderer {
     font_family: String,
     cell_w: f32,
     cell_h: f32,
+    /// 内边距（物理像素）。
+    padding: f32,
 }
 
 impl Renderer {
@@ -118,6 +122,7 @@ impl Renderer {
             font_family,
             cell_w,
             cell_h,
+            padding: PADDING * scale_factor,
         })
     }
 
@@ -126,10 +131,12 @@ impl Renderer {
         (self.cell_w, self.cell_h)
     }
 
-    /// 当前能容纳的 (rows, cols)。
+    /// 当前能容纳的 (rows, cols)（扣除四周内边距）。
     pub fn grid_size(&self) -> (usize, usize) {
-        let rows = (self.config.height as f32 / self.cell_h).floor() as usize;
-        let cols = (self.config.width as f32 / self.cell_w).floor() as usize;
+        let usable_h = (self.config.height as f32 - self.padding * 2.0).max(0.0);
+        let usable_w = (self.config.width as f32 - self.padding * 2.0).max(0.0);
+        let rows = (usable_h / self.cell_h).floor() as usize;
+        let cols = (usable_w / self.cell_w).floor() as usize;
         (rows.max(1), cols.max(1))
     }
 
@@ -163,6 +170,7 @@ impl Renderer {
         let rows = grid.rows();
         let cols = grid.cols();
         let (cw, ch) = (self.cell_w, self.cell_h);
+        let pad = self.padding;
 
         // ---- 收集矩形：背景色块、下划线/删除线、光标 ----
         let mut instances: Vec<rect::RectInstance> = Vec::new();
@@ -177,7 +185,7 @@ impl Renderer {
                 } else {
                     cw
                 };
-                let (x, y) = (c as f32 * cw, vr as f32 * ch);
+                let (x, y) = (pad + c as f32 * cw, pad + vr as f32 * ch);
                 if bg != self.theme.background {
                     instances.push(rect::RectInstance {
                         pos: [x, y],
@@ -212,7 +220,10 @@ impl Renderer {
                 .get(cursor.col)
                 .is_some_and(|c| c.flags.contains(CellFlags::WIDE));
             instances.push(rect::RectInstance {
-                pos: [cursor.col as f32 * cw, cursor_view_row as f32 * ch],
+                pos: [
+                    pad + cursor.col as f32 * cw,
+                    pad + cursor_view_row as f32 * ch,
+                ],
                 size: [if on_wide { cw * 2.0 } else { cw }, ch],
                 color: self.theme.cursor.to_linear_f32(0.55),
             });
@@ -239,7 +250,7 @@ impl Renderer {
 
         for (vr, row) in grid.visible_rows().enumerate() {
             let cells = row.cells();
-            let y = vr as f32 * ch;
+            let y = pad + vr as f32 * ch;
             let row_len = cols.min(cells.len());
             let mut c = 0usize;
 
@@ -281,7 +292,7 @@ impl Renderer {
                         Shaping::Advanced,
                         None,
                     );
-                    placed.push((used, c as f32 * cw, y));
+                    placed.push((used, pad + c as f32 * cw, y));
                     used += 1;
                     c += 2; // 跳过右半占位格
                     continue;
@@ -341,7 +352,7 @@ impl Renderer {
                     Shaping::Advanced,
                     None,
                 );
-                placed.push((used, start_col as f32 * cw, y));
+                placed.push((used, pad + start_col as f32 * cw, y));
                 used += 1;
             }
         }
