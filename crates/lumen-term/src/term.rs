@@ -67,6 +67,14 @@ impl Terminal {
     pub fn is_alt_screen(&self) -> bool {
         self.inner.saved_main.is_some()
     }
+
+    /// 是否处于同步更新区间（DEC 2026 BSU/ESU）。
+    ///
+    /// TUI 程序用它包住整帧重绘，期间上层不应渲染，
+    /// 否则会把光标游走、半成品内容等中间状态画出来。
+    pub fn is_synchronized(&self) -> bool {
+        self.inner.sync_output
+    }
 }
 
 /// 实际的 Perform 实现，与 Parser 分离以满足借用规则。
@@ -86,6 +94,8 @@ struct TermInner {
     /// 需回写 PTY 的应答字节（DSR 等）。
     responses: Vec<u8>,
     bell: bool,
+    /// DEC 2026 同步更新进行中。
+    sync_output: bool,
 }
 
 impl TermInner {
@@ -101,6 +111,7 @@ impl TermInner {
             blocks: Vec::new(),
             responses: Vec::new(),
             bell: false,
+            sync_output: false,
         }
     }
 
@@ -482,6 +493,7 @@ impl Perform for TermInner {
                         match g.first().copied().unwrap_or(0) {
                             25 => self.grid.cursor.visible = on,
                             1049 | 1047 => self.set_alt_screen(on),
+                            2026 => self.sync_output = on,
                             1048 => {
                                 if on {
                                     self.saved_cursor =
@@ -511,6 +523,37 @@ impl Perform for TermInner {
             'c' => {
                 // DA：宣告为 VT220 级别终端。
                 self.responses.extend_from_slice(b"\x1b[?62;22c");
+            }
+            'p' if private && intermediates.contains(&b'$') => {
+                // DECRQM 私有模式查询：TUI 库以此探测能力（尤其 2026
+                // 同步更新，不应答就不会启用 BSU/ESU）。1=开 2=关 0=不支持。
+                let mode = p0.unwrap_or(0);
+                let value = match mode {
+                    25 => {
+                        if self.grid.cursor.visible {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1049 | 1047 => {
+                        if self.saved_main.is_some() {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    2026 => {
+                        if self.sync_output {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => 0,
+                };
+                let s = format!("\x1b[?{mode};{value}$y");
+                self.responses.extend_from_slice(s.as_bytes());
             }
             's' => self.saved_cursor = Some((cur.row, cur.col, self.pen)),
             'u' => {
@@ -686,6 +729,22 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].is_closed());
         assert_eq!(blocks[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn 同步更新模式切换与查询应答() {
+        let mut t = term();
+        assert!(!t.is_synchronized());
+        t.advance(b"\x1b[?2026h");
+        assert!(t.is_synchronized());
+        // DECRQM 查询应在同步中应答 1。
+        t.advance(b"\x1b[?2026$p");
+        assert_eq!(t.take_responses(), b"\x1b[?2026;1$y".to_vec());
+        t.advance(b"\x1b[?2026l");
+        assert!(!t.is_synchronized());
+        // 未知模式应答 0。
+        t.advance(b"\x1b[?9999$p");
+        assert_eq!(t.take_responses(), b"\x1b[?9999;0$y".to_vec());
     }
 
     #[test]

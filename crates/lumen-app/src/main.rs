@@ -3,9 +3,11 @@
 
 mod input;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use crossbeam_channel::Receiver;
 use log::{error, info};
 use lumen_pty::{PtyEvent, PtySession};
 use lumen_renderer::Renderer;
@@ -19,15 +21,16 @@ use winit::window::{Window, WindowId};
 /// scrollback 容量（行）。
 const SCROLLBACK: usize = 10_000;
 
-/// 自定义事件：PTY 输出经转发线程注入事件循环。
+/// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
+///
+/// 不直接携带数据：主循环收到信号后一次 drain 全部积压字节再渲染，
+/// 避免把 TUI 重绘的中间状态（光标游走、半成品行）画到屏幕上。
 #[derive(Debug)]
-enum UserEvent {
-    Pty(PtyEvent),
-}
+struct PtyWake;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    let event_loop = EventLoop::<PtyWake>::with_user_event()
         .build()
         .context("创建事件循环失败")?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -38,7 +41,7 @@ fn main() -> Result<()> {
 }
 
 struct App {
-    proxy: EventLoopProxy<UserEvent>,
+    proxy: EventLoopProxy<PtyWake>,
     state: Option<AppState>,
 }
 
@@ -47,6 +50,9 @@ struct AppState {
     renderer: Renderer,
     term: Terminal,
     pty: PtySession,
+    pty_rx: Receiver<PtyEvent>,
+    /// 与转发线程共享的「wake 已挂起」标志，用于事件去重。
+    wake_pending: Arc<AtomicBool>,
     modifiers: ModifiersState,
 }
 
@@ -68,13 +74,22 @@ impl App {
         let term = Terminal::new(rows, cols, SCROLLBACK);
         let (pty, rx) = PtySession::spawn(None, rows as u16, cols as u16)?;
 
-        // 转发线程：crossbeam channel → winit 事件循环。
+        // 转发线程：把事件搬进主循环可 drain 的通道，并以去重信号唤醒
+        // 事件循环（信号挂起期间不重复发，避免事件风暴）。
+        let (tx2, rx2) = crossbeam_channel::bounded::<PtyEvent>(256);
+        let wake_pending = Arc::new(AtomicBool::new(false));
         let proxy = self.proxy.clone();
+        let pending = wake_pending.clone();
         std::thread::Builder::new()
             .name("lumen-pty-forward".into())
             .spawn(move || {
                 for ev in rx {
-                    if proxy.send_event(UserEvent::Pty(ev)).is_err() {
+                    if tx2.send(ev).is_err() {
+                        break;
+                    }
+                    if !pending.swap(true, Ordering::AcqRel)
+                        && proxy.send_event(PtyWake).is_err()
+                    {
                         break;
                     }
                 }
@@ -86,12 +101,14 @@ impl App {
             renderer,
             term,
             pty,
+            pty_rx: rx2,
+            wake_pending,
             modifiers: ModifiersState::default(),
         })
     }
 }
 
-impl ApplicationHandler<UserEvent> for App {
+impl ApplicationHandler<PtyWake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
             match self.init(event_loop) {
@@ -104,42 +121,58 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: PtyWake) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        match event {
-            UserEvent::Pty(PtyEvent::Data(bytes)) => {
-                // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
-                if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                    {
-                        let _ = f.write_all(&bytes);
+        // 先清挂起标志再 drain：drain 期间新到的数据会触发下一个 wake，不丢。
+        state.wake_pending.store(false, Ordering::Release);
+
+        let mut got_data = false;
+        let mut exited = false;
+        while let Ok(ev) = state.pty_rx.try_recv() {
+            match ev {
+                PtyEvent::Data(bytes) => {
+                    // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
+                    if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let _ = f.write_all(&bytes);
+                        }
                     }
+                    state.term.advance(&bytes);
+                    got_data = true;
                 }
-                state.term.advance(&bytes);
-                // 终端应答（DSR/DA 等）回写给 shell。
-                let resp = state.term.take_responses();
-                if !resp.is_empty() {
-                    let _ = state.pty.write(&resp);
-                }
-                // 有新输出时跟随到底部。
-                state.term.grid_mut().scroll_to_bottom();
-                if !state.term.title().is_empty() {
-                    state
-                        .window
-                        .set_title(&format!("Lumen — {}", state.term.title()));
-                }
+                PtyEvent::Exited => exited = true,
+            }
+        }
+
+        if got_data {
+            // 终端应答（DSR/DA/DECRQM 等）回写给 shell。
+            let resp = state.term.take_responses();
+            if !resp.is_empty() {
+                let _ = state.pty.write(&resp);
+            }
+            // 有新输出时跟随到底部。
+            state.term.grid_mut().scroll_to_bottom();
+            if !state.term.title().is_empty() {
+                state
+                    .window
+                    .set_title(&format!("Lumen — {}", state.term.title()));
+            }
+            // DEC 2026 同步更新进行中不渲染，等 ESU 到达的批次一次画出，
+            // 否则会把 TUI 重绘中间态（光标游走）上屏。
+            if !state.term.is_synchronized() {
                 state.window.request_redraw();
             }
-            UserEvent::Pty(PtyEvent::Exited) => {
-                info!("shell 已退出，关闭窗口");
-                event_loop.exit();
-            }
+        }
+        if exited {
+            info!("shell 已退出，关闭窗口");
+            event_loop.exit();
         }
     }
 
