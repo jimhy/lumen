@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use log::{error, info};
 use lumen_pty::PtyEvent;
 use lumen_renderer::{wgpu, Renderer};
@@ -84,6 +84,10 @@ struct AppState {
     sessions: Vec<Session>,
     /// 激活会话在 `sessions` 中的下标。
     active: usize,
+    /// 会话 id 自增分配器（关闭不回收，残留事件按 id 丢弃）。
+    next_session_id: SessionId,
+    /// 全局 PTY 事件通道发送端（新建会话的转发线程汇入用）。
+    pty_tx: Sender<(SessionId, PtyEvent)>,
     /// 全局 PTY 事件通道接收端（各会话转发线程汇入，元素带会话 id）。
     pty_rx: Receiver<(SessionId, PtyEvent)>,
     /// 后台会话超出单轮消化上限时滞留的事件（下个 wake 优先处理，
@@ -115,6 +119,8 @@ struct AppState {
     /// egui 主动要求的下次重绘时刻（动画等），about_to_wait 里与
     /// 终端渲染计划合流取 min。
     egui_repaint_at: Option<Instant>,
+    /// 外壳 UI 的跨帧状态（重命名编辑等）。
+    shell_state: shell::ShellState,
 }
 
 impl AppState {
@@ -127,16 +133,26 @@ impl AppState {
         }
     }
 
-    /// 鼠标当前位置是否落在终端区矩形内。
+    /// 鼠标当前位置是否落在终端区上（且未被 egui 弹层盖住）。
     ///
-    /// M3.1 终端区鼠标交互（选区/块点击/滚轮）以此为闸，不依赖 egui
-    /// 的 consumed（CentralPanel 覆盖终端区，悬停即视为「在 egui 区域
-    /// 上」，consumed 对鼠标无判别力）。M3.2+ 出现盖在终端上的弹层
-    /// 时需在此叠加 egui 层命中检测。
+    /// 终端区鼠标交互（选区/块点击/滚轮）以此为闸，不依赖 egui 的
+    /// consumed（CentralPanel 覆盖终端区，悬停即视为「在 egui 区域
+    /// 上」，consumed 对鼠标无判别力）。右键菜单等弹层可能盖在终端
+    /// 上：面板与 CentralPanel 同属 Background 层，弹层在更高层——
+    /// 命中非背景层即视为「鼠标在 egui 弹层上」，交互归 egui。
     fn mouse_in_term(&self) -> bool {
         let (x, y, w, h) = self.term_rect_px;
         let (mx, my) = self.mouse_pos;
-        mx >= x as f64 && my >= y as f64 && mx < (x + w) as f64 && my < (y + h) as f64
+        let inside =
+            mx >= x as f64 && my >= y as f64 && mx < (x + w) as f64 && my < (y + h) as f64;
+        if !inside {
+            return false;
+        }
+        let ppp = self.egui_ctx.pixels_per_point();
+        let pos = egui::pos2(mx as f32 / ppp, my as f32 / ppp);
+        self.egui_ctx
+            .layer_id_at(pos)
+            .is_none_or(|l| l.order == egui::Order::Background)
     }
 
     /// 把当前鼠标像素位置换算成选区端点（绝对行号，取激活会话网格）。
@@ -189,6 +205,40 @@ impl AppState {
             self.activate(idx.min(self.sessions.len() - 1));
         }
         false
+    }
+
+    /// 新建会话（继承当前 shell 配置）并切换为激活。
+    /// 行列数取当前终端区（所有会话同尺寸）。
+    fn new_session(&mut self) {
+        let g = self.sessions[self.active].term.grid();
+        let (rows, cols) = (g.rows(), g.cols());
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        match Session::spawn(
+            id,
+            rows,
+            cols,
+            SCROLLBACK,
+            self.pty_tx.clone(),
+            self.wake_pending.clone(),
+            self.proxy.clone(),
+        ) {
+            Ok(s) => {
+                self.sessions.push(s);
+                self.activate(self.sessions.len() - 1);
+            }
+            Err(e) => error!("新建会话失败: {e:#}"),
+        }
+    }
+
+    /// 循环切换激活会话：dir 为 1（下一个）或 -1（上一个）。
+    fn cycle_session(&mut self, dir: isize) {
+        let n = self.sessions.len() as isize;
+        if n <= 1 {
+            return;
+        }
+        let idx = (self.active as isize + dir).rem_euclid(n) as usize;
+        self.activate(idx);
     }
 
     /// 窗口标题跟随激活会话（自定义名优先，无标题回退应用名）。
@@ -258,7 +308,7 @@ impl App {
             rows,
             cols,
             SCROLLBACK,
-            pty_tx,
+            pty_tx.clone(),
             wake_pending.clone(),
             self.proxy.clone(),
         )?;
@@ -283,6 +333,8 @@ impl App {
             renderer,
             sessions: vec![first],
             active: 0,
+            next_session_id: 1,
+            pty_tx,
             pty_rx,
             carry: None,
             wake_pending,
@@ -298,6 +350,7 @@ impl App {
             term_rect_px: (sidebar_px, 0.0, term_w as f32, term_h as f32),
             terminal_focused: true,
             egui_repaint_at: None,
+            shell_state: shell::ShellState::default(),
         })
     }
 }
@@ -415,9 +468,9 @@ impl ApplicationHandler<PtyWake> for App {
                 let now = Instant::now();
                 let recent = state
                     .last_render_at
-                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(8));
-                if recent {
-                    let at = state.last_render_at.unwrap() + Duration::from_millis(8);
+                    .filter(|t| now.duration_since(*t) < Duration::from_millis(8));
+                if let Some(last) = recent {
+                    let at = last + Duration::from_millis(8);
                     s.redraw_at = Some(at);
                     s.redraw_hard_at = None;
                     s.redraw_abs_at = Some(at + Duration::from_millis(50));
@@ -574,14 +627,46 @@ impl ApplicationHandler<PtyWake> for App {
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::{Key, NamedKey};
+                let pressed = event.state == ElementState::Pressed;
+                // —— 外壳级快捷键：Ctrl+T 新建 / Ctrl+W 关闭当前 /
+                // Ctrl+Tab 下一个（Ctrl+Shift+Tab 上一个）——
+                // 路由规则：非 alt-screen 时优先于终端直通拦截（窗口级，
+                // 终端是否聚焦都生效）；**alt screen 激活时全部直通终端
+                // 不拦截**——vim 的 Ctrl+W 是窗口操作前缀键、全屏 TUI
+                // 也可能吃 Ctrl+Tab，抢按键会毁掉用户操作；重命名编辑
+                // 中按键归 egui 的输入框，同样不拦截。
+                if pressed
+                    && state.modifiers.control_key()
+                    && !state.sessions[state.active].term.is_alt_screen()
+                    && state.shell_state.renaming.is_none()
+                {
+                    let shift = state.modifiers.shift_key();
+                    match &event.logical_key {
+                        Key::Character(c) if !shift && c.eq_ignore_ascii_case("t") => {
+                            state.new_session();
+                            return;
+                        }
+                        Key::Character(c) if !shift && c.eq_ignore_ascii_case("w") => {
+                            if state.close_session(state.active) {
+                                info!("最后一个会话已关闭，退出应用");
+                                event_loop.exit();
+                            }
+                            return;
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            state.cycle_session(if shift { -1 } else { 1 });
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 // 终端聚焦时键盘绕过 egui 直通此处；非聚焦时按键归
                 // egui，无论它是否消费都不再写 PTY（点了侧栏还往
                 // shell 灌字节是事故）。
                 if !state.terminal_focused {
                     return;
                 }
-                use winit::keyboard::{Key, NamedKey};
-                let pressed = event.state == ElementState::Pressed;
                 let active = state.active;
                 // 抬起事件仅在 win32-input-mode 下投递（协议需要 Kd=0）。
                 if !pressed {
@@ -843,17 +928,72 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // —— egui 帧：跑 UI 布局，产出本帧终端区矩形 ——
                 let raw_input = state.egui_state.take_egui_input(&state.window);
-                let title = state.sessions[state.active].display_title().to_owned();
+                let entries: Vec<shell::SessionEntry> = state
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| shell::SessionEntry {
+                        id: s.id,
+                        title: {
+                            let t = s.display_title();
+                            if t.is_empty() {
+                                "PowerShell".to_owned()
+                            } else {
+                                t.to_owned()
+                            }
+                        },
+                        active: i == state.active,
+                        unseen: s.has_unseen_output,
+                    })
+                    .collect();
                 let tex_id = state.term_tex_id;
+                let was_renaming = state.shell_state.renaming.is_some();
+                let shell_state = &mut state.shell_state;
                 let mut shell_out = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
-                    shell_out = Some(shell::show(ui, tex_id, &title));
+                    shell_out = Some(shell::show(ui, tex_id, &entries, shell_state));
                 });
                 let Some(shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
                 };
                 if shell_out.term_clicked {
                     state.terminal_focused = true;
+                }
+                // 重命名编辑期间键盘/IME 归 egui 的输入框（右键打开
+                // 菜单不经过左键焦点仲裁，必须在此强制让出）；编辑
+                // 结束把焦点还给终端。
+                if state.shell_state.renaming.is_some() {
+                    state.terminal_focused = false;
+                } else if was_renaming {
+                    state.terminal_focused = true;
+                }
+
+                // —— 侧栏动作：切换 / 重命名 / 新建 / 关闭 ——
+                if let Some(id) = shell_out.activate {
+                    if let Some(idx) = state.sessions.iter().position(|s| s.id == id) {
+                        if idx != state.active {
+                            state.activate(idx);
+                        }
+                    }
+                }
+                if let Some((id, name)) = shell_out.rename {
+                    if let Some(s) = state.sessions.iter_mut().find(|s| s.id == id) {
+                        // 空名 = 清除自定义名，恢复跟随终端 OSC 标题。
+                        s.custom_title = (!name.is_empty()).then_some(name);
+                    }
+                    state.update_window_title();
+                }
+                if shell_out.new_session {
+                    state.new_session();
+                }
+                if let Some(id) = shell_out.close {
+                    if let Some(idx) = state.sessions.iter().position(|s| s.id == id) {
+                        if state.close_session(idx) {
+                            info!("最后一个会话已关闭，退出应用");
+                            event_loop.exit();
+                            return; // 不再呈现本帧（应用退出中）
+                        }
+                    }
                 }
 
                 // —— 终端区矩形（物理像素）变化 → 重建离屏 + resize ——
