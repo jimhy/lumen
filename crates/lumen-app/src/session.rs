@@ -52,6 +52,12 @@ pub struct Session {
     pub redraw_hard_at: Option<Instant>,
     /// 绝对兜底时刻：超过后即使在同步区间内也渲染。
     pub redraw_abs_at: Option<Instant>,
+    /// 「欠一帧终端渲染」：渲染计划到点（about_to_wait 清计划并请求
+    /// 重绘）或 ESU 快路直渲时置位。RedrawRequested 的同步区间门控
+    /// 见此标志必须渲染终端（不许跳过）——否则计划被清后若新数据又
+    /// 重新武装了同步区间，欠下的帧会被门控反复推迟（兜底失效）。
+    /// 终端离屏真正渲染过即清零。
+    pub term_frame_due: bool,
     /// 后台期间有新输出（tab 未读点；切换到本会话时清除）。
     pub has_unseen_output: bool,
 }
@@ -106,6 +112,7 @@ impl Session {
             redraw_at: None,
             redraw_hard_at: None,
             redraw_abs_at: None,
+            term_frame_due: false,
             has_unseen_output: false,
         })
     }

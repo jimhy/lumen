@@ -240,6 +240,17 @@ impl Renderer {
         resolved
     }
 
+    /// DPI 缩放因子变化（窗口跨显示器迁移 / 运行中改系统缩放）。
+    ///
+    /// 更新缩放并按新值重算内边距（物理像素）。字号/单元格度量不在
+    /// 此处重算——调用方随后必须调 [`Self::reconfigure_font`] 以新
+    /// 缩放重测（顺带使行排版缓存失效），再走「矩形/网格对照检查」
+    /// 链路完成行列数重算与全会话 resize。
+    pub fn set_scale_factor(&mut self, scale: f32) {
+        self.scale_factor = scale.max(0.1);
+        self.padding = PADDING * self.scale_factor;
+    }
+
     /// 切换终端主题，并使行排版缓存整体失效——行哈希只包含单元格
     /// 自身的颜色编码（Indexed/Rgb），不含主题解析出的实际 RGB，
     /// 换主题后必须强制全量重排一次，否则旧配色的行会因哈希命中

@@ -78,7 +78,13 @@ struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
     perf_t0: Instant,
+    /// 最近一帧（任何内容）的渲染时刻：事件驱动重绘的 8ms 合帧下限
+    /// 以它为基准（整帧负载视角，UI 帧与终端帧都算）。
     last_render_at: Option<Instant>,
+    /// 最近一次**终端离屏**真正渲染的时刻：ESU 直渲的 8ms 限频以它
+    /// 为基准。与 last_render_at 分开——鼠标驱动的纯 UI 重绘（同步
+    /// 区间内跳过终端渲染）不该反向推迟 ESU 完成帧的上屏。
+    last_term_render_at: Option<Instant>,
     window: Arc<Window>,
     renderer: Renderer,
     /// 全部会话（per-session 状态见 [`Session`]）。至少一个；最后
@@ -124,8 +130,12 @@ struct AppState {
     /// false。egui 不会为非控件区域持焦点，键盘与 IME 路由全靠它。
     terminal_focused: bool,
     /// egui 主动要求的下次重绘时刻（动画等），about_to_wait 里与
-    /// 终端渲染计划合流取 min。
+    /// 终端渲染计划合流取 min。事件驱动重绘触发过密（<8ms）时也
+    /// 合并进此计划（见 window_event 入口的合帧下限）。
     egui_repaint_at: Option<Instant>,
+    /// 上一帧是否有 egui 弹层（右键菜单/头像菜单等 Popup）打开。
+    /// 用于检测「弹层关闭」边沿，按关闭方式仲裁焦点归属。
+    was_popup_open: bool,
     /// 外壳 UI 的跨帧状态（重命名编辑等）。
     shell_state: shell::ShellState,
 }
@@ -177,16 +187,33 @@ impl AppState {
 
     /// 切换激活会话：清掉目标会话的冻结计时与渲染计划（属于「上次
     /// 激活期间」的旧时间轴，带过来会借用过期的调度），清未读点，
-    /// 同步窗口标题并立即重绘。切到的终端默认拿键盘/IME 焦点。
+    /// 同步窗口标题并立即重绘。无覆盖层/重命名时终端拿键盘/IME 焦点。
     fn activate(&mut self, idx: usize) {
+        // 换出会话的拖选手势随切换结束：按住左键 Ctrl+Tab 切走后，
+        // Released 只检查新激活会话的 selecting，旧会话的标志会永久
+        // 残留——切回时不按键鼠标一动就「幽灵拖选」，且 Ctrl+C 被
+        // 选区复制分支吞掉。close_session 路径下旧下标可能已越界
+        // （删的是末位激活 tab），用 get_mut 防御。
+        if let Some(prev) = self.sessions.get_mut(self.active) {
+            prev.selecting = false;
+        }
         self.active = idx;
         let s = &mut self.sessions[idx];
         s.cursor_frozen_at = None;
         s.redraw_at = None;
         s.redraw_hard_at = None;
         s.redraw_abs_at = None;
+        // 离屏纹理里还是换出会话的画面：下一帧必须渲染本会话的终端，
+        // 即使它正处于 DEC 2026 同步区间（画半成品也好过画错会话）。
+        s.term_frame_due = true;
         s.has_unseen_output = false;
-        self.terminal_focused = true;
+        // 焦点归属按覆盖层/重命名状态计算，不无条件抢回：后台 shell
+        // 自行退出触发的 activate 可能发生在用户正往设置页/登录表单/
+        // 重命名框打字时，无脑置 true 会让在途按键直写邻位会话的 PTY
+        // （bypass_egui 即刻生效，等不到下一帧的纠偏）。
+        self.terminal_focused = !(self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.renaming.is_some());
         self.update_window_title();
         self.window.request_redraw();
     }
@@ -204,6 +231,11 @@ impl AppState {
         if self.sessions.is_empty() {
             return true;
         }
+        // 会话列表变化必须立即反映到侧栏：后台 shell 自行退出关 tab
+        // 不经过 activate()，没有这句时已死条目会一直挂在侧栏，直到
+        // 下一个无关事件碰巧触发重绘。激活路径里 activate() 也会
+        // request_redraw，重复请求由 winit 合并，无害。
+        self.window.request_redraw();
         if idx < self.active {
             // 移除位在激活位之前：激活会话整体左移一位，无需切换。
             self.active -= 1;
@@ -373,6 +405,7 @@ impl App {
             perf,
             perf_t0: Instant::now(),
             last_render_at: None,
+            last_term_render_at: None,
             window,
             renderer,
             sessions: vec![first],
@@ -396,6 +429,7 @@ impl App {
             term_rect_px: (sidebar_px, topbar_px, term_w as f32, term_h as f32),
             terminal_focused: true,
             egui_repaint_at: None,
+            was_popup_open: false,
             shell_state: shell::ShellState::default(),
         };
         state.shell_state.settings.font_hint = font_hint;
@@ -483,6 +517,10 @@ impl ApplicationHandler<PtyWake> for App {
         // 写 DSR/DA 会卡死对端程序）；渲染调度只对激活会话生效，后台
         // 只更新 ESU 标记并标未读点。
         let mut active_stats = None;
+        // 后台会话未读点 false→true 翻转：侧栏需要一次重绘（仅翻转
+        // 那次请求，已置位后的后续批次不再重复，保持「后台 drain 不
+        // 打扰前台渲染节拍」的原设计）。
+        let mut needs_shell_redraw = false;
         for (idx, s) in state.sessions.iter_mut().enumerate() {
             if !got_data[idx] {
                 continue;
@@ -504,7 +542,10 @@ impl ApplicationHandler<PtyWake> for App {
             s.last_esu_mark = esu_mark;
 
             if !is_active {
-                s.has_unseen_output = true;
+                if !s.has_unseen_output {
+                    s.has_unseen_output = true;
+                    needs_shell_redraw = true;
+                }
                 continue;
             }
             active_stats = Some((sync, frame_completed, s.term.cursor_unsettled()));
@@ -513,9 +554,11 @@ impl ApplicationHandler<PtyWake> for App {
                 // 呈现」，零等待直接渲染（codex 打字回显走这条快路）。
                 // 但渲染频率以 ~8ms 为下限：极速输入（百帧每秒级回显）
                 // 时把积压帧合并，避免渲染请求超出显示能力拖垮主线程。
+                // 限频基准用 last_term_render_at（终端帧时间戳）：鼠标
+                // 驱动的纯 UI 重绘不该反向推迟完成帧的上屏。
                 let now = Instant::now();
                 let recent = state
-                    .last_render_at
+                    .last_term_render_at
                     .filter(|t| now.duration_since(*t) < Duration::from_millis(8));
                 if let Some(last) = recent {
                     let at = last + Duration::from_millis(8);
@@ -526,6 +569,9 @@ impl ApplicationHandler<PtyWake> for App {
                     s.redraw_at = None;
                     s.redraw_hard_at = None;
                     s.redraw_abs_at = None;
+                    // 直渲请求是「欠帧」：到 RedrawRequested 执行前若有
+                    // 新 BSU 批到达重新拉起同步区间，门控不得跳过这帧。
+                    s.term_frame_due = true;
                     state.window.request_redraw();
                 }
             } else {
@@ -543,6 +589,9 @@ impl ApplicationHandler<PtyWake> for App {
         // 窗口标题跟随激活会话（OSC 标题可能随本批数据更新）。
         if active_stats.is_some() {
             state.update_window_title();
+        }
+        if needs_shell_redraw {
+            state.window.request_redraw();
         }
         let total: usize = consumed.iter().sum();
         if total > 0 {
@@ -623,6 +672,11 @@ impl ApplicationHandler<PtyWake> for App {
             s.redraw_at = None;
             s.redraw_hard_at = None;
             s.redraw_abs_at = None;
+            // 终端计划到点 = 欠一帧终端渲染。计划已清空，若执行重绘
+            // 前新数据又拉起同步区间（abs 重新武装到未来），同步门控
+            // 会误判「计划在途」而跳过——欠帧标志保证这帧必画（绝对
+            // 兜底到点的强制渲染正是走这里，不许被门控吃掉）。
+            s.term_frame_due = true;
         }
         if state.egui_repaint_at.is_some_and(|e| now >= e) {
             state.egui_repaint_at = None;
@@ -661,7 +715,25 @@ impl ApplicationHandler<PtyWake> for App {
         if !bypass_egui {
             let resp = state.egui_state.on_window_event(&state.window, &event);
             if resp.repaint {
-                state.window.request_redraw();
+                // 事件驱动重绘的 8ms 合帧下限：egui-winit 对几乎一切
+                // 输入事件（含 CursorMoved）都返回 repaint:true，高回报
+                // 率鼠标（1000Hz）划过窗口时无脑 request_redraw 会让每
+                // 个事件循环迭代渲染一帧（Mailbox 非阻塞呈现不被垂直
+                // 同步限速），主线程被渲染占满、打字处理被挤——与 ESU
+                // 直渲同款的退化。距上帧不足 8ms 时合入 egui_repaint_at
+                // 计划，由 about_to_wait 统一调度（复用同步区间顺延与
+                // ControlFlow 复位逻辑，不会空转）。
+                let now = Instant::now();
+                let recent = state
+                    .last_render_at
+                    .filter(|t| now.duration_since(*t) < Duration::from_millis(8));
+                if let Some(last) = recent {
+                    let at = last + Duration::from_millis(8);
+                    state.egui_repaint_at =
+                        Some(state.egui_repaint_at.map_or(at, |e| e.min(at)));
+                } else {
+                    state.window.request_redraw();
+                }
             }
         }
 
@@ -672,6 +744,20 @@ impl ApplicationHandler<PtyWake> for App {
                 state.renderer.resize_surface(size.width, size.height);
                 // 终端行列数跟随 egui 布局出的终端区矩形，统一在
                 // RedrawRequested 里检测变化并 resize（离屏纹理同步重建）。
+                state.window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // DPI 迁移（跨显示器拖动/改系统缩放）：egui-winit 已在
+                // 上方消化此事件更新 pixels_per_point，渲染器侧的缩放
+                // 与字体度量必须同步更新，否则终端文字物理字号永久停
+                // 在启动时的 DPI（且设置页改字号也按错误 DPI 生效）。
+                // 行列数重算、全会话 resize、离屏重建由下一帧
+                // RedrawRequested 的矩形/网格对照检查自动完成（与设置
+                // 页改字号同链路）；伴随的 Resized 事件已有分支处理
+                // surface 重配。
+                state.renderer.set_scale_factor(scale_factor as f32);
+                let ap = &state.settings.appearance;
+                state.renderer.reconfigure_font(&ap.font_family, ap.font_size);
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -685,9 +771,18 @@ impl ApplicationHandler<PtyWake> for App {
                 // 不拦截**——vim 的 Ctrl+W 是窗口操作前缀键、全屏 TUI
                 // 也可能吃 Ctrl+Tab，抢按键会毁掉用户操作；重命名编辑
                 // 中按键归 egui 的输入框，同样不拦截。
+                // 例外：覆盖层（设置/登录）已打开时按键根本到不了终端
+                // （terminal_focused=false 的闸在下方拦截），「让键给
+                // vim」的前提不成立——放行快捷键块，否则 alt screen 下
+                // Ctrl+, 关不掉已打开的设置页（开关不对称，按键被静默
+                // 吞掉）。match 内部的 login/settings 守卫臂保证放行后
+                // 唯一新增的行为就是 Ctrl+, 的关闭路径。
+                let overlay_open =
+                    state.shell_state.settings.open || state.shell_state.login.open;
                 if pressed
                     && state.modifiers.control_key()
-                    && !state.sessions[state.active].term.is_alt_screen()
+                    && (overlay_open
+                        || !state.sessions[state.active].term.is_alt_screen())
                     && state.shell_state.renaming.is_none()
                 {
                     let shift = state.modifiers.shift_key();
@@ -941,6 +1036,9 @@ impl ApplicationHandler<PtyWake> for App {
                 if !state.terminal_focused {
                     return;
                 }
+                // 与按键路径一致：输入即回滚到底部——翻看历史时提交
+                // 中文，视图不跳回底部会看不到自己的回显。
+                state.sessions[state.active].term.grid_mut().scroll_to_bottom();
                 if let Err(e) = state.sessions[state.active].pty.write(text.as_bytes()) {
                     error!("写入 PTY 失败: {e:#}");
                 }
@@ -973,7 +1071,26 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 let render_t0 = Instant::now();
 
-                {
+                // —— DEC 2026 同步区间门控（事件驱动重绘的保护层）——
+                // M3 起鼠标划过窗口等任意 egui repaint 都会触发本处理器，
+                // 而 BSU..ESU 之间 grid 是边收边改的半成品（光标游走、
+                // 未画完的行）——静默合帧/小步顺延只管**定时调度**路径，
+                // 管不住事件驱动的 request_redraw。此处兜底：同步区间内
+                // 且渲染计划在途（abs 兜底未到点）且不欠帧时，跳过终端
+                // 离屏渲染——egui 照常布局合成（悬停高亮不受影响），
+                // 离屏纹理保留上一完整帧，ESU 到达后由快路/计划补画。
+                // 跳过时也不动 take_dirty 与光标冻结状态（属于「真渲染」
+                // 的配套动作，提前执行会吃掉 damage、错推冻结时间轴）。
+                // term_frame_due（欠帧）必须放行：计划到点已被清空，若
+                // 新数据又拉起同步区间，没有它绝对兜底会被无限顺延。
+                let mut skip_term_render = {
+                    let s = &state.sessions[state.active];
+                    !s.term_frame_due
+                        && s.term.is_synchronized()
+                        && s.redraw_abs_at.is_some_and(|a| render_t0 < a)
+                };
+
+                if !skip_term_render {
                     let s = &mut state.sessions[state.active];
                     s.term.grid_mut().take_dirty();
                     // 光标跟随策略：正常情况下零延迟跟随终端光标；处于
@@ -1053,13 +1170,36 @@ impl ApplicationHandler<PtyWake> for App {
                     state.terminal_focused = true;
                 }
                 // 重命名编辑期间键盘/IME 归 egui 的输入框（右键打开
-                // 菜单不经过左键焦点仲裁，必须在此强制让出）；编辑
-                // 结束把焦点还给终端。
+                // 菜单不经过左键焦点仲裁，必须在此强制让出）；编辑以
+                // **键盘**结束（Enter/Esc）才把焦点还给终端——点击别处
+                // 取消时那次点击已按鼠标仲裁决定焦点归属（点头像/面板
+                // 为 false），无条件翻回 true 会让头像菜单开着时键盘
+                // 直通 PTY（Esc 关不掉菜单、打字进 shell）。
                 if state.shell_state.renaming.is_some() {
                     state.terminal_focused = false;
-                } else if was_renaming {
+                } else if was_renaming && shell_out.rename_ended_by_key {
                     state.terminal_focused = true;
                 }
+                // —— egui 弹层（右键菜单/头像菜单等 Popup）焦点路由 ——
+                // 打开期间键盘恒归 egui：右键打开菜单不经过左键焦点
+                // 仲裁，没有这层时 terminal_focused 仍为 true，Esc 想关
+                // 菜单却把 \x1b 写进 PTY（PSReadLine 清掉输入中的命令
+                // 行），打字也漏进 shell。关闭那帧的焦点归属按关闭方式
+                // 仲裁：键盘（Esc）关闭还给终端（关完直接继续敲命令）；
+                // 点击关闭尊重该次点击的鼠标仲裁结果（点终端区已置
+                // true、点面板保持 false），不强行翻转。
+                let popup_open = egui::Popup::is_any_open(&state.egui_ctx);
+                if popup_open {
+                    state.terminal_focused = false;
+                } else if state.was_popup_open
+                    && state.shell_state.renaming.is_none()
+                    && !state.shell_state.settings.open
+                    && !state.shell_state.login.open
+                    && !state.egui_ctx.input(|i| i.pointer.any_click())
+                {
+                    state.terminal_focused = true;
+                }
+                state.was_popup_open = popup_open;
 
                 // —— 侧栏动作：切换 / 重命名 / 新建 / 关闭 ——
                 if let Some(id) = shell_out.activate {
@@ -1162,16 +1302,22 @@ impl ApplicationHandler<PtyWake> for App {
                 }
 
                 // —— 终端区矩形（物理像素）变化 → 重建离屏 + resize ——
+                // 对各边按 epaint 同款语义取整后求宽高：分数 DPI（如
+                // 125%）下布局矩形的物理尺寸可为分数，纹理尺寸若单独
+                // round 会与呈现 quad 差出 0.5px——Nearest 采样在区中部
+                // 复制/丢一行 texel（1px 接缝游走）。shell 侧已把矩形
+                // round_to_pixels（见 shell/mod.rs），三者同源后纹理与
+                // 屏上 quad 像素数严格相等（1:1 映射），term_rect_px
+                // （鼠标/IME 映射）的 ±0.5px 系统偏差也一并消除。
                 let ppp = full_output.pixels_per_point;
                 let r = shell_out.term_rect;
-                state.term_rect_px = (
-                    r.min.x * ppp,
-                    r.min.y * ppp,
-                    r.width() * ppp,
-                    r.height() * ppp,
-                );
-                let tw = (r.width() * ppp).round().max(1.0) as u32;
-                let th = (r.height() * ppp).round().max(1.0) as u32;
+                let x0 = (r.min.x * ppp).round();
+                let y0 = (r.min.y * ppp).round();
+                let x1 = (r.max.x * ppp).round();
+                let y1 = (r.max.y * ppp).round();
+                state.term_rect_px = (x0, y0, x1 - x0, y1 - y0);
+                let tw = (x1 - x0).max(1.0) as u32;
+                let th = (y1 - y0).max(1.0) as u32;
                 if state.renderer.ensure_offscreen(tw, th) {
                     // 原地换绑：TextureId 不变，本帧 egui pass 即采样新视图。
                     state.egui_renderer.update_egui_texture_from_wgpu_texture(
@@ -1180,6 +1326,9 @@ impl ApplicationHandler<PtyWake> for App {
                         wgpu::FilterMode::Nearest,
                         state.term_tex_id,
                     );
+                    // 新建的纹理是空的：本帧必须渲染终端，否则 egui 采样
+                    // 到全黑（即使正处同步区间，半成品也好过黑屏闪烁）。
+                    skip_term_render = false;
                 }
                 // 行列数同时受终端区矩形与 cell 尺寸（设置页字体/字号）
                 // 影响，每帧对照激活会话网格检测（廉价的整数比较）。
@@ -1197,21 +1346,31 @@ impl ApplicationHandler<PtyWake> for App {
                         let g = s.term.grid();
                         s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
                     }
+                    // 网格已重排（字号变更等可不伴随纹理重建）：旧帧
+                    // 内容与新行列数不匹配，本帧必须渲染终端。
+                    skip_term_render = false;
                 }
 
                 // —— 终端管线渲染到离屏纹理（damage/行缓存机制原样）——
-                let s = &state.sessions[state.active];
-                let cursor = s
-                    .cursor_displayed
-                    .2
-                    .then_some((s.cursor_displayed.0, s.cursor_displayed.1));
-                if let Err(e) = state.renderer.render(
-                    &s.term,
-                    s.selection.as_ref(),
-                    cursor,
-                    s.selected_block,
-                ) {
-                    error!("渲染失败: {e:#}");
+                // 同步区间门控跳过时不渲染：离屏纹理保留上一完整帧，
+                // egui pass 照常采样合成（渲染计划在途，ESU 后补画）。
+                if !skip_term_render {
+                    let s = &mut state.sessions[state.active];
+                    s.term_frame_due = false;
+                    let s = &state.sessions[state.active];
+                    let cursor = s
+                        .cursor_displayed
+                        .2
+                        .then_some((s.cursor_displayed.0, s.cursor_displayed.1));
+                    if let Err(e) = state.renderer.render(
+                        &s.term,
+                        s.selection.as_ref(),
+                        cursor,
+                        s.selected_block,
+                    ) {
+                        error!("渲染失败: {e:#}");
+                    }
+                    state.last_term_render_at = Some(render_t0);
                 }
 
                 // —— egui 平台输出 + IME 强制复位（IME 最大坑对策）——
@@ -1307,9 +1466,12 @@ impl ApplicationHandler<PtyWake> for App {
                     state.perf_log(format_args!("egui repaint_delay {repaint_delay:?}"));
                 }
                 state.egui_repaint_at = if repaint_delay == Duration::ZERO {
-                    // 动画进行中要求立即重绘；request_redraw 自带合并。
-                    state.window.request_redraw();
-                    None
+                    // 动画进行中要求立即重绘——但同样受 8ms 合帧下限
+                    // 约束：帧尾直接 request_redraw 会形成「画完即请求
+                    // 下一帧」的紧循环（实测启动动画期间每 ~0.4ms 一帧、
+                    // 千帧每秒级白占主线程）。改排计划由 about_to_wait
+                    // 统一调度，动画以 ~125fps 推进（视觉无差异）。
+                    Some(render_t0 + Duration::from_millis(8))
                 } else if repaint_delay < Duration::from_secs(3600) {
                     Some(render_t0 + repaint_delay)
                 } else {
@@ -1327,8 +1489,13 @@ impl ApplicationHandler<PtyWake> for App {
                     .take()
                     .map(|t| format!(" 键→上屏 {:?}", t.elapsed()))
                     .unwrap_or_default();
+                let term_mark = if skip_term_render {
+                    " 终端=跳过(同步区间)"
+                } else {
+                    ""
+                };
                 state.perf_log(format_args!(
-                    "render 耗时 {:?} 距上帧 {gap:?}{key_to_screen}",
+                    "render 耗时 {:?} 距上帧 {gap:?}{key_to_screen}{term_mark}",
                     render_t0.elapsed()
                 ));
             }

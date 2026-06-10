@@ -68,6 +68,10 @@ pub struct ShellOutput {
     pub close: Option<u64>,
     /// 提交的重命名：(会话 id, 新名字)。空字符串 = 清除自定义名。
     pub rename: Option<(u64, String)>,
+    /// 重命名编辑本帧以**键盘**结束（Enter 提交 / Esc 取消）。点击
+    /// 别处取消时为 false——main 只在键盘结束时把焦点还给终端，
+    /// 点击结束时尊重鼠标仲裁的结果（点面板不抢回焦点）。
+    pub rename_ended_by_key: bool,
     /// 点击了「新建会话」。
     pub new_session: bool,
     /// 文件树：激活了目录且 shell 空闲，请求向激活会话注入 cd。
@@ -109,6 +113,7 @@ pub fn show(
         activate: None,
         close: None,
         rename: None,
+        rename_ended_by_key: false,
         new_session: false,
         cd_dir: None,
         open_file: None,
@@ -130,6 +135,9 @@ pub fn show(
         .is_some_and(|(id, _)| !input.sessions.iter().any(|e| e.id == *id))
     {
         st.renaming = None;
+        // 编辑框已随会话消失，视同键盘结束：焦点交还终端（否则键盘
+        // 焦点悬空，用户必须再点一次终端区才能打字）。
+        out.rename_ended_by_key = true;
     }
 
     // —— 顶栏（先于侧栏加入面板布局，横贯整窗）：标题 + 头像菜单 ——
@@ -177,7 +185,16 @@ pub fn show(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show_inside(root, |ui| {
-            let rect = ui.available_rect_before_wrap();
+            // 终端区矩形对齐到物理像素：分数 DPI（如 125%）下面板布局
+            // 出的逻辑矩形换算物理像素可为分数，而离屏纹理尺寸只能取
+            // 整数——呈现 quad 与纹理像素数不等时 Nearest 采样会在区
+            // 中部复制/丢一行 texel（1px 接缝、半像素错位）。这里先
+            // 取整再布置 Image，main.rs 用同一矩形换算纹理尺寸与
+            // term_rect_px，保证三者同源、采样 1:1。
+            use egui::emath::GuiRounding as _;
+            let rect = ui
+                .available_rect_before_wrap()
+                .round_to_pixels(ui.pixels_per_point());
             ui.put(
                 rect,
                 egui::Image::new(egui::load::SizedTexture::new(input.term_tex, rect.size())),
@@ -258,9 +275,18 @@ fn sidebar_ui(
                     st.rename_focus = false;
                 }
                 if resp.lost_focus() {
+                    // 区分结束方式：键盘（Enter 提交 / Esc 取消）结束时
+                    // main 把焦点还给终端；点击别处取消则不还——那次
+                    // 点击已按鼠标仲裁决定了焦点归属（点终端区 true、
+                    // 点面板/头像 false），强行翻回会让悬浮菜单开着时
+                    // 键盘直通 PTY。
+                    let by_key = ui.input(|i| {
+                        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)
+                    });
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         out.rename = Some((entry.id, buf.trim().to_owned()));
                     }
+                    out.rename_ended_by_key = by_key;
                     st.renaming = None;
                 }
             }
