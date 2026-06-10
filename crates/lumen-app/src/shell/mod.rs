@@ -1,9 +1,11 @@
-//! 应用外壳 UI（egui）：侧栏 + 终端工作区布局。
+//! 应用外壳 UI（egui）：侧栏 + 文件树 + 终端工作区布局。
 //!
 //! M3.2 起侧栏是真功能的会话 tab 列表：条目（标题 + 未读点 + 激活
-//! 高亮）点击切换、右键菜单重命名/关闭、底部新建。UI 只产出动作
-//! （[`ShellOutput`]），会话增删切换由 main.rs 执行。
+//! 高亮）点击切换、右键菜单重命名/关闭、底部新建。M3.3 增加中间一栏
+//! 文件树（跟随激活会话 cwd，可折叠）。UI 只产出动作
+//! （[`ShellOutput`]），会话增删切换/PTY 写入由 main.rs 执行。
 
+pub mod filetree;
 pub mod theme;
 
 /// 左侧会话栏宽度（逻辑像素）。
@@ -26,6 +28,8 @@ pub struct ShellState {
     pub renaming: Option<(u64, String)>,
     /// 重命名刚开始，下一帧把焦点交给编辑框。
     rename_focus: bool,
+    /// 文件树（树根/展开/可见性等跨帧状态）。
+    pub filetree: filetree::FileTreeState,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -42,14 +46,21 @@ pub struct ShellOutput {
     pub rename: Option<(u64, String)>,
     /// 点击了「新建会话」。
     pub new_session: bool,
+    /// 文件树：激活了目录且 shell 空闲，请求向激活会话注入 cd。
+    pub cd_dir: Option<std::path::PathBuf>,
+    /// 文件树：激活了文件，用系统默认程序打开。
+    pub open_file: Option<std::path::PathBuf>,
 }
 
-/// 绘制整个外壳：左侧会话栏 + 中央终端纹理。
+/// 绘制整个外壳：左侧会话栏 + 中间文件树 + 中央终端纹理。
+/// `cwd`/`shell_idle` 均取自激活会话（文件树跟随与 cd 注入闸门）。
 pub fn show(
     root: &mut egui::Ui,
     term_tex: egui::TextureId,
     sessions: &[SessionEntry],
     st: &mut ShellState,
+    cwd: Option<&std::path::Path>,
+    shell_idle: bool,
 ) -> ShellOutput {
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
@@ -58,6 +69,8 @@ pub fn show(
         close: None,
         rename: None,
         new_session: false,
+        cd_dir: None,
+        open_file: None,
     };
     // 重命名目标可能已被关闭（进程退出等）：清掉孤儿编辑态，
     // 否则编辑框永不渲染、也永不失焦，键盘焦点会卡在 egui 侧。
@@ -79,6 +92,12 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(8, 10)),
         )
         .show_inside(root, |ui| sidebar_ui(ui, sessions, st, &mut out));
+
+    // 中间一栏：文件树（可折叠；树根跟随激活会话 cwd）。开合改变
+    // 终端区宽度，沿用「矩形变化 → 重建离屏纹理 + 全会话 resize」链路。
+    let ft = filetree::show(root, &mut st.filetree, cwd, shell_idle);
+    out.cd_dir = ft.cd_dir;
+    out.open_file = ft.open_file;
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)

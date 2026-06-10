@@ -630,7 +630,8 @@ impl ApplicationHandler<PtyWake> for App {
                 use winit::keyboard::{Key, NamedKey};
                 let pressed = event.state == ElementState::Pressed;
                 // —— 外壳级快捷键：Ctrl+T 新建 / Ctrl+W 关闭当前 /
-                // Ctrl+Tab 下一个（Ctrl+Shift+Tab 上一个）——
+                // Ctrl+Tab 下一个（Ctrl+Shift+Tab 上一个）/
+                // Ctrl+B 文件树开合 ——
                 // 路由规则：非 alt-screen 时优先于终端直通拦截（窗口级，
                 // 终端是否聚焦都生效）；**alt screen 激活时全部直通终端
                 // 不拦截**——vim 的 Ctrl+W 是窗口操作前缀键、全屏 TUI
@@ -652,6 +653,14 @@ impl ApplicationHandler<PtyWake> for App {
                                 info!("最后一个会话已关闭，退出应用");
                                 event_loop.exit();
                             }
+                            return;
+                        }
+                        Key::Character(c) if !shift && c.eq_ignore_ascii_case("b") => {
+                            // 文件树开合：终端区宽度随之变化，下一帧
+                            // egui 布局产出新矩形并触发离屏重建+resize。
+                            let ft = &mut state.shell_state.filetree;
+                            ft.visible = !ft.visible;
+                            state.window.request_redraw();
                             return;
                         }
                         Key::Named(NamedKey::Tab) => {
@@ -948,10 +957,24 @@ impl ApplicationHandler<PtyWake> for App {
                     .collect();
                 let tex_id = state.term_tex_id;
                 let was_renaming = state.shell_state.renaming.is_some();
+                // 文件树输入：激活会话的 cwd（OSC 9;9 上报）与空闲态
+                // （cd 注入闸门，见 Terminal::shell_waiting_input）。
+                let active_cwd = state.sessions[state.active]
+                    .term
+                    .cwd()
+                    .map(std::path::Path::to_path_buf);
+                let shell_idle = state.sessions[state.active].term.shell_waiting_input();
                 let shell_state = &mut state.shell_state;
                 let mut shell_out = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
-                    shell_out = Some(shell::show(ui, tex_id, &entries, shell_state));
+                    shell_out = Some(shell::show(
+                        ui,
+                        tex_id,
+                        &entries,
+                        shell_state,
+                        active_cwd.as_deref(),
+                        shell_idle,
+                    ));
                 });
                 let Some(shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
@@ -994,6 +1017,22 @@ impl ApplicationHandler<PtyWake> for App {
                             return; // 不再呈现本帧（应用退出中）
                         }
                     }
+                }
+
+                // —— 文件树动作：双击目录 cd / 双击文件系统默认程序打开 ——
+                if let Some(dir) = shell_out.cd_dir {
+                    // UI 已按 shell 空闲闸门过滤，这里直接注入。
+                    let cmd = shell::filetree::cd_command(&dir);
+                    let s = &mut state.sessions[state.active];
+                    s.term.grid_mut().scroll_to_bottom();
+                    if let Err(e) = s.pty.write(&cmd) {
+                        error!("写入 PTY 失败: {e:#}");
+                    }
+                    // cd 后把键盘/IME 焦点交还终端，用户可直接继续敲命令。
+                    state.terminal_focused = true;
+                }
+                if let Some(file) = shell_out.open_file {
+                    shell::filetree::open_with_default(&file);
                 }
 
                 // —— 终端区矩形（物理像素）变化 → 重建离屏 + resize ——

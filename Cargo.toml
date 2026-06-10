@@ -37,6 +37,8 @@ pollster = "0.4"
 egui = "0.34"
 egui-wgpu = "0.34"
 egui-winit = "0.34"
+# 文件树控件（单一维护者风险：用法收敛在 shell/filetree.rs 单模块内，便于替换）。
+egui_ltreeview = "0.7"
 
 # 不开 LTO：本机 rustc 1.94/1.96 两个版本开 thin LTO（linker-plugin-lto）
 # 编译均随机崩溃（HEAP_CORRUPTION/ACCESS_VIOLATION），关闭后稳定通过。
