@@ -620,7 +620,6 @@ fn background_group(
         // —— 不透明度滑块 ——
         // 拖动中预览（settings 字段实时更新），松手才写盘（background_params_changed）。
         ui.label(egui::RichText::new("不透明度").color(pal.fg));
-        let before_opacity = settings.appearance.background.opacity;
         let mut opacity_preview = st
             .bg_opacity_drag
             .unwrap_or(settings.appearance.background.opacity);
@@ -642,16 +641,18 @@ fn background_group(
         if opacity_committed {
             st.bg_opacity_drag = None;
             settings.appearance.background.opacity = opacity_preview;
-            if (before_opacity - opacity_preview).abs() > f32::EPSILON {
-                out.background_params_changed = true;
-            }
+            // 无条件落盘：拖动中已实时写 settings 做即时预览（与字号滑块
+            // 不同），松手帧拿不到「拖动前原值」做变更对比——本帧开头读
+            // 到的已是上一帧的预览值，对比恒等导致信号永不置位（持久化
+            // 失效 bug，海风哥 2026-06-11 实测上报）。点击未改值多写一次
+            // 盘（原子写、低频）无害，换确定性。
+            out.background_params_changed = true;
         }
 
         ui.add_space(8.0);
 
         // —— 暗化滑块 ——
         ui.label(egui::RichText::new("暗化").color(pal.fg));
-        let before_dim = settings.appearance.background.dim;
         let mut dim_preview = st.bg_dim_drag.unwrap_or(settings.appearance.background.dim);
         let resp_dim = ui.add(
             egui::Slider::new(
@@ -669,9 +670,8 @@ fn background_group(
         if dim_committed {
             st.bg_dim_drag = None;
             settings.appearance.background.dim = dim_preview;
-            if (before_dim - dim_preview).abs() > f32::EPSILON {
-                out.background_params_changed = true;
-            }
+            // 无条件落盘，理由同上方不透明度滑块。
+            out.background_params_changed = true;
         }
 
         ui.label(
