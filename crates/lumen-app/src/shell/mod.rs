@@ -106,6 +106,11 @@ pub struct ShellOutput {
     /// 点击了某窗格标题栏的 ✕（关闭该窗格；F7① 起常驻标题栏，
     /// 单窗格时关闭 = 关整个 tab）。
     pub pane_close: Option<usize>,
+    /// 拖动窗格标题栏松手落在另一窗格上：(源窗格, 目标窗格)，请求
+    /// 交换两窗格的**内容**（panes 下标互换、布局权重不动——位置
+    /// 换、比例格不变；焦点跟随被拖窗格落位。F7②）。落在源格自身
+    /// 或所有窗格之外为 None（取消，无副作用）。
+    pub pane_swap: Option<(usize, usize)>,
     /// 各窗格关闭按钮的命中矩形（egui 逻辑坐标，与窗格同序）。
     /// main.rs 据此让 raw 鼠标路由对 ✕ 让位（不聚焦/不建选区/不交
     /// 出终端焦点，点击由 egui 侧处理）。
@@ -182,6 +187,7 @@ pub fn show(
         term_clicked: false,
         pane_clicked: None,
         pane_close: None,
+        pane_swap: None,
         pane_close_rects: Vec::new(),
         new_pane: false,
         divider_drag: None,
@@ -302,6 +308,12 @@ pub fn show(
                 &uniform_fallback
             };
             let rects = lay.pane_rects(area);
+            // 标题栏拖动换位的本帧状态（F7②）：拖动中 (源下标, 指针
+            // 位置) 驱动视觉反馈；松手 (源下标, 落点) 做换位判定。
+            // 在窗格循环里采集、循环后统一处理（落点判定需要全部
+            // 整格矩形）。
+            let mut title_drag: Option<(usize, egui::Pos2)> = None;
+            let mut title_drop: Option<(usize, egui::Pos2)> = None;
             for (i, (pane, rect)) in input.panes.iter().zip(&rects).enumerate() {
                 let rect = rect.round_to_pixels(ppp);
                 // —— 窗格标题栏（F7①）：顶部窄条，左标题右 ✕，占高从
@@ -366,10 +378,12 @@ pub fn show(
                 }
                 out.pane_close_rects.push(close_rect);
 
-                // 标题：左侧单行截断展示；点击标题栏 = 聚焦该窗格
-                // （F7①；也是批次2 拖动换位的抓手——届时把 Sense::
-                // click 换成 click_and_drag 即可在此拖起整个窗格）。
-                // 悬停展示完整 cwd（截断时可看全）。
+                // 标题：左侧单行截断展示；点击标题栏 = 聚焦该窗格，
+                // 拖动标题栏 = 拖起整个窗格换位（F7①②）。点击与拖动
+                // 的仲裁交给 egui 现成语义：按下后移动不超阈值（6 逻辑
+                // px）且未长按算点击，超出才算拖——clicked 与 dragged
+                // 互斥，不会一次手势两个动作都触发。悬停展示完整 cwd
+                // （截断时可看全）。
                 let title_hit = egui::Rect::from_min_max(
                     title_rect.min,
                     egui::pos2(close_rect.min.x - 4.0, title_rect.max.y),
@@ -391,11 +405,27 @@ pub fn show(
                 let tresp = ui.interact(
                     title_hit,
                     ui.id().with(("pane_title", i)),
-                    egui::Sense::click(),
+                    egui::Sense::click_and_drag(),
                 );
                 if tresp.clicked() {
                     out.pane_clicked = Some(i);
                     out.term_clicked = true;
+                }
+                // 拖动换位（F7②）：仅多窗格时有交换对象。悬停标题栏
+                // 给 Grab 光标提示可拖；拖动中/松手的状态循环后处理。
+                if input.panes.len() > 1 {
+                    if tresp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if tresp.dragged() {
+                        if let Some(p) = tresp.interact_pointer_pos() {
+                            title_drag = Some((i, p));
+                        }
+                    } else if tresp.drag_stopped() {
+                        if let Some(p) = tresp.interact_pointer_pos() {
+                            title_drop = Some((i, p));
+                        }
+                    }
                 }
                 if let Some(path) = &pane.title_hover {
                     tresp.on_hover_text(path.clone());
@@ -493,6 +523,57 @@ pub fn show(
                     .rect_filled(line.round_to_pixels(ppp), 0.0, pal.bg_highlight);
                 out.divider_rects.push(hit);
             }
+
+            // —— 标题栏拖动换位（F7②）——拖动中：悬停目标窗格画
+            // accent 高亮（2px 内描边 + 8% 半透明蒙层盖整格），指针
+            // 右下跟一张半透明标题小卡（Foreground 层，不受面板裁
+            // 剪）；落点判定用**整格矩形**（含标题栏，rects 非内容
+            // 矩形）。松手落在其他窗格 → 产出 pane_swap（main 交换
+            // panes 下标，权重不动）；落在源格/窗格外 → 取消无副作用。
+            if let Some((src, pos)) = title_drag {
+                if let Some(dst) = swap_target(&rects, src, pos) {
+                    ui.painter().rect(
+                        rects[dst].round_to_pixels(ppp),
+                        0.0,
+                        pal.accent.gamma_multiply(0.08),
+                        egui::Stroke::new(2.0, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                // 跟手浮层：源窗格标题的圆角小卡（半透明，让得出底下
+                // 的目标高亮），画在 Foreground 层盖过一切面板内容。
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("pane_title_drag_overlay"),
+                ));
+                let galley = painter.layout_no_wrap(
+                    input.panes[src].title.clone(),
+                    egui::FontId::proportional(12.0),
+                    pal.fg,
+                );
+                let pad = egui::vec2(10.0, 5.0);
+                let chip = egui::Rect::from_min_size(
+                    pos + egui::vec2(14.0, 10.0),
+                    galley.size() + pad * 2.0,
+                );
+                painter.rect(
+                    chip,
+                    4.0,
+                    pal.bg_panel.gamma_multiply(0.85),
+                    egui::Stroke::new(1.0, pal.bg_highlight),
+                    egui::StrokeKind::Inside,
+                );
+                painter.galley(chip.min + pad, galley, pal.fg);
+                // 拖动中指针可能滑出标题栏命中区：保持抓取光标。
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            if let Some((src, pos)) = title_drop {
+                out.pane_swap = swap_target(&rects, src, pos).map(|dst| (src, dst));
+                // 拖动结束（无论换位还是取消）键盘焦点交还终端：按下
+                // 落在标题栏时 raw 路由按「点击面板」交出过焦点，这里
+                // 收回——拖完接着打字不该断流。
+                out.term_clicked = true;
+            }
         });
 
     // 文件树节点拖放的落点判定：要等 CentralPanel 布局出本帧窗格
@@ -554,6 +635,16 @@ pub fn show(
     // —— 系统提示浮层（最后绘制 = 叠在一切覆盖层之上）——
     toast::show(root.ctx(), &mut st.toast, pal);
     out
+}
+
+/// 标题栏拖动换位的落点判定（F7②）：指针落在哪个窗格（`rects` =
+/// 整格矩形，含标题栏）。落在源格自身或所有窗格之外返回 None
+/// （取消，无副作用）。
+fn swap_target(rects: &[egui::Rect], src: usize, pos: egui::Pos2) -> Option<usize> {
+    rects
+        .iter()
+        .position(|r| r.contains(pos))
+        .filter(|&dst| dst != src)
 }
 
 /// 侧栏内容：tab 条目列表 + 底部设置/新建按钮。
@@ -662,4 +753,38 @@ fn sidebar_ui(
             out.new_session = true;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 两格左右布局的整格矩形（含标题栏）。
+    fn two_rects() -> Vec<egui::Rect> {
+        vec![
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0)),
+            egui::Rect::from_min_size(egui::pos2(102.0, 0.0), egui::vec2(100.0, 100.0)),
+        ]
+    }
+
+    #[test]
+    fn 换位落点_命中目标窗格() {
+        // 从 0 号拖到 1 号窗格内部 → 目标 1；反向同理。
+        assert_eq!(
+            swap_target(&two_rects(), 0, egui::pos2(150.0, 50.0)),
+            Some(1)
+        );
+        assert_eq!(
+            swap_target(&two_rects(), 1, egui::pos2(50.0, 50.0)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn 换位落点_源格与区外取消() {
+        // 落回源格自身 / 窗格间隙 / 终端区外 → 取消（None）。
+        assert_eq!(swap_target(&two_rects(), 0, egui::pos2(50.0, 50.0)), None);
+        assert_eq!(swap_target(&two_rects(), 0, egui::pos2(101.0, 50.0)), None);
+        assert_eq!(swap_target(&two_rects(), 0, egui::pos2(300.0, 300.0)), None);
+    }
 }

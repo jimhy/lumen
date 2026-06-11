@@ -1861,6 +1861,31 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
 
+                // —— 拖动标题栏换位（F7②）：交换两窗格在 panes 中的
+                // 下标——交换的是格子里的「内容」（Session），格子的
+                // 几何（布局权重）不动；焦点跟随被拖窗格落位，被换走
+                // 的格子若持有焦点则跟去对侧（其余窗格焦点不动）。
+                // 下标对应 run_ui 时的布局，结构同帧变更（防御）越界
+                // 即跳过；交换后 layout_pane_ids 对照不再一致，本帧
+                // 跳过矩形应用、下一帧按新顺序重建（与增删窗格同款
+                // 瞬态）。
+                if let Some((src, dst)) = shell_out.pane_swap {
+                    let tab = &mut state.tabs[state.active_tab];
+                    if src != dst && src < tab.panes.len() && dst < tab.panes.len() {
+                        tab.panes.swap(src, dst);
+                        if tab.focused == src {
+                            tab.focused = dst;
+                        } else if tab.focused == dst {
+                            tab.focused = src;
+                        }
+                        // 窗格顺序即持久化顺序：换位是结构性变更，立即
+                        // 落盘（沿用既有时机；快照一致时内部自动跳过）。
+                        state.update_window_title();
+                        state.window.request_redraw();
+                        state.persist_sessions();
+                    }
+                }
+
                 // —— 分隔条调比例（F7③）：拖动把边界拖到指针处（实时
                 // 生效——比例变化下一帧产出新矩形，沿用「矩形变化 →
                 // 离屏重建 + term/pty resize」既有链路；拖动重绘已被
