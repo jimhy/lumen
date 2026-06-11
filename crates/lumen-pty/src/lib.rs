@@ -5,6 +5,7 @@
 //! 通过 crossbeam channel 把字节流推给上层（主事件循环）。
 
 use std::io::{Read, Write};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -36,11 +37,15 @@ impl PtySession {
     /// `shell` 为 None 时按平台选默认：Windows 优先 `pwsh.exe`，
     /// 找不到则回退 `powershell.exe`；unix 用 `$SHELL` 或 `/bin/bash`。
     /// `args` 为附加启动参数（如 shell integration 注入）。
+    /// `cwd` 为 shell 初始工作目录（会话恢复用，F4）；None 沿用
+    /// 本进程当前目录。调用方需保证目录存在——不存在时子进程会
+    /// 启动失败。
     pub fn spawn(
         shell: Option<&str>,
         args: &[String],
         rows: u16,
         cols: u16,
+        cwd: Option<&Path>,
     ) -> Result<(Self, Receiver<PtyEvent>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -55,6 +60,10 @@ impl PtySession {
         let shell = shell.map(str::to_owned).unwrap_or_else(default_shell);
         let mut cmd = CommandBuilder::new(&shell);
         cmd.args(args);
+        if let Some(dir) = cwd {
+            // 会话恢复：shell 在保存的工作目录中启动。
+            cmd.cwd(dir);
+        }
         // 终端能力声明：上层实现了 256 色与真彩 SGR。
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");

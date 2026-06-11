@@ -4,6 +4,7 @@
 mod input;
 mod profile;
 mod session;
+mod sessions_store;
 mod settings;
 mod shell;
 
@@ -114,6 +115,9 @@ struct AppState {
     proxy: EventLoopProxy<PtyWake>,
     /// 应用设置（设置页编辑的数据源；变更即写盘）。
     settings: settings::Settings,
+    /// 最近一次写盘的会话列表快照（F4 持久化去重：cwd 上报/结构
+    /// 变更都先与它比对，无变化不重复写盘）。None = 本次运行尚未写。
+    last_sessions_snapshot: Option<sessions_store::SessionsFile>,
     /// 登录档案（mock）：None = 未登录。顶栏头像、头像菜单、设置页
     /// Account 三处 UI 同源此字段；登录写盘 / 登出删盘（profile.json）。
     profile: Option<profile::Profile>,
@@ -229,6 +233,8 @@ impl AppState {
             || self.shell_state.filetree.dialog_open());
         self.update_window_title();
         self.window.request_redraw();
+        // 激活下标是持久化状态的一部分：切换即落盘（F4）。
+        self.persist_sessions();
     }
 
     /// 关闭会话：从列表移除即随 `PtySession` Drop 杀掉子进程；本会话
@@ -240,6 +246,9 @@ impl AppState {
         info!("关闭会话 id={}", removed.id);
         drop(removed);
         if self.sessions.is_empty() {
+            // 最后一个 tab 关闭即退出：以退出瞬间的（空）列表落盘，
+            // 下次启动回到单默认会话（F4）。
+            self.persist_sessions();
             return true;
         }
         // 会话列表变化必须立即反映到侧栏：后台 shell 自行退出关 tab
@@ -254,6 +263,9 @@ impl AppState {
             // 关闭激活 tab：切到邻位（右邻顶上原位；无右邻取末位）。
             self.activate(idx.min(self.sessions.len() - 1));
         }
+        // 关 tab 是结构性变更：落盘（activate 路径已写过时快照一致，
+        // 自动跳过）。
+        self.persist_sessions();
         false
     }
 
@@ -271,9 +283,11 @@ impl AppState {
             SCROLLBACK,
             self.wake_pending.clone(),
             self.proxy.clone(),
+            None,
         ) {
             Ok(s) => {
                 self.sessions.push(s);
+                // activate 内部会落盘会话快照（新建是结构性变更）。
                 self.activate(self.sessions.len() - 1);
             }
             Err(e) => error!("新建会话失败: {e:#}"),
@@ -290,14 +304,45 @@ impl AppState {
         self.activate(idx);
     }
 
-    /// 窗口标题跟随激活会话（自定义名优先，无标题回退应用名）。
+    /// 窗口标题跟随激活会话（与侧栏条目同源 display_title：自定义名 >
+    /// cwd > OSC 标题 > 「会话 N」，恒非空）。
     fn update_window_title(&self) {
         let title = self.sessions[self.active].display_title();
-        if title.is_empty() {
-            self.window.set_title("Lumen");
-        } else {
-            self.window.set_title(&format!("Lumen — {title}"));
+        self.window.set_title(&format!("Lumen — {title}"));
+    }
+
+    /// 构造当前会话列表的持久化快照（F4）。cwd 取 OSC 9;9 上报值，
+    /// 尚未上报（恢复后首个提示符还没到）时回退该会话启动时的初始
+    /// 目录——防止恢复后立即触发的写盘把保存的 cwd 冲成 None。
+    fn sessions_snapshot(&self) -> sessions_store::SessionsFile {
+        sessions_store::SessionsFile {
+            entries: self
+                .sessions
+                .iter()
+                .map(|s| sessions_store::SessionEntry {
+                    custom_title: s.custom_title.clone(),
+                    cwd: s
+                        .term
+                        .cwd()
+                        .map(std::path::Path::to_path_buf)
+                        .or_else(|| s.initial_cwd.clone()),
+                })
+                .collect(),
+            active: self.active,
         }
+    }
+
+    /// 会话列表持久化（F4）：结构性变更（新建/关闭/重命名/切换激活）
+    /// 与 cwd 上报变化时调用；快照与上次写盘一致则跳过，实际写频
+    /// ≈ 用户开关 tab / cd 的频率。失败只记日志（save 内部），不
+    /// 打扰终端使用。
+    fn persist_sessions(&mut self) {
+        let snap = self.sessions_snapshot();
+        if self.last_sessions_snapshot.as_ref() == Some(&snap) {
+            return;
+        }
+        snap.save();
+        self.last_sessions_snapshot = Some(snap);
     }
 }
 
@@ -394,14 +439,66 @@ impl App {
         // PTY 事件走 per-session 有界通道（Session 自持接收端），唤醒
         // 走全局去重的 PtyWake（见 session.rs 模块文档）。
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let first = Session::spawn(
-            0,
-            rows,
-            cols,
-            SCROLLBACK,
-            wake_pending.clone(),
-            self.proxy.clone(),
-        )?;
+
+        // —— 会话恢复（F4）：sessions.json 有效时按条目逐个重开 shell
+        // （初始目录用保存的 cwd，失效回退默认并提示；屏幕内容不恢复，
+        // 是新 shell）；缺失/损坏/全部 spawn 失败回退单默认会话。 ——
+        let stored = sessions_store::SessionsFile::load();
+        let mut sessions: Vec<Session> = Vec::new();
+        let mut active_idx = 0usize;
+        // 保存的 cwd 已失效（目录被删/网络盘离线）的条目数（toast 一次）。
+        let mut stale_cwd = 0usize;
+        if let Some(stored) = &stored {
+            for entry in &stored.entries {
+                let cwd = entry.usable_cwd();
+                if let Some(saved) = entry.cwd.as_deref() {
+                    if cwd.is_none() {
+                        stale_cwd += 1;
+                        log::warn!(
+                            "会话恢复：保存的工作目录已失效，回退默认目录: {}",
+                            saved.display()
+                        );
+                    }
+                }
+                let id = sessions.len() as SessionId;
+                match Session::spawn(
+                    id,
+                    rows,
+                    cols,
+                    SCROLLBACK,
+                    wake_pending.clone(),
+                    self.proxy.clone(),
+                    cwd,
+                ) {
+                    Ok(mut s) => {
+                        s.custom_title = entry.custom_title.clone();
+                        sessions.push(s);
+                    }
+                    // 单条 spawn 失败（shell 缺失等极端情况）跳过该
+                    // 条目，不连坐其余会话。
+                    Err(e) => error!("恢复会话失败（跳过该条目）: {e:#}"),
+                }
+            }
+            if !sessions.is_empty() {
+                active_idx = stored.active.min(sessions.len() - 1);
+                info!(
+                    "会话恢复：{} 个条目，激活 #{active_idx}（cwd 失效 {stale_cwd} 个）",
+                    sessions.len()
+                );
+            }
+        }
+        if sessions.is_empty() {
+            sessions.push(Session::spawn(
+                0,
+                rows,
+                cols,
+                SCROLLBACK,
+                wake_pending.clone(),
+                self.proxy.clone(),
+                None,
+            )?);
+        }
+        let next_session_id = sessions.len() as SessionId;
 
         let clipboard = match arboard::Clipboard::new() {
             Ok(c) => Some(c),
@@ -422,12 +519,13 @@ impl App {
             last_term_render_at: None,
             window,
             renderer,
-            sessions: vec![first],
-            active: 0,
-            next_session_id: 1,
+            sessions,
+            active: active_idx,
+            next_session_id,
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
+            last_sessions_snapshot: None,
             profile: user_profile,
             modifiers: ModifiersState::default(),
             clipboard,
@@ -444,6 +542,15 @@ impl App {
             shell_state: shell::ShellState::default(),
         };
         state.shell_state.settings.font_hint = font_hint;
+        // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
+        if stale_cwd > 0 {
+            state.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                format!("{stale_cwd} 个会话的保存目录已失效，已回退默认目录"),
+            );
+        }
+        // 窗口标题对齐激活会话（恢复多会话时 active 可能非 0）。
+        state.update_window_title();
         Ok(state)
     }
 }
@@ -597,9 +704,15 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
         }
-        // 窗口标题跟随激活会话（OSC 标题可能随本批数据更新）。
+        // 窗口标题跟随激活会话（OSC 标题/cwd 可能随本批数据更新）。
         if active_stats.is_some() {
             state.update_window_title();
+        }
+        // 会话快照持久化（F4）：任一会话的 cwd（OSC 9;9）可能随本批
+        // 数据更新，与上次写盘快照比对后按需落盘（实际写频≈用户 cd
+        // 频率，比对不同才写）。
+        if got_data.iter().any(|&b| b) {
+            state.persist_sessions();
         }
         if needs_shell_redraw {
             state.window.request_redraw();
@@ -752,7 +865,13 @@ impl ApplicationHandler<PtyWake> for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // 退出前以此刻的会话列表落盘（F4）：正常运行中每次
+                // 变更已即时写盘，这里兜底拿住「最后一次变更与关窗
+                // 之间」的状态（快照一致时内部自动跳过）。
+                state.persist_sessions();
+                event_loop.exit();
+            }
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
             WindowEvent::Resized(size) => {
                 state.renderer.resize_surface(size.width, size.height);
@@ -1156,18 +1275,18 @@ impl ApplicationHandler<PtyWake> for App {
                     .sessions
                     .iter()
                     .enumerate()
-                    .map(|(i, s)| shell::SessionEntry {
-                        id: s.id,
-                        title: {
-                            let t = s.display_title();
-                            if t.is_empty() {
-                                "PowerShell".to_owned()
-                            } else {
-                                t.to_owned()
-                            }
-                        },
-                        active: i == state.active,
-                        unseen: s.has_unseen_output,
+                    .map(|(i, s)| {
+                        // 标题取值（自定义名 > cwd > OSC 标题 > 会话 N）
+                        // 见 Session::display_title，恒非空；默认名为
+                        // cwd 时挂全路径悬停提示（截断时可看全，F4）。
+                        let title = s.display_title();
+                        shell::SessionEntry {
+                            id: s.id,
+                            hover_path: s.title_is_cwd().then(|| title.clone()),
+                            title,
+                            active: i == state.active,
+                            unseen: s.has_unseen_output,
+                        }
                     })
                     .collect();
                 let tex_id = state.term_tex_id;
@@ -1240,10 +1359,13 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if let Some((id, name)) = shell_out.rename {
                     if let Some(s) = state.sessions.iter_mut().find(|s| s.id == id) {
-                        // 空名 = 清除自定义名，恢复跟随终端 OSC 标题。
+                        // 空名 = 清除自定义名，恢复跟随默认标题（cwd >
+                        // OSC 标题）。
                         s.custom_title = (!name.is_empty()).then_some(name);
                     }
                     state.update_window_title();
+                    // 重命名是结构性变更：落盘（F4）。
+                    state.persist_sessions();
                 }
                 if shell_out.new_session {
                     state.new_session();

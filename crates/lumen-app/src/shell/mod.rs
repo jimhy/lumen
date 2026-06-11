@@ -21,8 +21,12 @@ pub const SIDEBAR_WIDTH: f32 = 180.0;
 /// 一条会话在侧栏的展示数据（由 main.rs 按帧构造）。
 pub struct SessionEntry {
     pub id: u64,
-    /// 展示标题（自定义名 > OSC 标题 > 默认名，已做空回退）。
+    /// 展示标题（自定义名 > cwd 完整路径 > OSC 标题 > 「会话 N」，
+    /// 取值见 Session::display_title，恒非空）。
     pub title: String,
+    /// 悬停提示：默认名为 cwd 时为完整路径（条目宽度有限会截断，
+    /// 悬停看全路径，F4）；其余情况 None 不挂提示。
+    pub hover_path: Option<String>,
     pub active: bool,
     /// 后台期间有未读输出（条目右侧小圆点）。
     pub unseen: bool,
@@ -155,8 +159,8 @@ pub fn show(
     }
 
     // —— 顶栏（先于侧栏加入面板布局，横贯整窗）：标题 + 头像菜单 ——
-    // 标题与窗口标题同源（激活会话的 display_title，侧栏条目已做
-    // 空回退），无激活条目（防御）时退回应用名。
+    // 标题与窗口标题同源（激活会话的 display_title，恒非空），
+    // 无激活条目（防御）时退回应用名。
     let active_title = input
         .sessions
         .iter()
@@ -344,7 +348,11 @@ fn sidebar_ui(
                 .fill(fill)
                 .wrap_mode(egui::TextWrapMode::Truncate)
                 .min_size(egui::vec2(ui.available_width(), 30.0));
-        let resp = ui.add(btn);
+        let mut resp = ui.add(btn);
+        if let Some(path) = &entry.hover_path {
+            // 默认名 = cwd：条目截断时悬停可看完整路径。
+            resp = resp.on_hover_text(path.clone());
+        }
         if resp.clicked() {
             out.activate = Some(entry.id);
         }

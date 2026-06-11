@@ -8,6 +8,7 @@
 //! 可触发 wake）。渲染调度只对激活会话生效；后台会话照常消化数据并
 //! 回写应答（DSR/DA 不回写会卡死对端程序），有新输出时只标记未读点。
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,8 +46,14 @@ pub struct Session {
     /// 本会话的 PTY 事件接收端（per-session 有界通道，见
     /// [`SESSION_EVENT_CAP`]）。drain 由主循环按「激活优先」轮询。
     pub rx: Receiver<PtyEvent>,
-    /// 用户重命名的标题；None 时跟随 term.title()（OSC 0/2）。
+    /// 用户重命名的标题；None 时跟随默认标题规则（cwd > OSC 标题，
+    /// 见 [`Self::display_title`]）。
     pub custom_title: Option<String>,
+    /// 启动恢复时的初始工作目录（F4 持久化）：OSC 9;9 尚未上报期间，
+    /// 会话快照写盘以它为 cwd 回退值——否则恢复后还没等到提示符上报
+    /// 就触发写盘（如切 tab）会把保存的 cwd 冲成 None。新建会话为
+    /// None（cwd 未知，等首个提示符上报）。
+    pub initial_cwd: Option<PathBuf>,
     /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
     pub last_esu_mark: u64,
     /// 实际绘制中的光标态 (行, 列, 可见)。光标处于「帧尾未归位」
@@ -84,6 +91,8 @@ impl Session {
     /// 启动一个新会话：spawn shell、起转发线程把 PTY 事件送入本会话
     /// 自己的有界通道，并以去重信号唤醒事件循环（信号挂起期间不重复
     /// 发，避免事件风暴——协议与单会话时代一致）。
+    /// `cwd` 为 shell 初始工作目录（会话恢复用，F4；调用方须先验证
+    /// 目录存在）；None 沿用默认目录。
     pub fn spawn(
         id: SessionId,
         rows: usize,
@@ -91,10 +100,16 @@ impl Session {
         scrollback: usize,
         wake_pending: Arc<AtomicBool>,
         proxy: EventLoopProxy<PtyWake>,
+        cwd: Option<&Path>,
     ) -> Result<Self> {
         let term = Terminal::new(rows, cols, scrollback);
-        let (pty, pty_rx) =
-            PtySession::spawn(None, &shell_integration_args(), rows as u16, cols as u16)?;
+        let (pty, pty_rx) = PtySession::spawn(
+            None,
+            &shell_integration_args(),
+            rows as u16,
+            cols as u16,
+            cwd,
+        )?;
         // per-session 有界通道：主循环持接收端，转发线程持发送端。
         let (tx, rx) = crossbeam_channel::bounded::<PtyEvent>(SESSION_EVENT_CAP);
         std::thread::Builder::new()
@@ -122,6 +137,7 @@ impl Session {
             pty,
             rx,
             custom_title: None,
+            initial_cwd: cwd.map(Path::to_path_buf),
             last_esu_mark: 0,
             cursor_displayed: (0, 0, true),
             cursor_frozen_at: None,
@@ -136,11 +152,28 @@ impl Session {
         })
     }
 
-    /// 展示用标题：用户自定义名优先，否则跟随终端 OSC 标题。
-    pub fn display_title(&self) -> &str {
-        self.custom_title
-            .as_deref()
-            .unwrap_or_else(|| self.term.title())
+    /// 展示用标题（侧栏条目与窗口标题同源此函数，F4）。取值优先级：
+    /// 自定义名（用户重命名）> cwd（OSC 9;9 上报的当前目录完整路径，
+    /// cd 后随下一个提示符上报自动跟随）> OSC 0/2 标题 > 「会话 N」。
+    /// PowerShell 默认把窗口标题设成 shell exe 路径，直接展示并不直观
+    /// ——cwd 优先于它。
+    pub fn display_title(&self) -> String {
+        if let Some(t) = &self.custom_title {
+            return t.clone();
+        }
+        if let Some(cwd) = self.term.cwd() {
+            return cwd.display().to_string();
+        }
+        let t = self.term.title();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+        format!("会话 {}", self.id + 1)
+    }
+
+    /// 默认标题当前是否来自 cwd（侧栏据此挂全路径悬停提示）。
+    pub fn title_is_cwd(&self) -> bool {
+        self.custom_title.is_none() && self.term.cwd().is_some()
     }
 
     /// 复制选中命令块的输出到剪贴板，返回是否复制了内容。
