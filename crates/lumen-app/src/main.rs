@@ -93,6 +93,131 @@ struct App {
     state: Option<AppState>,
 }
 
+/// PTY 原始字节的人类可读转义表示（LUMEN_DUMP_PTY 取证设施，B3）。
+///
+/// 格式规则：
+/// - 可打印 ASCII（0x20..=0x7e）原样输出；
+/// - CR(`\r`)→`<CR>`、LF(`\n`)→`<LF>\n`（保留换行让文本文件可读）；
+/// - ESC（0x1b）后跟 `[`：完整 CSI 序列以 `<ESC[...终止符>` 表示；
+/// - ESC 后跟 `]`：完整 OSC 序列以 `<OSC...ST>` 表示（含 BEL/ST 终止）；
+/// - 其余控制字符以 `<XX>` 十六进制表示。
+///
+/// # Examples
+///
+/// ```
+/// # use lumen_app::dump_pty_readable; // (仅文档说明，实际为 crate 内函数)
+/// // 简单断言：ESC[1;1H 应被展示为 <ESC[1;1H>
+/// let s = dump_pty_readable(b"\x1b[1;1H");
+/// assert!(s.contains("<ESC[1;1H>"));
+/// ```
+fn dump_pty_readable(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            // 可打印 ASCII 原样输出
+            0x20..=0x7e => {
+                out.push(b as char);
+                i += 1;
+            }
+            // CR
+            b'\r' => {
+                out.push_str("<CR>");
+                i += 1;
+            }
+            // LF：保留一个真换行让 .txt 文件可读
+            b'\n' => {
+                out.push_str("<LF>\n");
+                i += 1;
+            }
+            // BEL
+            0x07 => {
+                out.push_str("<BEL>");
+                i += 1;
+            }
+            // BS
+            0x08 => {
+                out.push_str("<BS>");
+                i += 1;
+            }
+            // ESC 序列
+            0x1b => {
+                let next = bytes.get(i + 1).copied();
+                match next {
+                    // CSI：ESC [ ... 终止符（0x40..=0x7e）
+                    Some(b'[') => {
+                        let start = i;
+                        i += 2; // 跳过 ESC [
+                        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1; // 包含终止符
+                        }
+                        out.push_str("<ESC");
+                        for &c in &bytes[start + 1..i] {
+                            if (0x20..=0x7e).contains(&c) {
+                                out.push(c as char);
+                            } else {
+                                out.push_str(&format!("\\x{c:02x}"));
+                            }
+                        }
+                        out.push('>');
+                    }
+                    // OSC：ESC ] ... BEL(0x07) 或 ST(ESC \)
+                    Some(b']') => {
+                        let start = i;
+                        i += 2; // 跳过 ESC ]
+                        loop {
+                            if i >= bytes.len() {
+                                break;
+                            }
+                            if bytes[i] == 0x07 {
+                                i += 1; // BEL 终止
+                                break;
+                            }
+                            // ST = ESC \
+                            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                        out.push_str("<OSC");
+                        for &c in &bytes[start + 2..i] {
+                            if c == 0x07 || (c == b'\\' && i > 0) {
+                                break;
+                            }
+                            if (0x20..=0x7e).contains(&c) {
+                                out.push(c as char);
+                            } else {
+                                out.push_str(&format!("\\x{c:02x}"));
+                            }
+                        }
+                        out.push_str("...ST>");
+                    }
+                    // 其它 ESC 序列（ESC x）
+                    Some(c) => {
+                        out.push_str(&format!("<ESC{}>", c as char));
+                        i += 2;
+                    }
+                    None => {
+                        out.push_str("<ESC>");
+                        i += 1;
+                    }
+                }
+            }
+            // 其余控制字符
+            c => {
+                out.push_str(&format!("<{c:02X}>"));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// 窗格 drain 的轮询顺序：激活 tab 的焦点窗格最先（回显延迟对排队
 /// 最敏感），其余激活 tab 窗格次之（可见、正在渲染），最后是后台
 /// tab 的窗格。`pane_counts` 为各 tab 的窗格数，`active_tab` /
@@ -1191,6 +1316,33 @@ impl ApplicationHandler<PtyWake> for App {
                                 .open(path)
                             {
                                 let _ = f.write_all(&bytes);
+                            }
+                        }
+                        // 取证设施（B3）：LUMEN_DUMP_PTY=<dir> 时按会话 id
+                        // 把原始字节流追加写入 <dir>/pane-<id>.bin，同时把
+                        // 可读的转义序列表示追加写入 <dir>/pane-<id>.txt。
+                        // 环境变量门控，零开销（仅读一次 env，实际写盘在
+                        // 条件分支内），长期保留供现场取证用。
+                        if let Ok(dir) = std::env::var("LUMEN_DUMP_PTY") {
+                            let sid = state.tabs[ti].panes[pi].id;
+                            use std::io::Write;
+                            let bin_path = format!("{dir}/pane-{sid}.bin");
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&bin_path)
+                            {
+                                let _ = f.write_all(&bytes);
+                            }
+                            let txt_path = format!("{dir}/pane-{sid}.txt");
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&txt_path)
+                            {
+                                // 人类可读格式：控制字符/转义序列以 <XX> 或
+                                // <ESC[...X> 表示，普通可打印字符原样输出。
+                                let _ = f.write_all(dump_pty_readable(&bytes).as_bytes());
                             }
                         }
                         state.tabs[ti].panes[pi].term.advance(&bytes);
