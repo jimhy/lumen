@@ -21,8 +21,9 @@ pub mod topbar;
 const PANE_CLOSE_SIZE: f32 = 16.0;
 
 /// 窗格标题栏高度（逻辑像素，F7①）：占高从终端内容区扣除（该格
-/// 终端行数相应减少）。
-const PANE_TITLE_HEIGHT: f32 = 24.0;
+/// 终端行数相应减少）。pub(crate)：main 的恢复路径按它估算各窗格
+/// spawn 时的初始行列（B2 修复，估算须与首帧实际占高同源）。
+pub(crate) const PANE_TITLE_HEIGHT: f32 = 24.0;
 
 /// 一个 tab 在侧栏的展示数据（由 main.rs 按帧构造；M3.7 起侧栏
 /// 条目 = tab，每 tab 含 1~6 个终端窗格）。

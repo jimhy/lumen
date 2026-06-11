@@ -124,6 +124,51 @@ fn width_worth_persisting(actual: f32, stored: f32, min: f32, max: f32) -> bool 
     (min - 1.0..=max + 1.0).contains(&actual) && (actual - stored).abs() >= 1.0
 }
 
+/// 恢复路径各窗格的初始内容区估算（B2 修复，抽成纯函数加单测）。
+///
+/// spawn 发生在首帧 egui 布局之前，旧实现给所有窗格统一按**整个
+/// 终端区**估算行列——多窗格布局下首帧要做腰斩级缩行 resize，恰
+/// 与 shell 打印首个提示符的时间窗重叠：ConPTY/PSReadLine 跨
+/// resize 的差量重绘按陈旧坐标落格，是 B2 症状②「提示符丢字 +
+/// 回显错位混叠」的温床；缩行擦除则联动症状①。这里用与 shell
+/// 首帧完全相同的布局引擎按还原权重预切窗格矩形、再扣窗格标题栏
+/// 占高，估算与首帧实际值的偏差只剩面板像素级出入（行列 ±1 级），
+/// 首帧 resize 从「腰斩」降为「微调或无」。
+///
+/// `area` 为终端工作区估算（逻辑点）；`maximized` 窗格按独占整区
+/// 计算，其余窗格仍按布局矩形——还原最大化时回到布局矩形，届时
+/// resize 近似无损。返回各窗格内容区物理像素 (宽, 高)，顺序与窗格
+/// 一致；布局与 n 不符（防御）时按均分计算。
+fn estimate_restored_pane_px(
+    area: egui::Rect,
+    layout: &PaneLayout,
+    n: usize,
+    maximized: Option<usize>,
+    scale: f32,
+) -> Vec<(u32, u32)> {
+    let rects = if layout.pane_count() == n {
+        layout.pane_rects(area)
+    } else {
+        PaneLayout::uniform(n).pane_rects(area)
+    };
+    rects
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let r = match maximized {
+                Some(m) if m == i => area,
+                _ => r,
+            };
+            // 与 shell/mod.rs 的窗格标题栏占高同源（极矮窗格防御：
+            // 最多占一半高）。
+            let title_h = shell::PANE_TITLE_HEIGHT.min(r.height() / 2.0);
+            let w = (r.width() * scale).round().max(1.0) as u32;
+            let h = ((r.height() - title_h) * scale).round().max(1.0) as u32;
+            (w, h)
+        })
+        .collect()
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -858,10 +903,22 @@ impl App {
         let term_w = ((size.width as f32 - sidebar_px).max(1.0)) as u32;
         let term_h = ((size.height as f32 - topbar_px).max(1.0)) as u32;
 
-        // 行列数先按整个终端区估算（分屏恢复时各窗格首帧会按实际
-        // 矩形 resize，spawn 值只影响 shell 启动瞬间的报告尺寸）。
+        // 单会话兜底的行列数按整个终端区估算；多窗格恢复时**逐窗格**
+        // 按还原布局预切矩形估算（见 estimate_restored_pane_px——B2
+        // 修复：旧实现全员按整区 spawn，首帧腰斩级缩行 resize 与首个
+        // 提示符打印撞车，是症状①②的共同触发器）。
         let (rows, cols) = renderer.grid_size_for(term_w, term_h);
         info!("终端尺寸: {rows} 行 x {cols} 列");
+        // 估算用终端工作区（逻辑点）：再扣文件树栏（启动时默认展开，
+        // 宽度来自设置）。与首帧实际布局的残差只剩面板边距像素级出入。
+        let filetree_px = (app_settings.layout.filetree_width * scale).round();
+        let est_area = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(
+                (term_w as f32 - filetree_px).max(1.0) / scale,
+                term_h as f32 / scale,
+            ),
+        );
 
         // PTY 事件走 per-session 有界通道（Session 自持接收端），唤醒
         // 走全局去重的 PtyWake（见 session.rs 模块文档）。
@@ -882,8 +939,18 @@ impl App {
         let mut restored_layouts = 0usize;
         if let Some(stored) = &stored {
             for tab_entry in &stored.tabs {
+                // 逐窗格估算 spawn 尺寸（B2 修复）：布局/最大化的取值
+                // 规则与下方实际还原同源。spawn 失败跳窗格时实际布局
+                // 会回退均分、估算随之偏差，但那是罕见降级路径，只
+                // 影响首帧 resize 幅度，不影响正确性。
+                let n = tab_entry.panes.len();
+                let est_layout =
+                    PaneLayout::from_weights(n, &tab_entry.row_weights, &tab_entry.col_weights)
+                        .unwrap_or_else(|| PaneLayout::uniform(n));
+                let est_max = tab_entry.maximized.filter(|&m| m < n && n > 1);
+                let est_px = estimate_restored_pane_px(est_area, &est_layout, n, est_max, scale);
                 let mut panes: Vec<Session> = Vec::new();
-                for pane_entry in &tab_entry.panes {
+                for (pi, pane_entry) in tab_entry.panes.iter().enumerate() {
                     let cwd = pane_entry.usable_cwd();
                     if let Some(saved) = pane_entry.cwd.as_deref() {
                         if cwd.is_none() {
@@ -894,10 +961,15 @@ impl App {
                             );
                         }
                     }
+                    // 估算不可用（防御，不应发生）回退整区行列。
+                    let (est_rows, est_cols) = est_px
+                        .get(pi)
+                        .map(|&(w, h)| renderer.grid_size_for(w, h))
+                        .unwrap_or((rows, cols));
                     match Session::spawn(
                         next_session_id,
-                        rows,
-                        cols,
+                        est_rows,
+                        est_cols,
                         SCROLLBACK,
                         wake_pending.clone(),
                         self.proxy.clone(),
@@ -2435,6 +2507,17 @@ impl ApplicationHandler<PtyWake> for App {
                             .zip(&layout_pane_ids)
                             .all(|(p, id)| p.id == *id)
                 });
+                // 分隔条拖动期间暂缓 term/PTY resize（B2 修复）：旧行为
+                // 逐帧 resize 是对 ConPTY 的整批重绘风暴，PSReadLine 的
+                // 差量渲染跨 resize 即坐标失步——提示符丢字、回显错位
+                // 混叠（症状②）的直接温床，且逐帧触发缩行。拖动中纹理
+                // 照常随矩形重建（边界视觉跟手，内容暂按旧行列呈现），
+                // 松手（drag_stopped）那一帧本判定即为 false，下方矩形
+                // 对照一次性提交 resize。拖动异常中断没等到结束事件也
+                // 无妨：下一帧 divider_drag 必为 None，照常提交，不留
+                // 永久失配。
+                let divider_resize_held =
+                    shell_out.divider_drag.is_some() && !shell_out.divider_drag_ended;
                 if structure_unchanged {
                     // 窗格关闭按钮命中区（F5 批2）：raw 鼠标路由的让位
                     // 判定用（mouse_on_pane_close）。
@@ -2506,10 +2589,27 @@ impl ApplicationHandler<PtyWake> for App {
                         // 是这条链路：cell 尺寸变 → 行列数变 → resize。
                         let (rows, cols) = state.renderer.grid_size_for(tw, th);
                         let s = &mut state.tabs[state.active_tab].panes[i];
-                        let g = s.term.grid();
-                        if (rows, cols) != (g.rows(), g.cols()) {
+                        let (old_rows, old_cols) = {
+                            let g = s.term.grid();
+                            (g.rows(), g.cols())
+                        };
+                        if !divider_resize_held && (rows, cols) != (old_rows, old_cols) {
+                            // 观测点（B2）：幅度可核对恢复路径估算的精度
+                            // ——估算到位时首帧 resize 应为 ±1 级微调。
+                            log::debug!(
+                                "窗格 id={} 网格 {old_rows}x{old_cols} → {rows}x{cols}",
+                                s.id
+                            );
                             s.term.resize(rows, cols);
-                            let _ = s.pty.resize(rows as u16, cols as u16);
+                            // resize 失败 = term 与 ConPTY 几何失步（丢字
+                            // /错位的温床），必须可观测（B2 修复：不再
+                            // `let _ =` 静默吞掉）。
+                            if let Err(e) = s.pty.resize(rows as u16, cols as u16) {
+                                log::warn!(
+                                    "窗格 id={} 的 PTY resize 到 {rows}x{cols} 失败: {e:#}",
+                                    s.id
+                                );
+                            }
                             // 尺寸变化会夹紧光标位置，立即同步绘制态。
                             let g = s.term.grid();
                             s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
@@ -2694,7 +2794,46 @@ impl ApplicationHandler<PtyWake> for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_order, width_worth_persisting};
+    use super::{drain_order, estimate_restored_pane_px, width_worth_persisting, PaneLayout};
+
+    /// 估算测试区域：与 layout.rs 测试同款 304x202（宽对 3 列、高对
+    /// 2 排整除：上3下2 时上排格 100x100、下排格 151x100）。
+    fn est_area() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(304.0, 202.0))
+    }
+
+    #[test]
+    fn 恢复估算_五格上3下2_扣标题栏() {
+        // B2 修复断言：估算必须与 shell 首帧同源——布局矩形扣
+        // 24px 窗格标题栏，再乘 DPI 缩放取整。
+        let px = estimate_restored_pane_px(est_area(), &PaneLayout::uniform(5), 5, None, 2.0);
+        assert_eq!(px.len(), 5);
+        // 上排格 100x100 逻辑 → 内容 100x76 → 物理 ×2。
+        assert_eq!(px[0], (200, 152));
+        assert_eq!(px[2], (200, 152));
+        // 下排格 151x100 逻辑。
+        assert_eq!(px[3], (302, 152));
+        assert_eq!(px[4], (302, 152));
+    }
+
+    #[test]
+    fn 恢复估算_最大化格按整区其余按布局() {
+        let px = estimate_restored_pane_px(est_area(), &PaneLayout::uniform(2), 2, Some(0), 1.0);
+        // 最大化格独占整区（304x202 − 24 标题栏）。
+        assert_eq!(px[0], (304, 178));
+        // 隐藏格按布局矩形（两格左右分 151x202；还原最大化时回到它，
+        // 届时 resize 近似无损）。
+        assert_eq!(px[1], (151, 178));
+    }
+
+    #[test]
+    fn 恢复估算_布局形状不符回退均分() {
+        // 布局是 3 格形状、实际 2 格（防御路径）：按 2 格均分计算，
+        // 不 panic、数量对位。
+        let px = estimate_restored_pane_px(est_area(), &PaneLayout::uniform(3), 2, None, 1.0);
+        assert_eq!(px.len(), 2);
+        assert_eq!(px[0], (151, 178));
+    }
 
     #[test]
     fn 焦点窗格最先_激活tab次之() {
