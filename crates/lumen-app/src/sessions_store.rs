@@ -4,8 +4,11 @@
 //! focused, panes: [{cwd}]}]}`：每个 tab 保存自定义名、窗格列表（各窗格
 //! 最后上报的 cwd，OSC 9;9）与焦点窗格下标，外加激活 tab 下标；启动时
 //! 按结构逐窗格重开 shell（初始工作目录用保存的 cwd，已失效则回退
-//! 默认目录并提示）。屏幕内容/滚动历史不持久化——重启是新 shell，
-//! 这是预期行为。读侧兼容两种旧格式（写侧只写 v2）：
+//! 默认目录并提示）。M3.7c（F7③）在 tab 条目上增量扩展布局比例
+//! `row_weights`/`col_weights`（serde default：旧 v2 文件无字段自动
+//! 均分，纯可选字段不 bump 版本号，新旧双向兼容）。屏幕内容/滚动
+//! 历史不持久化——重启是新 shell，这是预期行为。读侧兼容两种旧格式
+//! （写侧只写 v2）：
 //! - M3.6b 的 v1 平铺格式（`entries` 字段）自动迁移为「每条目一个
 //!   单窗格 tab」；
 //! - M3.7 批1 的过渡格式（嵌套 tabs 但根字段叫 `active`、无 version）
@@ -52,8 +55,10 @@ impl PaneEntry {
     }
 }
 
-/// 单个 tab 的持久化条目（F5：分屏后每窗格保存自己的 cwd）。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// 单个 tab 的持久化条目（F5：分屏后每窗格保存自己的 cwd；F7：外加
+/// 布局比例权重）。含 f32 权重后不再可派生 Eq（PartialEq 足够：快照
+/// 比对与单测都用它）。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TabEntry {
     /// 用户重命名的标题（None = 跟随默认标题规则：焦点窗格 cwd >
@@ -63,6 +68,13 @@ pub struct TabEntry {
     pub panes: Vec<PaneEntry>,
     /// 焦点窗格下标（加载时已夹紧到合法范围）。
     pub focused: usize,
+    /// 每排高度权重（F7③ 可调比例）。形状须与窗格数推导的网格结构
+    /// 一致才生效（layout::PaneLayout::from_weights 校验），否则恢复
+    /// 时回退均分；旧 v2 文件无此字段 → serde default 空 = 均分，
+    /// **无需 bump 版本号**（纯增量可选字段，新旧双向兼容）。
+    pub row_weights: Vec<f32>,
+    /// 每排内各列宽度权重（同上）。
+    pub col_weights: Vec<Vec<f32>>,
 }
 
 /// 旧版平铺条目（M3.6b 格式，仅读侧迁移用）。
@@ -74,7 +86,7 @@ struct LegacyEntry {
 }
 
 /// sessions.json 根结构。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionsFile {
     /// 格式版本：写盘恒为 [`FORMAT_VERSION`]（=2）；读侧加载后也归一
@@ -167,6 +179,8 @@ impl SessionsFile {
                     custom_title: e.custom_title,
                     panes: vec![PaneEntry { cwd: e.cwd }],
                     focused: 0,
+                    // 旧平铺条目无布局概念：空权重 = 恢复侧均分。
+                    ..Default::default()
                 })
                 .collect();
             log::info!(
@@ -257,11 +271,13 @@ mod tests {
                         pane(Some(r"D:\work 空格\中文目录")),
                     ],
                     focused: 1,
+                    ..Default::default()
                 },
                 TabEntry {
                     custom_title: None,
                     panes: vec![pane(None)],
                     focused: 0,
+                    ..Default::default()
                 },
             ],
             1,
@@ -271,6 +287,53 @@ mod tests {
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded, f);
+    }
+
+    #[test]
+    fn 带布局权重往返() {
+        // F7③：布局比例权重随 tab 条目写盘/读回，逐位不失真
+        // （serde_json 的 f32 序列化可精确往返）。
+        let f = SessionsFile::new(
+            vec![TabEntry {
+                custom_title: None,
+                panes: vec![pane(Some(r"C:\a")), pane(None), pane(None), pane(None)],
+                focused: 2,
+                row_weights: vec![0.3, 0.7],
+                col_weights: vec![vec![0.25, 0.75], vec![0.6, 0.4]],
+            }],
+            0,
+        );
+        let p = temp_path("weights_roundtrip");
+        f.save_to(&p).expect("写盘失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded, f);
+        assert_eq!(loaded.tabs[0].row_weights, vec![0.3, 0.7]);
+        assert_eq!(loaded.tabs[0].col_weights[1], vec![0.6, 0.4]);
+    }
+
+    #[test]
+    fn 旧v2无权重字段自动均分() {
+        // M3.7 批2 写出的 v2（无 row_weights/col_weights）：serde
+        // default 补空向量，恢复侧（main）据此回退均分布局——版本号
+        // 不 bump，旧文件原样可读。
+        let p = temp_path("v2_no_weights");
+        std::fs::write(
+            &p,
+            r#"{ "version": 2, "tabs": [ { "panes": [ { "cwd": "C:\\a" }, {} ], "focused": 1 } ], "active_tab": 0 }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert!(loaded.tabs[0].row_weights.is_empty(), "无字段应为空向量");
+        assert!(loaded.tabs[0].col_weights.is_empty());
+        // 空权重经布局校验回退均分（恢复链路的实际判定）。
+        assert!(crate::shell::layout::PaneLayout::from_weights(
+            2,
+            &loaded.tabs[0].row_weights,
+            &loaded.tabs[0].col_weights
+        )
+        .is_none());
     }
 
     #[test]

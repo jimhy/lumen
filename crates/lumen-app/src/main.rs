@@ -573,6 +573,10 @@ impl AppState {
                         })
                         .collect(),
                     focused: t.focused,
+                    // 布局比例（F7③）：构造路径保证归一化权重，写盘
+                    // 原值（拖动结束/双击复位时由调用时机触发落盘）。
+                    row_weights: t.layout.row_weights().to_vec(),
+                    col_weights: t.layout.col_weights().to_vec(),
                 })
                 .collect(),
             self.active_tab,
@@ -695,6 +699,8 @@ impl App {
         let mut active_idx = 0usize;
         // 保存的 cwd 已失效（目录被删/网络盘离线）的窗格数（toast 一次）。
         let mut stale_cwd = 0usize;
+        // 成功还原布局比例的 tab 数（F7 持久化；恢复日志用）。
+        let mut restored_layouts = 0usize;
         if let Some(stored) = &stored {
             for tab_entry in &stored.tabs {
                 let mut panes: Vec<Session> = Vec::new();
@@ -733,9 +739,19 @@ impl App {
                 }
                 let focused = tab_entry.focused.min(panes.len() - 1);
                 // 布局比例还原（F7 持久化）：保存的权重形状须与实际
-                // 起来的窗格数一致（spawn 失败跳窗格会改变数量），
-                // 否则回退均分。
-                let layout = PaneLayout::uniform(panes.len());
+                // 起来的窗格数一致（spawn 失败跳窗格会改变数量）且
+                // 数值合法，否则回退均分（旧 v2 无字段也走这条路）。
+                let layout = match PaneLayout::from_weights(
+                    panes.len(),
+                    &tab_entry.row_weights,
+                    &tab_entry.col_weights,
+                ) {
+                    Some(l) => {
+                        restored_layouts += 1;
+                        l
+                    }
+                    None => PaneLayout::uniform(panes.len()),
+                };
                 tabs.push(Tab {
                     id: next_tab_id,
                     custom_title: tab_entry.custom_title.clone(),
@@ -749,7 +765,7 @@ impl App {
                 active_idx = stored.active_tab.min(tabs.len() - 1);
                 let pane_total: usize = tabs.iter().map(|t| t.panes.len()).sum();
                 info!(
-                    "会话恢复：{} 个 tab / {pane_total} 个窗格，激活 #{active_idx}（cwd 失效 {stale_cwd} 个）",
+                    "会话恢复：{} 个 tab / {pane_total} 个窗格，激活 #{active_idx}（cwd 失效 {stale_cwd} 个，布局比例还原 {restored_layouts} 个 tab）",
                     tabs.len()
                 );
             }
@@ -1705,9 +1721,30 @@ impl ApplicationHandler<PtyWake> for App {
                     .panes
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| shell::PaneView {
-                        tex: state.pane_textures.get(&p.id).copied(),
-                        focused: i == tab.focused,
+                    .map(|(i, p)| {
+                        // 窗格标题（F7①）：与侧栏 display_title 同源
+                        // 取值（cwd > OSC 标题），但标题栏空间窄，cwd
+                        // 取尾目录名（盘根等无尾名时回完整路径）；悬停
+                        // 提示完整 cwd。两者皆无回退「窗格 N」。
+                        let cwd = p.term.cwd();
+                        let title = cwd
+                            .map(|c| {
+                                c.file_name().map_or_else(
+                                    || c.display().to_string(),
+                                    |t| t.to_string_lossy().into_owned(),
+                                )
+                            })
+                            .or_else(|| {
+                                let t = p.term.title();
+                                (!t.is_empty()).then(|| t.to_owned())
+                            })
+                            .unwrap_or_else(|| format!("窗格 {}", i + 1));
+                        shell::PaneView {
+                            tex: state.pane_textures.get(&p.id).copied(),
+                            focused: i == tab.focused,
+                            title,
+                            title_hover: cwd.map(|c| c.display().to_string()),
+                        }
                     })
                     .collect();
                 let was_renaming = state.shell_state.renaming.is_some();

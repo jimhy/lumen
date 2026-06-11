@@ -85,6 +85,45 @@ impl PaneLayout {
         }
     }
 
+    /// 从持久化权重还原（F7 持久化）：形状须与 n 个窗格的网格结构
+    /// 一致且所有权重有限、为正，否则返回 None（调用方回退均分——
+    /// 旧 v2 文件无权重字段、恢复时窗格 spawn 失败导致数量变化、
+    /// 手改文件的非法值都走这条降级路）。合法权重按组归一化。
+    pub fn from_weights(n: usize, rows: &[f32], cols: &[Vec<f32>]) -> Option<Self> {
+        if n == 0 || n > 6 {
+            return None;
+        }
+        let shape = grid_rows(n);
+        if rows.len() != shape.len() || cols.len() != shape.len() {
+            return None;
+        }
+        if cols.iter().zip(shape).any(|(c, &expect)| c.len() != expect) {
+            return None;
+        }
+        let valid = |w: &f32| w.is_finite() && *w > 0.0;
+        if !rows.iter().all(valid) || !cols.iter().flatten().all(valid) {
+            return None;
+        }
+        let norm = |v: &[f32]| -> Vec<f32> {
+            let s: f32 = v.iter().sum();
+            v.iter().map(|w| w / s).collect()
+        };
+        Some(Self {
+            row_weights: norm(rows),
+            col_weights: cols.iter().map(|c| norm(c)).collect(),
+        })
+    }
+
+    /// 排高权重（持久化快照取值）。
+    pub fn row_weights(&self) -> &[f32] {
+        &self.row_weights
+    }
+
+    /// 列宽权重（持久化快照取值）。
+    pub fn col_weights(&self) -> &[Vec<f32>] {
+        &self.col_weights
+    }
+
     /// 本布局对应的窗格数（shell 侧与传入的窗格列表对照防御）。
     pub fn pane_count(&self) -> usize {
         self.col_weights.iter().map(Vec::len).sum()
@@ -393,6 +432,27 @@ mod tests {
                 "n={n} 末格右下角 {last:?} 未贴齐区域 {a:?}"
             );
         }
+    }
+
+    #[test]
+    fn from_weights_合法归一化与非法回退() {
+        // 旧 v2 无权重字段（空向量）→ None（调用方回退均分）。
+        assert!(PaneLayout::from_weights(2, &[], &[]).is_none());
+        // 形状不符：排数 / 某排列数与网格规则不一致。
+        assert!(PaneLayout::from_weights(4, &[1.0], &[vec![1.0, 1.0]]).is_none());
+        assert!(PaneLayout::from_weights(2, &[1.0], &[vec![1.0, 1.0, 1.0]]).is_none());
+        // 非法值：NaN / 0 / 负数。
+        assert!(PaneLayout::from_weights(2, &[1.0], &[vec![f32::NAN, 1.0]]).is_none());
+        assert!(PaneLayout::from_weights(2, &[1.0], &[vec![0.0, 1.0]]).is_none());
+        assert!(PaneLayout::from_weights(2, &[-1.0], &[vec![1.0, 1.0]]).is_none());
+        // n 越界。
+        assert!(PaneLayout::from_weights(0, &[], &[]).is_none());
+        assert!(PaneLayout::from_weights(7, &[1.0, 1.0], &[vec![1.0; 3], vec![1.0; 3]]).is_none());
+        // 合法：按组归一化（2:6 → 0.25:0.75）。
+        let l = PaneLayout::from_weights(2, &[2.0], &[vec![2.0, 6.0]]).expect("合法权重");
+        assert!((l.row_weights()[0] - 1.0).abs() < 1e-6);
+        assert!((l.col_weights()[0][0] - 0.25).abs() < 1e-6);
+        assert!((l.col_weights()[0][1] - 0.75).abs() < 1e-6);
     }
 
     #[test]

@@ -19,8 +19,13 @@ pub mod topbar;
 /// 左侧会话栏宽度（逻辑像素）。
 pub const SIDEBAR_WIDTH: f32 = 180.0;
 
-/// 窗格右上角关闭按钮的边长（逻辑像素，F5 批2）。
+/// 窗格标题栏里关闭按钮的边长（逻辑像素，F5 批2 引入、F7① 迁入
+/// 标题栏常驻）。
 const PANE_CLOSE_SIZE: f32 = 16.0;
+
+/// 窗格标题栏高度（逻辑像素，F7①）：占高从终端内容区扣除（该格
+/// 终端行数相应减少）。
+const PANE_TITLE_HEIGHT: f32 = 24.0;
 
 /// 一个 tab 在侧栏的展示数据（由 main.rs 按帧构造；M3.7 起侧栏
 /// 条目 = tab，每 tab 含 1~6 个终端窗格）。
@@ -61,8 +66,13 @@ pub struct PaneView {
     /// 窗格离屏纹理的 egui 句柄（注册失败的极端情况为 None，该
     /// 窗格本帧只占位不画图像）。
     pub tex: Option<egui::TextureId>,
-    /// 是否为焦点窗格（多窗格时画 1px accent 边框）。
+    /// 是否为焦点窗格（多窗格时画 1px accent 边框 + 标题栏提亮）。
     pub focused: bool,
+    /// 标题栏展示名（F7①：cwd 尾目录名 > OSC 标题 > 「窗格 N」，
+    /// 与侧栏 display_title 同源取值；过长由 UI 截断）。
+    pub title: String,
+    /// 标题悬停提示：完整 cwd（截断时可看全）；cwd 未知时 None。
+    pub title_hover: Option<String>,
 }
 
 /// 一帧外壳 UI 的输入（main.rs 按帧构造的状态快照）。
@@ -85,18 +95,20 @@ pub struct ShellInput<'a> {
 pub struct ShellOutput {
     /// 终端工作区整体矩形（egui 逻辑点坐标；拖放落点判定等用）。
     pub term_rect: egui::Rect,
-    /// 各窗格矩形（与 [`ShellInput::panes`] 同序，已对齐物理像素；
-    /// main.rs 据此重建离屏纹理 / resize / 路由鼠标与 IME）。
+    /// 各窗格的**终端内容矩形**（与 [`ShellInput::panes`] 同序，已
+    /// 对齐物理像素；F7① 起不含顶部标题栏——标题栏上的鼠标事件不
+    /// 进终端）。main.rs 据此重建离屏纹理 / resize / 路由鼠标与 IME。
     pub pane_rects: Vec<egui::Rect>,
     /// 本帧用户点击了终端区（焦点交还终端）。
     pub term_clicked: bool,
     /// 点击了某个窗格（下标对应 [`ShellInput::panes`]；切换焦点窗格）。
     pub pane_clicked: Option<usize>,
-    /// 点击了某窗格右上角的 ✕（关闭该窗格；按钮仅多窗格时出现）。
+    /// 点击了某窗格标题栏的 ✕（关闭该窗格；F7① 起常驻标题栏，
+    /// 单窗格时关闭 = 关整个 tab）。
     pub pane_close: Option<usize>,
-    /// 各窗格关闭按钮的命中矩形（egui 逻辑坐标，与窗格同序；单窗格
-    /// 时为空）。main.rs 据此让 raw 鼠标路由对 ✕ 让位（不聚焦/不建
-    /// 选区/不交出终端焦点，点击由 egui 侧处理）。
+    /// 各窗格关闭按钮的命中矩形（egui 逻辑坐标，与窗格同序）。
+    /// main.rs 据此让 raw 鼠标路由对 ✕ 让位（不聚焦/不建选区/不交
+    /// 出终端焦点，点击由 egui 侧处理）。
     pub pane_close_rects: Vec<egui::Rect>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
@@ -292,22 +304,124 @@ pub fn show(
             let rects = lay.pane_rects(area);
             for (i, (pane, rect)) in input.panes.iter().zip(&rects).enumerate() {
                 let rect = rect.round_to_pixels(ppp);
-                if let Some(tex) = pane.tex {
-                    ui.put(
-                        rect,
-                        egui::Image::new(egui::load::SizedTexture::new(tex, rect.size())),
+                // —— 窗格标题栏（F7①）：顶部窄条，左标题右 ✕，占高从
+                // 终端内容区扣除（行数相应减少，沿用矩形→resize 链
+                // 路）。单窗格也显示（裁决：保持形态一致、关闭入口
+                // 常驻，且是批次2 拖动换位的抓手——Warp 本尊单格顶部
+                // 也有 pane 条）。极矮窗格防御：标题栏最多占一半高。
+                let title_h = PANE_TITLE_HEIGHT.min(rect.height() / 2.0);
+                let title_rect = egui::Rect::from_min_max(
+                    rect.min,
+                    egui::pos2(rect.max.x, rect.min.y + title_h),
+                )
+                .round_to_pixels(ppp);
+                let content_rect =
+                    egui::Rect::from_min_max(egui::pos2(rect.min.x, title_rect.max.y), rect.max);
+                // 焦点窗格标题栏提亮一档（底 btn_bg/文字 fg vs 底
+                // bg_dark/文字 fg_dim），作为 accent 边框外的焦点指示
+                // 补充。
+                let (bar_bg, bar_fg) = if pane.focused {
+                    (pal.btn_bg, pal.fg)
+                } else {
+                    (pal.bg_dark, pal.fg_dim)
+                };
+                ui.painter().rect_filled(title_rect, 0.0, bar_bg);
+
+                // ✕ 常驻标题栏右端（F7①：从悬停浮现迁入标题栏；单窗格
+                // 关闭 = 关整个 tab，与 Ctrl+Shift+W 同语义）。✕ 用画线
+                // 而非字形（不赌字体覆盖）；raw 鼠标路由对该矩形让位见
+                // main.rs（pane_close_rects_px）。
+                let close_rect = egui::Rect::from_center_size(
+                    egui::pos2(
+                        title_rect.max.x - 4.0 - PANE_CLOSE_SIZE / 2.0,
+                        title_rect.center().y,
+                    ),
+                    egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
+                );
+                let cresp = ui.interact(
+                    close_rect,
+                    ui.id().with(("pane_close", i)),
+                    egui::Sense::click(),
+                );
+                {
+                    let painter = ui.painter();
+                    let c = close_rect.center();
+                    if cresp.hovered() {
+                        painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
+                    }
+                    let r = 3.5;
+                    let stroke =
+                        egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
+                    painter.line_segment(
+                        [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+                        stroke,
                     );
                 }
-                // 点击窗格 → 聚焦该窗格 + 焦点交还终端。选区/块点击/
-                // 滚轮仍走 window_event 按窗格矩形路由（见 main.rs）。
-                let resp = ui.interact(rect, ui.id().with(("pane", i)), egui::Sense::click());
+                if cresp.on_hover_text("关闭窗格 (Ctrl+Shift+W)").clicked() {
+                    out.pane_close = Some(i);
+                }
+                out.pane_close_rects.push(close_rect);
+
+                // 标题：左侧单行截断展示；点击标题栏 = 聚焦该窗格
+                // （F7①；也是批次2 拖动换位的抓手——届时把 Sense::
+                // click 换成 click_and_drag 即可在此拖起整个窗格）。
+                // 悬停展示完整 cwd（截断时可看全）。
+                let title_hit = egui::Rect::from_min_max(
+                    title_rect.min,
+                    egui::pos2(close_rect.min.x - 4.0, title_rect.max.y),
+                );
+                let text_rect = egui::Rect::from_min_max(
+                    egui::pos2(title_hit.min.x + 8.0, title_hit.min.y),
+                    title_hit.max,
+                );
+                let mut title_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                title_ui.add(
+                    egui::Label::new(egui::RichText::new(&pane.title).size(12.0).color(bar_fg))
+                        .truncate()
+                        .selectable(false),
+                );
+                let tresp = ui.interact(
+                    title_hit,
+                    ui.id().with(("pane_title", i)),
+                    egui::Sense::click(),
+                );
+                if tresp.clicked() {
+                    out.pane_clicked = Some(i);
+                    out.term_clicked = true;
+                }
+                if let Some(path) = &pane.title_hover {
+                    tresp.on_hover_text(path.clone());
+                }
+
+                // 终端内容区：离屏纹理 + 点击聚焦。选区/块点击/滚轮仍
+                // 走 window_event 按**内容矩形**路由（见 main.rs）——
+                // 标题栏不在其中，标题栏上的鼠标事件不进终端。
+                if let Some(tex) = pane.tex {
+                    ui.put(
+                        content_rect,
+                        egui::Image::new(egui::load::SizedTexture::new(tex, content_rect.size())),
+                    );
+                }
+                let resp = ui.interact(
+                    content_rect,
+                    ui.id().with(("pane", i)),
+                    egui::Sense::click(),
+                );
                 if resp.clicked() {
                     out.pane_clicked = Some(i);
                     out.term_clicked = true;
                 }
-                // 焦点窗格指示：多窗格时画 1px accent 边框（M3.7b
-                // 起 accent = 纯白/近黑；单窗格不画，满屏边框只是
-                // 视觉噪音）。
+                // 焦点窗格指示：多窗格时画 1px accent 边框（整格含
+                // 标题栏；M3.7b 起 accent = 纯白/近黑；单窗格不画，
+                // 满屏边框只是视觉噪音）。
                 if pane.focused && input.panes.len() > 1 {
                     ui.painter().rect_stroke(
                         rect,
@@ -316,48 +430,9 @@ pub fn show(
                         egui::StrokeKind::Inside,
                     );
                 }
-                // 窗格关闭按钮（F5 批2）：多窗格时悬停窗格右上角浮现
-                // 小 ✕（裁决：右键已被「有选区复制/无选区粘贴」惯例
-                // 占用，右键菜单会破坏既有交互；悬停 ✕ 是 Warp 的窗格
-                // 控件形态、成本也更低）。命中区每帧固定注册（id 稳定、
-                // 首点即响应），仅悬停本窗格时绘制；✕ 用画线而非字形
-                // （不赌字体覆盖）。raw 鼠标路由对该矩形让位见 main.rs。
-                if input.panes.len() > 1 {
-                    let close_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.max.x - PANE_CLOSE_SIZE - 6.0, rect.min.y + 6.0),
-                        egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
-                    );
-                    let cresp = ui.interact(
-                        close_rect,
-                        ui.id().with(("pane_close", i)),
-                        egui::Sense::click(),
-                    );
-                    if ui.rect_contains_pointer(rect) || cresp.hovered() {
-                        let painter = ui.painter();
-                        let c = close_rect.center();
-                        if cresp.hovered() {
-                            painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
-                        }
-                        let r = 3.5;
-                        let stroke = egui::Stroke::new(
-                            1.2,
-                            if cresp.hovered() { pal.fg } else { pal.fg_dim },
-                        );
-                        painter.line_segment(
-                            [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
-                            stroke,
-                        );
-                        painter.line_segment(
-                            [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
-                            stroke,
-                        );
-                    }
-                    if cresp.on_hover_text("关闭窗格 (Ctrl+Shift+W)").clicked() {
-                        out.pane_close = Some(i);
-                    }
-                    out.pane_close_rects.push(close_rect);
-                }
-                out.pane_rects.push(rect);
+                // 窗格矩形 = 终端内容区（标题栏已扣除）：main 据此重建
+                // 离屏纹理 / resize / 路由鼠标与 IME。
+                out.pane_rects.push(content_rect);
             }
 
             // —— 分隔条（F7③ + P11 一体）：可视 1px 灰阶细线 + 加宽
