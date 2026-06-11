@@ -197,6 +197,8 @@ pub struct FileTreeOutput {
     pub cd_dir: Option<PathBuf>,
     /// 激活了文件：用系统默认程序打开。
     pub open_file: Option<PathBuf>,
+    /// 激活了目录但 shell 忙，cd 未注入（上层据此弹 toast）。
+    pub busy_hint: bool,
 }
 
 /// 绘制文件树栏（位于 tab 侧栏右侧、终端区左侧）。
@@ -362,8 +364,10 @@ fn panel_ui(
                             } else if shell_idle {
                                 out.cd_dir = Some(info.path.clone());
                             } else {
-                                // shell 忙：不注入命令，仅树内浏览 + 轻提示。
+                                // shell 忙：不注入命令，仅树内浏览 + 轻提示
+                                // （上层另弹 toast，见 shell/mod.rs）。
                                 *hint_until = Some(Instant::now() + HINT_DURATION);
+                                out.busy_hint = true;
                             }
                         }
                         NodeKind::File => out.open_file = Some(info.path.clone()),

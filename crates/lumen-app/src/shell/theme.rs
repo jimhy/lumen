@@ -33,6 +33,8 @@ pub struct Palette {
     pub warn: egui::Color32,
     /// 错误文字色（登录校验失败红字等），与终端主题红同源。
     pub error: egui::Color32,
+    /// 信息提示色（toast Info 等），与终端主题青同源。
+    pub info: egui::Color32,
 }
 
 /// 深色色板（Tokyo Night 同源）。
@@ -49,6 +51,7 @@ pub static DARK: Palette = Palette {
     extreme_bg: egui::Color32::from_rgb(0x10, 0x10, 0x17),
     warn: egui::Color32::from_rgb(0xe0, 0xaf, 0x68),
     error: egui::Color32::from_rgb(0xf7, 0x76, 0x8e),
+    info: egui::Color32::from_rgb(0x7d, 0xcf, 0xff),
 };
 
 /// 浅色色板（Tokyo Night Light 同源）。
@@ -65,6 +68,7 @@ pub static LIGHT: Palette = Palette {
     extreme_bg: egui::Color32::from_rgb(0xf0, 0xf1, 0xf5),
     warn: egui::Color32::from_rgb(0x8c, 0x6c, 0x3e),
     error: egui::Color32::from_rgb(0x8c, 0x43, 0x51),
+    info: egui::Color32::from_rgb(0x00, 0x71, 0x97),
 };
 
 /// 按明暗取色板。

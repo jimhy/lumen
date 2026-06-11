@@ -168,13 +168,17 @@ impl Settings {
         s
     }
 
-    /// 写盘（设置变更即调用）。失败仅记日志——写不进盘不应影响终端使用。
-    pub fn save(&self) {
-        let Some(p) = Self::path() else {
-            return;
-        };
-        if let Err(e) = self.save_to(&p) {
-            log::error!("写设置文件失败 {}: {e:#}", p.display());
+    /// 写盘（设置变更即调用）。失败记日志并返回错误描述（调用方据此
+    /// 弹 toast 告知用户）——写不进盘不应影响终端使用。无持久化路径
+    /// （LOCALAPPDATA 缺失）时静默返回 None（加载时已警告过）。
+    pub fn save(&self) -> Option<String> {
+        let p = Self::path()?;
+        match self.save_to(&p) {
+            Ok(()) => None,
+            Err(e) => {
+                log::error!("写设置文件失败 {}: {e:#}", p.display());
+                Some(format!("{e:#}"))
+            }
         }
     }
 

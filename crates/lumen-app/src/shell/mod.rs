@@ -12,6 +12,7 @@ pub mod filetree;
 pub mod login_ui;
 pub mod settings_ui;
 pub mod theme;
+pub mod toast;
 pub mod topbar;
 
 /// 左侧会话栏宽度（逻辑像素）。
@@ -40,6 +41,8 @@ pub struct ShellState {
     pub settings: settings_ui::SettingsUiState,
     /// 登录覆盖层（开关/输入缓冲等跨帧状态）。
     pub login: login_ui::LoginUiState,
+    /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
+    pub toast: toast::ToastState,
 }
 
 /// 一帧外壳 UI 的输入（main.rs 按帧构造的状态快照）。
@@ -181,6 +184,11 @@ pub fn show(
     let ft = filetree::show(root, &mut st.filetree, input.cwd, input.shell_idle, pal);
     out.cd_dir = ft.cd_dir;
     out.open_file = ft.open_file;
+    if ft.busy_hint {
+        // shell 忙未注入 cd：树内轻提示之外再弹 toast（更醒目，树栏
+        // 收窄/视线在终端区时也能看到）。
+        st.toast.push(toast::ToastKind::Warn, "Shell 正忙，未执行 cd");
+    }
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
@@ -246,6 +254,9 @@ pub fn show(
             out.login_closed = true;
         }
     }
+
+    // —— 系统提示浮层（最后绘制 = 叠在一切覆盖层之上）——
+    toast::show(root.ctx(), &mut st.toast, pal);
     out
 }
 

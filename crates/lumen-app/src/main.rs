@@ -327,8 +327,9 @@ impl App {
         .then(|| format!("系统中未找到「{}」，已回退「{actual_family}」", ap.font_family));
         // 首次启动（无设置文件）落盘默认值，方便用户直接手改；
         // 文件存在但损坏时不在此覆盖（保留现场，变更时才写）。
+        // 此刻 UI 尚未建立，失败只记日志（save 内部已记）不弹 toast。
         if settings::Settings::path().is_some_and(|p| !p.exists()) {
-            app_settings.save();
+            let _ = app_settings.save();
         }
 
         // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
@@ -1266,8 +1267,16 @@ impl ApplicationHandler<PtyWake> for App {
                     );
                 }
                 if shell_out.settings_font_changed || shell_out.settings_theme_changed {
-                    // 变更即写盘（写临时文件后改名，防半写损坏）。
-                    state.settings.save();
+                    // 变更即写盘（写临时文件后改名，防半写损坏）。失败
+                    // 弹 toast：用户以为改完即存，静默丢失重启才发现。
+                    if let Some(err) = state.settings.save() {
+                        state.shell_state.toast.push(
+                            shell::toast::ToastKind::Error,
+                            format!("设置保存失败：{err}"),
+                        );
+                        // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
+                        state.window.request_redraw();
+                    }
                 }
 
                 // —— 登录/登出动作：state.profile 是唯一数据源，更新后
@@ -1276,6 +1285,12 @@ impl ApplicationHandler<PtyWake> for App {
                     // mock 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
                     p.save();
                     info!("登录成功（mock）：{} <{}>", p.display_name, p.email);
+                    state
+                        .shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Info, format!("已登录：{}", p.display_name));
+                    // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
+                    state.window.request_redraw();
                     state.profile = Some(p);
                 }
                 if shell_out.logged_out {
