@@ -81,6 +81,14 @@ pub struct ShellOutput {
     pub cd_dir: Option<std::path::PathBuf>,
     /// 文件树：激活了文件，用系统默认程序打开。
     pub open_file: Option<std::path::PathBuf>,
+    /// 文件树：节点拖放到终端区，把路径文本插入命令行（不带回车，
+    /// 转义见 filetree::path_insert_text）。
+    pub insert_path: Option<std::path::PathBuf>,
+    /// 文件树：请求写剪贴板的文本（复制绝对/相对路径；arboard 在
+    /// main 持有）。
+    pub copy_text: Option<String>,
+    /// 文件树：对话框（新建/删除确认）本帧关闭（main 把焦点交还终端）。
+    pub filetree_dialog_closed: bool,
     /// 设置页本帧被打开（main 把终端焦点交给 egui）。
     pub settings_opened: bool,
     /// 设置页本帧被关闭（main 把焦点交还终端，IME 复位链路照旧）。
@@ -120,6 +128,9 @@ pub fn show(
         new_session: false,
         cd_dir: None,
         open_file: None,
+        insert_path: None,
+        copy_text: None,
+        filetree_dialog_closed: false,
         settings_opened: false,
         settings_closed: false,
         settings_font_changed: false,
@@ -184,10 +195,16 @@ pub fn show(
     let ft = filetree::show(root, &mut st.filetree, input.cwd, input.shell_idle, pal);
     out.cd_dir = ft.cd_dir;
     out.open_file = ft.open_file;
+    out.copy_text = ft.copy_text;
+    out.filetree_dialog_closed = ft.dialog_closed;
     if ft.busy_hint {
         // shell 忙未注入 cd：树内轻提示之外再弹 toast（更醒目，树栏
         // 收窄/视线在终端区时也能看到）。
         st.toast.push(toast::ToastKind::Warn, "Shell 正忙，未执行 cd");
+    }
+    // 文件操作/搜索的结果反馈（egui 帧内 push，当帧即可见）。
+    for (kind, text) in ft.toasts {
+        st.toast.push(kind, text);
     }
 
     egui::CentralPanel::default()
@@ -213,6 +230,15 @@ pub fn show(
             out.term_clicked = resp.clicked();
             out.term_rect = rect;
         });
+
+    // 文件树节点拖放的落点判定：要等 CentralPanel 布局出本帧终端区
+    // 矩形，故放在面板之后。落在终端区 → 请求把路径插入命令行；
+    // 落在别处（侧栏/树内回弹）→ 静默忽略。
+    if let Some((path, pos)) = ft.external_drop {
+        if out.term_rect.contains(pos) {
+            out.insert_path = Some(path);
+        }
+    }
 
     // —— 设置覆盖层（盖住三栏；终端在其下照常消化输出与渲染）——
     // 齿轮按钮本帧点击 → 立即打开（同帧呈现，避免一帧裸跳）。

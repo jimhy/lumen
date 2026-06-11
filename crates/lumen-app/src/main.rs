@@ -226,7 +226,8 @@ impl AppState {
         // （bypass_egui 即刻生效，等不到下一帧的纠偏）。
         self.terminal_focused = !(self.shell_state.settings.open
             || self.shell_state.login.open
-            || self.shell_state.renaming.is_some());
+            || self.shell_state.renaming.is_some()
+            || self.shell_state.filetree.dialog_open());
         self.update_window_title();
         self.window.request_redraw();
     }
@@ -795,6 +796,9 @@ impl ApplicationHandler<PtyWake> for App {
                     && (overlay_open
                         || !state.sessions[state.active].term.is_alt_screen())
                     && state.shell_state.renaming.is_none()
+                    // 文件树对话框（新建/删除确认）打开期间键盘归 egui
+                    // 的输入框，外壳快捷键不响应（Ctrl+W 关会话等）。
+                    && !state.shell_state.filetree.dialog_open()
                 {
                     let shift = state.modifiers.shift_key();
                     match &event.logical_key {
@@ -1258,6 +1262,14 @@ impl ApplicationHandler<PtyWake> for App {
                     // 关闭后焦点交还终端（IME 强制复位链路每帧照旧执行）。
                     state.terminal_focused = true;
                 }
+                // 文件树对话框（新建输入/删除确认）：打开期间键盘/IME
+                // 归 egui 的输入框（与重命名编辑同款仲裁）；关闭后交还
+                // 终端（与设置页关闭同款，点「取消」也交还）。
+                if state.shell_state.filetree.dialog_open() {
+                    state.terminal_focused = false;
+                } else if shell_out.filetree_dialog_closed {
+                    state.terminal_focused = true;
+                }
                 if shell_out.settings_opened
                     || state.shell_state.settings.open
                     || shell_out.login_opened
@@ -1335,6 +1347,42 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if let Some(file) = shell_out.open_file {
                     shell::filetree::open_with_default(&file);
+                }
+                // —— 文件树拖放：把路径文本插入命令行（不带回车）——
+                // 转义与 cd 注入同一套设施（弯引号同形字/控制字符防御
+                // 见 filetree::path_insert_text；空字节串 = 路径被拒绝）。
+                if let Some(path) = shell_out.insert_path {
+                    let bytes = shell::filetree::path_insert_text(&path);
+                    if !bytes.is_empty() {
+                        let s = &mut state.sessions[state.active];
+                        s.term.grid_mut().scroll_to_bottom();
+                        if let Err(e) = s.pty.write(&bytes) {
+                            error!("写入 PTY 失败: {e:#}");
+                        }
+                        // 插入后把键盘/IME 焦点交还终端，接着编辑命令行。
+                        state.terminal_focused = true;
+                    }
+                }
+                // —— 文件树右键菜单：复制绝对/相对路径到剪贴板 ——
+                if let Some(text) = shell_out.copy_text {
+                    let ok = matches!(
+                        state.clipboard.as_mut().map(|c| c.set_text(text.clone())),
+                        Some(Ok(()))
+                    );
+                    if ok {
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Info, format!("已复制：{text}"));
+                    } else {
+                        error!("写剪贴板失败（复制路径）");
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, "复制失败：剪贴板不可用");
+                    }
+                    // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
+                    state.window.request_redraw();
                 }
 
                 // —— 终端区矩形（物理像素）变化 → 重建离屏 + resize ——

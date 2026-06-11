@@ -24,4 +24,5 @@ lumen-renderer.workspace = true
 lumen-term.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+trash.workspace = true
 winit.workspace = true
