@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender};
 use log::{error, info};
 use lumen_pty::PtyEvent;
 use lumen_renderer::{wgpu, Renderer};
@@ -46,8 +45,9 @@ const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// 调小到 10ms 时 ESU 直渲下残留位会在超时后漏画（闪烁回归）。
 const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
 /// 后台会话单次 wake 的消化字节上限：`advance()` 在主线程跑，后台
-/// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在通道
-/// 里（靠 bounded 容量反压读线程），并补发一个 wake 下轮继续消化。
+/// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在**本
+/// 会话自己的通道**里（靠 bounded 容量反压该会话的读线程，不连坐
+/// 其他会话），并补发一个 wake 下轮继续消化。
 const BG_DRAIN_CAP: usize = 256 * 1024;
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
@@ -74,6 +74,18 @@ struct App {
     state: Option<AppState>,
 }
 
+/// 会话 drain 的轮询顺序：激活会话最先（回显延迟对排队最敏感），
+/// 其余按下标升序。`n` 为会话数，`active` 为激活下标；抽成纯函数
+/// 便于单测，`active` 越界（防御）时退化为纯下标序。
+fn drain_order(n: usize, active: usize) -> Vec<usize> {
+    let mut order = Vec::with_capacity(n);
+    if active < n {
+        order.push(active);
+    }
+    order.extend((0..n).filter(|&i| i != active));
+    order
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -92,17 +104,11 @@ struct AppState {
     sessions: Vec<Session>,
     /// 激活会话在 `sessions` 中的下标。
     active: usize,
-    /// 会话 id 自增分配器（关闭不回收，残留事件按 id 丢弃）。
+    /// 会话 id 自增分配器（关闭不回收；通道随会话销毁，残留事件
+    /// 无需按 id 过滤）。
     next_session_id: SessionId,
-    /// 全局 PTY 事件通道发送端（新建会话的转发线程汇入用）。
-    pty_tx: Sender<(SessionId, PtyEvent)>,
-    /// 全局 PTY 事件通道接收端（各会话转发线程汇入，元素带会话 id）。
-    pty_rx: Receiver<(SessionId, PtyEvent)>,
-    /// 后台会话超出单轮消化上限时滞留的事件（下个 wake 优先处理，
-    /// 保持同会话事件顺序）。
-    carry: Option<(SessionId, PtyEvent)>,
     /// 与转发线程共享的「wake 已挂起」标志，用于事件去重（全局一个，
-    /// 唤醒协议与单会话时代零变化）。
+    /// 任一会话的转发线程都可触发，唤醒协议与单会话时代零变化）。
     wake_pending: Arc<AtomicBool>,
     /// 事件循环唤醒句柄（补发 wake / 新建会话的转发线程用）。
     proxy: EventLoopProxy<PtyWake>,
@@ -225,15 +231,13 @@ impl AppState {
         self.window.request_redraw();
     }
 
-    /// 关闭会话：从列表移除即随 `PtySession` Drop 杀掉子进程。
+    /// 关闭会话：从列表移除即随 `PtySession` Drop 杀掉子进程；本会话
+    /// 通道的接收端同时销毁，转发线程 send 失败自然退出（残留事件随
+    /// 通道一并丢弃，无需清理）。
     /// 返回是否已无会话（调用方应退出应用）。
     fn close_session(&mut self, idx: usize) -> bool {
         let removed = self.sessions.remove(idx);
         info!("关闭会话 id={}", removed.id);
-        // 丢弃属于该会话的滞留事件（通道里的残留靠 drain 时按 id 丢）。
-        if self.carry.as_ref().is_some_and(|(sid, _)| *sid == removed.id) {
-            self.carry = None;
-        }
         drop(removed);
         if self.sessions.is_empty() {
             return true;
@@ -265,7 +269,6 @@ impl AppState {
             rows,
             cols,
             SCROLLBACK,
-            self.pty_tx.clone(),
             self.wake_pending.clone(),
             self.proxy.clone(),
         ) {
@@ -383,16 +386,14 @@ impl App {
         let (rows, cols) = renderer.grid_size_for(term_w, term_h);
         info!("终端尺寸: {rows} 行 x {cols} 列");
 
-        // 全局 PTY 事件通道：各会话的转发线程汇入同一条（元素带会话
-        // id），bounded 容量对高产出会话形成背压。
-        let (pty_tx, pty_rx) = crossbeam_channel::bounded::<(SessionId, PtyEvent)>(256);
+        // PTY 事件走 per-session 有界通道（Session 自持接收端），唤醒
+        // 走全局去重的 PtyWake（见 session.rs 模块文档）。
         let wake_pending = Arc::new(AtomicBool::new(false));
         let first = Session::spawn(
             0,
             rows,
             cols,
             SCROLLBACK,
-            pty_tx.clone(),
             wake_pending.clone(),
             self.proxy.clone(),
         )?;
@@ -419,9 +420,6 @@ impl App {
             sessions: vec![first],
             active: 0,
             next_session_id: 1,
-            pty_tx,
-            pty_rx,
-            carry: None,
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
@@ -469,55 +467,52 @@ impl ApplicationHandler<PtyWake> for App {
         state.wake_pending.store(false, Ordering::Release);
 
         let drain_t0 = Instant::now();
+        let n = state.sessions.len();
         // 每会话本轮已消化字节数 / 是否有新数据（按 sessions 下标）。
-        let mut consumed = vec![0usize; state.sessions.len()];
-        let mut got_data = vec![false; state.sessions.len()];
+        let mut consumed = vec![0usize; n];
+        let mut got_data = vec![false; n];
         let mut exited: Vec<SessionId> = Vec::new();
-        // 后台会话超限导致提前停止 drain（需补发 wake 续处理）。
+        // 后台会话超出本轮配额提前停手（需补发 wake 续处理）。
         let mut backlog = false;
-        // Receiver 克隆一份避免 drain 循环内长借用 state。
-        let rx = state.pty_rx.clone();
-        // 上轮滞留的事件优先处理（保持同会话事件顺序）。
-        let mut pending = state.carry.take();
-        loop {
-            let (sid, ev) = match pending.take() {
-                Some(x) => x,
-                None => match rx.try_recv() {
-                    Ok(x) => x,
-                    Err(_) => break,
-                },
-            };
-            // 已关闭会话的残留事件直接丢弃。
-            let Some(idx) = state.sessions.iter().position(|s| s.id == sid) else {
-                continue;
-            };
-            match ev {
-                PtyEvent::Data(bytes) => {
-                    if idx != state.active && consumed[idx] >= BG_DRAIN_CAP {
-                        // 后台会话本轮额度用尽：事件滞留、停止 drain
-                        // （通道 FIFO，不能越过它取后面的事件），剩余
-                        // 留到补发的下一个 wake 再消化，前台打字不被
-                        // yes 级后台输出抢占主线程。
-                        state.carry = Some((sid, PtyEvent::Data(bytes)));
-                        backlog = true;
-                        break;
-                    }
-                    consumed[idx] += bytes.len();
-                    // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
-                    if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                        {
-                            let _ = f.write_all(&bytes);
-                        }
-                    }
-                    state.sessions[idx].term.advance(&bytes);
-                    got_data[idx] = true;
+        // per-session 通道按「激活优先」轮询（需求池 P5）：先清激活
+        // 会话的通道——其量受前台回显/输出规模天然限制且消化快于
+        // 产出；再按 BG_DRAIN_CAP 配额逐个消化后台会话，超限事件留在
+        // 各自通道里由有界容量反压各自的读线程，互不连坐。旧的全局
+        // 单通道下激活会话的回显最坏要排在 ~2MB 后台洪泛之后（队头
+        // 阻塞，延迟尖峰 10~30ms）。
+        for idx in drain_order(n, state.active) {
+            let is_active = idx == state.active;
+            // Receiver 克隆一份（Arc 浅拷贝）避免循环内长借用 state。
+            let rx = state.sessions[idx].rx.clone();
+            loop {
+                if !is_active && consumed[idx] >= BG_DRAIN_CAP {
+                    // 后台会话本轮配额用尽：剩余留到补发的下一个 wake
+                    // 再消化，前台打字不被 yes 级后台输出抢占主线程。
+                    backlog = true;
+                    break;
                 }
-                PtyEvent::Exited => exited.push(sid),
+                let Ok(ev) = rx.try_recv() else {
+                    break;
+                };
+                match ev {
+                    PtyEvent::Data(bytes) => {
+                        consumed[idx] += bytes.len();
+                        // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
+                        if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                            {
+                                let _ = f.write_all(&bytes);
+                            }
+                        }
+                        state.sessions[idx].term.advance(&bytes);
+                        got_data[idx] = true;
+                    }
+                    PtyEvent::Exited => exited.push(state.sessions[idx].id),
+                }
             }
         }
 
@@ -1540,5 +1535,28 @@ impl ApplicationHandler<PtyWake> for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_order;
+
+    #[test]
+    fn 激活会话排最前() {
+        assert_eq!(drain_order(4, 2), vec![2, 0, 1, 3]);
+        assert_eq!(drain_order(3, 0), vec![0, 1, 2]);
+        assert_eq!(drain_order(3, 2), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn 单会话与空列表() {
+        assert_eq!(drain_order(1, 0), vec![0]);
+        assert!(drain_order(0, 0).is_empty());
+    }
+
+    #[test]
+    fn 激活下标越界时退化为顺序遍历() {
+        assert_eq!(drain_order(3, 7), vec![0, 1, 2]);
     }
 }

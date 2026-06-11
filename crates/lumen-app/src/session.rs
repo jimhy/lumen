@@ -1,17 +1,19 @@
 //! 会话：一个 PTY 子进程 + 终端状态机 + 每会话的渲染/交互状态。
 //!
-//! 多会话架构（M3.2，规格见 docs/M3应用外壳设计.md §2）：主循环持有
-//! `Vec<Session>`，各会话的 PTY 事件经独立转发线程汇入同一条全局通道
-//! （元素带会话 id），`PtyWake` 去重协议与单会话时代零变化。渲染调度
-//! 只对激活会话生效；后台会话照常消化数据并回写应答（DSR/DA 不回写
-//! 会卡死对端程序），有新输出时只标记未读点。
+//! 多会话架构（M3.2，规格见 docs/M3应用外壳设计.md §2；M3.6 P5 通道
+//! 改造）：主循环持有 `Vec<Session>`，各会话的 PTY 事件经独立转发
+//! 线程送入**本会话自己的有界通道**（[`Session::rx`]），背压只作用于
+//! 该会话的读线程链路、互不连坐；`PtyWake` 无数据 user event + 全局
+//! `wake_pending` 去重协议与单会话时代零变化（任一会话的转发线程都
+//! 可触发 wake）。渲染调度只对激活会话生效；后台会话照常消化数据并
+//! 回写应答（DSR/DA 不回写会卡死对端程序），有新输出时只标记未读点。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use crossbeam_channel::Sender;
+use crossbeam_channel::Receiver;
 use log::{error, info};
 use lumen_pty::{PtyEvent, PtySession};
 use lumen_term::{Selection, Terminal};
@@ -19,18 +21,30 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::PtyWake;
 
-/// 会话唯一标识。自增分配、关闭后不复用——全局通道里残留的已关闭
-/// 会话事件按 id 直接丢弃，不会误投给新会话。
+/// 会话唯一标识。自增分配、关闭后不复用——退出列表/侧栏动作等按
+/// id 寻会话，复用会与滞后引用相撞；通道里的残留事件随本会话的
+/// Receiver 一并丢弃，无需按 id 过滤。
 pub type SessionId = u64;
+
+/// 每会话事件通道容量（事件粒度为 PTY 读线程的单次 read，至多
+/// 8KiB）：满时转发线程的 send 阻塞，背压沿「转发线程 → PTY 读线程
+/// → ConPTY 管道」传导回本会话的 shell，**不再连坐其他会话**——旧
+/// 的全局单通道下，后台洪泛会让激活会话的回显排在最坏 ~2MB 之后
+/// （队头阻塞，延迟尖峰 10~30ms，需求池 P5）。
+const SESSION_EVENT_CAP: usize = 256;
 
 /// 一个终端会话的全部独立状态。
 ///
 /// Drop 即随 `PtySession` 杀掉 shell 子进程（关 tab = 杀进程）；
-/// 其读线程随后收到 EOF 退出，转发线程跟着结束，无需额外清理。
+/// [`Self::rx`] 同时被丢弃，转发线程 send 失败退出，其持有的 PTY
+/// 事件接收端随之释放、读线程跟着结束，无需额外清理。
 pub struct Session {
     pub id: SessionId,
     pub term: Terminal,
     pub pty: PtySession,
+    /// 本会话的 PTY 事件接收端（per-session 有界通道，见
+    /// [`SESSION_EVENT_CAP`]）。drain 由主循环按「激活优先」轮询。
+    pub rx: Receiver<PtyEvent>,
     /// 用户重命名的标题；None 时跟随 term.title()（OSC 0/2）。
     pub custom_title: Option<String>,
     /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
@@ -67,30 +81,34 @@ pub struct Session {
 }
 
 impl Session {
-    /// 启动一个新会话：spawn shell、起转发线程把事件（带会话 id）
-    /// 汇入全局通道，并以去重信号唤醒事件循环（信号挂起期间不重复
+    /// 启动一个新会话：spawn shell、起转发线程把 PTY 事件送入本会话
+    /// 自己的有界通道，并以去重信号唤醒事件循环（信号挂起期间不重复
     /// 发，避免事件风暴——协议与单会话时代一致）。
     pub fn spawn(
         id: SessionId,
         rows: usize,
         cols: usize,
         scrollback: usize,
-        events_tx: Sender<(SessionId, PtyEvent)>,
         wake_pending: Arc<AtomicBool>,
         proxy: EventLoopProxy<PtyWake>,
     ) -> Result<Self> {
         let term = Terminal::new(rows, cols, scrollback);
-        let (pty, rx) = PtySession::spawn(
+        let (pty, pty_rx) = PtySession::spawn(
             None,
             &shell_integration_args(),
             rows as u16,
             cols as u16,
         )?;
+        // per-session 有界通道：主循环持接收端，转发线程持发送端。
+        let (tx, rx) = crossbeam_channel::bounded::<PtyEvent>(SESSION_EVENT_CAP);
         std::thread::Builder::new()
             .name(format!("lumen-pty-forward-{id}"))
             .spawn(move || {
-                for ev in rx {
-                    if events_tx.send((id, ev)).is_err() {
+                for ev in pty_rx {
+                    // 通道满时 send 阻塞（背压只传导回本会话的读线程）；
+                    // 会话关闭（Receiver 随 Session Drop 丢弃）时返回
+                    // Err，线程自然退出——阻塞中的 send 也会被唤醒。
+                    if tx.send(ev).is_err() {
                         break;
                     }
                     if !wake_pending.swap(true, Ordering::AcqRel)
@@ -106,6 +124,7 @@ impl Session {
             id,
             term,
             pty,
+            rx,
             custom_title: None,
             last_esu_mark: 0,
             cursor_displayed: (0, 0, true),
