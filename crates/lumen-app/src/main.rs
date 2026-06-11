@@ -1,6 +1,7 @@
 //! Lumen 主程序：winit 事件循环，组装 PTY → 终端状态机 → 渲染器 → egui 外壳。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod input;
 mod profile;
 mod session;
@@ -389,6 +390,9 @@ struct AppState {
     /// window resize 的 term/PTY resize 不被永久卡住。每帧 RedrawRequested
     /// 处理完窗格 resize 后即清零（单次消耗）。
     window_just_resized: bool,
+    /// 背景图纹理（P13）：已成功加载时为 Some，未启用/加载失败时为 None。
+    /// egui 层在终端工作区底部绘制；关闭时 free 旧纹理防泄漏。
+    bg_texture: Option<background::BgTexture>,
 }
 
 impl AppState {
@@ -409,6 +413,54 @@ impl AppState {
         self.renderer.set_theme(info.theme());
         shell::theme::apply_style(&self.egui_ctx, &shell::theme::shell_palette(info));
         info!("主题已应用：{}（id {}）", info.name, info.id);
+    }
+
+    /// 加载或重载背景图纹理（P13）。
+    ///
+    /// - 启用且有路径：解码图片 → 上传 GPU → 更新 `bg_texture`；
+    ///   路径变更时先 free 旧纹理（防泄漏），再加载新纹理。
+    /// - 禁用或路径清除：free 旧纹理、置 `bg_texture = None`。
+    /// - 加载失败（文件不存在/解码失败/尺寸超限）：toast error，
+    ///   `bg_texture` 置 None（本次运行视为未启用，不改写 settings）。
+    fn apply_background_image(&mut self) {
+        let bg = &self.settings.appearance.background;
+        let should_load = bg.enabled && bg.path.is_some();
+        let path = bg.path.clone();
+
+        // 先 free 旧纹理（无论是关闭还是换图）。
+        if let Some(old) = self.bg_texture.take() {
+            self.pending_tex_free.push(old.texture_id);
+        }
+
+        if !should_load {
+            // 禁用或无路径：关闭透明通路。
+            self.renderer.set_transparent_background(false);
+            return;
+        }
+
+        let path_str = path.as_deref().unwrap_or("");
+        match background::load_background_texture(
+            path_str,
+            self.renderer.device(),
+            self.renderer.queue(),
+            &mut self.egui_renderer,
+        ) {
+            Ok(tex) => {
+                log::info!("背景图已加载：{path_str} ({}×{})", tex.width, tex.height);
+                self.renderer.set_transparent_background(true);
+                self.bg_texture = Some(tex);
+            }
+            Err(e) => {
+                log::error!("背景图加载失败：{e}");
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    format!("背景图加载失败：{e}"),
+                );
+                // 加载失败 = 本次运行禁用背景图（不改写 settings）。
+                self.renderer.set_transparent_background(false);
+                self.window.request_redraw();
+            }
+        }
     }
 
     /// 焦点窗格 = 激活 tab 的焦点窗格（键盘/IME/滚轮/选区/粘贴/块
@@ -1271,6 +1323,7 @@ impl App {
             was_popup_open: false,
             shell_state: shell::ShellState::default(),
             window_just_resized: false,
+            bg_texture: None,
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -1279,6 +1332,12 @@ impl App {
                 shell::toast::ToastKind::Warn,
                 format!("{stale_cwd} 个会话的保存目录已失效，已回退默认目录"),
             );
+        }
+        // 启动时加载背景图（P13）：enabled 且有 path 时解码上传 GPU。
+        if state.settings.appearance.background.enabled
+            && state.settings.appearance.background.path.is_some()
+        {
+            state.apply_background_image();
         }
         // 窗口标题对齐激活会话（恢复多会话时 active 可能非 0）。
         state.update_window_title();
@@ -2292,6 +2351,14 @@ impl ApplicationHandler<PtyWake> for App {
                     .cwd()
                     .map(std::path::Path::to_path_buf);
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
+                // 背景图参数（P13）：仅当纹理已加载且 settings 启用时传入。
+                let bg_image = state.bg_texture.as_ref().map(|tex| shell::BgImageInput {
+                    texture_id: tex.texture_id,
+                    width: tex.width,
+                    height: tex.height,
+                    opacity: state.settings.appearance.background.opacity,
+                    dim: state.settings.appearance.background.dim,
+                });
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -2301,6 +2368,7 @@ impl ApplicationHandler<PtyWake> for App {
                     cwd: active_cwd.as_deref(),
                     shell_idle,
                     os_dark: state.os_dark,
+                    bg_image,
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;

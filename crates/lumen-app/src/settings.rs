@@ -53,6 +53,47 @@ pub fn theme_info(id: &str) -> &'static lumen_renderer::themes::ThemeInfo {
     lumen_renderer::themes::find_or_default(id)
 }
 
+/// 终端背景图片设置（P13）。
+///
+/// 背景图仅作用于终端工作区整体（跨窗格共一张图）；侧栏/顶栏/
+/// 文件树/设置页不透图。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundSettings {
+    /// 是否启用背景图片功能。
+    pub enabled: bool,
+    /// 图片文件绝对路径；`None` 表示未选图。
+    pub path: Option<String>,
+    /// 背景图不透明度：0.05（几乎透明）～1.0（完全不透明）。
+    /// 默认 0.4 保留足够可读性。
+    pub opacity: f32,
+    /// 额外暗化蒙层强度：0.0（不暗化）～0.9（深暗）。
+    /// 与 opacity 叠用；深色终端内容建议调低此值。
+    pub dim: f32,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            opacity: 0.4,
+            dim: 0.0,
+        }
+    }
+}
+
+/// 背景图不透明度下限（设置页滑块范围；加载时同样夹紧）。
+pub const BACKGROUND_OPACITY_MIN: f32 = 0.05;
+/// 背景图不透明度上限。
+pub const BACKGROUND_OPACITY_MAX: f32 = 1.0;
+/// 背景图暗化强度下限。
+pub const BACKGROUND_DIM_MIN: f32 = 0.0;
+/// 背景图暗化强度上限。
+pub const BACKGROUND_DIM_MAX: f32 = 0.9;
+/// 图片边长最大值（超出则拒绝加载，防显存溢出）。
+pub const BACKGROUND_MAX_DIM: u32 = 8192;
+
 /// 外观设置（Appearance 节）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -71,6 +112,8 @@ pub struct AppearanceSettings {
     pub font_family: String,
     /// 终端字号（逻辑像素，DPI 缩放由渲染器处理）。
     pub font_size: f32,
+    /// 终端背景图片（P13）。
+    pub background: BackgroundSettings,
 }
 
 impl Default for AppearanceSettings {
@@ -82,6 +125,7 @@ impl Default for AppearanceSettings {
             light_theme_id: lumen_renderer::themes::LUMEN_LIGHT.to_owned(),
             font_family: String::new(),
             font_size: FONT_SIZE_DEFAULT,
+            background: BackgroundSettings::default(),
         }
     }
 }
@@ -232,6 +276,35 @@ impl Settings {
                 );
                 s.appearance.font_size =
                     lenient_field(ap, "font_size", "appearance.font_size", d.font_size, path);
+                // 背景图子结构：整节宽松解析。
+                if let Some(bg) = ap.get("background") {
+                    if bg.is_object() {
+                        let dg = BackgroundSettings::default();
+                        s.appearance.background.enabled = lenient_field(
+                            bg,
+                            "enabled",
+                            "appearance.background.enabled",
+                            dg.enabled,
+                            path,
+                        );
+                        s.appearance.background.path =
+                            lenient_field(bg, "path", "appearance.background.path", dg.path, path);
+                        s.appearance.background.opacity = lenient_field(
+                            bg,
+                            "opacity",
+                            "appearance.background.opacity",
+                            dg.opacity,
+                            path,
+                        );
+                        s.appearance.background.dim =
+                            lenient_field(bg, "dim", "appearance.background.dim", dg.dim, path);
+                    } else {
+                        log::warn!(
+                            "设置节 appearance.background 不是对象，整节降级默认值: {}",
+                            path.display()
+                        );
+                    }
+                }
             } else {
                 log::warn!(
                     "设置节 appearance 不是对象，整节降级默认值: {}",
@@ -367,6 +440,20 @@ impl Settings {
             FILETREE_WIDTH_MAX,
             FILETREE_WIDTH_DEFAULT,
         );
+        // 背景图参数夹紧：NaN/Inf 归默认，有限值夹到合法范围。
+        let bg = &mut self.appearance.background;
+        bg.opacity = clamp_or(
+            bg.opacity,
+            BACKGROUND_OPACITY_MIN,
+            BACKGROUND_OPACITY_MAX,
+            BackgroundSettings::default().opacity,
+        );
+        bg.dim = clamp_or(
+            bg.dim,
+            BACKGROUND_DIM_MIN,
+            BACKGROUND_DIM_MAX,
+            BackgroundSettings::default().dim,
+        );
     }
 }
 
@@ -456,6 +543,7 @@ mod tests {
                 light_theme_id: "solarized-light".to_owned(),
                 font_family: "JetBrains Mono".to_owned(),
                 font_size: 18.0,
+                background: BackgroundSettings::default(),
             },
             layout: LayoutSettings {
                 sidebar_width: 260.0,
@@ -647,6 +735,92 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded.layout.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(loaded.layout.filetree_width, 300.0);
+    }
+
+    #[test]
+    fn 背景图_默认值() {
+        let s = Settings::default();
+        assert!(!s.appearance.background.enabled);
+        assert!(s.appearance.background.path.is_none());
+        assert_eq!(s.appearance.background.opacity, 0.4);
+        assert_eq!(s.appearance.background.dim, 0.0);
+    }
+
+    #[test]
+    fn 背景图_旧文件缺字段平滑升级() {
+        // 旧文件无 appearance.background 节：加载后补默认值。
+        let p = temp_path("bg_missing");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 18.0 } }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.font_size, 18.0, "好字段保留");
+        assert_eq!(
+            loaded.appearance.background,
+            BackgroundSettings::default(),
+            "缺背景图节时补默认值"
+        );
+    }
+
+    #[test]
+    fn 背景图_opacity_dim_夹紧() {
+        let p = temp_path("bg_clamp");
+        // opacity 越界（>1.0）夹到上限，dim 越界（>0.9）夹到上限。
+        std::fs::write(
+            &p,
+            r#"{ "appearance": { "background": { "enabled": true, "opacity": 9.9, "dim": 5.0 } } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        assert_eq!(loaded.appearance.background.opacity, BACKGROUND_OPACITY_MAX);
+        assert_eq!(loaded.appearance.background.dim, BACKGROUND_DIM_MAX);
+        // opacity 过小（<0.05）夹到下限。
+        std::fs::write(
+            &p,
+            r#"{ "appearance": { "background": { "opacity": 0.0, "dim": -1.0 } } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.background.opacity, BACKGROUND_OPACITY_MIN);
+        assert_eq!(loaded.appearance.background.dim, BACKGROUND_DIM_MIN);
+    }
+
+    #[test]
+    fn 背景图_opacity_零值夹到下限() {
+        // opacity=0.0 小于 BACKGROUND_OPACITY_MIN，加载时应夹到下限。
+        // （NaN/Inf 无法写入合法 JSON，通过越界测试覆盖夹紧逻辑即可。）
+        let p = temp_path("bg_opacity_zero");
+        std::fs::write(
+            &p,
+            r#"{ "appearance": { "background": { "enabled": true, "opacity": 0.0, "dim": -0.5 } } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            loaded.appearance.background.opacity, BACKGROUND_OPACITY_MIN,
+            "0.0 夹到下限"
+        );
+        assert_eq!(
+            loaded.appearance.background.dim, BACKGROUND_DIM_MIN,
+            "负值夹到下限"
+        );
+    }
+
+    #[test]
+    fn 背景图_序列化往返() {
+        let p = temp_path("bg_roundtrip");
+        let mut s = Settings::default();
+        s.appearance.background = BackgroundSettings {
+            enabled: true,
+            path: Some("/home/test/wallpaper.png".to_owned()),
+            opacity: 0.6,
+            dim: 0.2,
+        };
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.background, s.appearance.background);
     }
 
     #[test]

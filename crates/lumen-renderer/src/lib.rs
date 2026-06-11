@@ -125,6 +125,14 @@ pub struct Renderer {
     cell_h: f32,
     /// 内边距（物理像素）。
     padding: f32,
+    /// 背景图模式（P13）：`true` 时离屏 Clear 用全透明，让 egui 层的
+    /// 背景图纹理透出；`false` 时 Clear 为主题背景色（默认行为）。
+    ///
+    /// 技术细节：egui mesh blend 是 premultiplied（ONE, ONE_MINUS_SRC_ALPHA）。
+    /// 若 Clear 为不透明色（RGB≠0, A=1）而下层已有背景图，终端像素的
+    /// RGB 分量会被加色叠加到背景图上，导致颜色泄漏（发白/发亮）。
+    /// 全透明（RGBA=0）则终端像素完整覆盖背景图对应区域，无泄漏。
+    transparent_background: bool,
 }
 
 impl Renderer {
@@ -212,6 +220,7 @@ impl Renderer {
             cell_w,
             cell_h,
             padding: PADDING * scale_factor,
+            transparent_background: false,
         })
     }
 
@@ -259,6 +268,15 @@ impl Renderer {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.invalidate_row_cache();
+    }
+
+    /// 设置背景图透明通路（P13）。
+    ///
+    /// `enabled` 为 `true` 时离屏 Clear 改用全透明（`wgpu::Color::TRANSPARENT`），
+    /// 允许 egui 层的背景图透过终端内容区显现；
+    /// `false` 时恢复主题背景色 Clear（默认行为）。
+    pub fn set_transparent_background(&mut self, enabled: bool) {
+        self.transparent_background = enabled;
     }
 
     /// 行级排版缓存整体失效（字体/字号/主题变更后调用，全窗格）。
@@ -714,13 +732,21 @@ impl Renderer {
                 label: Some("lumen frame"),
             });
         {
+            // 背景图模式（P13）：透明背景时 Clear 用 TRANSPARENT（RGBA=0），
+            // 让 egui 层的背景图透出。不能用主题色 Clear（即使 A=0 RGB≠0
+            // 也会因 premultiplied blend 把颜色加色叠加到背景图上）。
+            let clear_color = if self.transparent_background {
+                wgpu::Color::TRANSPARENT
+            } else {
+                self.theme.background.to_wgpu()
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("lumen pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.theme.background.to_wgpu()),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,

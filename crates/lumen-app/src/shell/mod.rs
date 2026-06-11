@@ -73,6 +73,20 @@ pub struct PaneView {
     pub title_hover: Option<String>,
 }
 
+/// 背景图绘制参数（P13）：由 main 构造、传入 shell 绘制层。
+pub struct BgImageInput {
+    /// egui 纹理 id（由 [`background::load_background_texture`] 注册）。
+    pub texture_id: egui::TextureId,
+    /// 图片原始宽度（用于 cover UV 计算）。
+    pub width: u32,
+    /// 图片原始高度（用于 cover UV 计算）。
+    pub height: u32,
+    /// 不透明度（0.05～1.0）。
+    pub opacity: f32,
+    /// 暗化强度（0.0～0.9，0.0 = 不暗化）。
+    pub dim: f32,
+}
+
 /// 一帧外壳 UI 的输入（main.rs 按帧构造的状态快照）。
 pub struct ShellInput<'a> {
     /// 激活 tab 的窗格（布局顺序：先上排后下排、行内自左向右）。
@@ -94,6 +108,8 @@ pub struct ShellInput<'a> {
     /// 系统当前是否深色模式（P12 Sync with OS：外壳色板与设置页
     /// 「当前主题」展示按它解析生效主题 id）。
     pub os_dark: bool,
+    /// 背景图绘制参数（P13）：None 表示未启用/加载失败，不绘制。
+    pub bg_image: Option<BgImageInput>,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -446,6 +462,43 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
+
+            // 背景图（P13）：在终端工作区整体底部绘制，绘制发生在任何
+            // 窗格内容之前（窗格标题栏/分隔线在循环内稍后盖住背景图）。
+            // 侧栏/文件树/顶栏在各自面板内，不受影响。
+            // cover 模式：保宽高比居中裁剪填满 area。
+            // opacity 控制不透明度；dim>0 时额外叠一层半透明黑蒙层。
+            if let Some(bg) = &input.bg_image {
+                let (uv_min, uv_max) = crate::background::cover_uv(
+                    bg.width as f32,
+                    bg.height as f32,
+                    area.width(),
+                    area.height(),
+                );
+                let tint = egui::Color32::from_rgba_unmultiplied(
+                    255,
+                    255,
+                    255,
+                    // opacity ∈ [0.05,1.0] → alpha ∈ [13,255]
+                    (bg.opacity.clamp(0.05, 1.0) * 255.0).round() as u8,
+                );
+                ui.painter().image(
+                    bg.texture_id,
+                    area,
+                    egui::Rect::from_min_max(
+                        egui::pos2(uv_min[0], uv_min[1]),
+                        egui::pos2(uv_max[0], uv_max[1]),
+                    ),
+                    tint,
+                );
+                // 额外暗化蒙层（dim > 0）：叠一层半透明黑，增强文字可读性。
+                if bg.dim > 0.0 {
+                    let dim_alpha = (bg.dim.clamp(0.0, 0.9) * 255.0).round() as u8;
+                    ui.painter()
+                        .rect_filled(area, 0.0, egui::Color32::from_black_alpha(dim_alpha));
+                }
+            }
+
             // P16b：命令行区（CentralPanel 整体）轮廓描边——只画右/上/下三边，
             // 省略左边（左边是与文件树右边的共享边，文件树侧已画）。
             //

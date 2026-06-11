@@ -26,6 +26,9 @@ serde.workspace = true
 serde_json.workspace = true
 trash.workspace = true
 winit.workspace = true
+# 背景图片功能（P13）。
+image.workspace = true
+rfd.workspace = true
 
 # 单实例检测（F8）仅 Windows 路径需要 Win32 同步原语。
 [target.'cfg(windows)'.dependencies]
