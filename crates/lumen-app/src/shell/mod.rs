@@ -121,6 +121,9 @@ pub struct ShellOutput {
     pub pane_close_rects: Vec<egui::Rect>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
+    /// 顶栏「▦」（P15）：当前 tab 全部窗格比例恢复均分（最大化态
+    /// 先退出）；复位后 main 落盘。
+    pub layout_reset: bool,
     /// 分隔条拖动中：(分隔条, 指针位置（逻辑点）)。main 据此把对应
     /// 边界拖到指针处（绝对定位无累积漂移；最小尺寸钳制在 layout）。
     pub divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
@@ -207,6 +210,7 @@ pub fn show(
         pane_swap: None,
         pane_close_rects: Vec::new(),
         new_pane: false,
+        layout_reset: false,
         divider_drag: None,
         divider_drag_ended: false,
         divider_reset: None,
@@ -258,6 +262,9 @@ pub fn show(
     let tb = topbar::show(root, active_title, input.panes.len(), input.profile, pal);
     if tb.new_pane {
         out.new_pane = true;
+    }
+    if tb.reset_layout {
+        out.layout_reset = true;
     }
     if tb.open_settings {
         out.settings_opened = true;

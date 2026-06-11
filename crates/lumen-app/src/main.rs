@@ -639,6 +639,35 @@ impl AppState {
         self.persist_sessions();
     }
 
+    /// 一键恢复默认布局（P15：顶栏「▦」）：激活 tab 的行/列权重全部
+    /// 恢复均分；处于最大化态先退出（其余窗格还原可见并强制补帧）。
+    /// 复位后落盘。单窗格/已均分且非最大化时无事可做。
+    fn reset_pane_layout(&mut self) {
+        let tab = &mut self.tabs[self.active_tab];
+        if tab.panes.len() <= 1 {
+            return; // 顶栏按钮单窗格时已禁用，纯防御
+        }
+        let uniform = PaneLayout::uniform(tab.panes.len());
+        if tab.maximized.is_some() {
+            tab.maximized = None;
+            // 与 toggle_maximize_pane 的还原分支同款：隐藏窗格的纹理
+            // 还是旧画面，强制下一帧渲染。
+            for s in &mut tab.panes {
+                s.term_frame_due_since = Some(
+                    Instant::now()
+                        .checked_sub(REDRAW_ABS_CAP)
+                        .unwrap_or_else(Instant::now),
+                );
+            }
+        } else if tab.layout == uniform {
+            return; // 已是均分且非最大化：无变化不写盘
+        }
+        tab.layout = uniform;
+        self.window.request_redraw();
+        // 复位后写盘（P15；与拖动结束/双击复位同语义）。
+        self.persist_sessions();
+    }
+
     /// 循环切换激活 tab：dir 为 1（下一个）或 -1（上一个）。
     fn cycle_tab(&mut self, dir: isize) {
         let n = self.tabs.len() as isize;
@@ -2031,6 +2060,11 @@ impl ApplicationHandler<PtyWake> for App {
                 // Ctrl+Shift+Enter 同语义，toggle 内部含下标防御）。
                 if let Some(pi) = shell_out.pane_maximize {
                     state.toggle_maximize_pane(pi);
+                }
+                // —— 一键恢复默认布局（P15）：顶栏「▦」——全部比例
+                // 均分 + 最大化态先退出，复位后落盘。
+                if shell_out.layout_reset {
+                    state.reset_pane_layout();
                 }
 
                 // —— 拖动标题栏换位（F7②）：交换两窗格在 panes 中的

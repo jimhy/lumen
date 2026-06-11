@@ -38,6 +38,9 @@ pub struct TopbarOutput {
     pub log_out: bool,
     /// 点击了「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
+    /// 点击了「▦」复位按钮（P15）：当前 tab 全部窗格比例恢复均分
+    /// （处于最大化态时先退出再复位）。
+    pub reset_layout: bool,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
@@ -80,6 +83,19 @@ pub fn show(
                     .on_disabled_hover_text(format!("最多 {MAX_PANES} 个窗格"));
                 if presp.clicked() {
                     out.new_pane = true;
+                }
+                ui.add_space(2.0);
+                // 「▦」复位布局（P15）：当前 tab 窗格比例恢复均分；
+                // 单窗格无比例可言，禁用态。
+                let reset =
+                    egui::Button::new(egui::RichText::new("▦").size(13.0).color(pal.fg_dim))
+                        .min_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE));
+                let rresp = ui
+                    .add_enabled(pane_count > 1, reset)
+                    .on_hover_text("恢复窗格默认大小")
+                    .on_disabled_hover_text("单窗格无需复位");
+                if rresp.clicked() {
+                    out.reset_layout = true;
                 }
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
