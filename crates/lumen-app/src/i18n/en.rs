@@ -16,6 +16,10 @@ pub static STRINGS: Strings = Strings {
     pane_maximize_tip: "Maximize pane (Ctrl+Shift+Enter)",
     shell_busy_cd: "Shell is busy, cd not executed",
     // Topbar
+    wc_minimize: "Minimize",
+    wc_maximize: "Maximize",
+    wc_restore: "Restore",
+    wc_close: "Close",
     topbar_new_pane_tip: "New pane (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "Maximum {} panes",
     topbar_reset_tip: "Reset pane sizes",

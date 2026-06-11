@@ -28,6 +28,9 @@ use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
+// M3.8 自绘标题栏：Windows 平台扩展（无边框阴影 / 圆角）。
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
 
 /// scrollback 容量（行）。
 const SCROLLBACK: usize = 10_000;
@@ -1048,12 +1051,32 @@ impl AppState {
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<AppState> {
-        // 启动默认最大化（P17）：inner_size 保留为「取消最大化」后的还原尺寸。
+        // M3.8 自绘标题栏：无边框窗口 + DWM 阴影/Win11 圆角。
+        // with_decorations(false) 在 Windows 上保留 WS_THICKFRAME（拖边 resize
+        // 可用），WM_NCCALCSIZE 铺满客户区（无系统标题栏）。
+        // with_undecorated_shadow(true) 启用 DWM 阴影并允许 Win11 圆角识别；
+        // 副作用：顶部 1px 黑线（顶栏背景色覆盖消除）。
+        // 非 Windows 平台降级保留系统装饰（with_decorations 有 #[cfg(windows)] 处理）。
+        #[cfg(target_os = "windows")]
+        let attrs = {
+            Window::default_attributes()
+                .with_title("Lumen")
+                .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
+                .with_maximized(true)
+                .with_decorations(false)
+                .with_undecorated_shadow(true)
+        };
+        #[cfg(not(target_os = "windows"))]
         let attrs = Window::default_attributes()
             .with_title("Lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
             .with_maximized(true);
+        // 启动默认最大化（P17）：inner_size 保留为「取消最大化」后的还原尺寸。
         let window = Arc::new(event_loop.create_window(attrs).context("创建窗口失败")?);
+        // workaround winit #4186：with_decorations(false) + with_resizable(true) 下
+        // 拖边 resize 可能失效（WS_THICKFRAME 添加时序 bug，PR #4188 修复未合入 0.30.9）。
+        // init 后显式调 set_resizable(true) 可触发 WS_THICKFRAME 重新施加，绕过该 bug。
+        window.set_resizable(true);
         window.set_ime_allowed(true);
         // 告知输入法处于终端语境（egui-winit 内部有同等映射）。
         window.set_ime_purpose(winit::window::ImePurpose::Terminal);
@@ -2393,9 +2416,17 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
+                // M3.8：传入当前窗口最大化态，顶栏据此切换最大化/还原图标。
+                let is_maximized = state.window.is_maximized();
                 let mut shell_out = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
-                    shell_out = Some(shell::show(ui, &shell_input, shell_state, app_settings));
+                    shell_out = Some(shell::show(
+                        ui,
+                        &shell_input,
+                        shell_state,
+                        app_settings,
+                        is_maximized,
+                    ));
                 });
                 let Some(shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
@@ -2469,6 +2500,39 @@ impl ApplicationHandler<PtyWake> for App {
                             return; // 不再呈现本帧（应用退出中）
                         }
                     }
+                }
+
+                // —— M3.8 自绘标题栏：窗口控制动作处理 ——
+                // drag_window / set_minimized / set_maximized 须在 shell::show
+                // 同帧（RedrawRequested 内）执行，时序成立（调研 §3 已证）。
+                if shell_out.drag_title_bar {
+                    // drag_window 内部发 WM_NCLBUTTONDOWN + HTCAPTION 启动系统拖动。
+                    // 失败（如最大化态下操作）静默忽略——不影响应用逻辑。
+                    if let Err(e) = state.window.drag_window() {
+                        log::debug!("drag_window 失败（忽略）：{e}");
+                    }
+                }
+                if shell_out.minimize_window {
+                    state.window.set_minimized(true);
+                }
+                if shell_out.toggle_maximize_window {
+                    state.window.set_maximized(!state.window.is_maximized());
+                }
+                if shell_out.close_window {
+                    // 关闭窗口：走与 CloseRequested 同路径——落盘后退出。
+                    state.persist_sessions();
+                    info!("自绘标题栏关闭按钮：落盘后退出");
+                    event_loop.exit();
+                    return; // 本帧不再继续呈现
+                }
+                if let Some((lx, ly)) = shell_out.show_window_menu_at {
+                    // 逻辑点换算为物理像素，传给 show_window_menu。
+                    let scale = state.window.scale_factor();
+                    let px = winit::dpi::PhysicalPosition::new(
+                        (lx as f64 * scale).round() as i32,
+                        (ly as f64 * scale).round() as i32,
+                    );
+                    state.window.show_window_menu(px);
                 }
 
                 // —— 窗格级动作（F5 批2）：顶栏「＋」新增 / 窗格 ✕ 关闭

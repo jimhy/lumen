@@ -39,6 +39,14 @@ pub struct Strings {
     pub shell_busy_cd: &'static str,
 
     // ── 顶栏 ─────────────────────────────────────────────────────────
+    /// 窗控：最小化按钮 tooltip
+    pub wc_minimize: &'static str,
+    /// 窗控：最大化按钮 tooltip（普通态）
+    pub wc_maximize: &'static str,
+    /// 窗控：还原按钮 tooltip（最大化态）
+    pub wc_restore: &'static str,
+    /// 窗控：关闭按钮 tooltip
+    pub wc_close: &'static str,
     /// 新增窗格 tooltip "新增窗格 (Ctrl+Shift+D)"
     pub topbar_new_pane_tip: &'static str,
     /// 新增窗格禁用 tooltip，单参 `{}`：MAX_PANES 数字

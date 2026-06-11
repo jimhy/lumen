@@ -16,6 +16,10 @@ pub static STRINGS: Strings = Strings {
     pane_maximize_tip: "最大化窗格 (Ctrl+Shift+Enter)",
     shell_busy_cd: "Shell 正忙，未执行 cd",
     // 顶栏
+    wc_minimize: "最小化",
+    wc_maximize: "最大化",
+    wc_restore: "还原",
+    wc_close: "关闭",
     topbar_new_pane_tip: "新增窗格 (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "最多 {} 个窗格",
     topbar_reset_tip: "恢复窗格默认大小",

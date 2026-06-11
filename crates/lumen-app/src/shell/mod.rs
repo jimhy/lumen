@@ -139,6 +139,17 @@ pub struct ShellOutput {
     /// 坐标，仅可见窗格、不保序）。main.rs 据此让 raw 鼠标路由让位
     /// （不聚焦/不建选区/不交出终端焦点，点击由 egui 侧处理）。
     pub pane_close_rects: Vec<egui::Rect>,
+    /// 顶栏窗控：拖动自绘标题栏空白区（M3.8）——main 调 window.drag_window()。
+    pub drag_title_bar: bool,
+    /// 顶栏窗控：最小化窗口（M3.8）。
+    pub minimize_window: bool,
+    /// 顶栏窗控：切换最大化/还原（M3.8）。
+    pub toggle_maximize_window: bool,
+    /// 顶栏窗控：关闭窗口（M3.8）——走与 CloseRequested 同路径（落盘再退）。
+    pub close_window: bool,
+    /// 顶栏窗控：显示系统窗口菜单（右键标题栏空白区，M3.8）；
+    /// 坐标为 egui 逻辑点（调用方换算为物理像素后传 show_window_menu）。
+    pub show_window_menu_at: Option<(f32, f32)>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
     /// 顶栏「▦」（P15）：当前 tab 全部窗格比例恢复均分（最大化态
@@ -221,12 +232,14 @@ pub struct ShellOutput {
 /// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
 /// 设置/登录覆盖层。输入是 main 按帧构造的状态快照（[`ShellInput`]）；
 /// `app_settings` 是设置页直接编辑的数据（变更经 [`ShellOutput`]
-/// 通知 main 即时生效与写盘）。
+/// 通知 main 即时生效与写盘）；`is_maximized` 用于顶栏窗控按钮图标
+/// 切换（M3.8 自绘标题栏）。
 pub fn show(
     root: &mut egui::Ui,
     input: &ShellInput<'_>,
     st: &mut ShellState,
     app_settings: &mut crate::settings::Settings,
+    is_maximized: bool,
 ) -> ShellOutput {
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
@@ -237,6 +250,11 @@ pub fn show(
         pane_maximize: None,
         pane_swap: None,
         pane_close_rects: Vec::new(),
+        drag_title_bar: false,
+        minimize_window: false,
+        toggle_maximize_window: false,
+        close_window: false,
+        show_window_menu_at: None,
         new_pane: false,
         layout_reset: false,
         divider_drag: None,
@@ -294,7 +312,14 @@ pub fn show(
         .iter()
         .find(|e| e.active)
         .map_or("Lumen", |e| e.title.as_str());
-    let tb = topbar::show(root, active_title, input.panes.len(), input.profile, pal);
+    let tb = topbar::show(
+        root,
+        active_title,
+        input.panes.len(),
+        input.profile,
+        pal,
+        is_maximized,
+    );
     if tb.new_pane {
         out.new_pane = true;
     }
@@ -315,6 +340,22 @@ pub fn show(
     }
     if tb.log_out {
         out.logged_out = true;
+    }
+    // M3.8 自绘标题栏：窗口控制信号转发
+    if tb.drag_title_bar {
+        out.drag_title_bar = true;
+    }
+    if tb.minimize_window {
+        out.minimize_window = true;
+    }
+    if tb.toggle_maximize_window {
+        out.toggle_maximize_window = true;
+    }
+    if tb.close_window {
+        out.close_window = true;
+    }
+    if tb.show_window_menu_at.is_some() {
+        out.show_window_menu_at = tb.show_window_menu_at;
     }
 
     // 左侧会话栏：可拖宽（P10）。default_size 只在 egui 无面板记忆
