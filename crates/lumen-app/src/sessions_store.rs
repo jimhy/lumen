@@ -1,11 +1,15 @@
 //! 会话列表持久化（F4 / F5 分屏升级）：`%LOCALAPPDATA%/Lumen/sessions.json`。
 //!
-//! M3.7 起为嵌套结构：每个 tab 保存自定义名、窗格列表（各窗格最后
-//! 上报的 cwd，OSC 9;9）与焦点窗格下标，外加激活 tab 下标；启动时
+//! M3.7 起为 v2 嵌套结构 `{version: 2, active_tab, tabs: [{custom_title,
+//! focused, panes: [{cwd}]}]}`：每个 tab 保存自定义名、窗格列表（各窗格
+//! 最后上报的 cwd，OSC 9;9）与焦点窗格下标，外加激活 tab 下标；启动时
 //! 按结构逐窗格重开 shell（初始工作目录用保存的 cwd，已失效则回退
 //! 默认目录并提示）。屏幕内容/滚动历史不持久化——重启是新 shell，
-//! 这是预期行为。M3.6b 的旧平铺格式（`entries` 字段）读侧自动迁移
-//! 为「每条目一个单窗格 tab」，写侧只写新格式。
+//! 这是预期行为。读侧兼容两种旧格式（写侧只写 v2）：
+//! - M3.6b 的 v1 平铺格式（`entries` 字段）自动迁移为「每条目一个
+//!   单窗格 tab」；
+//! - M3.7 批1 的过渡格式（嵌套 tabs 但根字段叫 `active`、无 version）
+//!   经 serde alias 直接读取。
 //!
 //! 写盘时机（main.rs）：结构性变更（新建/关闭/重命名/切换激活/切换
 //! 焦点窗格/增删窗格）即写；cwd 随提示符上报变化时与上次快照比对后
@@ -20,6 +24,16 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::session::MAX_PANES;
+
+/// 当前写盘格式版本（F5 嵌套结构 = 2；M3.6b 平铺 = 1，无该字段）。
+const FORMAT_VERSION: u32 = 2;
+
+/// 文件中缺 `version` 字段时的读侧默认值（v1 平铺与批1 过渡格式都
+/// 没有该字段）。结构识别不依赖版本号（按字段形态），它只用于日志
+/// 与未来格式演进的兼容判断。
+fn legacy_format_version() -> u32 {
+    1
+}
 
 /// 单个窗格的持久化条目。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -63,24 +77,31 @@ struct LegacyEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionsFile {
+    /// 格式版本：写盘恒为 [`FORMAT_VERSION`]（=2）；读侧加载后也归一
+    /// 为当前版本（迁移完成即是新格式）。缺字段（v1/批1 过渡）默认 1。
+    #[serde(default = "legacy_format_version")]
+    pub version: u32,
     /// tab 条目（侧栏自上而下的顺序）。
     pub tabs: Vec<TabEntry>,
     /// 旧平铺格式字段（M3.6b）：读侧迁移为单窗格 tab；写侧恒空、
     /// 不序列化。
     #[serde(skip_serializing)]
     entries: Vec<LegacyEntry>,
-    /// 激活 tab 下标（加载时已夹紧到合法范围）。
-    pub active: usize,
+    /// 激活 tab 下标（加载时已夹紧到合法范围）。批1 过渡格式的字段
+    /// 名 `active` 经 alias 兼容读取，写盘按规格名 `active_tab`。
+    #[serde(alias = "active")]
+    pub active_tab: usize,
 }
 
 impl SessionsFile {
-    /// 以新格式构造（main 构造持久化快照用；`entries` 为模块私有的
-    /// 迁移残留字段，外部不可见）。
-    pub fn new(tabs: Vec<TabEntry>, active: usize) -> Self {
+    /// 以当前版本格式构造（main 构造持久化快照用；`entries` 为模块
+    /// 私有的迁移残留字段，外部不可见）。
+    pub fn new(tabs: Vec<TabEntry>, active_tab: usize) -> Self {
         Self {
+            version: FORMAT_VERSION,
             tabs,
             entries: Vec::new(),
-            active,
+            active_tab,
         }
     }
 
@@ -128,6 +149,14 @@ impl SessionsFile {
                 return None;
             }
         };
+        if file.version > FORMAT_VERSION {
+            // 未来版本写的文件（降级运行场景）：尽力按当前结构加载
+            // （serde 忽略未知字段），提示一次。
+            log::warn!(
+                "会话列表为较新格式版本 v{}（当前支持 v{FORMAT_VERSION}），尽力加载",
+                file.version
+            );
+        }
         // 旧平铺格式迁移：每个条目变成一个单窗格 tab。新旧字段同时
         // 出现（异常手改）时以新格式为准。
         if file.tabs.is_empty() && !file.entries.is_empty() {
@@ -165,7 +194,10 @@ impl SessionsFile {
             // 空列表 = 上次退出前关掉了全部 tab：与缺失同义。
             return None;
         }
-        file.active = file.active.min(file.tabs.len() - 1);
+        file.active_tab = file.active_tab.min(file.tabs.len() - 1);
+        // 加载即归一为当前版本（迁移/清洗完成后内存中就是 v2 结构；
+        // 快照比对与下次写盘都以当前版本为准）。
+        file.version = FORMAT_VERSION;
         Some(file)
     }
 
@@ -258,14 +290,36 @@ mod tests {
         assert_eq!(loaded.tabs[0].panes, vec![pane(Some(r"C:\a"))]);
         assert_eq!(loaded.tabs[0].focused, 0);
         assert_eq!(loaded.tabs[1].panes, vec![pane(Some(r"C:\b"))]);
-        assert_eq!(loaded.active, 1);
-        // 迁移后再写盘 = 新格式（不再含 entries 字段）。
+        assert_eq!(loaded.active_tab, 1);
+        assert_eq!(loaded.version, 2, "迁移后版本应归一为 2");
+        // 迁移后再写盘 = v2 新格式（version/active_tab，不再含
+        // entries 字段）。
         let p2 = temp_path("legacy_rewrite");
         loaded.save_to(&p2).expect("写盘失败");
         let text = std::fs::read_to_string(&p2).expect("读回失败");
         let _ = std::fs::remove_file(&p2);
         assert!(text.contains("\"tabs\""), "应写新格式: {text}");
+        assert!(text.contains("\"version\": 2"), "应带版本号: {text}");
+        assert!(text.contains("\"active_tab\""), "应写规格字段名: {text}");
         assert!(!text.contains("\"entries\""), "不应再写旧字段: {text}");
+    }
+
+    #[test]
+    fn 批1过渡格式_active别名与缺version() {
+        // M3.7 批1 写盘的过渡格式：嵌套 tabs 但根字段叫 active、无
+        // version 字段。alias 兼容读取，加载后版本归一为 2。
+        let p = temp_path("transitional");
+        std::fs::write(
+            &p,
+            r#"{ "tabs": [ { "panes": [ { "cwd": "C:\\a" } ] }, { "panes": [ {}, {} ], "focused": 1 } ], "active": 1 }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs.len(), 2);
+        assert_eq!(loaded.active_tab, 1, "active 别名应读入 active_tab");
+        assert_eq!(loaded.tabs[1].focused, 1);
+        assert_eq!(loaded.version, 2, "加载后版本应归一为 2");
     }
 
     #[test]
@@ -287,7 +341,8 @@ mod tests {
     #[test]
     fn 空tab列表视同缺失() {
         let p = temp_path("empty");
-        std::fs::write(&p, r#"{ "tabs": [], "active": 0 }"#).expect("写测试文件失败");
+        std::fs::write(&p, r#"{ "version": 2, "tabs": [], "active_tab": 0 }"#)
+            .expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert!(loaded.is_none(), "空列表应回退单默认会话");
@@ -299,13 +354,13 @@ mod tests {
         let p = temp_path("empty_panes");
         std::fs::write(
             &p,
-            r#"{ "tabs": [ { "panes": [] }, { "panes": [ { "cwd": "C:\\a" } ] } ], "active": 1 }"#,
+            r#"{ "version": 2, "tabs": [ { "panes": [] }, { "panes": [ { "cwd": "C:\\a" } ] } ], "active_tab": 1 }"#,
         )
         .expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded.tabs.len(), 1);
-        assert_eq!(loaded.active, 0, "丢 tab 后激活下标应夹紧");
+        assert_eq!(loaded.active_tab, 0, "丢 tab 后激活下标应夹紧");
     }
 
     #[test]
@@ -313,14 +368,14 @@ mod tests {
         let p = temp_path("clamp");
         std::fs::write(
             &p,
-            r#"{ "tabs": [ { "panes": [ {}, {}, {}, {}, {}, {}, {}, {} ], "focused": 99 } ], "active": 9 }"#,
+            r#"{ "version": 2, "tabs": [ { "panes": [ {}, {}, {}, {}, {}, {}, {}, {} ], "focused": 99 } ], "active_tab": 9 }"#,
         )
         .expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded.tabs[0].panes.len(), MAX_PANES, "窗格数应截断到上限");
         assert_eq!(loaded.tabs[0].focused, MAX_PANES - 1);
-        assert_eq!(loaded.active, 0);
+        assert_eq!(loaded.active_tab, 0);
     }
 
     #[test]
@@ -328,7 +383,7 @@ mod tests {
         let p = temp_path("blank_title");
         std::fs::write(
             &p,
-            r#"{ "tabs": [ { "custom_title": "   ", "panes": [ { "cwd": "C:\\a" } ] } ], "active": 0 }"#,
+            r#"{ "version": 2, "tabs": [ { "custom_title": "   ", "panes": [ { "cwd": "C:\\a" } ] } ], "active_tab": 0 }"#,
         )
         .expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
@@ -346,7 +401,24 @@ mod tests {
         assert_eq!(loaded.tabs.len(), 1);
         assert!(loaded.tabs[0].custom_title.is_none());
         assert!(loaded.tabs[0].panes[0].cwd.is_none());
-        assert_eq!(loaded.active, 0);
+        assert_eq!(loaded.active_tab, 0);
+    }
+
+    #[test]
+    fn 未来版本尽力加载() {
+        // version 大于当前支持版本（降级运行）：未知字段忽略、已知
+        // 结构尽力加载，版本归一为当前版本。
+        let p = temp_path("future");
+        std::fs::write(
+            &p,
+            r#"{ "version": 9, "tabs": [ { "panes": [ { "cwd": "C:\\a", "future_field": 1 } ] } ], "active_tab": 0, "extra": true }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].panes, vec![pane(Some(r"C:\a"))]);
+        assert_eq!(loaded.version, 2);
     }
 
     #[test]

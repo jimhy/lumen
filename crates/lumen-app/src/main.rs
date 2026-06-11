@@ -716,7 +716,7 @@ impl App {
                 next_tab_id += 1;
             }
             if !tabs.is_empty() {
-                active_idx = stored.active.min(tabs.len() - 1);
+                active_idx = stored.active_tab.min(tabs.len() - 1);
                 let pane_total: usize = tabs.iter().map(|t| t.panes.len()).sum();
                 info!(
                     "会话恢复：{} 个 tab / {pane_total} 个窗格，激活 #{active_idx}（cwd 失效 {stale_cwd} 个）",
