@@ -154,6 +154,10 @@ struct AppState {
     proxy: EventLoopProxy<PtyWake>,
     /// 应用设置（设置页编辑的数据源；变更即写盘）。
     settings: settings::Settings,
+    /// 系统当前是否深色模式（P12 Sync with OS）：启动时取
+    /// `window.theme()`、运行中由 `WindowEvent::ThemeChanged` 维护；
+    /// 开启跟随时主题按它在深/浅槽位间解析。
+    os_dark: bool,
     /// 最近一次写盘的会话列表快照（F4 持久化去重：cwd 上报/结构
     /// 变更都先与它比对，无变化不重复写盘）。None = 本次运行尚未写。
     last_sessions_snapshot: Option<sessions_store::SessionsFile>,
@@ -227,6 +231,16 @@ impl AppState {
             let t = self.perf_t0.elapsed().as_millis();
             let _ = writeln!(f, "[{t:>7}ms] {msg}");
         }
+    }
+
+    /// 按设置与系统深浅模式应用当前生效主题（P12）：终端配色（含
+    /// 行排版缓存失效）+ 外壳 egui 样式联动。设置页主题/槽位/Sync
+    /// with OS 变更与系统深浅切换共用此链路。
+    fn apply_theme(&mut self) {
+        let info = settings::theme_info(self.settings.effective_theme_id(self.os_dark));
+        self.renderer.set_theme(info.theme());
+        shell::theme::apply_style(&self.egui_ctx, &shell::theme::shell_palette(info));
+        info!("主题已应用：{}（id {}）", info.name, info.id);
     }
 
     /// 焦点窗格 = 激活 tab 的焦点窗格（键盘/IME/滚轮/选区/粘贴/块
@@ -774,12 +788,18 @@ impl App {
 
         // —— 设置加载与应用（settings.json；缺失/损坏降级默认值）——
         let app_settings = settings::Settings::load();
+        // 系统深浅模式（P12 Sync with OS）：winit 报不出来（None）按
+        // 深色处理——默认主题即深色；后续变化经 ThemeChanged 事件维护。
+        let os_dark = !matches!(window.theme(), Some(winit::window::Theme::Light));
         let ap = &app_settings.appearance;
         let actual_family = renderer.reconfigure_font(&ap.font_family, ap.font_size);
-        renderer.set_theme(ap.theme.terminal_theme());
+        let theme_info = settings::theme_info(app_settings.effective_theme_id(os_dark));
+        renderer.set_theme(theme_info.theme());
         info!(
-            "设置加载：主题 {} 字号 {} 侧栏宽 {}/{} 字体「{}」→ 实际生效「{actual_family}」",
-            ap.theme.display_name(),
+            "设置加载：主题 {}（id {}，sync_with_os={}）字号 {} 侧栏宽 {}/{} 字体「{}」→ 实际生效「{actual_family}」",
+            theme_info.name,
+            theme_info.id,
+            ap.sync_with_os,
             ap.font_size,
             app_settings.layout.sidebar_width,
             app_settings.layout.filetree_width,
@@ -814,10 +834,7 @@ impl App {
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
-        shell::theme::apply_style(
-            &egui_ctx,
-            shell::theme::palette(app_settings.appearance.theme.is_light()),
-        );
+        shell::theme::apply_style(&egui_ctx, &shell::theme::shell_palette(theme_info));
         shell::theme::install_cjk_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -986,6 +1003,7 @@ impl App {
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
+            os_dark,
             last_sessions_snapshot: None,
             layout_dirty: false,
             layout_apply_logged: false,
@@ -1986,6 +2004,7 @@ impl ApplicationHandler<PtyWake> for App {
                     profile: state.profile.as_ref(),
                     cwd: active_cwd.as_deref(),
                     shell_idle,
+                    os_dark: state.os_dark,
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
@@ -2201,14 +2220,9 @@ impl ApplicationHandler<PtyWake> for App {
                     .then(|| format!("系统中未找到「{}」，已回退「{actual}」", ap.font_family));
                 }
                 if shell_out.settings_theme_changed {
-                    // 主题即时生效：终端配色（含行排版缓存失效，行哈希
-                    // 不含主题解析色）+ 外壳 egui 样式联动。
-                    let theme = state.settings.appearance.theme;
-                    state.renderer.set_theme(theme.terminal_theme());
-                    shell::theme::apply_style(
-                        &state.egui_ctx,
-                        shell::theme::palette(theme.is_light()),
-                    );
+                    // 主题即时生效（P12 画廊点选/槽位变更/Sync 开关
+                    // 共用）：按生效主题 id 切终端配色 + 外壳样式。
+                    state.apply_theme();
                 }
                 if shell_out.settings_font_changed || shell_out.settings_theme_changed {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败

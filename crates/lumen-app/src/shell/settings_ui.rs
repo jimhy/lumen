@@ -9,7 +9,7 @@
 //! ——覆盖层只是 UI 层。
 
 use crate::profile::Profile;
-use crate::settings::{self, Settings, ThemeChoice};
+use crate::settings::{self, Settings};
 
 use super::theme::Palette;
 
@@ -313,15 +313,20 @@ fn appearance(
 ) {
     heading(ui, pal, "Appearance");
 
-    // —— 主题 ——
+    // —— 主题（P12 注册表驱动；画廊版式见下一批）——
     ui.label(egui::RichText::new("主题").color(pal.fg));
-    let before_theme = settings.appearance.theme;
+    let before_theme = settings.appearance.theme.clone();
     egui::ComboBox::from_id_salt("lumen_theme_combo")
         .width(240.0)
-        .selected_text(settings.appearance.theme.display_name())
+        .selected_text(settings::theme_info(&settings.appearance.theme).name)
         .show_ui(ui, |ui| {
-            for t in [ThemeChoice::TokyoNight, ThemeChoice::TokyoNightLight] {
-                ui.selectable_value(&mut settings.appearance.theme, t, t.display_name());
+            for info in lumen_renderer::themes::BUILTIN {
+                if ui
+                    .selectable_label(settings.appearance.theme == info.id, info.name)
+                    .clicked()
+                {
+                    settings.appearance.theme = info.id.to_owned();
+                }
             }
         });
     if settings.appearance.theme != before_theme {

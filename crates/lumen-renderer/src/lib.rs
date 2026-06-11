@@ -11,6 +11,7 @@
 
 mod rect;
 mod theme;
+pub mod themes;
 
 use std::collections::HashMap;
 

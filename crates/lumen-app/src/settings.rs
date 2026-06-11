@@ -41,46 +41,31 @@ pub const FILETREE_WIDTH_MAX: f32 = 480.0;
 /// 中间文件树栏默认宽度。
 pub const FILETREE_WIDTH_DEFAULT: f32 = 220.0;
 
-/// 主题选择（设置页下拉项；新增主题在此扩展枚举）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ThemeChoice {
-    /// Tokyo Night（默认深色）。
-    #[default]
-    TokyoNight,
-    /// Tokyo Night Light（浅色备选）。
-    TokyoNightLight,
-}
+/// 当前 settings.json 模式版本：v2 起（P12）`appearance.theme` 为
+/// 主题注册表 id 字符串（旧版为 ThemeChoice 枚举的 kebab-case 序列
+/// 化值，加载时按版本迁移，见 [`migrate_theme_id`]）。
+pub const SETTINGS_VERSION: u32 = 2;
 
-impl ThemeChoice {
-    /// 设置页展示名。
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::TokyoNight => "Tokyo Night",
-            Self::TokyoNightLight => "Tokyo Night Light",
-        }
-    }
-
-    /// 是否浅色主题（外壳 egui 色板联动用）。
-    pub fn is_light(self) -> bool {
-        matches!(self, Self::TokyoNightLight)
-    }
-
-    /// 对应的终端配色主题（lumen-renderer 侧）。
-    pub fn terminal_theme(self) -> lumen_renderer::Theme {
-        match self {
-            Self::TokyoNight => lumen_renderer::Theme::tokyo_night(),
-            Self::TokyoNightLight => lumen_renderer::Theme::tokyo_night_light(),
-        }
-    }
+/// 按 id 取主题注册条目（P12）：未注册回退默认主题 Lumen Dark——
+/// 加载侧 [`Settings::load_from`] 的 sanitize 已把非法 id 降级，
+/// 这里的回退只是运行期改值的防御。
+pub fn theme_info(id: &str) -> &'static lumen_renderer::themes::ThemeInfo {
+    lumen_renderer::themes::find_or_default(id)
 }
 
 /// 外观设置（Appearance 节）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSettings {
-    /// 终端与外壳的配色主题。
-    pub theme: ThemeChoice,
+    /// 终端与外壳的配色主题 id（注册表见 lumen_renderer::themes；
+    /// Sync with OS 开启时不读本字段，走深浅槽位二选）。
+    pub theme: String,
+    /// 跟随系统深浅模式自动切换主题（P12 Sync with OS）。
+    pub sync_with_os: bool,
+    /// 系统深色模式时使用的主题 id（Sync with OS 深色槽位）。
+    pub dark_theme_id: String,
+    /// 系统浅色模式时使用的主题 id（Sync with OS 浅色槽位）。
+    pub light_theme_id: String,
     /// 终端字体家族名；空串 = 自动挑选系统等宽字体
     /// （Cascadia Mono → Consolas → 任意 Monospace）。
     pub font_family: String,
@@ -91,7 +76,10 @@ pub struct AppearanceSettings {
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::default(),
+            theme: lumen_renderer::themes::LUMEN_DARK.to_owned(),
+            sync_with_os: false,
+            dark_theme_id: lumen_renderer::themes::LUMEN_DARK.to_owned(),
+            light_theme_id: lumen_renderer::themes::LUMEN_LIGHT.to_owned(),
             font_family: String::new(),
             font_size: FONT_SIZE_DEFAULT,
         }
@@ -119,11 +107,24 @@ impl Default for LayoutSettings {
 }
 
 /// 应用设置根结构。
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// 模式版本（P12 引入；旧文件缺省视作 0，触发主题 id 迁移，
+    /// 重新写盘即升级到 [`SETTINGS_VERSION`]）。
+    pub version: u32,
     pub appearance: AppearanceSettings,
     pub layout: LayoutSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_VERSION,
+            appearance: AppearanceSettings::default(),
+            layout: LayoutSettings::default(),
+        }
+    }
 }
 
 impl Settings {
@@ -188,10 +189,40 @@ impl Settings {
             );
             return s;
         }
+        // 模式版本：旧文件（P12 前）无此字段视作 0，主题字段按旧值
+        // 迁移；加载结果恒为当前版本（下次写盘即落 v2 格式）。
+        let file_version = root
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        s.version = SETTINGS_VERSION;
         if let Some(ap) = root.get("appearance") {
             if ap.is_object() {
                 let d = AppearanceSettings::default();
-                s.appearance.theme = lenient_field(ap, "theme", "appearance.theme", d.theme, path);
+                let raw_theme: String =
+                    lenient_field(ap, "theme", "appearance.theme", d.theme, path);
+                s.appearance.theme = migrate_theme_id(file_version, raw_theme, path);
+                s.appearance.sync_with_os = lenient_field(
+                    ap,
+                    "sync_with_os",
+                    "appearance.sync_with_os",
+                    d.sync_with_os,
+                    path,
+                );
+                s.appearance.dark_theme_id = lenient_field(
+                    ap,
+                    "dark_theme_id",
+                    "appearance.dark_theme_id",
+                    d.dark_theme_id,
+                    path,
+                );
+                s.appearance.light_theme_id = lenient_field(
+                    ap,
+                    "light_theme_id",
+                    "appearance.light_theme_id",
+                    d.light_theme_id,
+                    path,
+                );
                 s.appearance.font_family = lenient_field(
                     ap,
                     "font_family",
@@ -265,8 +296,23 @@ impl Settings {
         Ok(())
     }
 
-    /// 加载后规整：字号/侧栏宽度夹紧到合法范围、字体名去首尾空白
-    /// （越界/NaN/空白来自用户手改文件）。
+    /// 当前生效的主题 id（P12）：Sync with OS 开启时按系统深浅模式
+    /// 取对应槽位，否则取手选主题。
+    pub fn effective_theme_id(&self, os_dark: bool) -> &str {
+        let ap = &self.appearance;
+        if ap.sync_with_os {
+            if os_dark {
+                &ap.dark_theme_id
+            } else {
+                &ap.light_theme_id
+            }
+        } else {
+            &ap.theme
+        }
+    }
+
+    /// 加载后规整：字号/侧栏宽度夹紧到合法范围、字体名去首尾空白、
+    /// 主题 id 未注册降级默认（越界/NaN/空白/坏 id 来自用户手改文件）。
     fn sanitize(&mut self) {
         /// 有限值夹紧到 [min, max]，非有限（NaN/Inf）回默认值。
         fn clamp_or(v: f32, min: f32, max: f32, default: f32) -> f32 {
@@ -276,6 +322,29 @@ impl Settings {
                 default
             }
         }
+        /// 主题 id 校验：未注册记 warn 后降级 `fallback`（字段级容错
+        /// 的延伸——id 是开放字符串，注册表查不到才算非法）。
+        fn valid_theme_or(id: &mut String, fallback: &str, field: &str) {
+            if lumen_renderer::themes::find(id).is_none() {
+                log::warn!("设置字段 {field} 主题 id「{id}」未注册，降级「{fallback}」");
+                *id = fallback.to_owned();
+            }
+        }
+        valid_theme_or(
+            &mut self.appearance.theme,
+            lumen_renderer::themes::LUMEN_DARK,
+            "appearance.theme",
+        );
+        valid_theme_or(
+            &mut self.appearance.dark_theme_id,
+            lumen_renderer::themes::LUMEN_DARK,
+            "appearance.dark_theme_id",
+        );
+        valid_theme_or(
+            &mut self.appearance.light_theme_id,
+            lumen_renderer::themes::LUMEN_LIGHT,
+            "appearance.light_theme_id",
+        );
         self.appearance.font_size = clamp_or(
             self.appearance.font_size,
             FONT_SIZE_MIN,
@@ -299,6 +368,30 @@ impl Settings {
             FILETREE_WIDTH_DEFAULT,
         );
     }
+}
+
+/// 旧版主题值迁移（P12）：v2 之前 `appearance.theme` 是 ThemeChoice
+/// 枚举的序列化值——旧 "tokyo-night" 实为 M3.7b 改色版（中性灰选区），
+/// 即现在的 Lumen Dark，故映射到 `lumen-dark`（保住用户原观感；纯正
+/// 官方版 Tokyo Night 是 P12 新增的另一条目）。v2 起的文件 id 原样
+/// 保留（"tokyo-night" 此时指官方版）。未知旧值原样返回，交由
+/// sanitize 的注册表校验降级。
+fn migrate_theme_id(file_version: u64, id: String, file: &Path) -> String {
+    if file_version >= u64::from(SETTINGS_VERSION) {
+        return id;
+    }
+    // "TokyoNight"/"TokyoNightLight" 为防御映射：枚举序列化历史上
+    // 恒为 kebab-case，但手改文件可能照抄枚举名。
+    let mapped = match id.as_str() {
+        "tokyo-night" | "TokyoNight" => lumen_renderer::themes::LUMEN_DARK,
+        "tokyo-night-light" | "TokyoNightLight" => lumen_renderer::themes::LUMEN_LIGHT,
+        _ => return id,
+    };
+    log::info!(
+        "设置迁移：旧主题值「{id}」→ 主题 id「{mapped}」: {}",
+        file.display()
+    );
+    mapped.to_owned()
 }
 
 /// 单字段宽松取值：缺失 → 静默用 `fallback`（与 `#[serde(default)]`
@@ -341,7 +434,11 @@ mod tests {
     #[test]
     fn 默认值() {
         let s = Settings::default();
-        assert_eq!(s.appearance.theme, ThemeChoice::TokyoNight);
+        assert_eq!(s.version, SETTINGS_VERSION);
+        assert_eq!(s.appearance.theme, "lumen-dark");
+        assert!(!s.appearance.sync_with_os);
+        assert_eq!(s.appearance.dark_theme_id, "lumen-dark");
+        assert_eq!(s.appearance.light_theme_id, "lumen-light");
         assert!(s.appearance.font_family.is_empty());
         assert_eq!(s.appearance.font_size, FONT_SIZE_DEFAULT);
         assert_eq!(s.layout.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
@@ -351,8 +448,12 @@ mod tests {
     #[test]
     fn 序列化往返() {
         let s = Settings {
+            version: SETTINGS_VERSION,
             appearance: AppearanceSettings {
-                theme: ThemeChoice::TokyoNightLight,
+                theme: "nord".to_owned(),
+                sync_with_os: true,
+                dark_theme_id: "gruvbox-dark".to_owned(),
+                light_theme_id: "solarized-light".to_owned(),
                 font_family: "JetBrains Mono".to_owned(),
                 font_size: 18.0,
             },
@@ -366,6 +467,67 @@ mod tests {
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn 迁移_旧主题值映射到lumen双主题() {
+        // P12 前的旧文件（无 version 字段）：旧 "tokyo-night" 实为
+        // M3.7b 改色版 = 现 Lumen Dark；浅色同理。
+        let p = temp_path("migrate_old");
+        std::fs::write(&p, r#"{ "appearance": { "theme": "tokyo-night" } }"#)
+            .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        assert_eq!(loaded.appearance.theme, "lumen-dark");
+        assert_eq!(loaded.version, SETTINGS_VERSION, "加载即升级版本");
+        std::fs::write(&p, r#"{ "appearance": { "theme": "tokyo-night-light" } }"#)
+            .expect("写测试文件失败");
+        assert_eq!(Settings::load_from(&p).appearance.theme, "lumen-light");
+        // 防御：手改文件照抄枚举名的大写变体同样迁移。
+        std::fs::write(&p, r#"{ "appearance": { "theme": "TokyoNight" } }"#)
+            .expect("写测试文件失败");
+        assert_eq!(Settings::load_from(&p).appearance.theme, "lumen-dark");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn 迁移_v2文件的官方tokyo_night不迁移() {
+        // v2 起 "tokyo-night" 指 P12 新增的纯正官方版，原样保留。
+        let p = temp_path("migrate_v2");
+        std::fs::write(
+            &p,
+            r#"{ "version": 2, "appearance": { "theme": "tokyo-night" } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.theme, "tokyo-night");
+    }
+
+    #[test]
+    fn 主题id_未注册降级默认() {
+        let p = temp_path("bad_theme_id");
+        std::fs::write(
+            &p,
+            r#"{ "version": 2, "appearance": { "theme": "没有这个主题", "dark_theme_id": "x", "light_theme_id": "y", "font_size": 18.0 } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.theme, "lumen-dark");
+        assert_eq!(loaded.appearance.dark_theme_id, "lumen-dark");
+        assert_eq!(loaded.appearance.light_theme_id, "lumen-light");
+        assert_eq!(loaded.appearance.font_size, 18.0, "好字段应保留");
+    }
+
+    #[test]
+    fn 生效主题id_随sync与系统深浅() {
+        let mut s = Settings::default();
+        s.appearance.theme = "dracula".to_owned();
+        assert_eq!(s.effective_theme_id(true), "dracula", "未开 sync 走手选");
+        assert_eq!(s.effective_theme_id(false), "dracula");
+        s.appearance.sync_with_os = true;
+        assert_eq!(s.effective_theme_id(true), "lumen-dark", "深色槽位");
+        assert_eq!(s.effective_theme_id(false), "lumen-light", "浅色槽位");
     }
 
     #[test]
@@ -391,7 +553,7 @@ mod tests {
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded.appearance.font_size, 20.0);
-        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNight);
+        assert_eq!(loaded.appearance.theme, "lumen-dark");
         assert!(loaded.appearance.font_family.is_empty());
     }
 
@@ -407,20 +569,16 @@ mod tests {
 
     #[test]
     fn 字段级容错_theme非法不连坐() {
-        // theme 拼错（缺连字符）只降级 theme 自己，字体与字号保留。
+        // theme 不是字符串（类型非法）只降级 theme 自己，字体与字号保留。
         let p = temp_path("lenient_theme");
         std::fs::write(
             &p,
-            r#"{ "appearance": { "theme": "tokyonight", "font_family": "JetBrains Mono", "font_size": 18.0 } }"#,
+            r#"{ "appearance": { "theme": 42, "font_family": "JetBrains Mono", "font_size": 18.0 } }"#,
         )
         .expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
-        assert_eq!(
-            loaded.appearance.theme,
-            ThemeChoice::TokyoNight,
-            "坏字段降级默认"
-        );
+        assert_eq!(loaded.appearance.theme, "lumen-dark", "坏字段降级默认");
         assert_eq!(
             loaded.appearance.font_family, "JetBrains Mono",
             "好字段应保留"
@@ -430,7 +588,8 @@ mod tests {
 
     #[test]
     fn 字段级容错_字号类型非法不连坐() {
-        // font_size 写成字符串：仅字号降级默认，theme 保留。
+        // font_size 写成字符串：仅字号降级默认，theme 保留（旧文件
+        // 无 version，旧浅色值迁移到 lumen-light）。
         let p = temp_path("lenient_size");
         std::fs::write(
             &p,
@@ -439,11 +598,7 @@ mod tests {
         .expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
-        assert_eq!(
-            loaded.appearance.theme,
-            ThemeChoice::TokyoNightLight,
-            "好字段应保留"
-        );
+        assert_eq!(loaded.appearance.theme, "lumen-light", "好字段应保留");
         assert_eq!(
             loaded.appearance.font_size, FONT_SIZE_DEFAULT,
             "坏字段降级默认"
@@ -505,7 +660,7 @@ mod tests {
         .expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
-        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNightLight);
+        assert_eq!(loaded.appearance.theme, "lumen-light", "旧值迁移");
         assert_eq!(loaded.appearance.font_size, 20.0);
     }
 }

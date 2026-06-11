@@ -90,6 +90,9 @@ pub struct ShellInput<'a> {
     pub cwd: Option<&'a std::path::Path>,
     /// 焦点窗格 shell 空闲（文件树 cd 注入闸门）。
     pub shell_idle: bool,
+    /// 系统当前是否深色模式（P12 Sync with OS：外壳色板与设置页
+    /// 「当前主题」展示按它解析生效主题 id）。
+    pub os_dark: bool,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -237,7 +240,11 @@ pub fn show(
         logged_in: None,
         logged_out: false,
     };
-    let pal = theme::palette(app_settings.appearance.theme.is_light());
+    // 生效主题的外壳色板（P12）：Lumen 双主题取手调静态板、其余主题
+    // 派生（每帧少量色彩数学，开销可忽略）。
+    let pal = &theme::shell_palette(crate::settings::theme_info(
+        app_settings.effective_theme_id(input.os_dark),
+    ));
     // 重命名目标可能已被关闭（进程退出等）：清掉孤儿编辑态，
     // 否则编辑框永不渲染、也永不失焦，键盘焦点会卡在 egui 侧。
     if st

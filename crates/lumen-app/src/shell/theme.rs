@@ -11,7 +11,9 @@
 use std::sync::Arc;
 
 /// 外壳 UI 色板。所有面板/控件颜色经由它取用（不再用裸常量），
-/// 主题切换 = 换一个 `&'static Palette` + [`apply_style`] 重设 egui 样式。
+/// 主题切换 = 换一个 [`Palette`]（[`shell_palette`] 按主题取手调
+/// 静态板或派生板）+ [`apply_style`] 重设 egui 样式。
+#[derive(Clone)]
 pub struct Palette {
     /// 是否浅色主题（egui `dark_mode` 取反）。
     pub light: bool,
@@ -118,13 +120,162 @@ pub static LIGHT: Palette = Palette {
     info: egui::Color32::from_rgb(0x3c, 0x3c, 0x3c),
 };
 
-/// 按明暗取色板。
-pub fn palette(light: bool) -> &'static Palette {
-    if light {
-        &LIGHT
+/// 取主题对应的外壳色板（P12 外壳联动）。
+///
+/// Lumen Dark/Light 两个默认主题用 P9 手调的 [`DARK`] / [`LIGHT`]
+/// 静态板（保真，不走派生）；其余内置主题从终端配色的 bg/fg/ANSI
+/// 按 [`derive_palette`] 的规则自动派生灰阶层次。
+pub fn shell_palette(info: &lumen_renderer::themes::ThemeInfo) -> Palette {
+    use lumen_renderer::themes::{LUMEN_DARK, LUMEN_LIGHT};
+    if info.id == LUMEN_DARK {
+        DARK.clone()
+    } else if info.id == LUMEN_LIGHT {
+        LIGHT.clone()
     } else {
-        &DARK
+        derive_palette(info.light, &info.theme())
     }
+}
+
+/// 从终端主题派生外壳色板（P12）。派生规则：
+///
+/// - **灰阶阶梯**以终端 bg 为基色向黑/白混合（保留主题底色的色相，
+///   如 Nord 蓝灰、Solarized 暖黄）。深色板亮度梯：extreme_bg <
+///   bg_dark < filetree_fill < bg_panel < btn_bg < bg_highlight <
+///   selection（控件「平时→悬停→激活」递亮）；浅色板方向相反
+///   （递暗）。混合比例见各行注释，单测保证单调性。
+/// - **文字**跟随终端 fg：向白（深）/黑（浅）推进直到对 btn_bg
+///   ≥7:1 且对 selection ≥4.5:1；fg_dim 取 fg 与 bg_dark 的混合再
+///   保证对 bg_dark ≥4.5:1（WCAG AA，单测把关下限）。
+/// - **accent 保持黑白化原则**（P9）：深色板纯白、浅色板近黑，不随
+///   主题彩色化；accent_fg 与之明度相反。
+/// - **语义色**取主题 ANSI 黄（warn）/红（error），不足 4.5:1 时向
+///   白/黑提对比；info 为中性的 fg 微暗档。
+fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
+    let base = c32(t.background);
+    let black = egui::Color32::BLACK;
+    let white = egui::Color32::WHITE;
+    if light {
+        // 浅色：外壳比终端 bg 略暗一线（终端区成为画面最亮处），
+        // 控件越深越显眼（与 LIGHT 手调板同方向）。
+        let bg_dark = mix(base, black, 0.05);
+        let extreme_bg = mix(base, white, 0.60); // 输入框最白
+        let bg_panel = mix(base, white, 0.45); // 弹层/卡片浮起
+        let filetree_fill = mix(base, white, 0.22); // 与侧栏分一线
+        let btn_bg = mix(base, black, 0.12); // 控件平时
+        let bg_highlight = mix(base, black, 0.20); // 悬停/分隔线
+        let selection = mix(base, black, 0.29); // 激活/选中
+        let fg = push_until(c32(t.foreground), black, |c| {
+            contrast(c, btn_bg) >= 7.0 && contrast(c, selection) >= 4.5
+        });
+        let fg_dim = push_until(mix(fg, bg_dark, 0.35), fg, |c| contrast(c, bg_dark) >= 4.6);
+        Palette {
+            light: true,
+            bg_dark,
+            bg_panel,
+            btn_bg,
+            bg_highlight,
+            fg,
+            fg_dim,
+            // 黑白化原则：浅色板近黑强调 + 白字（同 LIGHT 手调板）。
+            accent: egui::Color32::from_rgb(0x1f, 0x1f, 0x1f),
+            accent_fg: white,
+            selection,
+            filetree_fill,
+            extreme_bg,
+            warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, black),
+            error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, black),
+            info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, black),
+        }
+    } else {
+        // 深色：外壳比终端 bg 略暗（终端内容区微浮起），控件递亮。
+        let extreme_bg = mix(base, black, 0.50); // 输入框最深（凹陷）
+        let bg_dark = mix(base, black, 0.30);
+        let filetree_fill = mix(base, black, 0.16);
+        let bg_panel = mix(base, white, 0.04); // 弹层/卡片浮起
+        let btn_bg = mix(base, white, 0.09); // 控件平时
+        let bg_highlight = mix(base, white, 0.17); // 悬停/分隔线
+        let selection = mix(base, white, 0.26); // 激活/选中
+        let fg = push_until(c32(t.foreground), white, |c| {
+            contrast(c, btn_bg) >= 7.0 && contrast(c, selection) >= 4.5
+        });
+        let fg_dim = push_until(mix(fg, bg_dark, 0.35), fg, |c| contrast(c, bg_dark) >= 4.6);
+        Palette {
+            light: false,
+            bg_dark,
+            bg_panel,
+            btn_bg,
+            bg_highlight,
+            fg,
+            fg_dim,
+            // 黑白化原则：深色板纯白强调 + 近黑字（同 DARK 手调板）。
+            accent: white,
+            accent_fg: egui::Color32::from_rgb(0x11, 0x11, 0x11),
+            selection,
+            filetree_fill,
+            extreme_bg,
+            warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, white),
+            error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, white),
+            info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, white),
+        }
+    }
+}
+
+/// 渲染器 Rgb → egui Color32。
+pub fn c32(c: lumen_renderer::Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
+/// sRGB 分量线性插值：`t=0` 取 `a`，`t=1` 取 `b`。
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    egui::Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// WCAG 相对亮度（sRGB → 线性加权）。
+fn rel_lum(c: egui::Color32) -> f32 {
+    fn lin(v: u8) -> f32 {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG 对比度（≥1，越大对比越强）。
+fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+    let (x, y) = (rel_lum(a), rel_lum(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// 从 `from` 向 `toward` 按 1/40 步长推进，返回第一个满足 `ok` 的
+/// 颜色；走满全程仍不满足（极端防御，内置主题不会触发）返回
+/// `toward` 本身。
+fn push_until(
+    from: egui::Color32,
+    toward: egui::Color32,
+    ok: impl Fn(egui::Color32) -> bool,
+) -> egui::Color32 {
+    for i in 0..=40 {
+        let cand = mix(from, toward, i as f32 / 40.0);
+        if ok(cand) {
+            return cand;
+        }
+    }
+    toward
+}
+
+/// `c` 对底色 `bg` 的对比不足 `target` 时向 `toward` 推进补足。
+fn ensure_contrast(
+    c: egui::Color32,
+    bg: egui::Color32,
+    target: f32,
+    toward: egui::Color32,
+) -> egui::Color32 {
+    push_until(c, toward, |x| contrast(x, bg) >= target)
 }
 
 /// 应用全局 egui 样式（启动与主题切换时调用）。
@@ -221,4 +372,134 @@ pub fn install_cjk_fonts(ctx: &egui::Context) {
         return;
     }
     log::warn!("未找到系统中文字体（msyh.ttc / simhei.ttf），外壳界面中文将无法显示");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lumen_renderer::themes::{BUILTIN, LUMEN_DARK, LUMEN_LIGHT};
+
+    /// 派生主题迭代器（排除走手调板的 Lumen 双主题）。
+    fn derived() -> impl Iterator<Item = &'static lumen_renderer::themes::ThemeInfo> {
+        BUILTIN
+            .iter()
+            .filter(|i| i.id != LUMEN_DARK && i.id != LUMEN_LIGHT)
+    }
+
+    #[test]
+    fn 派生_深色亮度阶梯单调递增() {
+        for info in derived().filter(|i| !i.light) {
+            let p = shell_palette(info);
+            let steps = [
+                ("extreme_bg", p.extreme_bg),
+                ("bg_dark", p.bg_dark),
+                ("filetree_fill", p.filetree_fill),
+                ("bg_panel", p.bg_panel),
+                ("btn_bg", p.btn_bg),
+                ("bg_highlight", p.bg_highlight),
+                ("selection", p.selection),
+            ];
+            for w in steps.windows(2) {
+                assert!(
+                    rel_lum(w[0].1) < rel_lum(w[1].1),
+                    "{}: {} 应暗于 {}",
+                    info.id,
+                    w[0].0,
+                    w[1].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 派生_浅色亮度阶梯单调递减() {
+        for info in derived().filter(|i| i.light) {
+            let p = shell_palette(info);
+            let steps = [
+                ("extreme_bg", p.extreme_bg),
+                ("bg_panel", p.bg_panel),
+                ("filetree_fill", p.filetree_fill),
+                ("bg_dark", p.bg_dark),
+                ("btn_bg", p.btn_bg),
+                ("bg_highlight", p.bg_highlight),
+                ("selection", p.selection),
+            ];
+            for w in steps.windows(2) {
+                assert!(
+                    rel_lum(w[0].1) > rel_lum(w[1].1),
+                    "{}: {} 应亮于 {}",
+                    info.id,
+                    w[0].0,
+                    w[1].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 派生_对比度下限() {
+        for info in derived() {
+            let p = shell_palette(info);
+            let cases = [
+                // 主文字对主底/控件底/选中底（核心可读性）。
+                ("fg vs bg_dark", contrast(p.fg, p.bg_dark), 7.0),
+                ("fg vs btn_bg", contrast(p.fg, p.btn_bg), 7.0),
+                ("fg vs selection", contrast(p.fg, p.selection), 4.5),
+                // 次要文字与语义色（WCAG AA 下限）。
+                ("fg_dim vs bg_dark", contrast(p.fg_dim, p.bg_dark), 4.5),
+                ("warn vs bg_dark", contrast(p.warn, p.bg_dark), 4.5),
+                ("error vs bg_dark", contrast(p.error, p.bg_dark), 4.5),
+                ("info vs bg_dark", contrast(p.info, p.bg_dark), 4.5),
+                // 实底按钮上的文字。
+                ("accent_fg vs accent", contrast(p.accent_fg, p.accent), 4.5),
+            ];
+            for (name, got, min) in cases {
+                assert!(got >= min, "{}: {name} 对比 {got:.2} < {min}", info.id);
+            }
+        }
+    }
+
+    #[test]
+    fn lumen双主题走手调板不派生() {
+        // P9 手调值保真：与静态板逐项一致（抽查关键字段）。
+        let d = shell_palette(lumen_renderer::themes::find_or_default(LUMEN_DARK));
+        assert_eq!(d.bg_dark, DARK.bg_dark);
+        assert_eq!(d.accent, DARK.accent);
+        assert_eq!(d.selection, DARK.selection);
+        assert!(!d.light);
+        let l = shell_palette(lumen_renderer::themes::find_or_default(LUMEN_LIGHT));
+        assert_eq!(l.bg_dark, LIGHT.bg_dark);
+        assert_eq!(l.accent, LIGHT.accent);
+        assert_eq!(l.selection, LIGHT.selection);
+        assert!(l.light);
+    }
+
+    #[test]
+    fn 派生_accent保持黑白化() {
+        // P9 黑白化原则不随主题彩色化：深=纯白 / 浅=近黑。
+        for info in derived() {
+            let p = shell_palette(info);
+            if p.light {
+                assert_eq!(p.accent, egui::Color32::from_rgb(0x1f, 0x1f, 0x1f));
+                assert_eq!(p.accent_fg, egui::Color32::WHITE);
+            } else {
+                assert_eq!(p.accent, egui::Color32::WHITE);
+                assert_eq!(p.accent_fg, egui::Color32::from_rgb(0x11, 0x11, 0x11));
+            }
+        }
+    }
+
+    #[test]
+    fn 工具函数_mix与contrast() {
+        let black = egui::Color32::BLACK;
+        let white = egui::Color32::WHITE;
+        assert_eq!(mix(black, white, 0.0), black);
+        assert_eq!(mix(black, white, 1.0), white);
+        // 黑白对比 = WCAG 满格 21:1。
+        assert!((contrast(black, white) - 21.0).abs() < 0.01);
+        assert!((contrast(white, white) - 1.0).abs() < 0.01);
+        // push_until：永不满足时回退 toward。
+        assert_eq!(push_until(black, white, |_| false), white);
+        assert_eq!(push_until(black, white, |c| c == black), black);
+    }
 }
