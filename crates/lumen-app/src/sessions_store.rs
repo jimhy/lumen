@@ -233,8 +233,11 @@ impl SessionsFile {
         let Some(p) = Self::path() else {
             return;
         };
-        if let Err(e) = self.save_to(&p) {
-            log::error!("写会话列表失败 {}: {e:#}", p.display());
+        match self.save_to(&p) {
+            // 写盘日志带 PID（F8 纵深防御）：多开放行（测试场景）时
+            // 会话快照仍可能互踩，便于排查「后写者赢」来自哪个进程。
+            Ok(()) => log::debug!("会话列表写盘 pid={}: {}", std::process::id(), p.display()),
+            Err(e) => log::error!("写会话列表失败 {}: {e:#}", p.display()),
         }
     }
 

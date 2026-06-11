@@ -238,7 +238,12 @@ impl Settings {
     pub fn save(&self) -> Option<String> {
         let p = Self::path()?;
         match self.save_to(&p) {
-            Ok(()) => None,
+            Ok(()) => {
+                // 写盘日志带 PID（F8 纵深防御）：多开放行（测试场景）
+                // 时配置仍可能互踩，便于排查「后写者赢」来自哪个进程。
+                log::debug!("设置写盘 pid={}: {}", std::process::id(), p.display());
+                None
+            }
             Err(e) => {
                 log::error!("写设置文件失败 {}: {e:#}", p.display());
                 Some(format!("{e:#}"))

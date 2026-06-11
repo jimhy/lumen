@@ -95,8 +95,11 @@ impl Profile {
         let Some(p) = Self::path() else {
             return;
         };
-        if let Err(e) = self.save_to(&p) {
-            log::error!("写 profile 文件失败 {}: {e:#}", p.display());
+        match self.save_to(&p) {
+            // 写盘日志带 PID（F8 纵深防御）：多开放行（测试场景）时
+            // profile 仍可能互踩，便于排查「后写者赢」来自哪个进程。
+            Ok(()) => log::debug!("profile 写盘 pid={}: {}", std::process::id(), p.display()),
+            Err(e) => log::error!("写 profile 文件失败 {}: {e:#}", p.display()),
         }
     }
 

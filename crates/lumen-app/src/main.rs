@@ -7,6 +7,7 @@ mod session;
 mod sessions_store;
 mod settings;
 mod shell;
+mod single_instance;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,11 +63,26 @@ struct PtyWake;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // F8 单实例限制（事件循环创建前检测）：release 默认单开——已有
+    // 实例在跑时通知其前台化、本实例静默退出；debug 构建与
+    // --multi-instance / LUMEN_MULTI_INSTANCE=1 放行多开。
+    // `instance` 持有命名互斥量，必须存活到 main 结束（单实例锁覆盖
+    // 整个运行期）。
+    let instance = single_instance::acquire();
+    if matches!(instance, single_instance::InstanceCheck::AlreadyRunning) {
+        info!("已有 Lumen 实例在运行，已通知其前台化，本实例退出");
+        return Ok(());
+    }
     let event_loop = EventLoop::<PtyWake>::with_user_event()
         .build()
         .context("创建事件循环失败")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    // 第一实例：起前台化监听线程（第二实例 SetEvent → 置标志 + 借
+    // PtyWake 唤醒主循环，见 single_instance 模块文档）。
+    if let single_instance::InstanceCheck::Primary(guard) = &instance {
+        single_instance::spawn_foreground_listener(guard, proxy.clone());
+    }
     let mut app = App { proxy, state: None };
     event_loop.run_app(&mut app).context("事件循环异常退出")?;
     Ok(())
@@ -1023,6 +1039,17 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        // F8 前台化：第二实例被单实例锁拒掉前发来的请求——恢复最小
+        // 化并请求焦点（Windows 限制跨进程抢前台，focus_window 可能
+        // 只闪任务栏，request_user_attention 兜底向用户示意）。
+        if single_instance::take_foreground_request() {
+            info!("处理前台化请求：set_minimized(false) + focus_window + request_user_attention");
+            state.window.set_minimized(false);
+            state.window.focus_window();
+            state
+                .window
+                .request_user_attention(Some(winit::window::UserAttentionType::Informational));
+        }
         if state.tabs.is_empty() {
             return; // 退出流程中（exit 后仍可能有滞后事件）
         }

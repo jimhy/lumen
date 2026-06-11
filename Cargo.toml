@@ -44,6 +44,13 @@ egui_ltreeview = "0.7"
 # 删除走回收站（文件树右键删除，需求池 P3）：Windows 端封装 IFileOperation
 # COM 全套，自实现成本高且易错；trash 是该领域的事实标准库。
 trash = "5"
+# 单实例检测（F8）：CreateMutexW / 命名事件等 Win32 同步原语。已是
+# winit/wgpu 等的传递依赖（lock 中已有 0.61），零新增外部 crate。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 
 # 不开 LTO：本机 rustc 1.94/1.96 两个版本开 thin LTO（linker-plugin-lto）
 # 编译均随机崩溃（HEAP_CORRUPTION/ACCESS_VIOLATION），关闭后稳定通过。
