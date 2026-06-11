@@ -673,11 +673,7 @@ mod tests {
 
         // 历史行拉回时位于 screen 顶部（pop_back 取最新历史优先放顶）
         // 三行历史均含 'P'（已被 fill_region 清空为空格，仅验证不 panic）。
-        assert_eq!(
-            g.row(0)[0].ch,
-            ' ',
-            "fill_region 后 screen[0][0] 应为空格"
-        );
+        assert_eq!(g.row(0)[0].ch, ' ', "fill_region 后 screen[0][0] 应为空格");
     }
 
     #[test]

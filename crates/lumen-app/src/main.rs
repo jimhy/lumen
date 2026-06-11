@@ -48,6 +48,20 @@ const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// （动画残留位）——经实战验证 50ms 能盖住 codex 归位批的延迟，
 /// 调小到 10ms 时 ESU 直渲下残留位会在超时后漏画（闪烁回归）。
 const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
+/// PSReadLine 锚点修复注入的延迟（B3-5）：resize 完成后等待此时长，
+/// 再向处于「等待输入」状态的窗格注入 F13 无操作键序
+/// (`ESC [ 2 5 ~`)，让 PSReadLine 走一轮 ProcessOneKey → ForceRender
+/// → RecomputeInitialCoords，按新 BufferWidth 重算 `_initialX`/
+/// `_initialY` 锚点，消除「旧窄格折行锚点留存 → 扩宽后打字写到旧位
+/// 置」的混叠根因。300ms 足够 ConPTY VT reflow 报文送达并被 PSReadLine
+/// 消化完毕（实测 resize 完到 ESC[8…t 的整条重绘序列在 100ms 内完成），
+/// 同时对用户打字无感（300ms 是 PSReadLine 内部键盘批次去抖的 6 倍）。
+const RESIZE_INJECT_DELAY: Duration = Duration::from_millis(300);
+/// 注入的 VT 序列：F13 键（xterm `ESC [ 2 5 ~`）。
+/// PSReadLine 对 F13 无默认绑定 → SelfInsert 处理 → KeyChar='\0' 直接返回，
+/// 不向命令行插入任何字符。整条注入对用户完全不可见，副作用为零。
+/// 参考：xterm-256color terminfo ft=f13=\E[25~，ECMA-48 §8.3.30。
+const F13_VT_SEQ: &[u8] = b"\x1b[25~";
 /// 后台会话单次 wake 的消化字节上限：`advance()` 在主线程跑，后台
 /// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在**本
 /// 会话自己的通道**里（靠 bounded 容量反压该会话的读线程，不连坐
@@ -382,6 +396,14 @@ struct AppState {
     was_popup_open: bool,
     /// 外壳 UI 的跨帧状态（重命名编辑等）。
     shell_state: shell::ShellState,
+    /// resize 后待注入 F13 无操作键的窗格队列（B3-5 PSReadLine 锚点修复）。
+    ///
+    /// 元素 `(SessionId, Instant)`：会话 id + 注入时刻（`now + RESIZE_INJECT_DELAY`）。
+    /// 每次向处于 `shell_waiting_input()` 的窗格提交 PTY resize 时追加；
+    /// `about_to_wait` 循环中检查到期项，向对应窗格写入 [`F13_VT_SEQ`]，
+    /// 促使 PSReadLine 走一轮 `RecomputeInitialCoords` 重算行锚点。
+    /// 同一窗格在前次注入未到期时再次 resize 只刷新时刻（覆盖而非重复追加）。
+    resize_inject_pending: Vec<(SessionId, Instant)>,
 }
 
 impl AppState {
@@ -1263,6 +1285,7 @@ impl App {
             egui_repaint_at: None,
             was_popup_open: false,
             shell_state: shell::ShellState::default(),
+            resize_inject_pending: Vec::new(),
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -1600,6 +1623,60 @@ impl ApplicationHandler<PtyWake> for App {
             Some(e) => wake = Some(wake.map_or(e, |w| w.min(e))),
             None => {}
         }
+
+        // B3-5 PSReadLine 锚点修复：处理 resize 后的延迟注入队列。
+        // 到期项：向对应窗格注入 F13 无操作键序（`ESC[25~`），触发
+        // PSReadLine RecomputeInitialCoords 重算行锚点。未到期项：
+        // 时刻计入 wake，保证事件循环准时唤醒执行注入。
+        // 注入失败（窗格已关闭/PTY 退出）静默丢弃——下轮清理会
+        // 把它从队列移除（find_pane 找不到则不注入并在下方清除）。
+        {
+            let mut remaining = Vec::with_capacity(state.resize_inject_pending.len());
+            for (sid, inject_at) in state.resize_inject_pending.drain(..) {
+                if now < inject_at {
+                    // 未到期：保留，并更新唤醒时刻。
+                    wake = Some(wake.map_or(inject_at, |w| w.min(inject_at)));
+                    remaining.push((sid, inject_at));
+                    continue;
+                }
+                // 到期：定位窗格并注入。
+                let pane_opt =
+                    state.tabs.iter().enumerate().find_map(|(ti, t)| {
+                        t.panes.iter().find(|p| p.id == sid).map(|p| (ti, p.id))
+                    });
+                if let Some((_ti, found_sid)) = pane_opt {
+                    // 再次确认窗格仍在等待输入（resize 到注入之间可能
+                    // 已有命令执行完成，不对执行中的进程注入）。
+                    let still_waiting = state
+                        .tabs
+                        .iter()
+                        .flat_map(|t| t.panes.iter())
+                        .find(|p| p.id == found_sid)
+                        .is_some_and(|p| p.term.shell_waiting_input());
+                    if still_waiting {
+                        if let Some(pane) = state
+                            .tabs
+                            .iter()
+                            .flat_map(|t| t.panes.iter())
+                            .find(|p| p.id == found_sid)
+                        {
+                            match pane.pty.write(F13_VT_SEQ) {
+                                Ok(()) => log::debug!(
+                                    "B3-5 注入 F13 到窗格 id={found_sid}（PSReadLine 锚点修复）"
+                                ),
+                                Err(e) => {
+                                    log::warn!("B3-5 F13 注入失败 窗格 id={found_sid}: {e:#}")
+                                }
+                            }
+                        }
+                    }
+                    // 到期项无论成功与否均不放回队列（单次注入）。
+                }
+                // 找不到窗格（已关闭）：静默丢弃，不放回队列。
+            }
+            state.resize_inject_pending = remaining;
+        }
+
         if fire {
             // 重绘在途；ControlFlow 显式回 Wait（粘性的 WaitUntil(过去
             // 时刻) 会让事件循环全速空转，历史事故见 git log）。
@@ -2803,6 +2880,26 @@ impl ApplicationHandler<PtyWake> for App {
                                     s.id
                                 );
                             }
+                            // B3-5 PSReadLine 锚点修复：resize 时若窗格处于「等待输入」
+                            // 态（OSC 133;B 标记、非备用屏幕），在 RESIZE_INJECT_DELAY
+                            // 后向其注入 F13 无操作键，让 PSReadLine 走一轮
+                            // ProcessOneKey→ForceRender→RecomputeInitialCoords，
+                            // 以新 BufferWidth 重算 _initialX/_initialY 锚点。
+                            // 同窗格前次未到期的注入计划直接覆盖（按 sid 去重）：
+                            // 连续快速 resize（拖分隔条）只留最后一次延迟，不堆积。
+                            if s.term.shell_waiting_input() {
+                                let inject_at = Instant::now() + RESIZE_INJECT_DELAY;
+                                let sid = s.id;
+                                if let Some(entry) = state
+                                    .resize_inject_pending
+                                    .iter_mut()
+                                    .find(|(id, _)| *id == sid)
+                                {
+                                    entry.1 = inject_at;
+                                } else {
+                                    state.resize_inject_pending.push((sid, inject_at));
+                                }
+                            }
                             // 尺寸变化会夹紧光标位置，立即同步绘制态。
                             let g = s.term.grid();
                             s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
@@ -3074,5 +3171,25 @@ mod tests {
         // NaN/Inf 防御：不写。
         assert!(!width_worth_persisting(f32::NAN, 180.0, 140.0, 320.0));
         assert!(!width_worth_persisting(f32::INFINITY, 180.0, 140.0, 320.0));
+    }
+
+    /// B3-5 PSReadLine 锚点修复：注入序列必须是正确的 F13 xterm VT 序列。
+    ///
+    /// PSReadLine 对 F13 无默认绑定，SelfInsert 对 KeyChar='\0' 直接返回，
+    /// 对命令行内容零副作用；同时触发 ProcessOneKey 调用链，使
+    /// RecomputeInitialCoords 以新 BufferWidth 重算 _initialX/_initialY。
+    #[test]
+    fn b3_5_f13注入序列字节正确() {
+        use super::F13_VT_SEQ;
+        // xterm-256color ft=f13: \E[25~
+        assert_eq!(F13_VT_SEQ, b"\x1b[25~");
+        // 序列必须以 ESC 开始（0x1b）
+        assert_eq!(F13_VT_SEQ[0], 0x1b);
+        // CSI 引导符
+        assert_eq!(F13_VT_SEQ[1], b'[');
+        // 参数 "25"
+        assert_eq!(&F13_VT_SEQ[2..4], b"25");
+        // 终止符 '~'
+        assert_eq!(F13_VT_SEQ[4], b'~');
     }
 }
