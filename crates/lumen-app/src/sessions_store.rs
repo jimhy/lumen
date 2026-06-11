@@ -1,14 +1,17 @@
-//! 会话列表持久化（F4）：`%LOCALAPPDATA%/Lumen/sessions.json`。
+//! 会话列表持久化（F4 / F5 分屏升级）：`%LOCALAPPDATA%/Lumen/sessions.json`。
 //!
-//! 保存各会话的自定义名与最后上报的 cwd（OSC 9;9）以及激活下标；
-//! 启动时按条目逐个重开 shell（初始工作目录用保存的 cwd，已失效则
-//! 回退默认目录并提示）。屏幕内容/滚动历史不持久化——重启是新 shell，
-//! 这是预期行为。
+//! M3.7 起为嵌套结构：每个 tab 保存自定义名、窗格列表（各窗格最后
+//! 上报的 cwd，OSC 9;9）与焦点窗格下标，外加激活 tab 下标；启动时
+//! 按结构逐窗格重开 shell（初始工作目录用保存的 cwd，已失效则回退
+//! 默认目录并提示）。屏幕内容/滚动历史不持久化——重启是新 shell，
+//! 这是预期行为。M3.6b 的旧平铺格式（`entries` 字段）读侧自动迁移
+//! 为「每条目一个单窗格 tab」，写侧只写新格式。
 //!
-//! 写盘时机（main.rs）：结构性变更（新建/关闭/重命名/切换激活）即写；
-//! cwd 随提示符上报变化时与上次快照比对后按需写（写频≈用户 cd 频率）。
-//! 原子写盘模式与 settings.rs 一致（同目录临时文件 + rename 覆盖）。
-//! 缺失/损坏 → 启动回退单默认会话，损坏记日志警告、不 panic。
+//! 写盘时机（main.rs）：结构性变更（新建/关闭/重命名/切换激活/切换
+//! 焦点窗格/增删窗格）即写；cwd 随提示符上报变化时与上次快照比对后
+//! 按需写（写频≈用户 cd 频率）。原子写盘模式与 settings.rs 一致
+//! （同目录临时文件 + rename 覆盖）。缺失/损坏 → 启动回退单默认
+//! 会话，损坏记日志警告、不 panic。
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -16,17 +19,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// 单个会话的持久化条目。
+use crate::session::MAX_PANES;
+
+/// 单个窗格的持久化条目。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SessionEntry {
-    /// 用户重命名的标题（None = 跟随默认标题规则：cwd > OSC 标题）。
-    pub custom_title: Option<String>,
+pub struct PaneEntry {
     /// 最后上报的 cwd（OSC 9;9）；恢复时作为 shell 初始工作目录。
     pub cwd: Option<PathBuf>,
 }
 
-impl SessionEntry {
+impl PaneEntry {
     /// 恢复时可用的初始 cwd：仅当保存的路径仍是存在的目录。失效
     /// （目录被删/重命名/网络盘离线）返回 None，调用方回退默认
     /// 目录并 toast 提示。
@@ -35,17 +38,52 @@ impl SessionEntry {
     }
 }
 
+/// 单个 tab 的持久化条目（F5：分屏后每窗格保存自己的 cwd）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabEntry {
+    /// 用户重命名的标题（None = 跟随默认标题规则：焦点窗格 cwd >
+    /// OSC 标题）。
+    pub custom_title: Option<String>,
+    /// 窗格条目（布局顺序：先上排后下排、行内自左向右）。
+    pub panes: Vec<PaneEntry>,
+    /// 焦点窗格下标（加载时已夹紧到合法范围）。
+    pub focused: usize,
+}
+
+/// 旧版平铺条目（M3.6b 格式，仅读侧迁移用）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+struct LegacyEntry {
+    custom_title: Option<String>,
+    cwd: Option<PathBuf>,
+}
+
 /// sessions.json 根结构。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionsFile {
-    /// 会话条目（侧栏自上而下的顺序）。
-    pub entries: Vec<SessionEntry>,
-    /// 激活会话下标（加载时已夹紧到合法范围）。
+    /// tab 条目（侧栏自上而下的顺序）。
+    pub tabs: Vec<TabEntry>,
+    /// 旧平铺格式字段（M3.6b）：读侧迁移为单窗格 tab；写侧恒空、
+    /// 不序列化。
+    #[serde(skip_serializing)]
+    entries: Vec<LegacyEntry>,
+    /// 激活 tab 下标（加载时已夹紧到合法范围）。
     pub active: usize,
 }
 
 impl SessionsFile {
+    /// 以新格式构造（main 构造持久化快照用；`entries` 为模块私有的
+    /// 迁移残留字段，外部不可见）。
+    pub fn new(tabs: Vec<TabEntry>, active: usize) -> Self {
+        Self {
+            tabs,
+            entries: Vec::new(),
+            active,
+        }
+    }
+
     /// 持久化路径：`%LOCALAPPDATA%/Lumen/sessions.json`。
     /// 环境变量缺失（极端定制环境）返回 None，本次运行不持久化。
     pub fn path() -> Option<PathBuf> {
@@ -90,22 +128,44 @@ impl SessionsFile {
                 return None;
             }
         };
-        if file.entries.is_empty() {
-            // 空列表 = 上次退出前关掉了全部 tab：与缺失同义。
-            return None;
+        // 旧平铺格式迁移：每个条目变成一个单窗格 tab。新旧字段同时
+        // 出现（异常手改）时以新格式为准。
+        if file.tabs.is_empty() && !file.entries.is_empty() {
+            file.tabs = file
+                .entries
+                .drain(..)
+                .map(|e| TabEntry {
+                    custom_title: e.custom_title,
+                    panes: vec![PaneEntry { cwd: e.cwd }],
+                    focused: 0,
+                })
+                .collect();
+            log::info!(
+                "会话列表：旧平铺格式已迁移为 {} 个单窗格 tab",
+                file.tabs.len()
+            );
         }
-        // 激活下标夹紧（手改文件/旧版本残留的越界值）。
-        file.active = file.active.min(file.entries.len() - 1);
-        // 空白自定义名视同未命名（重命名路径不会写空名，防手改）。
-        for entry in &mut file.entries {
-            if entry
+        file.entries.clear();
+        // 结构清洗（手改文件/旧版本残留的非法值）：空窗格列表的 tab
+        // 丢弃；窗格数超上限截断；焦点下标夹紧；空白自定义名视同未
+        // 命名（重命名路径不会写空名）。
+        file.tabs.retain(|t| !t.panes.is_empty());
+        for tab in &mut file.tabs {
+            tab.panes.truncate(MAX_PANES);
+            tab.focused = tab.focused.min(tab.panes.len() - 1);
+            if tab
                 .custom_title
                 .as_ref()
                 .is_some_and(|t| t.trim().is_empty())
             {
-                entry.custom_title = None;
+                tab.custom_title = None;
             }
         }
+        if file.tabs.is_empty() {
+            // 空列表 = 上次退出前关掉了全部 tab：与缺失同义。
+            return None;
+        }
+        file.active = file.active.min(file.tabs.len() - 1);
         Some(file)
     }
 
@@ -148,30 +208,64 @@ mod tests {
         ))
     }
 
+    fn pane(cwd: Option<&str>) -> PaneEntry {
+        PaneEntry {
+            cwd: cwd.map(PathBuf::from),
+        }
+    }
+
     #[test]
-    fn 序列化往返() {
-        let f = SessionsFile {
-            entries: vec![
-                SessionEntry {
+    fn 嵌套格式序列化往返() {
+        let f = SessionsFile::new(
+            vec![
+                TabEntry {
                     custom_title: Some("构建机".to_owned()),
-                    cwd: Some(PathBuf::from(r"C:\proj\lumen")),
+                    panes: vec![
+                        pane(Some(r"C:\proj\lumen")),
+                        pane(Some(r"D:\work 空格\中文目录")),
+                    ],
+                    focused: 1,
                 },
-                SessionEntry {
+                TabEntry {
                     custom_title: None,
-                    cwd: Some(PathBuf::from(r"D:\work 空格\中文目录")),
-                },
-                SessionEntry {
-                    custom_title: None,
-                    cwd: None,
+                    panes: vec![pane(None)],
+                    focused: 0,
                 },
             ],
-            active: 1,
-        };
+            1,
+        );
         let p = temp_path("roundtrip");
         f.save_to(&p).expect("写盘失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded, f);
+    }
+
+    #[test]
+    fn 旧平铺格式自动迁移() {
+        // M3.6b 写出的格式：entries 平铺 + active。每条目应迁移为
+        // 单窗格 tab，自定义名保留、cwd 进唯一窗格、焦点为 0。
+        let p = temp_path("legacy");
+        std::fs::write(
+            &p,
+            r#"{ "entries": [ { "custom_title": "构建机", "cwd": "C:\\a" }, { "cwd": "C:\\b" } ], "active": 1 }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs.len(), 2);
+        assert_eq!(loaded.tabs[0].custom_title.as_deref(), Some("构建机"));
+        assert_eq!(loaded.tabs[0].panes, vec![pane(Some(r"C:\a"))]);
+        assert_eq!(loaded.tabs[0].focused, 0);
+        assert_eq!(loaded.tabs[1].panes, vec![pane(Some(r"C:\b"))]);
+        assert_eq!(loaded.active, 1);
+        // 迁移后再写盘 = 新格式（不再含 entries 字段）。
+        let p2 = temp_path("legacy_rewrite");
+        loaded.save_to(&p2).expect("写盘失败");
+        let text = std::fs::read_to_string(&p2).expect("读回失败");
+        let _ = std::fs::remove_file(&p2);
+        assert!(text.contains("\"tabs\""), "应写新格式: {text}");
+        assert!(!text.contains("\"entries\""), "不应再写旧字段: {text}");
     }
 
     #[test]
@@ -191,25 +285,42 @@ mod tests {
     }
 
     #[test]
-    fn 空条目视同缺失() {
+    fn 空tab列表视同缺失() {
         let p = temp_path("empty");
-        std::fs::write(&p, r#"{ "entries": [], "active": 0 }"#).expect("写测试文件失败");
+        std::fs::write(&p, r#"{ "tabs": [], "active": 0 }"#).expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert!(loaded.is_none(), "空列表应回退单默认会话");
     }
 
     #[test]
-    fn 激活下标越界夹紧() {
-        let p = temp_path("clamp");
+    fn 空窗格tab被丢弃() {
+        // 手改文件可能出现 panes 为空的 tab：丢弃该 tab，整体仍可加载。
+        let p = temp_path("empty_panes");
         std::fs::write(
             &p,
-            r#"{ "entries": [ { "cwd": "C:\\a" }, { "cwd": "C:\\b" } ], "active": 9 }"#,
+            r#"{ "tabs": [ { "panes": [] }, { "panes": [ { "cwd": "C:\\a" } ] } ], "active": 1 }"#,
         )
         .expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
-        assert_eq!(loaded.active, 1);
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.active, 0, "丢 tab 后激活下标应夹紧");
+    }
+
+    #[test]
+    fn 下标越界与窗格超限夹紧() {
+        let p = temp_path("clamp");
+        std::fs::write(
+            &p,
+            r#"{ "tabs": [ { "panes": [ {}, {}, {}, {}, {}, {}, {}, {} ], "focused": 99 } ], "active": 9 }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs[0].panes.len(), MAX_PANES, "窗格数应截断到上限");
+        assert_eq!(loaded.tabs[0].focused, MAX_PANES - 1);
+        assert_eq!(loaded.active, 0);
     }
 
     #[test]
@@ -217,24 +328,24 @@ mod tests {
         let p = temp_path("blank_title");
         std::fs::write(
             &p,
-            r#"{ "entries": [ { "custom_title": "   ", "cwd": "C:\\a" } ], "active": 0 }"#,
+            r#"{ "tabs": [ { "custom_title": "   ", "panes": [ { "cwd": "C:\\a" } ] } ], "active": 0 }"#,
         )
         .expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
-        assert!(loaded.entries[0].custom_title.is_none());
+        assert!(loaded.tabs[0].custom_title.is_none());
     }
 
     #[test]
     fn 缺字段平滑加载() {
-        // 旧版本/手改文件缺字段：serde(default) 补默认值。
+        // 手改/未来版本缺字段：serde(default) 补默认值。
         let p = temp_path("partial");
-        std::fs::write(&p, r#"{ "entries": [ {} ] }"#).expect("写测试文件失败");
+        std::fs::write(&p, r#"{ "tabs": [ { "panes": [ {} ] } ] }"#).expect("写测试文件失败");
         let loaded = SessionsFile::load_from(&p).expect("应能加载");
         let _ = std::fs::remove_file(&p);
-        assert_eq!(loaded.entries.len(), 1);
-        assert!(loaded.entries[0].custom_title.is_none());
-        assert!(loaded.entries[0].cwd.is_none());
+        assert_eq!(loaded.tabs.len(), 1);
+        assert!(loaded.tabs[0].custom_title.is_none());
+        assert!(loaded.tabs[0].panes[0].cwd.is_none());
         assert_eq!(loaded.active, 0);
     }
 
@@ -242,32 +353,21 @@ mod tests {
     fn cwd失效回退() {
         // 存在的目录 → 可用；不存在的目录/指向文件的路径 → None。
         let dir = std::env::temp_dir();
-        let ok = SessionEntry {
-            custom_title: None,
-            cwd: Some(dir.clone()),
-        };
+        let ok = pane(dir.to_str());
         assert_eq!(ok.usable_cwd(), Some(dir.as_path()));
 
-        let gone = SessionEntry {
-            custom_title: None,
-            cwd: Some(PathBuf::from(r"C:\lumen_不存在的目录_单测专用")),
-        };
+        let gone = pane(Some(r"C:\lumen_不存在的目录_单测专用"));
         assert!(gone.usable_cwd().is_none(), "失效目录应回退 None");
 
         let file_path = dir.join(format!("lumen_sessions_cwd_{}.txt", std::process::id()));
         std::fs::write(&file_path, b"x").expect("写测试文件失败");
-        let not_dir = SessionEntry {
-            custom_title: None,
+        let not_dir = PaneEntry {
             cwd: Some(file_path.clone()),
         };
         let usable = not_dir.usable_cwd().is_none();
         let _ = std::fs::remove_file(&file_path);
         assert!(usable, "指向文件的 cwd 不可用");
 
-        let none = SessionEntry {
-            custom_title: None,
-            cwd: None,
-        };
-        assert!(none.usable_cwd().is_none());
+        assert!(pane(None).usable_cwd().is_none());
     }
 }

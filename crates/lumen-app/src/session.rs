@@ -1,12 +1,13 @@
 //! 会话：一个 PTY 子进程 + 终端状态机 + 每会话的渲染/交互状态。
 //!
 //! 多会话架构（M3.2，规格见 docs/M3应用外壳设计.md §2；M3.6 P5 通道
-//! 改造）：主循环持有 `Vec<Session>`，各会话的 PTY 事件经独立转发
-//! 线程送入**本会话自己的有界通道**（[`Session::rx`]），背压只作用于
-//! 该会话的读线程链路、互不连坐；`PtyWake` 无数据 user event + 全局
-//! `wake_pending` 去重协议与单会话时代零变化（任一会话的转发线程都
-//! 可触发 wake）。渲染调度只对激活会话生效；后台会话照常消化数据并
-//! 回写应答（DSR/DA 不回写会卡死对端程序），有新输出时只标记未读点。
+//! 改造；M3.7 F5 分屏升级为 `Vec<Tab>`，每 tab 1~6 个窗格、窗格 =
+//! [`Session`]）：各会话的 PTY 事件经独立转发线程送入**本会话自己的
+//! 有界通道**（[`Session::rx`]），背压只作用于该会话的读线程链路、
+//! 互不连坐；`PtyWake` 无数据 user event + 全局 `wake_pending` 去重
+//! 协议与单会话时代零变化（任一会话的转发线程都可触发 wake）。渲染
+//! 调度只对激活 tab 的窗格生效；后台 tab 的窗格照常消化数据并回写
+//! 应答（DSR/DA 不回写会卡死对端程序），有新输出时只标记未读点。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,69 @@ use crate::PtyWake;
 /// Receiver 一并丢弃，无需按 id 过滤。
 pub type SessionId = u64;
 
+/// Tab 唯一标识。自增分配、关闭后不复用（侧栏动作按 id 寻 tab，
+/// 与 SessionId 同理防滞后引用相撞）。
+pub type TabId = u64;
+
+/// 每个 tab 的窗格数上限（F5 拍板：最多 6 格）。
+pub const MAX_PANES: usize = 6;
+
+/// 一个侧栏 tab：1~6 个终端窗格（分屏，F5 / M3.7）。
+///
+/// 语义映射：侧栏条目 = Tab；原「激活会话」概念 = 「激活 tab 的
+/// 焦点窗格」（窗口标题、IME、键盘路由、文件树 cwd 都取它）。
+/// 窗格按布局顺序存放：两排时先上排后下排、行内自左向右
+/// （见 shell::layout::pane_rects）。
+pub struct Tab {
+    pub id: TabId,
+    /// 用户重命名的标题；None 时跟随默认规则（焦点窗格 cwd >
+    /// OSC 标题，见 [`Self::display_title`]）。
+    pub custom_title: Option<String>,
+    /// 窗格列表。**恒非空**——最后一个窗格关闭即关整个 tab
+    /// （main::close_pane 维护此不变量）。
+    pub panes: Vec<Session>,
+    /// 焦点窗格在 `panes` 中的下标。增删窗格时由调用方维护合法性，
+    /// 访问器仍做防御夹紧。
+    pub focused: usize,
+}
+
+impl Tab {
+    /// 焦点窗格（键盘/IME/滚轮/选区/粘贴/块操作的路由目标）。
+    /// 下标防御夹紧；`panes` 恒非空（见字段不变量）。
+    pub fn focused_pane(&self) -> &Session {
+        &self.panes[self.focused.min(self.panes.len() - 1)]
+    }
+
+    /// 焦点窗格（可变）。
+    pub fn focused_pane_mut(&mut self) -> &mut Session {
+        let i = self.focused.min(self.panes.len() - 1);
+        &mut self.panes[i]
+    }
+
+    /// 展示标题（侧栏条目与窗口标题同源此函数）。取值优先级：
+    /// 自定义名（用户重命名）> 焦点窗格 cwd（OSC 9;9 完整路径，
+    /// cd 后跟随）> 焦点窗格 OSC 0/2 标题 > 「会话 N」（N = tab
+    /// id + 1）。
+    pub fn display_title(&self) -> String {
+        if let Some(t) = &self.custom_title {
+            return t.clone();
+        }
+        self.focused_pane()
+            .default_title()
+            .unwrap_or_else(|| format!("会话 {}", self.id + 1))
+    }
+
+    /// 默认标题当前是否来自焦点窗格的 cwd（侧栏据此挂全路径悬停提示）。
+    pub fn title_is_cwd(&self) -> bool {
+        self.custom_title.is_none() && self.focused_pane().term.cwd().is_some()
+    }
+
+    /// tab 内任意窗格有未读输出（侧栏未读点；切到本 tab 时全清）。
+    pub fn has_unseen(&self) -> bool {
+        self.panes.iter().any(|p| p.has_unseen_output)
+    }
+}
+
 /// 每会话事件通道容量（事件粒度为 PTY 读线程的单次 read，至多
 /// 8KiB）：满时转发线程的 send 阻塞，背压沿「转发线程 → PTY 读线程
 /// → ConPTY 管道」传导回本会话的 shell，**不再连坐其他会话**——旧
@@ -44,11 +108,8 @@ pub struct Session {
     pub term: Terminal,
     pub pty: PtySession,
     /// 本会话的 PTY 事件接收端（per-session 有界通道，见
-    /// [`SESSION_EVENT_CAP`]）。drain 由主循环按「激活优先」轮询。
+    /// [`SESSION_EVENT_CAP`]）。drain 由主循环按「焦点窗格优先」轮询。
     pub rx: Receiver<PtyEvent>,
-    /// 用户重命名的标题；None 时跟随默认标题规则（cwd > OSC 标题，
-    /// 见 [`Self::display_title`]）。
-    pub custom_title: Option<String>,
     /// 启动恢复时的初始工作目录（F4 持久化）：OSC 9;9 尚未上报期间，
     /// 会话快照写盘以它为 cwd 回退值——否则恢复后还没等到提示符上报
     /// 就触发写盘（如切 tab）会把保存的 cwd 冲成 None。新建会话为
@@ -136,7 +197,6 @@ impl Session {
             term,
             pty,
             rx,
-            custom_title: None,
             initial_cwd: cwd.map(Path::to_path_buf),
             last_esu_mark: 0,
             cursor_displayed: (0, 0, true),
@@ -152,28 +212,17 @@ impl Session {
         })
     }
 
-    /// 展示用标题（侧栏条目与窗口标题同源此函数，F4）。取值优先级：
-    /// 自定义名（用户重命名）> cwd（OSC 9;9 上报的当前目录完整路径，
-    /// cd 后随下一个提示符上报自动跟随）> OSC 0/2 标题 > 「会话 N」。
-    /// PowerShell 默认把窗口标题设成 shell exe 路径，直接展示并不直观
-    /// ——cwd 优先于它。
-    pub fn display_title(&self) -> String {
-        if let Some(t) = &self.custom_title {
-            return t.clone();
-        }
+    /// 窗格的默认标题：cwd（OSC 9;9 上报的当前目录完整路径，cd 后
+    /// 随下一个提示符上报自动跟随）> OSC 0/2 标题；两者皆无返回
+    /// None（由 [`Tab::display_title`] 落「会话 N」兜底）。PowerShell
+    /// 默认把窗口标题设成 shell exe 路径，直接展示并不直观——cwd
+    /// 优先于它。
+    pub fn default_title(&self) -> Option<String> {
         if let Some(cwd) = self.term.cwd() {
-            return cwd.display().to_string();
+            return Some(cwd.display().to_string());
         }
         let t = self.term.title();
-        if !t.is_empty() {
-            return t.to_owned();
-        }
-        format!("会话 {}", self.id + 1)
-    }
-
-    /// 默认标题当前是否来自 cwd（侧栏据此挂全路径悬停提示）。
-    pub fn title_is_cwd(&self) -> bool {
-        self.custom_title.is_none() && self.term.cwd().is_some()
+        (!t.is_empty()).then(|| t.to_owned())
     }
 
     /// 复制选中命令块的输出到剪贴板，返回是否复制了内容。

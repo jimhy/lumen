@@ -4,10 +4,15 @@
 //!
 //! M3 起终端内容渲染到**持久离屏纹理**（egui 以 `ui.image` 把它嵌进
 //! 工作区），surface 的取帧/呈现所有权上移到 app 层（egui pass 是
-//! surface 的唯一写入方）。
+//! surface 的唯一写入方）。M3.7 分屏（F5）后离屏纹理与行级排版缓存
+//! 都按窗格（会话 id）隔离：激活 tab 的全部窗格同帧各渲各的纹理，
+//! 共享 atlas/字体系统/矩形管线等重资源；窗格关闭时调用方负责
+//! [`Renderer::drop_offscreen`] 释放纹理与缓存。
 
 mod rect;
 mod theme;
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use glyphon::{
@@ -38,8 +43,8 @@ struct RowSegs {
 /// 期望「非 sRGB-aware」纹理（它自己做 gamma→linear），若用 sRGB 视图
 /// 采样会被硬件先转线性、再被 egui 二次转换，画面整体偏暗。
 struct Offscreen {
-    texture: wgpu::Texture,
-    /// 终端管线的渲染目标视图（纹理本身格式）。
+    /// 终端管线的渲染目标视图（纹理本身格式）。两个视图各自持有
+    /// 底层纹理的引用（wgpu 资源引用计数），不必单独保存 Texture。
     render_view: wgpu::TextureView,
     /// 供 egui 采样的视图（非 sRGB 格式重解释）。
     sample_view: wgpu::TextureView,
@@ -77,7 +82,6 @@ impl Offscreen {
             ..Default::default()
         });
         Self {
-            texture,
             render_view,
             sample_view,
             width,
@@ -92,18 +96,21 @@ pub struct Renderer {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    /// 终端内容的离屏渲染目标（尺寸 = 终端区物理像素）。
-    offscreen: Offscreen,
+    /// 各窗格的离屏渲染目标（键 = 会话 id，尺寸 = 窗格物理像素）。
+    /// 窗格关闭时由调用方 [`Self::drop_offscreen`] 释放。
+    offscreens: HashMap<u64, Offscreen>,
 
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// 行级排版缓存：行内容（哈希）不变则整行跳过 shaping。
-    /// TUI 全屏界面（如 codex 的框线边框）段数巨大，没有缓存时
-    /// 每帧全量整形会把打字回显拖卡。
-    row_segs: Vec<RowSegs>,
+    /// 行级排版缓存（键 = 会话 id）：行内容（哈希）不变则整行跳过
+    /// shaping。TUI 全屏界面（如 codex 的框线边框）段数巨大，没有
+    /// 缓存时每帧全量整形会把打字回显拖卡。多窗格同帧渲染必须按
+    /// 会话隔离，否则互相踢缓存等于没有缓存；窗格关闭随
+    /// [`Self::drop_offscreen`] 一并清理，防内存泄漏。
+    row_caches: HashMap<u64, Vec<RowSegs>>,
     rects: rect::RectRenderer,
 
     theme: Theme,
@@ -168,9 +175,6 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        // 初始离屏纹理先按整窗尺寸建；app 层拿到 egui 布局的终端区
-        // 矩形后用 ensure_offscreen 重建到实际尺寸。
-        let offscreen = Offscreen::new(&device, format, config.width, config.height);
 
         let mut font_system = FontSystem::new();
         let font_family = pick_mono_family(&font_system);
@@ -192,13 +196,13 @@ impl Renderer {
             queue,
             surface,
             config,
-            offscreen,
+            offscreens: HashMap::new(),
             font_system,
             swash_cache: SwashCache::new(),
             viewport,
             atlas,
             text_renderer,
-            row_segs: Vec::new(),
+            row_caches: HashMap::new(),
             rects,
             theme: Theme::default(),
             font_family,
@@ -256,10 +260,12 @@ impl Renderer {
         self.invalidate_row_cache();
     }
 
-    /// 行级排版缓存整体失效（字体/字号/主题变更后调用）。
+    /// 行级排版缓存整体失效（字体/字号/主题变更后调用，全窗格）。
     fn invalidate_row_cache(&mut self) {
-        for r in &mut self.row_segs {
-            r.hash = None;
+        for cache in self.row_caches.values_mut() {
+            for r in cache.iter_mut() {
+                r.hash = None;
+            }
         }
     }
 
@@ -277,10 +283,11 @@ impl Renderer {
         (rows.max(1), cols.max(1))
     }
 
-    /// 终端区内像素坐标（相对终端区原点）→ 视图格子坐标（行, 列），
-    /// 自动夹紧到网格范围。
-    pub fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
-        let (rows, cols) = self.grid_size_for(self.offscreen.width, self.offscreen.height);
+    /// 窗格内像素坐标（相对窗格原点）→ 视图格子坐标（行, 列），
+    /// 自动夹紧到该窗格的网格范围。`width`/`height` 为窗格物理像素
+    /// 尺寸（分屏后各窗格尺寸不同，由调用方传入）。
+    pub fn cell_at(&self, px: f64, py: f64, width: u32, height: u32) -> (usize, usize) {
+        let (rows, cols) = self.grid_size_for(width, height);
         let col = ((px as f32 - self.padding) / self.cell_w).floor() as isize;
         let row = ((py as f32 - self.padding) / self.cell_h).floor() as isize;
         (
@@ -322,25 +329,35 @@ impl Renderer {
         &self.theme
     }
 
-    /// 终端内容的离屏纹理。
-    pub fn offscreen_texture(&self) -> &wgpu::Texture {
-        &self.offscreen.texture
+    /// 指定窗格供 egui 采样的离屏视图（非 sRGB 重解释，缘由见
+    /// [`Offscreen`]）；该窗格尚未创建离屏纹理时返回 None。
+    pub fn offscreen_view(&self, id: u64) -> Option<&wgpu::TextureView> {
+        self.offscreens.get(&id).map(|o| &o.sample_view)
     }
 
-    /// 供 egui 采样的离屏视图（非 sRGB 重解释，缘由见 [`Offscreen`]）。
-    pub fn offscreen_view(&self) -> &wgpu::TextureView {
-        &self.offscreen.sample_view
-    }
-
-    /// 确保离屏纹理为指定尺寸；尺寸变化时重建并返回 true
-    /// （调用方需重新把新视图绑定到 egui 纹理 id）。
-    pub fn ensure_offscreen(&mut self, width: u32, height: u32) -> bool {
+    /// 确保指定窗格的离屏纹理存在且为指定尺寸；新建或尺寸变化重建
+    /// 时返回 true（调用方需把新视图绑定到该窗格的 egui 纹理 id）。
+    pub fn ensure_offscreen(&mut self, id: u64, width: u32, height: u32) -> bool {
         let (width, height) = (width.max(1), height.max(1));
-        if (self.offscreen.width, self.offscreen.height) == (width, height) {
+        if self
+            .offscreens
+            .get(&id)
+            .is_some_and(|o| (o.width, o.height) == (width, height))
+        {
             return false;
         }
-        self.offscreen = Offscreen::new(&self.device, self.config.format, width, height);
+        self.offscreens.insert(
+            id,
+            Offscreen::new(&self.device, self.config.format, width, height),
+        );
         true
+    }
+
+    /// 释放指定窗格的离屏纹理与行排版缓存（窗格关闭时调用；egui 侧
+    /// 的纹理注册由调用方自行注销）。
+    pub fn drop_offscreen(&mut self, id: u64) {
+        self.offscreens.remove(&id);
+        self.row_caches.remove(&id);
     }
 
     /// 窗口 surface 物理尺寸变化（离屏纹理由 [`Self::ensure_offscreen`] 单独管理）。
@@ -368,8 +385,8 @@ impl Renderer {
         }
     }
 
-    /// 渲染一帧终端内容到离屏纹理（不触碰 surface，呈现由 app 层的
-    /// egui pass 完成）。
+    /// 渲染一帧终端内容到指定窗格（`id` = 会话 id）的离屏纹理
+    /// （不触碰 surface，呈现由 app 层的 egui pass 完成）。
     ///
     /// `selection` 为当前鼠标选区（绝对行号定位）；`cursor` 为绘制中
     /// 的光标态 (行, 列, 可见)——由上层做位置防抖后传入，不直接读
@@ -379,14 +396,18 @@ impl Renderer {
     /// 命令块的 id（块背景高亮）。
     pub fn render(
         &mut self,
+        id: u64,
         term: &Terminal,
         selection: Option<&Selection>,
         cursor: (usize, usize, bool),
         selected_block: Option<u64>,
     ) -> Result<()> {
         // 离屏视图按值克隆（Arc 浅拷贝），避免长借用 self 卡住后续字段访问。
-        let view = self.offscreen.render_view.clone();
-        let (target_w, target_h) = (self.offscreen.width, self.offscreen.height);
+        let Some(off) = self.offscreens.get(&id) else {
+            anyhow::bail!("窗格 {id} 的离屏纹理不存在（须先 ensure_offscreen）");
+        };
+        let view = off.render_view.clone();
+        let (target_w, target_h) = (off.width, off.height);
 
         let grid = term.grid();
         let rows = grid.rows();
@@ -522,8 +543,11 @@ impl Renderer {
         let family = self.font_family.clone();
         let base_attrs = Attrs::new().family(Family::Name(&family));
 
-        if self.row_segs.len() != rows {
-            self.row_segs.resize_with(rows, || RowSegs {
+        // 本窗格的行级排版缓存（按会话 id 隔离：多窗格同帧渲染若共享
+        // 一份缓存会互相踢行哈希，等于没有缓存）。
+        let row_segs = self.row_caches.entry(id).or_default();
+        if row_segs.len() != rows {
+            row_segs.resize_with(rows, || RowSegs {
                 hash: None,
                 segs: Vec::new(),
             });
@@ -531,12 +555,12 @@ impl Renderer {
 
         for (vr, row) in grid.visible_rows().enumerate() {
             let h = hash_row(row, cols);
-            if self.row_segs[vr].hash == Some(h) {
+            if row_segs[vr].hash == Some(h) {
                 continue;
             }
-            self.row_segs[vr].hash = Some(h);
+            row_segs[vr].hash = Some(h);
             // 取出 segs 重建（旧 buffer 复用，超出部分截断）。
-            let mut segs = std::mem::take(&mut self.row_segs[vr].segs);
+            let mut segs = std::mem::take(&mut row_segs[vr].segs);
             let mut seg_count = 0usize;
 
             let cells = row.cells();
@@ -635,13 +659,12 @@ impl Renderer {
                 seg_count += 1;
             }
             segs.truncate(seg_count);
-            self.row_segs[vr].segs = segs;
+            row_segs[vr].segs = segs;
         }
 
         let fg_default = self.theme.foreground.to_glyphon();
         let width = target_w as i32;
-        let text_areas: Vec<TextArea> = self
-            .row_segs
+        let text_areas: Vec<TextArea> = row_segs
             .iter()
             .take(rows)
             .enumerate()
