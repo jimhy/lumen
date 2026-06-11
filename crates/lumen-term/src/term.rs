@@ -970,13 +970,11 @@ mod tests {
     }
 
     #[test]
-    fn 缩行后_conpty_重发_cup_不错位() {
-        // B3 根治回归测试。模拟「有内容的多行网格缩行后 ConPTY 重发
-        // CUP 定位」场景：缩行前行0=提示符、行1=空命令、行2=输出…
-        // 缩行后 ConPTY 认为 row-0 仍是屏幕第一行（与我们的 screen[0]
-        // 对齐），重发 `ESC[1;1H` 应命中我们的 row 0。
-        // B3 前旧行为：顶行推入 scrollback → 我们的 screen[0] = 原 row1
-        // → ConPTY 的 ESC[1;1H 落错格 → 字符错位混叠。
+    fn 缩行后_cup_落在可视区首行() {
+        // VT CUP（ESC[row;colH）是可视区（screen）内坐标，与 scrollback
+        // 无关——无论缩行后历史有多少行，ESC[1;1H 始终落在 screen[0]。
+        // 此测试验证该不变量：缩行触发顶行进 scrollback 之后，ConPTY
+        // 重发的 ESC[1;1H 仍命中 screen[0]，字符不错位。
         let mut t = Terminal::new(5, 20, 100);
         // 写入 5 行内容（行0..4 各有文字，恰好填满可视区）
         t.advance(b"line0\r\n");
@@ -985,10 +983,10 @@ mod tests {
         t.advance(b"line3\r\n");
         t.advance(b"line4");
         assert_eq!(t.grid().cursor.row, 4);
-        // 缩到 3 行：触发裁行（第一步无空行可收割）。
+        // 缩到 3 行：第一步无空行可收割，第二步顶行进 scrollback。
         t.resize(3, 20);
-        // B3 关键：scrollback 保持为 0，screen[0] 不变（不偏移）。
-        assert_eq!(t.grid().scrollback_len(), 0, "B3: 裁行不得推入 scrollback");
+        // 缩行后历史有 2 行（原 line0/line1 进 scrollback）。
+        assert_eq!(t.grid().scrollback_len(), 2);
         // 模拟 ConPTY 重发 repaint：ESC[1;1H 定位到新屏幕 row-0，
         // 写入「重绘的提示符」，验证落在我们的 screen[0]。
         t.advance(b"\x1b[1;1HPS> ");
@@ -999,7 +997,7 @@ mod tests {
             .collect();
         assert!(
             rows[0].starts_with("PS> "),
-            "ConPTY 重发的提示符应落在 row0，实际: {:?}",
+            "ESC[1;1H 应落在 screen[0]，实际: {:?}",
             rows[0]
         );
     }
