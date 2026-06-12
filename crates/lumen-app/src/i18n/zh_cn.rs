@@ -27,6 +27,7 @@ pub static STRINGS: Strings = Strings {
     menu_log_in: "登录",
     // 设置页
     settings_title: "设置",
+    settings_close: "关闭设置",
     nav_account: "账号",
     nav_appearance: "外观",
     nav_keyboard_shortcuts: "键盘快捷键",
@@ -81,7 +82,6 @@ pub static STRINGS: Strings = Strings {
     login_password_hint: "密码",
     login_btn: "登录",
     // 文件树 UI
-    filetree_refresh: "刷新",
     filetree_refresh_tip: "重新读取目录",
     filetree_search_tip: "搜索文件名",
     filetree_root_placeholder: "文件",

@@ -690,32 +690,142 @@ fn panel_ui(
     let s = crate::i18n::strings();
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let refresh = egui::Button::new(
-                egui::RichText::new(s.filetree_refresh)
-                    .size(10.0)
-                    .color(pal.fg_dim),
-            )
-            .small();
-            if ui
-                .add(refresh)
-                .on_hover_text(s.filetree_refresh_tip)
-                .clicked()
+            // —— 刷新按钮：24×24 热区，painter 画圆弧箭头 ——
+            let (refresh_rect, refresh_resp) =
+                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
             {
+                let painter = ui.painter();
+                if refresh_resp.hovered() {
+                    painter.rect_filled(
+                        refresh_rect,
+                        egui::CornerRadius::same(4),
+                        pal.bg_highlight,
+                    );
+                }
+                let fg = if refresh_resp.hovered() {
+                    pal.fg
+                } else {
+                    pal.fg_dim
+                };
+                let stroke = egui::Stroke::new(1.2, fg);
+                let c = refresh_rect.center();
+                // 圆弧箭头：用 11 段折线逼近约 270° 圆弧（从 45° 到 315°，顺时针）
+                // 半径 5.0，圆心在热区中心偏上 0.5px 以视觉居中
+                let r = 5.0_f32;
+                let arc_cx = c.x;
+                let arc_cy = c.y + 0.5;
+                // 起点角度 45°（右上），终点角度 315°（右下），顺时针即角度递减
+                // 逼近段数 11，覆盖约 270°
+                let start_deg = 45.0_f32;
+                let sweep_deg = -270.0_f32; // 顺时针 270°
+                let n = 11usize;
+                let mut arc_pts: Vec<egui::Pos2> = (0..=n)
+                    .map(|i| {
+                        let t = i as f32 / n as f32;
+                        let angle = (start_deg + t * sweep_deg).to_radians();
+                        egui::pos2(
+                            arc_cx + r * angle.cos(),
+                            arc_cy - r * angle.sin(), // egui y 轴向下，sin 取反
+                        )
+                    })
+                    .collect();
+                // 绘制折线段
+                for w in arc_pts.windows(2) {
+                    painter.line_segment([w[0], w[1]], stroke);
+                }
+                // 末端箭头（位于弧终点约 315°，朝向切线方向）
+                // 切线方向：顺时针圆弧末端切线沿 225° 方向（向左下），箭头两短线
+                let end_pt = arc_pts.pop().unwrap_or(c);
+                let arrow_len = 3.5_f32;
+                // 末端切线角度（顺时针弧末端切线 = 起始角 + 顺时针 270° - 90°）
+                // 实际切线朝 (45° - 270° - 90°) = -315° ≡ 45° 向下即约 -45° + 180° = 135°
+                // 更直观：末端点约在 315°（右下），顺时针切线方向向左 = 约 180°+45°=225°
+                let tangent_deg: f32 = 225.0;
+                let tangent_rad = tangent_deg.to_radians();
+                let perp1 = (tangent_deg + 40.0).to_radians();
+                let perp2 = (tangent_deg - 40.0).to_radians();
+                painter.line_segment(
+                    [
+                        end_pt,
+                        egui::pos2(
+                            end_pt.x
+                                + arrow_len * tangent_rad.cos()
+                                + arrow_len * 0.6 * perp1.cos(),
+                            end_pt.y
+                                - arrow_len * tangent_rad.sin()
+                                - arrow_len * 0.6 * perp1.sin(),
+                        ),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        end_pt,
+                        egui::pos2(
+                            end_pt.x
+                                + arrow_len * tangent_rad.cos()
+                                + arrow_len * 0.6 * perp2.cos(),
+                            end_pt.y
+                                - arrow_len * tangent_rad.sin()
+                                - arrow_len * 0.6 * perp2.sin(),
+                        ),
+                    ],
+                    stroke,
+                );
+            }
+            if refresh_resp.on_hover_text(s.filetree_refresh_tip).clicked() {
                 st.reset_nodes();
             }
-            // 搜索开关：点击展开输入行；再点收起并清空（Esc 同义）。
-            let search_color = if st.search_open {
-                pal.accent
-            } else {
-                pal.fg_dim
-            };
-            let search_btn =
-                egui::Button::new(egui::RichText::new("🔍").size(10.0).color(search_color)).small();
-            if ui
-                .add(search_btn)
-                .on_hover_text(s.filetree_search_tip)
-                .clicked()
+
+            // —— 搜索开关按钮：24×24 热区，painter 画放大镜 ——
+            // 激活态用 accent 色；点击展开输入行，再点收起并清空（Esc 同义）。
+            let (search_rect, search_resp) =
+                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
             {
+                let painter = ui.painter();
+                let is_active = st.search_open;
+                if search_resp.hovered() {
+                    painter.rect_filled(search_rect, egui::CornerRadius::same(4), pal.bg_highlight);
+                }
+                let fg = if is_active {
+                    pal.accent
+                } else if search_resp.hovered() {
+                    pal.fg
+                } else {
+                    pal.fg_dim
+                };
+                let stroke = egui::Stroke::new(1.2, fg);
+                let c = search_rect.center();
+                // 放大镜圆（圆心偏左上，半径 4.5）
+                let lens_r = 4.5_f32;
+                let lens_cx = c.x - 1.5;
+                let lens_cy = c.y - 1.5;
+                // 用 12 段折线逼近整圆
+                let n = 12usize;
+                let circle_pts: Vec<egui::Pos2> = (0..=n)
+                    .map(|i| {
+                        let angle = (i as f32 / n as f32) * std::f32::consts::TAU;
+                        egui::pos2(
+                            lens_cx + lens_r * angle.cos(),
+                            lens_cy + lens_r * angle.sin(),
+                        )
+                    })
+                    .collect();
+                for w in circle_pts.windows(2) {
+                    painter.line_segment([w[0], w[1]], stroke);
+                }
+                // 柄：从圆边 45° 方向延伸约 4px
+                let handle_start = egui::pos2(
+                    lens_cx + lens_r * 45.0_f32.to_radians().cos(),
+                    lens_cy + lens_r * 45.0_f32.to_radians().sin(),
+                );
+                let handle_end = egui::pos2(
+                    handle_start.x + 4.0 * 45.0_f32.to_radians().cos(),
+                    handle_start.y + 4.0 * 45.0_f32.to_radians().sin(),
+                );
+                painter.line_segment([handle_start, handle_end], stroke);
+            }
+            if search_resp.on_hover_text(s.filetree_search_tip).clicked() {
                 if st.search_open {
                     st.close_search();
                 } else {

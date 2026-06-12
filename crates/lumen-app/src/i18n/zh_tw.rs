@@ -33,6 +33,7 @@ pub static STRINGS: Strings = Strings {
     menu_log_in: "登入",
     // 設定頁
     settings_title: "設定",
+    settings_close: "關閉設定",
     nav_account: "帳號",
     nav_appearance: "外觀",
     nav_keyboard_shortcuts: "鍵盤快捷鍵",
@@ -87,7 +88,6 @@ pub static STRINGS: Strings = Strings {
     login_password_hint: "密碼",
     login_btn: "登入",
     // 檔案樹 UI
-    filetree_refresh: "重新整理",
     filetree_refresh_tip: "重新讀取目錄",
     filetree_search_tip: "搜尋檔案名稱",
     filetree_root_placeholder: "檔案",

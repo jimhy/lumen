@@ -185,14 +185,40 @@ pub fn show(
                 egui::FontId::proportional(13.0),
                 pal.fg_dim,
             );
+            // 关闭按钮：painter 画线 ✕（r=4.5，线宽 1.2，同顶栏窗控同款几何）
+            // 不用 RichText 字符，避免字体覆盖导致字形不可控。
             let close_rect = egui::Rect::from_center_size(
                 egui::pos2(bar.right() - 26.0, bar.center().y),
                 egui::vec2(26.0, 26.0),
             );
-            let close_btn =
-                egui::Button::new(egui::RichText::new("✕").size(14.0).color(pal.fg_dim))
-                    .fill(egui::Color32::TRANSPARENT);
-            if ui.put(close_rect, close_btn).clicked() {
+            let close_resp = ui.allocate_rect(close_rect, egui::Sense::click());
+            {
+                let painter = ui.painter();
+                if close_resp.hovered() {
+                    // 面板关闭，hover 用 bg_highlight 圆角底（非窗口关闭，无红底）
+                    painter.rect_filled(close_rect, egui::CornerRadius::same(4), pal.bg_highlight);
+                }
+                let fg = if close_resp.hovered() {
+                    pal.fg
+                } else {
+                    pal.fg_dim
+                };
+                let r = 4.5_f32;
+                let c = close_rect.center();
+                let stroke = egui::Stroke::new(1.2, fg);
+                painter.line_segment(
+                    [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+                    stroke,
+                );
+            }
+            if close_resp
+                .on_hover_text(i18n::strings().settings_close)
+                .clicked()
+            {
                 out.closed = true;
             }
 

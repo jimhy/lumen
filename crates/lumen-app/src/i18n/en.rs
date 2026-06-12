@@ -27,6 +27,7 @@ pub static STRINGS: Strings = Strings {
     menu_log_in: "Log in",
     // Settings page
     settings_title: "Settings",
+    settings_close: "Close settings",
     nav_account: "Account",
     nav_appearance: "Appearance",
     nav_keyboard_shortcuts: "Keyboard shortcuts",
@@ -83,7 +84,6 @@ pub static STRINGS: Strings = Strings {
     login_password_hint: "Password",
     login_btn: "Log in",
     // File tree UI
-    filetree_refresh: "Refresh",
     filetree_refresh_tip: "Reload directory",
     filetree_search_tip: "Search file names",
     filetree_root_placeholder: "Files",

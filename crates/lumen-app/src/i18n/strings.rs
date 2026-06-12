@@ -63,6 +63,8 @@ pub struct Strings {
     // ── 设置页 ───────────────────────────────────────────────────────
     /// 设置页顶栏标题 "Settings"
     pub settings_title: &'static str,
+    /// 设置页关闭按钮 tooltip
+    pub settings_close: &'static str,
     /// 导航 "Account"
     pub nav_account: &'static str,
     /// 导航 "Appearance"
@@ -166,8 +168,6 @@ pub struct Strings {
     pub login_btn: &'static str,
 
     // ── 文件树 UI ────────────────────────────────────────────────────
-    /// 刷新按钮标签
-    pub filetree_refresh: &'static str,
     /// 刷新 tooltip
     pub filetree_refresh_tip: &'static str,
     /// 搜索按钮 tooltip
