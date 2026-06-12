@@ -3,3 +3,7 @@
 *.pdb
 /.engram/
 .playwright-mcp/
+
+# agent 验证日志（纪律：不入库，放 target/ 下）
+*-log.txt
+F*ClaudeWorkspacesLumen*
