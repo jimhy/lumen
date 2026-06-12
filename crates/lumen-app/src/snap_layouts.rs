@@ -36,10 +36,10 @@ mod windows_impl {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsZoomed, ShowWindow, HTMAXBUTTON, SW_MAXIMIZE, SW_RESTORE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
-        WM_NCLBUTTONUP,
+        IsZoomed, ShowWindow, HTMAXBUTTON, SW_MAXIMIZE, SW_RESTORE, WM_NCDESTROY, WM_NCHITTEST,
+        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
     };
 
     /// 子类 ID（任意非零常量，与本模块唯一绑定）。
@@ -112,19 +112,32 @@ mod windows_impl {
         (x, y)
     }
 
-    /// 判断屏幕点 (px, py) 是否落在最大化按钮矩形内。
+    /// 纯函数：判断点 `(px, py)` 是否落在矩形 `[l, r) × [t, b)` 内。
     ///
-    /// 矩形退化（right ≤ left 或 bottom ≤ top）时始终返回 false。
-    pub fn hit_maximize_button(px: i32, py: i32) -> bool {
-        let l = BTN_LEFT.load(Ordering::Relaxed);
-        let t = BTN_TOP.load(Ordering::Relaxed);
-        let r = BTN_RIGHT.load(Ordering::Relaxed);
-        let b = BTN_BOTTOM.load(Ordering::Relaxed);
+    /// 矩形退化（`r ≤ l` 或 `b ≤ t`）时始终返回 `false`。
+    /// 此函数不依赖任何全局状态，可在测试中直接调用而不影响其他测试。
+    ///
+    /// # 参数
+    /// - `px` / `py`：待判断的点坐标。
+    /// - `l` / `t` / `r` / `b`：矩形的左、上、右、下边界（物理像素，屏幕坐标）。
+    pub fn hit_rect(px: i32, py: i32, l: i32, t: i32, r: i32, b: i32) -> bool {
         // 退化矩形不命中
         if r <= l || b <= t {
             return false;
         }
         px >= l && px < r && py >= t && py < b
+    }
+
+    /// 判断屏幕点 `(px, py)` 是否落在当前最大化按钮矩形内。
+    ///
+    /// 从全局原子读取矩形后委托 [`hit_rect`] 执行命中判断；
+    /// 矩形退化时始终返回 `false`（初始值全零即退化，等价于「禁用」）。
+    pub fn hit_maximize_button(px: i32, py: i32) -> bool {
+        let l = BTN_LEFT.load(Ordering::Relaxed);
+        let t = BTN_TOP.load(Ordering::Relaxed);
+        let r = BTN_RIGHT.load(Ordering::Relaxed);
+        let b = BTN_BOTTOM.load(Ordering::Relaxed);
+        hit_rect(px, py, l, t, r, b)
     }
 
     /// Snap Layouts 子类窗口过程（comctl32 SetWindowSubclass 回调）。
@@ -168,6 +181,18 @@ mod windows_impl {
                 // SAFETY: hwnd 有效，cmd 是合法的 SHOW_WINDOW_CMD。
                 unsafe { ShowWindow(hwnd, cmd) };
                 0
+            }
+            WM_NCDESTROY => {
+                // MSDN「Subclassing Controls」规范：在 WM_NCDESTROY 中移除子类，
+                // 防止窗口已销毁后子类过程仍被调用（use-after-free）。
+                // 先 RemoveWindowSubclass 注销，再 DefSubclassProc 完成默认销毁。
+                //
+                // SAFETY: hwnd 在 WM_NCDESTROY 回调时仍处于销毁流程中、尚未
+                // 最终无效；SUBCLASS_ID 与 install() 一致，保证移除的是本模块
+                // 注册的子类而非其他子类。
+                unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
+                // SAFETY: hwnd / wparam / lparam 由系统保证在此回调期间有效。
+                unsafe { DefSubclassProc(hwnd, umsg, wparam, lparam) }
             }
             _ => {
                 // 其余消息透传给系统默认子类处理。
@@ -222,58 +247,76 @@ mod windows_impl {
             assert_eq!(unpack_lparam(lp), (32767, 32767));
         }
 
-        // 矩形命中判定测试
+        // ── 矩形命中判定测试（测纯函数 hit_rect，不写全局原子）────────────
+        // 直接测 hit_rect 纯函数：无全局状态、并行安全、结果确定。
 
         #[test]
-        fn hit_inside_button() {
-            update_button_rect(100, 0, 146, 34);
-            assert!(hit_maximize_button(100, 0), "左上角应命中");
-            assert!(hit_maximize_button(120, 17), "中心应命中");
-            assert!(hit_maximize_button(145, 33), "右下角内侧应命中");
+        fn hit_rect_inside() {
+            // 左上角、中心、右下角内侧均命中
+            assert!(hit_rect(100, 0, 100, 0, 146, 34), "左上角应命中");
+            assert!(hit_rect(120, 17, 100, 0, 146, 34), "中心应命中");
+            assert!(hit_rect(145, 33, 100, 0, 146, 34), "右下角内侧应命中");
         }
 
         #[test]
-        fn hit_outside_button() {
-            update_button_rect(100, 0, 146, 34);
-            assert!(!hit_maximize_button(99, 17), "左侧不命中");
-            assert!(!hit_maximize_button(146, 17), "right 边界（不含）不命中");
-            assert!(!hit_maximize_button(120, 34), "bottom 边界（不含）不命中");
-            assert!(!hit_maximize_button(120, -1), "上方不命中");
+        fn hit_rect_outside() {
+            // 左侧、右边界（不含）、下边界（不含）、上方均不命中
+            assert!(!hit_rect(99, 17, 100, 0, 146, 34), "左侧不命中");
+            assert!(
+                !hit_rect(146, 17, 100, 0, 146, 34),
+                "right 边界（不含）不命中"
+            );
+            assert!(
+                !hit_rect(120, 34, 100, 0, 146, 34),
+                "bottom 边界（不含）不命中"
+            );
+            assert!(!hit_rect(120, -1, 100, 0, 146, 34), "上方不命中");
         }
 
         #[test]
-        fn zero_rect_never_hits() {
-            // 初始状态：all-zero 退化矩形，任意坐标不命中
-            update_button_rect(0, 0, 0, 0);
-            assert!(!hit_maximize_button(0, 0));
-            assert!(!hit_maximize_button(50, 50));
+        fn hit_rect_zero_rect_never_hits() {
+            // all-zero 退化矩形（right == left, bottom == top），任意坐标不命中
+            assert!(!hit_rect(0, 0, 0, 0, 0, 0));
+            assert!(!hit_rect(50, 50, 0, 0, 0, 0));
         }
 
         #[test]
-        fn degenerate_rect_never_hits() {
+        fn hit_rect_degenerate_never_hits() {
             // right <= left
-            update_button_rect(100, 0, 50, 34);
-            assert!(!hit_maximize_button(70, 17));
+            assert!(!hit_rect(70, 17, 100, 0, 50, 34));
             // bottom <= top
-            update_button_rect(100, 20, 146, 10);
-            assert!(!hit_maximize_button(120, 15));
+            assert!(!hit_rect(120, 15, 100, 20, 146, 10));
         }
 
         #[test]
-        fn negative_screen_coords() {
+        fn hit_rect_negative_screen_coords() {
             // 多显示器：主屏左侧，屏幕坐标为负
-            update_button_rect(-1024 + 100, 0, -1024 + 146, 34);
-            assert!(hit_maximize_button(-924, 17), "负屏幕坐标应命中");
-            assert!(!hit_maximize_button(-1024, 17), "负屏幕坐标左侧不命中");
+            let (l, r) = (-1024 + 100, -1024 + 146);
+            assert!(hit_rect(-924, 17, l, 0, r, 34), "负屏幕坐标应命中");
+            assert!(!hit_rect(-1024, 17, l, 0, r, 34), "负屏幕坐标左侧不命中");
         }
 
         #[test]
-        fn boundary_on_left_edge() {
-            update_button_rect(200, 0, 246, 34);
-            // 左边界：px == l，命中（使用 >= l && < r 规则）
-            assert!(hit_maximize_button(200, 17));
-            // 右边界：px == r，不命中
-            assert!(!hit_maximize_button(246, 17));
+        fn hit_rect_boundary_edges() {
+            // 左边界：px == l → 命中（>= l && < r）
+            assert!(hit_rect(200, 17, 200, 0, 246, 34));
+            // 右边界：px == r → 不命中
+            assert!(!hit_rect(246, 17, 200, 0, 246, 34));
+        }
+
+        // ── 全局原子冒烟测试（串行安全：单个测试写入后立即读取）──────────────
+        // 仅验证 update_button_rect + hit_maximize_button 路径可通，
+        // 不在此处测矩形逻辑（逻辑已由 hit_rect 测试覆盖）。
+        // 注意：本测试写全局原子，需在同一逻辑单元内完成写-读，
+        // 不依赖其他测试写入的值，因此与并行测试不互相干扰。
+        #[test]
+        fn update_and_hit_maximize_button_smoke() {
+            // 写一个确定命中的矩形，读回应命中
+            update_button_rect(500, 10, 546, 44);
+            assert!(
+                hit_maximize_button(520, 27),
+                "update_button_rect + hit_maximize_button 路径应命中"
+            );
         }
     }
 }

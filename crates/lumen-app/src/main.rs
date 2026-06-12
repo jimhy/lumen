@@ -1383,8 +1383,8 @@ impl App {
         // M3.8 批2 Snap Layouts 子类化：窗口创建后安装子类过程。
         // 失败时记 warn 日志并继续（Snap 是增强功能，不影响应用主体逻辑）。
         // 取 HWND：winit 使用 rwh_06，HasWindowHandle trait 提供 window_handle()。
-        // Win32WindowHandle.hwnd 字段类型为 NonNull<core::ffi::c_void>，
-        // 转为 isize 传入 install。
+        // raw-window-handle 0.6 中 Win32WindowHandle.hwnd 字段类型为 NonZeroIsize，
+        // 调用 .get() 取出 isize 值传入 install。
         #[cfg(target_os = "windows")]
         {
             use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -2578,10 +2578,11 @@ impl ApplicationHandler<PtyWake> for App {
                 //   - egui 坐标原点 = 窗口客户区左上角（逻辑像素）。
                 //   - 屏幕坐标原点 = 主显示器左上角（物理像素，可为负值）。
                 //   - inner_position() 返回客户区左上角的屏幕物理坐标（PhysicalPosition）。
-                //   - 无边框窗口：inner_position == outer_position（系统阴影在客户区外，
-                //     DWM 层处理，不占客户区坐标空间）。
+                //   - egui 坐标原点 = 客户区屏幕左上角 = inner_position()（无边框下
+                //     NC offset 为 0；最大化时系统将窗口推至约 (-8,-8) 隐藏粗边框，
+                //     inner_position 如实反映该值，换算仍正确）。
                 //     选用 inner_position 而非 outer_position，是因为 egui 坐标
-                //     原点确实对应客户区——无论有无边框都正确。
+                //     原点确实对应客户区——无论有无边框、是否最大化都正确。
                 #[cfg(target_os = "windows")]
                 if let Some(rect) = shell_out.maximize_btn_rect {
                     // inner_position 可能在 Resumed 前失败，用 ok() 静默跳过。
