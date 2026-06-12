@@ -11,6 +11,76 @@
 //! # 设计稿对应章节
 //! 设计稿 §2「输入模式机（四态）」、§7.1「footer 输入区（零新 GPU 管线）」。
 
+/// footer 编辑器的文本选区（规范化端点，start ≤ end）。
+///
+/// 坐标单位与 [`ComposerView::cursor`] 相同：`(行索引, 行内字节偏移)`。
+///
+/// 保证不变量：`start.0 < end.0`，或 `start.0 == end.0 && start.1 < end.1`，
+/// 即 start 在文档顺序上严格早于 end（等于 = 空选区，app 侧不填此字段）。
+///
+/// # Examples
+/// ```
+/// use lumen_renderer::composer_view::FooterSelection;
+///
+/// // 单行选区：第 0 行字节 2..5
+/// let sel = FooterSelection { start: (0, 2), end: (0, 5) };
+/// assert!(sel.start < sel.end);
+///
+/// // 多行选区：第 0 行字节 3 到第 2 行字节 1
+/// let multi = FooterSelection { start: (0, 3), end: (2, 1) };
+/// assert!(multi.start.0 < multi.end.0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterSelection {
+    /// 选区起点 `(行索引, 字节偏移)`（文档顺序的较早端）。
+    pub start: (usize, usize),
+    /// 选区终点 `(行索引, 字节偏移)`（文档顺序的较晚端，exclusive）。
+    pub end: (usize, usize),
+}
+
+/// 将 anchor/cursor 两端规范化为 [`FooterSelection`]。
+///
+/// 若两端相等（纯光标，无选区），返回 `None`。
+/// 否则以文档顺序将较小者设为 start，较大者设为 end。
+///
+/// # Arguments
+/// * `anchor` - 选区锚点 `(行, 字节)`。
+/// * `cursor` - 选区活动端 `(行, 字节)`。
+///
+/// # Examples
+/// ```
+/// use lumen_renderer::composer_view::normalize_selection;
+///
+/// // 正向选区（anchor 早于 cursor）
+/// assert_eq!(
+///     normalize_selection((0, 1), (0, 5)),
+///     Some(lumen_renderer::composer_view::FooterSelection { start: (0, 1), end: (0, 5) })
+/// );
+///
+/// // 逆向选区（cursor 早于 anchor）
+/// assert_eq!(
+///     normalize_selection((1, 3), (0, 2)),
+///     Some(lumen_renderer::composer_view::FooterSelection { start: (0, 2), end: (1, 3) })
+/// );
+///
+/// // 相等 = 无选区
+/// assert_eq!(normalize_selection((0, 0), (0, 0)), None);
+/// ```
+pub fn normalize_selection(
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+) -> Option<FooterSelection> {
+    if anchor == cursor {
+        return None;
+    }
+    let (start, end) = if anchor <= cursor {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+    Some(FooterSelection { start, end })
+}
+
 /// footer 的显示形态，由上层 app 按当前 [`InputMode`] 组装。
 ///
 /// [`InputMode`]: crate::InputMode（app 侧 mode.rs）
@@ -32,11 +102,12 @@ pub enum FooterKind {
 /// - `kind`：形态选择（Composer / StatusBar / Hidden）。
 /// - `lines`：文本行内容（Compose 态为编辑内容，Running 态为 `["状态文案"]`）。
 /// - `cursor`：光标位置 `(行索引, 字节偏移)`，仅 Compose 态有意义。
+/// - `selection`：文本选区（规范化后的 [`FooterSelection`]，有选区时 Some）。M4.1 批F。
 /// - `label`：模式提示标签（如 "Compose" / "直通中" / 空串）。
 /// - `preedit`：IME 预编辑文本（Compose 态；None 表示无预编辑）。M4.1 批D2。
 /// - `exit_badge`：退出码角标（None 表示无需显示）。M4.1 批D2。
 /// - `placeholder`：占位提示文字（Compose 态 lines 全空时以 fg_dim 色显示）。M4.1 批E。
-/// - `ghost`：历史联想 ghost text（光标在文末时追加渲染，fg_dim 色，→/End 接受）。M4.1 批E。
+/// - `ghost`：历史联想 ghost text（有选区时不显示；光标在文末时追加渲染，fg_dim 色）。M4.1 批E。
 #[derive(Debug, Clone)]
 pub struct ComposerView {
     /// footer 形态。
@@ -45,6 +116,9 @@ pub struct ComposerView {
     pub lines: Vec<String>,
     /// 光标 `(行索引, 字节偏移)`，仅 Compose 态绘制竖条光标时使用。
     pub cursor: (usize, usize),
+    /// 文本选区（M4.1 批F）：anchor ≠ cursor 时为 Some；已由 app 侧规范化（start ≤ end）。
+    /// None = 纯光标（无选区）；有选区时 ghost text 不显示（视觉冲突，与系统惯例一致）。
+    pub selection: Option<FooterSelection>,
     /// 模式提示标签（状态条右侧角落，可为空串）。
     pub label: String,
     /// IME 预编辑文本（M4.1 批D2）：Some 时在光标处内嵌绘制（下划线样式）。
@@ -58,6 +132,7 @@ pub struct ComposerView {
     pub placeholder: Option<String>,
     /// 历史联想 ghost text（M4.1 批E）：光标在文末时在光标后以 fg_dim 色
     /// 追加渲染；→/End 键在文末+ghost 存在时接受（InsertText(ghost)）。
+    /// `selection.is_some()` 时不渲染（有选区时无 inline 补全，与系统惯例一致）。
     /// None = 无联想；不参与光标/选区几何；超行宽由 TextBounds 自然裁剪。
     pub ghost: Option<String>,
 }
@@ -94,6 +169,7 @@ impl ComposerView {
             kind: FooterKind::Composer,
             lines: vec![String::new()],
             cursor: (0, 0),
+            selection: None,
             label: label.into(),
             preedit: None,
             exit_badge: None,
@@ -112,6 +188,7 @@ impl ComposerView {
             kind: FooterKind::StatusBar,
             lines: vec![status_text.into()],
             cursor: (0, 0),
+            selection: None,
             label: label.into(),
             preedit: None,
             exit_badge: None,
@@ -126,6 +203,7 @@ impl ComposerView {
             kind: FooterKind::Hidden,
             lines: Vec::new(),
             cursor: (0, 0),
+            selection: None,
             label: String::new(),
             preedit: None,
             exit_badge: None,
@@ -182,6 +260,157 @@ pub fn footer_height_px(
     let line_count = v.line_count().max(1) as f32;
     let raw = line_count * cell_h + footer_padding * 2.0;
     raw.min(max_height_px)
+}
+
+/// 将行内字节偏移转换为显示列数（宽字符 CJK/emoji 占 2 列）。
+///
+/// 与 `lumen-editor::cursor::byte_to_display_col` 语义相同；
+/// renderer 不依赖 lumen-editor，此处复制相同算法并与光标绘制逻辑对齐。
+///
+/// # Arguments
+/// * `line` - 行文本（UTF-8）。
+/// * `byte` - 行内字节偏移（超出行长时夹紧到行尾）。
+///
+/// # Examples
+/// ```
+/// use lumen_renderer::composer_view::footer_byte_to_col;
+///
+/// assert_eq!(footer_byte_to_col("hello", 3), 3);
+/// // 汉字各占 3 字节（UTF-8）但显示宽度 2 列
+/// assert_eq!(footer_byte_to_col("中文", 3), 2);  // 第一个汉字后
+/// assert_eq!(footer_byte_to_col("中文", 6), 4);  // 两个汉字后
+/// // ASCII 后接汉字
+/// assert_eq!(footer_byte_to_col("ab中", 2), 2);  // "ab" 后
+/// assert_eq!(footer_byte_to_col("ab中", 5), 4);  // "ab中" 后
+/// ```
+pub fn footer_byte_to_col(line: &str, byte: usize) -> usize {
+    // 注意：与光标绘制处的 `chars().count()` 不同，此处使用 unicode-width
+    // 正确计算宽字符（CJK/emoji）的显示列数（每个宽字符占 2 列）。
+    // 光标绘制处的 chars().count() 在 CJK 场景下会低估列数（教训 8ff0cb5）；
+    // 选区几何与光标几何必须用同一套列换算，故此处使用精确宽度。
+    //
+    // ALLOW: unicode_width 是 glyphon 传递依赖，已在 workspace Cargo.lock 中；
+    // renderer Cargo.toml 显式声明以避免隐式传递依赖被静默升降版本。
+    use unicode_width::UnicodeWidthChar;
+    let byte = byte.min(line.len());
+    line[..byte]
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+/// 选区高亮矩形（像素坐标），供 renderer 转为 `RectInstance`。
+///
+/// 每个元素为 `(x, y, width, height)`（物理像素，左上角原点）。
+/// 单行选区返回 1 个矩形；多行返回 3 段（首行尾段、中间整行、末行首段）。
+/// 空选区（`sel` 的 start == end，或 lines 为空）返回空 Vec。
+///
+/// 与光标绘制使用相同的列换算（[`footer_byte_to_col`]），保证选区边界与光标位置对齐。
+///
+/// # Arguments
+/// * `sel` - 已规范化的选区（start ≤ end）。
+/// * `lines` - 编辑器行文本切片（与 `ComposerView::lines` 对应）。
+/// * `footer_top` - footer 顶边物理像素 y 坐标。
+/// * `fp` - footer 内边距（物理像素，与光标绘制同一 `fp`）。
+/// * `footer_w` - footer 物理宽度（像素）。
+/// * `cw` - 单元格宽度（物理像素）。
+/// * `ch` - 单元格高度（物理像素）。
+///
+/// # Examples
+/// ```
+/// use lumen_renderer::composer_view::{FooterSelection, selection_rects};
+///
+/// let lines = vec!["hello world".to_string()];
+/// let sel = FooterSelection { start: (0, 0), end: (0, 5) };
+/// let rects = selection_rects(&sel, &lines, 100.0, 4.0, 300.0, 8.0, 20.0);
+/// assert_eq!(rects.len(), 1);
+/// let (x, _y, w, h) = rects[0];
+/// assert_eq!(x, 4.0); // fp
+/// assert!((w - 5.0 * 8.0).abs() < 0.01); // 5 列 × cw
+/// assert!((h - 20.0).abs() < 0.01); // ch
+/// ```
+pub fn selection_rects(
+    sel: &FooterSelection,
+    lines: &[String],
+    footer_top: f32,
+    fp: f32,
+    footer_w: f32,
+    cw: f32,
+    ch: f32,
+) -> Vec<(f32, f32, f32, f32)> {
+    let (sl, sb) = sel.start;
+    let (el, eb) = sel.end;
+    if sl == el && sb == eb {
+        return Vec::new(); // 空选区
+    }
+
+    let line_y = |li: usize| footer_top + fp + li as f32 * ch;
+
+    // 取某行的显示列数（超出行范围时返回 0 或行末列）
+    let col_of = |li: usize, byte: usize| -> f32 {
+        let text = lines.get(li).map(|s| s.as_str()).unwrap_or("");
+        footer_byte_to_col(text, byte) as f32
+    };
+
+    // 某行的文本宽（显示列数），即行末列
+    let line_end_col = |li: usize| -> f32 {
+        let text = lines.get(li).map(|s| s.as_str()).unwrap_or("");
+        footer_byte_to_col(text, text.len()) as f32
+    };
+
+    let mut rects = Vec::new();
+
+    if sl == el {
+        // 单行选区
+        let start_col = col_of(sl, sb);
+        let end_col = col_of(el, eb);
+        let x = fp + start_col * cw;
+        let w = ((end_col - start_col) * cw).max(0.0);
+        if w > 0.0 {
+            rects.push((x, line_y(sl), w.min(footer_w - x), ch));
+        }
+    } else {
+        // 多行选区：首行尾段 + 中间整行 + 末行首段
+
+        // 首行：从 start_col 到行末
+        {
+            let start_col = col_of(sl, sb);
+            let end_col = line_end_col(sl);
+            let x = fp + start_col * cw;
+            // 若行为空则画到行末（至少留 1 列宽做视觉提示）
+            let w = if end_col > start_col {
+                (end_col - start_col) * cw
+            } else {
+                cw // 行尾选区，最少画 1 格宽
+            };
+            let w = w.min(footer_w - x);
+            if w > 0.0 {
+                rects.push((x, line_y(sl), w, ch));
+            }
+        }
+
+        // 中间整行（若有）
+        for li in (sl + 1)..el {
+            let end_col = line_end_col(li).max(1.0); // 空行至少 1 格宽
+            let x = fp;
+            let w = (end_col * cw).min(footer_w - x);
+            if w > 0.0 {
+                rects.push((x, line_y(li), w, ch));
+            }
+        }
+
+        // 末行：从行首到 end_col
+        {
+            let end_col = col_of(el, eb);
+            let x = fp;
+            let w = (end_col * cw).min(footer_w - x);
+            if w > 0.0 {
+                rects.push((x, line_y(el), w, ch));
+            }
+        }
+    }
+
+    rects
 }
 
 #[cfg(test)]
@@ -269,5 +498,155 @@ mod tests {
             h_compose, h_running,
             "Compose↔Running 等高，切换不触发 resize"
         );
+    }
+
+    // ── normalize_selection 选区规范化 ─────────────────────────────────
+
+    /// 正向选区（anchor 早于 cursor）：直接映射 start/end。
+    #[test]
+    fn 规范化_正向选区() {
+        let result = normalize_selection((0, 1), (0, 5));
+        assert_eq!(
+            result,
+            Some(FooterSelection {
+                start: (0, 1),
+                end: (0, 5)
+            }),
+            "正向选区应原样映射 start/end"
+        );
+    }
+
+    /// 逆向选区（cursor 早于 anchor）：交换后规范化。
+    #[test]
+    fn 规范化_逆向选区() {
+        let result = normalize_selection((1, 3), (0, 2));
+        assert_eq!(
+            result,
+            Some(FooterSelection {
+                start: (0, 2),
+                end: (1, 3)
+            }),
+            "逆向选区应交换为 start ≤ end"
+        );
+    }
+
+    /// 折叠选区（anchor == cursor）：纯光标，应返回 None。
+    #[test]
+    fn 规范化_折叠为空() {
+        assert_eq!(
+            normalize_selection((0, 0), (0, 0)),
+            None,
+            "纯光标应返回 None"
+        );
+        assert_eq!(
+            normalize_selection((2, 5), (2, 5)),
+            None,
+            "多行纯光标应返回 None"
+        );
+    }
+
+    // ── footer_byte_to_col 字节→列换算 ────────────────────────────────
+
+    /// ASCII 字符：每字节 = 1 列。
+    #[test]
+    fn 字节到列_ascii() {
+        assert_eq!(footer_byte_to_col("hello", 0), 0);
+        assert_eq!(footer_byte_to_col("hello", 3), 3);
+        assert_eq!(footer_byte_to_col("hello", 5), 5);
+    }
+
+    /// CJK 汉字：每字符 3 字节 UTF-8，显示 2 列。
+    #[test]
+    fn 字节到列_cjk() {
+        // "中文" = 6 字节，显示 4 列
+        assert_eq!(footer_byte_to_col("中文", 0), 0);
+        assert_eq!(footer_byte_to_col("中文", 3), 2, "第一个汉字后 = 2 列");
+        assert_eq!(footer_byte_to_col("中文", 6), 4, "两个汉字后 = 4 列");
+    }
+
+    /// 超出行长：夹紧到行尾。
+    #[test]
+    fn 字节到列_超出行长夹紧() {
+        assert_eq!(footer_byte_to_col("hi", 999), 2, "超出行长应夹紧到行尾");
+    }
+
+    // ── selection_rects 选区几何纯函数 ────────────────────────────────
+
+    /// 单行选区：返回 1 个矩形，x/w 对应列范围。
+    #[test]
+    fn 选区矩形_单行() {
+        let lines = vec!["hello world".to_string()];
+        let sel = FooterSelection {
+            start: (0, 0),
+            end: (0, 5),
+        };
+        let rects = selection_rects(&sel, &lines, 100.0, 4.0, 300.0, 8.0, 20.0);
+        assert_eq!(rects.len(), 1, "单行选区应返回 1 个矩形");
+        let (x, y, w, h) = rects[0];
+        assert!((x - 4.0).abs() < 0.01, "x = fp = 4");
+        assert!((y - (100.0 + 4.0)).abs() < 0.01, "y = footer_top + fp");
+        assert!((w - 5.0 * 8.0).abs() < 0.01, "w = 5列 × cw");
+        assert!((h - 20.0).abs() < 0.01, "h = ch");
+    }
+
+    /// 单行 CJK 选区：宽字符列换算正确。
+    #[test]
+    fn 选区矩形_单行_cjk() {
+        // "中文ab"：前两字各 2 列，选区覆盖 "中文"（字节 0..6）
+        let lines = vec!["中文ab".to_string()];
+        let sel = FooterSelection {
+            start: (0, 0),
+            end: (0, 6),
+        };
+        let rects = selection_rects(&sel, &lines, 0.0, 4.0, 500.0, 8.0, 20.0);
+        assert_eq!(rects.len(), 1);
+        let (_x, _y, w, _h) = rects[0];
+        // "中文" = 4 显示列，宽 = 4 × 8 = 32
+        assert!((w - 4.0 * 8.0).abs() < 0.01, "CJK 选区宽应为 4列×cw");
+    }
+
+    /// 两行选区：返回 2 个矩形（首行尾段 + 末行首段，无中间整行）。
+    #[test]
+    fn 选区矩形_两行() {
+        let lines = vec!["hello".to_string(), "world".to_string()];
+        let sel = FooterSelection {
+            start: (0, 2), // "hello" 字节 2（列 2）
+            end: (1, 3),   // "world" 字节 3（列 3）
+        };
+        let rects = selection_rects(&sel, &lines, 0.0, 4.0, 500.0, 8.0, 20.0);
+        // 首行：列 2..5（"llo"，3 列）+ 末行：列 0..3（"wor"，3 列）
+        assert_eq!(rects.len(), 2, "两行选区应返回 2 个矩形");
+        let (x0, _y0, w0, _h0) = rects[0]; // 首行
+        assert!(
+            (x0 - (4.0 + 2.0 * 8.0)).abs() < 0.01,
+            "首行 x = fp + 2列×cw"
+        );
+        assert!((w0 - 3.0 * 8.0).abs() < 0.01, "首行 w = 3列×cw（'llo'）");
+        let (x1, _y1, w1, _h1) = rects[1]; // 末行
+        assert!((x1 - 4.0).abs() < 0.01, "末行 x = fp（从行首）");
+        assert!((w1 - 3.0 * 8.0).abs() < 0.01, "末行 w = 3列×cw（'wor'）");
+    }
+
+    /// 三行选区（含中间整行）：返回 3 个矩形。
+    #[test]
+    fn 选区矩形_三行含中间整行() {
+        let lines = vec![
+            "hello".to_string(),  // 行 0：5 列
+            "middle".to_string(), // 行 1：6 列（中间整行）
+            "world".to_string(),  // 行 2：5 列
+        ];
+        let sel = FooterSelection {
+            start: (0, 2), // "hello" 列 2
+            end: (2, 3),   // "world" 列 3
+        };
+        let rects = selection_rects(&sel, &lines, 0.0, 4.0, 500.0, 8.0, 20.0);
+        assert_eq!(
+            rects.len(),
+            3,
+            "三行选区应返回 3 个矩形（首行尾段、中间整行、末行首段）"
+        );
+        // 中间整行（行 1）宽 = 6列×cw
+        let (_x1, _y1, w1, _h1) = rects[1];
+        assert!((w1 - 6.0 * 8.0).abs() < 0.01, "中间整行 w = 6列×cw");
     }
 }

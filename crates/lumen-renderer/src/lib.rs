@@ -693,9 +693,24 @@ impl Renderer {
                         color: self.footer_border_color.to_linear_f32(1.0),
                     });
 
-                    // Compose 态：竖条光标（宽 2px，前景色全不透明）。
+                    // Compose 态：选区高亮（在光标/IME 之前画，z 序在文字底下）+ 竖条光标。
                     use composer_view::FooterKind;
                     if cv.kind == FooterKind::Composer {
+                        // M4.1 批F：选区高亮矩形（先于光标入队，z 序在文字底下，与终端选区同惯例）。
+                        if let Some(sel) = &cv.selection {
+                            let sel_rects = composer_view::selection_rects(
+                                sel, &cv.lines, footer_top, fp, footer_w, cw, ch,
+                            );
+                            for (sx, sy, sw, sh) in sel_rects {
+                                instances.push(rect::RectInstance {
+                                    pos: [sx, sy],
+                                    size: [sw, sh],
+                                    // 与终端选区同色同 alpha（theme.selection，alpha=1.0）
+                                    color: self.theme.selection.to_linear_f32(1.0),
+                                });
+                            }
+                        }
+
                         let (cur_line, cur_byte) = cv.cursor;
                         // 首期等宽：字节偏移按 ASCII 宽度估算（unicode-width M4.2 精化）。
                         // 安全：lines 至少有 1 行（compose_empty 保证）。

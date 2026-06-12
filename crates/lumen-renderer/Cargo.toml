@@ -18,4 +18,5 @@ glyphon.workspace = true
 log.workspace = true
 lumen-term.workspace = true
 pollster.workspace = true
+unicode-width.workspace = true
 wgpu.workspace = true

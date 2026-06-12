@@ -23,7 +23,7 @@ use lumen_renderer::composer_view::ComposerView;
 #[cfg(feature = "input-editor")]
 use lumen_editor::EditorView;
 #[cfg(feature = "input-editor")]
-use lumen_renderer::composer_view::{ExitBadge, PreeditState};
+use lumen_renderer::composer_view::{normalize_selection, ExitBadge, PreeditState};
 
 /// 按当前有效输入模式组装 [`ComposerView`]。
 ///
@@ -71,16 +71,26 @@ pub fn compose_view_for_mode(
             // 占位提示（M4.1 批E）：lines 全空时显示 composer_placeholder。
             let all_empty = lines.iter().all(|l| l.is_empty());
             let placeholder = all_empty.then(|| s.composer_placeholder.to_owned());
+            // M4.1 批F：从 EditorView 取选区，规范化后填入 ComposerView。
+            // anchor ≠ cursor 时为非空选区；normalize_selection 返回 Some(FooterSelection)。
+            // 有选区时 ghost text 不显示（视觉冲突，系统惯例选区时无 inline 补全）。
+            let editor_sel = editor_view.selection();
+            let selection = normalize_selection(
+                (editor_sel.anchor.line, editor_sel.anchor.byte),
+                (editor_sel.cursor.line, editor_sel.cursor.byte),
+            );
+            let ghost = if selection.is_some() { None } else { ghost };
             // Position { line, byte }——与 ComposerView.cursor (行, 字节偏移) 语义相同
             ComposerView {
                 kind: lumen_renderer::composer_view::FooterKind::Composer,
                 lines,
                 cursor: (cur.line, cur.byte),
+                selection, // M4.1 批F：文本选区（规范化后，None=纯光标）
                 label: s.footer_label_compose.to_owned(),
                 preedit,     // M4.1 批D2：IME 预编辑
                 exit_badge,  // M4.1 批D2：退出码角标
                 placeholder, // M4.1 批E：占位提示（仅空编辑器显示）
-                ghost,       // M4.1 批3：历史联想后缀（光标在文末时渲染）
+                ghost,       // M4.1 批3：历史联想后缀（有选区时为 None）
             }
         }
         InputMode::Running => ComposerView::running(s.footer_running_text, s.footer_label_running),
@@ -247,6 +257,95 @@ mod tests {
                 lumen_renderer::composer_view::FooterKind::StatusBar,
                 "Running 态形态不受 ghost 影响"
             );
+        }
+
+        // ── M4.1 批F：选区传递 ──────────────────────────────────────────
+
+        /// 空编辑器（纯光标）：selection 应为 None。
+        #[test]
+        fn 空编辑器_无选区() {
+            let editor = empty_view();
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
+            assert_eq!(v.selection, None, "空编辑器应无选区");
+        }
+
+        /// 编辑器有选区时：selection 应被填入 Some(FooterSelection)，且已规范化（start ≤ end）。
+        #[test]
+        fn 有选区_正向_传入_compose_视图() {
+            use lumen_editor::{EditAction, Editor, Motion};
+            use lumen_renderer::composer_view::FooterSelection;
+
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText("hello".to_string()));
+            editor.apply(&EditAction::Move {
+                motion: Motion::LineStart,
+                extend: false,
+            });
+            // Shift+Right × 3 → 正向选区 anchor=(0,0) cursor=(0,3)
+            for _ in 0..3 {
+                editor.apply(&EditAction::Move {
+                    motion: Motion::GraphemeRight,
+                    extend: true,
+                });
+            }
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
+            assert_eq!(
+                v.selection,
+                Some(FooterSelection {
+                    start: (0, 0),
+                    end: (0, 3)
+                }),
+                "正向选区应被正确填入"
+            );
+        }
+
+        /// 逆向选区（cursor < anchor）：规范化后 start ≤ end。
+        #[test]
+        fn 有选区_逆向_规范化() {
+            use lumen_editor::{EditAction, Editor, Motion};
+            use lumen_renderer::composer_view::FooterSelection;
+
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText("hello".to_string()));
+            // 光标在行尾，Shift+Left × 2 → 逆向选区 anchor=(0,5) cursor=(0,3)
+            for _ in 0..2 {
+                editor.apply(&EditAction::Move {
+                    motion: Motion::GraphemeLeft,
+                    extend: true,
+                });
+            }
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
+            // 规范化后：start=(0,3) end=(0,5)
+            assert_eq!(
+                v.selection,
+                Some(FooterSelection {
+                    start: (0, 3),
+                    end: (0, 5)
+                }),
+                "逆向选区应被规范化为 start ≤ end"
+            );
+        }
+
+        /// 有选区时：ghost text 应被清空（视觉冲突，选区时无 inline 补全）。
+        #[test]
+        fn 有选区_ghost_被清空() {
+            use lumen_editor::{EditAction, Editor, Motion};
+
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText("hello".to_string()));
+            editor.apply(&EditAction::Move {
+                motion: Motion::LineStart,
+                extend: false,
+            });
+            editor.apply(&EditAction::Move {
+                motion: Motion::GraphemeRight,
+                extend: true,
+            });
+            // 有选区，传入 ghost
+            let ghost = Some("suffix".to_owned());
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, ghost);
+            assert!(v.selection.is_some(), "应有选区");
+            assert_eq!(v.ghost, None, "有选区时 ghost 应被清空");
         }
     }
 
