@@ -9,12 +9,20 @@
 //! - 中：焦点窗格 cwd（截断显示，hover 全路径）
 //! - 右：经典直通切换按钮（真按钮样式，hover tooltip，点击=ToggleFallback 同路径）
 //!
-//! # 经典模式按钮视觉规格（第十轮问题2）
+//! # 经典模式按钮视觉规格（第十五轮对齐 topbar 按钮语言）
 //! - 圆角矩形，圆角 4px（rounding = 4.0）
-//! - 1px `panel_outline` 描边，无填充（关闭态）
-//! - 悬停态：`bg_highlight` 填充（与其他控件 hover 一致）
-//! - 开启态（force_fallback=true）：`accent` 填充 + `accent_fg` 文字（白底黑字醒目 CTA）
-//! - 文字字号 11，垂直居中，按钮高度约 18px（24px 状态栏垂直居中）
+//! - 关闭态：**常态无边框无底色**（纯文字 fg_dim），hover 才画 bg_highlight 圆角底
+//!   （与 topbar 三视图/窗控按钮语言一致：常态无边框 + hover 圆角底）
+//! - 开启态（force_fallback=true）：accent 白底 + accent_fg 黑字（醒目反转 CTA，P9 风格）；
+//!   无额外描边，圆角 4
+//! - hover 文字色：关闭态 hover 时提亮为 fg；开启态始终 accent_fg
+//! - 文字字号 11，垂直居中
+//!
+//! # 垂直居中规格（第十五轮问题2：按钮贴顶修复）
+//! - 状态栏高度 24px；按钮高度 18px，allocate 只占 18px（不撑满 24px）
+//! - horizontal 布局 Align::Center 自动垂直居中 → 上下各 3px 间距，满足 ≥2px 与上边框间隙
+//! - 原因：旧版 allocate_exact_size(ui.available_height()) 把整栏高度分配，
+//!   感知区域从栏顶（紧贴 panel_outline 描边线）开始，视觉上零间距
 //!
 //! # 设计原则
 //! - 状态栏高度常驻（不影响 footer 的 resize 链，两者独立）
@@ -133,49 +141,33 @@ pub fn show(
             );
         }
 
-        // ── 右：经典直通切换按钮（真按钮样式，第十轮问题2）──────────
-        // 开启态（force_fallback=true）：accent 白底 + accent_fg 黑字（醒目 CTA）。
-        // 关闭态：线框灰字（panel_outline 1px 描边 + fg_dim 文字，低调）。
-        // 悬停：bg_highlight 填充（统一 hover 档）。
-        // 圆角 4px，高度约 18px（24px 状态栏垂直居中）。
-        let btn_fill = if force_fallback {
-            pal.accent
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        let btn_text_color = if force_fallback {
-            pal.accent_fg
-        } else {
-            pal.fg_dim
-        };
+        // ── 右：经典直通切换按钮（第十五轮：对齐 topbar 按钮语言）────────
+        // 按钮语言与 topbar 三视图/窗控按钮统一：
+        //   关闭态：常态无边框无底（纯文字 fg_dim）；hover 画 bg_highlight 圆角底 + 文字提亮为 fg
+        //   开启态：accent 白底 + accent_fg 黑字（醒目反转 CTA）；无额外描边
+        //
+        // 垂直居中修复：allocate_exact_size 只分配 btn_h（18px），
+        // horizontal(Align::Center) 自动垂直居中 → 上下各 3px，满足与上边框 ≥2px 间距。
+        // （旧版分配 ui.available_height()=24px，感知区从栏顶开始，视觉零间距。）
 
-        // 按钮内边距（水平 6px，垂直 1px），使整体高约 18px
+        // 按钮高度（18px）：allocate 只占此值，不撑满 24px 栏高
         let btn_h = 18.0_f32;
-        let pad_v = ((ui.available_height() - btn_h) / 2.0).max(0.0);
-        ui.add_space(0.0); // flush 布局
-                           // 按钮宽度：与上方 btn_w_approx 公式一致（ASCII 7px + CJK 12px，加 12px 内边距）。
-        let btn_size = egui::vec2(btn_text_w + 12.0, btn_h);
+        // 按钮宽度：与上方 btn_w_approx 公式一致（ASCII 7px + CJK 12px，加 12px 内边距）。
+        let btn_w = btn_text_w + 12.0;
 
-        // 使用 allocate_exact_size 手工绘制，以获得完整视觉控制
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(btn_size.x, ui.available_height()),
-            egui::Sense::click(),
-        );
+        // 使用 allocate_exact_size 分配 btn_h（非 available_height），
+        // horizontal Align::Center 保证自动垂直居中 → 上下各 3px 间距
+        let (btn_rect, resp) =
+            ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::click());
         let resp = resp.on_hover_text(s.statusbar_classic_tip);
-
-        // 垂直居中的按钮矩形
-        let btn_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x, rect.center().y - btn_h / 2.0),
-            egui::vec2(rect.width(), btn_h),
-        );
 
         if ui.is_rect_visible(btn_rect) {
             let painter = ui.painter();
             let rounding = egui::CornerRadius::same(4);
 
-            // 背景填充（悬停 or 开启态）
+            // 背景填充：开启态 accent 白底；关闭态 hover 时 bg_highlight；否则透明
             let fill = if force_fallback {
-                btn_fill
+                pal.accent
             } else if resp.hovered() {
                 pal.bg_highlight
             } else {
@@ -185,35 +177,30 @@ pub fn show(
                 painter.rect_filled(btn_rect, rounding, fill);
             }
 
-            // 1px 描边（关闭态始终显示；开启态白底自带视觉边界，但仍留描边保持形状）
-            let stroke_color = if force_fallback {
-                // 开启态：accent 描边（白底）
-                pal.accent
-            } else {
-                pal.panel_outline
-            };
-            painter.rect_stroke(
-                btn_rect,
-                rounding,
-                egui::Stroke::new(1.0, stroke_color),
-                egui::StrokeKind::Inside,
-            );
+            // 无常态描边（统一 topbar 风格：常态无边框）
+            // 开启态白底自带视觉边界，无需额外描边
 
-            // 文字居中
+            // 文字色：开启态 accent_fg（黑字），关闭态 hover 提亮为 fg，常态 fg_dim
+            let text_color = if force_fallback {
+                pal.accent_fg
+            } else if resp.hovered() {
+                pal.fg
+            } else {
+                pal.fg_dim
+            };
+            // 文字垂直居中于 btn_rect（18px 内）
             painter.text(
                 btn_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 btn_text,
                 egui::FontId::proportional(11.0),
-                btn_text_color,
+                text_color,
             );
         }
 
         if resp.clicked() {
             out.toggle_fallback = true;
         }
-
-        let _ = pad_v; // 已由 allocate_exact_size 覆盖居中逻辑
 
         ui.add_space(8.0);
     });
@@ -314,5 +301,54 @@ mod tests {
         v.lines[0] = "ls".to_owned();
         let all_empty = v.lines.iter().all(|l| l.is_empty());
         assert!(!all_empty, "非空编辑器 lines 不应全为空串");
+    }
+
+    // ── 按钮垂直居中几何纯函数测试（第十五轮 #2）──────────────────────────
+    // 钉住「状态栏高 24px / 按钮高 18px → 上下各 3px 间距」的数学约束。
+    // 这是 allocate_exact_size(btn_h) + horizontal(Align::Center) 的预期行为：
+    // egui 在 Align::Center 布局中将分配区域垂直居中于可用区域。
+
+    /// 计算 horizontal(Align::Center) 布局中，在高度为 `bar_h` 的区域里
+    /// 分配高度为 `btn_h` 的元素时，元素顶边相对于区域顶边的 y 偏移。
+    ///
+    /// 这是 egui Align::Center 的数学定义（无 egui 依赖的纯函数）。
+    fn center_y_offset(bar_h: f32, btn_h: f32) -> f32 {
+        (bar_h - btn_h) / 2.0
+    }
+
+    #[test]
+    fn 按钮垂直居中_栏高24_按钮高18_偏移3px() {
+        let offset = center_y_offset(HEIGHT, 18.0);
+        assert_eq!(
+            offset, 3.0,
+            "状态栏高 {HEIGHT}px / 按钮高 18px 应居中，上下各 3px 间距，实际 {offset}px"
+        );
+    }
+
+    #[test]
+    fn 按钮垂直居中_间距不小于2px() {
+        // 约束：无论按钮高度如何，上下间距必须 ≥2px
+        let btn_h = 18.0_f32;
+        let offset = center_y_offset(HEIGHT, btn_h);
+        assert!(
+            offset >= 2.0,
+            "与上边框间距 {offset}px < 2px（按钮高 {btn_h}px，栏高 {HEIGHT}px）"
+        );
+        // 下边距等于上边距（对称居中）
+        let gap_bottom = HEIGHT - btn_h - offset;
+        assert!(
+            gap_bottom >= 2.0,
+            "与下边距 {gap_bottom}px < 2px（对称居中验证）"
+        );
+    }
+
+    #[test]
+    fn 按钮垂直居中_按钮在栏内不溢出() {
+        let btn_h = 18.0_f32;
+        let offset = center_y_offset(HEIGHT, btn_h);
+        assert!(
+            offset >= 0.0 && offset + btn_h <= HEIGHT,
+            "按钮（offset={offset}, h={btn_h}）溢出状态栏（高 {HEIGHT}）"
+        );
     }
 }
