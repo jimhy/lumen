@@ -531,6 +531,26 @@ pub fn footer_height_debounce(
 }
 
 // ── 临时文件清理（测试辅助）────────────────────────────────────────
+/// 测试专用辅助：创建不绑文件路径的内存 HistoryStore，供跨模块单测注入条目。
+#[cfg(test)]
+impl HistoryStore {
+    /// 构造纯内存 HistoryStore（路径为占位符，不读/写磁盘）。
+    pub fn new_in_memory() -> Self {
+        Self {
+            path: PathBuf::from("__in_memory__"),
+            entries: Vec::new(),
+            cursor: None,
+            draft: None,
+            abandoned: None,
+        }
+    }
+
+    /// 直接向内存条目列表追加一条历史记录（不去重、不落盘；仅供单测）。
+    pub fn inject_entry(&mut self, entry: HistoryEntry) {
+        self.entries.push(entry);
+    }
+}
+
 #[cfg(test)]
 impl Drop for HistoryStore {
     fn drop(&mut self) {

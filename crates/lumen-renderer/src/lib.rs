@@ -1013,6 +1013,13 @@ impl Renderer {
                             // ghost text：光标在文末时在光标后追加渲染（fg_dim 色）。
                             // 条件：cursor 行有 ghost 字段且光标字节偏移 ≥ 该行长度。
                             if let Some(ghost) = &cv.ghost {
+                                log::debug!(
+                                    "[ghost] cv.ghost=Some({:?}) cursor=({},{}) line_len={}",
+                                    ghost,
+                                    cv.cursor.0,
+                                    cv.cursor.1,
+                                    cv.lines.get(cv.cursor.0).map(|s| s.len()).unwrap_or(0)
+                                );
                                 if !ghost.is_empty() {
                                     let (cur_line, cur_byte) = cv.cursor;
                                     let line_text =
@@ -1027,6 +1034,10 @@ impl Renderer {
                                         ) as f32;
                                         let ghost_x = fp + col * cw;
                                         let ghost_y = footer_top + fp + cur_line as f32 * ch;
+                                        log::debug!(
+                                            "[ghost] 绘制 ghost={:?} ghost_x={ghost_x:.1} ghost_y={ghost_y:.1} col={col} cw={cw} fp={fp}",
+                                            ghost
+                                        );
                                         let bottom_clamp =
                                             ((ghost_y + ch) as i32).min(target_h as i32);
                                         // 超宽由 TextBounds 自然裁剪（right = target_w）
@@ -1048,6 +1059,11 @@ impl Renderer {
                                             bottom_clamp,
                                             ghost_x,
                                         ));
+                                    } else {
+                                        log::debug!(
+                                            "[ghost] 跳过绘制：光标不在文末 cur_byte={cur_byte} line_len={}",
+                                            line_text.len()
+                                        );
                                     }
                                 }
                             }

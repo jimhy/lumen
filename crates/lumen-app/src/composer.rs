@@ -256,6 +256,118 @@ mod tests {
             );
         }
 
+        // ── 反馈B：Compose 态 ghost 全链路无头测试（第十七轮）─────────────
+        //
+        // 验收目标：HistoryStore（内存注入）→ find_ghost_prefix → compose_view_for_mode
+        // → ComposerView.ghost 字段 Some；同时验证渲染层前置条件（cur_byte ≥ 行末）。
+        // 渲染层需要 GPU 无法无头执行，此处钉死数据链路正确性。
+
+        /// 全链路 ghost 基线：注入历史 "git status" → 输入 "git s" → ghost = "tatus"。
+        #[test]
+        fn ghost_全链路_history注入到composerview() {
+            use crate::history::{HistoryEntry, HistoryStore};
+            use lumen_editor::{EditAction, Editor};
+
+            // 构造内存 HistoryStore（不落盘），注入 "git status" 条目。
+            let mut store = HistoryStore::new_in_memory();
+            store.inject_entry(HistoryEntry {
+                text: "git status".into(),
+                cwd: None,
+                exit_code: None,
+                duration_ms: None,
+                ts: 1,
+            });
+
+            // 编辑器输入 "git s"，光标在行末（byte=5）。
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText("git s".to_string()));
+
+            // 步骤1：find_ghost_prefix 基线——应返回 "tatus"。
+            let text = editor.view().text();
+            let ghost = store.find_ghost_prefix(&text);
+            assert_eq!(
+                ghost.as_deref(),
+                Some("tatus"),
+                "find_ghost_prefix(\"git s\") 应返回 \"tatus\""
+            );
+
+            // 步骤2：compose_view_for_mode 断言 ghost 字段 Some。
+            let v =
+                compose_view_for_mode(InputMode::Compose, editor.view(), None, None, ghost.clone());
+            assert_eq!(
+                v.ghost.as_deref(),
+                Some("tatus"),
+                "ComposerView.ghost 应为 Some(\"tatus\")"
+            );
+            assert_eq!(v.kind, lumen_renderer::composer_view::FooterKind::Composer);
+            assert!(v.selection.is_none(), "无选区时 ghost 不应被清空");
+
+            // 步骤3：验证渲染层前置条件。
+            // 渲染层条件：cur_byte >= line_text.len()（光标在行末才追加 ghost）。
+            let (cur_line, cur_byte) = v.cursor;
+            let line_text = v.lines.get(cur_line).map(|s| s.as_str()).unwrap_or("");
+            assert!(
+                cur_byte >= line_text.len(),
+                "光标字节偏移 ({cur_byte}) 应 >= 行末 ({})，否则渲染层不画 ghost",
+                line_text.len()
+            );
+        }
+
+        /// ghost 光标不在文末时渲染层不绘制：cur_byte < line.len()。
+        #[test]
+        fn ghost_光标不在文末_渲染条件不满足() {
+            use lumen_editor::{EditAction, Editor, Motion};
+
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText("git status".to_string()));
+            // 光标移回行首（byte=0），文本仍为 "git status"。
+            editor.apply(&EditAction::Move {
+                motion: Motion::LineStart,
+                extend: false,
+            });
+
+            let ghost = Some("uffix".to_owned()); // 假设有 ghost，但光标不在末
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, ghost);
+
+            // ComposerView 中 ghost 字段值仍为 Some（app 层不管渲染条件）。
+            assert!(
+                v.ghost.is_some(),
+                "app 层传入 ghost 时 ComposerView.ghost 应为 Some"
+            );
+
+            // 渲染层条件检查：cur_byte < line.len() → 渲染层不会画 ghost。
+            let (cur_line, cur_byte) = v.cursor;
+            let line_text = v.lines.get(cur_line).map(|s| s.as_str()).unwrap_or("");
+            assert!(
+                cur_byte < line_text.len(),
+                "光标在行首时 cur_byte ({cur_byte}) 应 < line.len() ({})；渲染层不绘制 ghost",
+                line_text.len()
+            );
+        }
+
+        /// ghost 空串不绘制：渲染层有 `if !ghost.is_empty()` 门控。
+        #[test]
+        fn ghost_空串_渲染门控() {
+            use crate::history::{HistoryEntry, HistoryStore};
+            use lumen_editor::{EditAction, Editor};
+
+            // 注入 "git"，前缀 "git" 完全等于条目 → find_ghost_prefix 返回 None。
+            let mut store = HistoryStore::new_in_memory();
+            store.inject_entry(HistoryEntry {
+                text: "git".into(),
+                cwd: None,
+                exit_code: None,
+                duration_ms: None,
+                ts: 1,
+            });
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText("git".to_string()));
+            let text = editor.view().text();
+            let ghost = store.find_ghost_prefix(&text);
+            // 完全匹配时 ghost 应为 None（避免空 ghost）。
+            assert!(ghost.is_none(), "前缀=条目时 find_ghost_prefix 返回 None");
+        }
+
         // ── M4.1 批F：选区传递 ──────────────────────────────────────────
 
         /// 空编辑器（纯光标）：selection 应为 None。
