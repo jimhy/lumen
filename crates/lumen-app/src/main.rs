@@ -836,47 +836,60 @@ impl AppState {
                     mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
                 match ca {
                     ComposerAction::Submit if current_mode == mode::InputMode::Compose => {
-                        // 步骤 1：门控（双重检查，keymap 已检查过一次）
-                        // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴无条件包裹）
-                        let raw_text = self.tabs[ti].panes[pi].editor.view().text();
-                        let payload = encode_submit(&raw_text);
-                        // 步骤 3：滚动到底 + 写 PTY
-                        self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
-                        if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
-                            log::error!("提交写 PTY 失败: {e:#}");
+                        // M4.2 批2：续行检测——文档末尾未闭合（引号/括号/here-string/
+                        // 块注释、行尾管道 `|` 或续行反引号）时，Enter 自动换行而非提交
+                        // （设计稿 §4），复用 lumen-editor tokenizer 判定。
+                        if self.tabs[ti].panes[pi].editor.needs_continuation() {
+                            self.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::InsertNewline);
+                            events.push(StateEvent::EditorRevision(
+                                self.tabs[ti].panes[pi].editor.revision(),
+                            ));
+                            self.window.request_redraw();
+                        } else {
+                            // 步骤 1：门控（双重检查，keymap 已检查过一次）
+                            // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴无条件包裹）
+                            let raw_text = self.tabs[ti].panes[pi].editor.view().text();
+                            let payload = encode_submit(&raw_text);
+                            // 步骤 3：滚动到底 + 写 PTY
+                            self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                            if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
+                                log::error!("提交写 PTY 失败: {e:#}");
+                            }
+                            // 步骤 4：清空编辑器缓冲 + 记录 pending_submit + 写历史库
+                            let submitted_at = std::time::Instant::now();
+                            // 取当前 cwd（OSC 9;9 上报值）
+                            let cwd = self.tabs[ti].panes[pi]
+                                .term
+                                .cwd()
+                                .map(|p| p.display().to_string());
+                            // 写历史库并取条目下标（用于块闭合时回填）
+                            let history_idx = self.history.append_submitted(raw_text.clone(), cwd);
+                            // 退出历史导航态（提交 = 新命令基线）
+                            self.history.exit_navigation();
+                            // 同步 abandoned 到历史库
+                            let abandoned = self.tabs[ti].panes[pi]
+                                .editor
+                                .abandoned()
+                                .map(|s| s.to_owned());
+                            self.history.set_abandoned(abandoned);
+                            self.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::Clear);
+                            // 清 IME preedit
+                            self.tabs[ti].panes[pi].preedit = None;
+                            // 清退出码角标（提交新命令时角标已无意义）
+                            self.tabs[ti].panes[pi].exit_badge = None;
+                            self.tabs[ti].panes[pi].pending_submit =
+                                Some((raw_text.clone(), submitted_at, history_idx));
+                            events.push(StateEvent::SubmittedText {
+                                text: raw_text,
+                                submitted_at,
+                                history_idx,
+                            });
+                            self.window.request_redraw();
                         }
-                        // 步骤 4：清空编辑器缓冲 + 记录 pending_submit + 写历史库
-                        let submitted_at = std::time::Instant::now();
-                        // 取当前 cwd（OSC 9;9 上报值）
-                        let cwd = self.tabs[ti].panes[pi]
-                            .term
-                            .cwd()
-                            .map(|p| p.display().to_string());
-                        // 写历史库并取条目下标（用于块闭合时回填）
-                        let history_idx = self.history.append_submitted(raw_text.clone(), cwd);
-                        // 退出历史导航态（提交 = 新命令基线）
-                        self.history.exit_navigation();
-                        // 同步 abandoned 到历史库
-                        let abandoned = self.tabs[ti].panes[pi]
-                            .editor
-                            .abandoned()
-                            .map(|s| s.to_owned());
-                        self.history.set_abandoned(abandoned);
-                        self.tabs[ti].panes[pi]
-                            .editor
-                            .apply(&lumen_editor::EditAction::Clear);
-                        // 清 IME preedit
-                        self.tabs[ti].panes[pi].preedit = None;
-                        // 清退出码角标（提交新命令时角标已无意义）
-                        self.tabs[ti].panes[pi].exit_badge = None;
-                        self.tabs[ti].panes[pi].pending_submit =
-                            Some((raw_text.clone(), submitted_at, history_idx));
-                        events.push(StateEvent::SubmittedText {
-                            text: raw_text,
-                            submitted_at,
-                            history_idx,
-                        });
-                        self.window.request_redraw();
                     }
                     ComposerAction::CancelLine if current_mode == mode::InputMode::Compose => {
                         // Ctrl+C 缓冲非空：清空并存放弃稿

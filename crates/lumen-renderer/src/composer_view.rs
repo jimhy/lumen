@@ -94,6 +94,45 @@ pub enum FooterKind {
     Hidden,
 }
 
+/// footer 语法高亮的 token 语义类别（M4.2 批2）。
+///
+/// 与 `lumen_editor::TokenKind` 同构，但 renderer **不依赖 lumen-editor**——
+/// app 层组装 [`ComposerView`] 时把 editor 的 token 翻译成本枚举（设计稿 §5）。
+/// renderer 据此从 [`crate::Theme`] 的 ANSI 16 色派生具体颜色（设计稿 §8），
+/// 故同一映射在 11 个主题下自动协调，无需逐主题配色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterTokenKind {
+    /// 命令名（语句起始位置的裸词）。
+    Command,
+    /// 语言关键字（`if`/`foreach`/`function` 等）。
+    Keyword,
+    /// 参数开关（`-Recurse`）。
+    Parameter,
+    /// 变量（`$x`、`$env:PATH`）。
+    Variable,
+    /// 数字字面量。
+    Number,
+    /// 字符串字面量（双/单引号、here-string）。
+    StringLit,
+    /// 操作符与标点（用前景色，不特别着色）。
+    Operator,
+    /// 注释（`#` 与 `<# #>`）。
+    Comment,
+    /// 普通裸词参数 / 未归类文本（用前景色）。
+    Text,
+}
+
+/// footer 一行内的一段高亮 span：行内字节区间 `[start, end)` + 语义类别（M4.2 批2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterSpan {
+    /// 起始字节偏移（行内，含）。
+    pub start: usize,
+    /// 结束字节偏移（行内，不含）。
+    pub end: usize,
+    /// token 语义类别。
+    pub kind: FooterTokenKind,
+}
+
 /// app 组装、renderer 消费的 footer 只读视图（M4.1 批C/D2/E）。
 ///
 /// renderer 仅读本结构，不感知 lumen-editor 内部状态。
@@ -132,6 +171,11 @@ pub struct ComposerView {
     /// `selection.is_some()` 时不渲染（有选区时无 inline 补全，与系统惯例一致）。
     /// None = 无联想；不参与光标/选区几何；超行宽由 TextBounds 自然裁剪。
     pub ghost: Option<String>,
+    /// 语法高亮 spans（M4.2 批2）：`highlight[row]` 对应 `lines[row]` 的着色区间。
+    /// 仅 Compose 态填充；空 Vec 或某行空列表 = 该行用前景色单色绘制。
+    /// 有 IME preedit 的行由 renderer 降级为单色（preedit 内嵌致字节偏移错位，
+    /// 组字过程短暂，可接受）。
+    pub highlight: Vec<Vec<FooterSpan>>,
 }
 
 /// IME 预编辑状态（M4.1 批D2，设计稿 §7.3）。
@@ -168,6 +212,7 @@ impl ComposerView {
             exit_badge: None,
             placeholder: None,
             ghost: None,
+            highlight: Vec::new(),
         }
     }
 
@@ -185,6 +230,7 @@ impl ComposerView {
             exit_badge: None,
             placeholder: None,
             ghost: None,
+            highlight: Vec::new(),
         }
     }
 
@@ -199,6 +245,7 @@ impl ComposerView {
             exit_badge: None,
             placeholder: None,
             ghost: None,
+            highlight: Vec::new(),
         }
     }
 

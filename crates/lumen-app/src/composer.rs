@@ -23,7 +23,31 @@ use lumen_renderer::composer_view::ComposerView;
 #[cfg(feature = "input-editor")]
 use lumen_editor::EditorView;
 #[cfg(feature = "input-editor")]
-use lumen_renderer::composer_view::{normalize_selection, ExitBadge, PreeditState};
+use lumen_renderer::composer_view::{normalize_selection, ExitBadge, FooterSpan, PreeditState};
+
+/// 把 lumen-editor 的高亮 [`lumen_editor::Token`] 翻译为 renderer 的 [`FooterSpan`]
+/// （M4.2 批2）——renderer 不依赖 lumen-editor，跨 crate 边界在此收口（设计稿 §5）。
+#[cfg(feature = "input-editor")]
+fn token_to_footer_span(t: &lumen_editor::Token) -> FooterSpan {
+    use lumen_editor::TokenKind as E;
+    use lumen_renderer::composer_view::FooterTokenKind as F;
+    let kind = match t.kind {
+        E::Command => F::Command,
+        E::Keyword => F::Keyword,
+        E::Parameter => F::Parameter,
+        E::Variable => F::Variable,
+        E::Number => F::Number,
+        E::StringLit => F::StringLit,
+        E::Operator => F::Operator,
+        E::Comment => F::Comment,
+        E::Text => F::Text,
+    };
+    FooterSpan {
+        start: t.start,
+        end: t.end,
+        kind,
+    }
+}
 
 /// 按当前有效输入模式组装 [`ComposerView`]。
 ///
@@ -80,6 +104,13 @@ pub fn compose_view_for_mode(
                 (editor_sel.cursor.line, editor_sel.cursor.byte),
             );
             let ghost = if selection.is_some() { None } else { ghost };
+            // M4.2 批2：语法高亮——editor tokenizer 逐行产出 token，翻译为 footer span。
+            // 行序与 `lines` 一致（同源 doc.lines）；renderer 按 li 索引对齐着色。
+            let highlight: Vec<Vec<FooterSpan>> = editor_view
+                .highlight()
+                .iter()
+                .map(|toks| toks.iter().map(token_to_footer_span).collect())
+                .collect();
             // Position { line, byte }——与 ComposerView.cursor (行, 字节偏移) 语义相同
             ComposerView {
                 kind: lumen_renderer::composer_view::FooterKind::Composer,
@@ -90,6 +121,7 @@ pub fn compose_view_for_mode(
                 exit_badge,  // M4.1 批D2：退出码角标
                 placeholder, // M4.1 批E：占位提示（仅空编辑器显示）
                 ghost,       // M4.1 批3：历史联想后缀（有选区时为 None）
+                highlight,   // M4.2 批2：语法高亮 spans（逐行）
             }
         }
         InputMode::Running => ComposerView::running(s.footer_running_text),
@@ -138,6 +170,47 @@ mod tests {
                 "Compose 模式应产出 Composer 形态"
             );
             assert!(v.is_visible(), "Compose 形态应可见");
+        }
+
+        #[test]
+        fn 高亮_compose态填充token_spans() {
+            use lumen_editor::{EditAction, Editor};
+            use lumen_renderer::composer_view::FooterTokenKind;
+
+            let mut editor = Editor::default();
+            editor.apply(&EditAction::InsertText(
+                "Get-ChildItem -Recurse".to_string(),
+            ));
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
+
+            // highlight 行数与 lines 对齐，首行有 token spans（翻译链路打通）。
+            assert_eq!(
+                v.highlight.len(),
+                v.lines.len(),
+                "highlight 行数应与 lines 一致"
+            );
+            let first = &v.highlight[0];
+            assert!(!first.is_empty(), "首行应产出 token spans");
+            // 命令名翻译为 Command、参数翻译为 Parameter（editor→FooterSpan 映射正确）。
+            assert!(
+                first.iter().any(|s| s.kind == FooterTokenKind::Command
+                    && v.lines[0].get(s.start..s.end) == Some("Get-ChildItem")),
+                "Get-ChildItem 应翻译为 Command span"
+            );
+            assert!(
+                first.iter().any(|s| s.kind == FooterTokenKind::Parameter
+                    && v.lines[0].get(s.start..s.end) == Some("-Recurse")),
+                "-Recurse 应翻译为 Parameter span"
+            );
+        }
+
+        #[test]
+        fn 高亮_非compose态不填充() {
+            use lumen_editor::Editor;
+            let editor = Editor::default();
+            // Running 态走 ComposerView::running()，highlight 默认空。
+            let v = compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
+            assert!(v.highlight.is_empty(), "Running 态不应填充 highlight");
         }
 
         #[test]

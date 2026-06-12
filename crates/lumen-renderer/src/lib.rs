@@ -939,38 +939,94 @@ impl Renderer {
                             if line_text.is_empty() {
                                 continue;
                             }
-                            // Compose 态：若有 preedit，在正文末尾内嵌预编辑文本。
-                            let display_text = if cv.kind == composer_view::FooterKind::Composer {
-                                if let Some(pre) = &cv.preedit {
-                                    if li == cv.cursor.0 {
-                                        // 在光标处插入预编辑文本（内嵌）。
-                                        let base = line_text.clone();
-                                        let byte_pos = cv.cursor.1.min(base.len());
-                                        let mut s =
-                                            String::with_capacity(base.len() + pre.text.len());
-                                        s.push_str(&base[..byte_pos]);
-                                        s.push_str(&pre.text);
-                                        s.push_str(&base[byte_pos..]);
-                                        s
-                                    } else {
-                                        line_text.clone()
-                                    }
-                                } else {
-                                    line_text.clone()
-                                }
+                            // Compose 态光标行若有 IME preedit，在光标处内嵌预编辑文本。
+                            let preedit_inline = if cv.kind == composer_view::FooterKind::Composer
+                                && li == cv.cursor.0
+                            {
+                                cv.preedit.as_ref()
+                            } else {
+                                None
+                            };
+                            let display_text = if let Some(pre) = preedit_inline {
+                                let byte_pos = cv.cursor.1.min(line_text.len());
+                                let mut s = String::with_capacity(line_text.len() + pre.text.len());
+                                s.push_str(&line_text[..byte_pos]);
+                                s.push_str(&pre.text);
+                                s.push_str(&line_text[byte_pos..]);
+                                s
                             } else {
                                 line_text.clone()
                             };
 
                             let mut buf = TextBuffer::new(&mut self.font_system, metrics);
                             buf.set_size(&mut self.font_system, None, Some(ch));
-                            buf.set_text(
-                                &mut self.font_system,
-                                &display_text,
-                                &base_attrs,
-                                Shaping::Advanced,
-                                None,
-                            );
+
+                            // M4.2 批2：语法高亮。无 preedit 内嵌的 Compose 行按 token
+                            // 着色（set_rich_text）；其余情形（preedit 行 / Running 文案 /
+                            // 无 highlight 数据）保持前景单色（set_text），与改造前逐字节一致。
+                            let line_spans = if preedit_inline.is_none()
+                                && cv.kind == composer_view::FooterKind::Composer
+                            {
+                                cv.highlight.get(li).filter(|s| !s.is_empty())
+                            } else {
+                                None
+                            };
+                            if let Some(spans) = line_spans {
+                                let base_color = self.theme.foreground.to_glyphon();
+                                let dlen = display_text.len();
+                                // 按 token 切成覆盖整行的连续段：span 区间用派生色，
+                                // 空隙（空白等）用前景 base_attrs。span 已排序不重叠
+                                // （lumen-editor tokenizer 保证）。
+                                let mut rich: Vec<(usize, usize, Attrs)> = Vec::new();
+                                let mut pos = 0usize;
+                                for sp in spans {
+                                    let s = sp.start.min(dlen);
+                                    let e = sp.end.min(dlen);
+                                    if s >= e {
+                                        continue;
+                                    }
+                                    if pos < s {
+                                        rich.push((pos, s, base_attrs.clone()));
+                                    }
+                                    // token → 当前主题 ANSI 16 色派生（设计稿 §8）：
+                                    // 命令蓝 / 关键字品红 / 参数青 / 变量红 / 数字黄 /
+                                    // 字符串绿 / 注释亮黑灰；操作符与文本走前景色。
+                                    let color = {
+                                        use composer_view::FooterTokenKind as K;
+                                        match sp.kind {
+                                            K::Command => self.theme.ansi[4].to_glyphon(),
+                                            K::Keyword => self.theme.ansi[5].to_glyphon(),
+                                            K::Parameter => self.theme.ansi[6].to_glyphon(),
+                                            K::Variable => self.theme.ansi[1].to_glyphon(),
+                                            K::Number => self.theme.ansi[3].to_glyphon(),
+                                            K::StringLit => self.theme.ansi[2].to_glyphon(),
+                                            K::Comment => self.theme.ansi[8].to_glyphon(),
+                                            K::Operator | K::Text => base_color,
+                                        }
+                                    };
+                                    rich.push((s, e, base_attrs.clone().color(color)));
+                                    pos = e;
+                                }
+                                if pos < dlen {
+                                    rich.push((pos, dlen, base_attrs.clone()));
+                                }
+                                buf.set_rich_text(
+                                    &mut self.font_system,
+                                    rich.iter()
+                                        .map(|(s, e, a)| (&display_text[*s..*e], a.clone())),
+                                    &base_attrs,
+                                    Shaping::Advanced,
+                                    None,
+                                );
+                            } else {
+                                buf.set_text(
+                                    &mut self.font_system,
+                                    &display_text,
+                                    &base_attrs,
+                                    Shaping::Advanced,
+                                    None,
+                                );
+                            }
                             let text_y = footer_top + fp + li as f32 * ch;
                             let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
                             bufs.push((li, buf, text_y, bottom_clamp, fp));
