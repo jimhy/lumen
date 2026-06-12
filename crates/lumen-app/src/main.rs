@@ -2156,6 +2156,12 @@ impl App {
             footer_context_menu_at: None,
         };
         state.shell_state.settings.font_hint = font_hint;
+        // 第十九轮：从持久化设置恢复文件树可见性初值。
+        // sidebar_visible 直接驱动 if app_settings.layout.sidebar_visible { } 渲染分支，
+        // 无需额外映射；filetree.visible 存于 ShellState（Default 硬编码 true），
+        // 必须在此显式从 settings 读出。两入口（顶栏②按钮 + Ctrl+B）切换时均同步
+        // 写盘（见 shell_out 处理段与 ToggleFiletree 分支），重启即可还原。
+        state.shell_state.filetree.visible = state.settings.layout.filetree_visible;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
         if stale_cwd > 0 {
             state.shell_state.toast.push(
@@ -2901,8 +2907,21 @@ impl ApplicationHandler<PtyWake> for App {
                                 if !state.shell_state.settings.open {
                                     // 文件树开合：终端区宽度随之变化，下一帧
                                     // egui 布局产出新矩形并触发离屏重建+resize。
-                                    let ft = &mut state.shell_state.filetree;
-                                    ft.visible = !ft.visible;
+                                    let new_visible = !state.shell_state.filetree.visible;
+                                    state.shell_state.filetree.visible = new_visible;
+                                    // 第十九轮持久化：Ctrl+B 路径写盘，重启还原。
+                                    // 与顶栏②按钮路径共用同一 settings 字段，两入口
+                                    // 保持状态源一致（ShellState::filetree.visible）。
+                                    state.settings.layout.filetree_visible = new_visible;
+                                    if let Some(err) = state.settings.save() {
+                                        state.shell_state.toast.push(
+                                            shell::toast::ToastKind::Error,
+                                            i18n::fmt1(
+                                                i18n::strings().toast_settings_save_failed_fmt,
+                                                &err,
+                                            ),
+                                        );
+                                    }
                                     state.window.request_redraw();
                                 }
                             }
@@ -3952,12 +3971,24 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
+                // 第十九轮：顶栏② 文件树显隐——写入 settings 并触发存盘。
+                // shell/mod.rs 已在 toggle_filetree 信号路径同步更新
+                // ShellState::filetree.visible（两入口共享同一状态源）；
+                // 此处只需同步 settings 字段并将 filetree_changed 并入
+                // need_save，Ctrl+B 路径自行落盘不走此分支。
+                let filetree_changed = if let Some(v) = shell_out.toggle_filetree {
+                    state.settings.layout.filetree_visible = v;
+                    true
+                } else {
+                    false
+                };
                 let need_save = shell_out.settings_font_changed
                     || shell_out.settings_theme_changed
                     || shell_out.settings_background_image_changed
                     || shell_out.settings_background_params_changed
                     || shell_out.settings_language_changed
-                    || sidebar_changed;
+                    || sidebar_changed
+                    || filetree_changed;
                 if need_save {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败
                     // 弹 toast：用户以为改完即存，静默丢失重启才发现。

@@ -143,10 +143,25 @@ pub struct LayoutSettings {
     /// `#[serde(default)]` 保证旧文件缺字段时补 true（与 Default 一致）。
     #[serde(default = "default_sidebar_visible")]
     pub sidebar_visible: bool,
+    /// 中间文件树栏是否可见（第十九轮持久化）：true = 显示（默认），false = 隐藏。
+    ///
+    /// 变更来源：顶栏②按钮（`toggle_filetree` 信号）与 Ctrl+B 快捷键
+    /// 共享同一 `ShellState::filetree.visible` 状态源；两入口切换时均写盘，
+    /// 重启后从本字段恢复 `ShellState::filetree.visible` 初值。
+    ///
+    /// `#[serde(default)]` 保证旧文件（第十九轮前）缺字段时补 `true`
+    /// （与 [`Default`] 一致），平滑升级无感知。
+    #[serde(default = "default_filetree_visible")]
+    pub filetree_visible: bool,
 }
 
 /// sidebar_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
 fn default_sidebar_visible() -> bool {
+    true
+}
+
+/// filetree_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
+fn default_filetree_visible() -> bool {
     true
 }
 
@@ -156,6 +171,7 @@ impl Default for LayoutSettings {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             filetree_width: FILETREE_WIDTH_DEFAULT,
             sidebar_visible: true,
+            filetree_visible: true,
         }
     }
 }
@@ -360,6 +376,14 @@ impl Settings {
                     "sidebar_visible",
                     "layout.sidebar_visible",
                     d.sidebar_visible,
+                    path,
+                );
+                // filetree_visible（第十九轮）：旧文件缺字段静默补 true。
+                s.layout.filetree_visible = lenient_field(
+                    ly,
+                    "filetree_visible",
+                    "layout.filetree_visible",
+                    d.filetree_visible,
                     path,
                 );
             } else {
@@ -595,6 +619,7 @@ mod tests {
                 sidebar_width: 260.0,
                 filetree_width: 320.0,
                 sidebar_visible: true,
+                filetree_visible: false,
             },
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,
@@ -952,5 +977,79 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded.appearance.theme, "lumen-light", "旧值迁移");
         assert_eq!(loaded.appearance.font_size, 20.0);
+    }
+
+    // ── 第十九轮：文件树可见性持久化测试 ────────────────────────────────────
+
+    #[test]
+    fn 文件树可见性_默认值为true() {
+        // LayoutSettings::default() 和 Settings::default() 均应 filetree_visible=true。
+        let s = Settings::default();
+        assert!(
+            s.layout.filetree_visible,
+            "filetree_visible 默认值应为 true（展开态）"
+        );
+        assert!(
+            s.layout.sidebar_visible,
+            "sidebar_visible 默认值应为 true（已有断言，顺带保护）"
+        );
+    }
+
+    #[test]
+    fn 文件树可见性_序列化往返_隐藏态() {
+        // filetree_visible=false 写盘后加载应保持 false。
+        let p = temp_path("ft_roundtrip_hidden");
+        let s = Settings {
+            layout: LayoutSettings {
+                filetree_visible: false,
+                ..LayoutSettings::default()
+            },
+            ..Settings::default()
+        };
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            !loaded.layout.filetree_visible,
+            "filetree_visible=false 写盘后加载应为 false"
+        );
+    }
+
+    #[test]
+    fn 文件树可见性_旧文件缺字段补true() {
+        // 第十九轮前的旧 settings.json 无 filetree_visible 字段：
+        // 加载后应静默补 true（平滑升级，不影响已有用户体验）。
+        let p = temp_path("ft_compat_old");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "sidebar_width": 200.0, "filetree_width": 240.0, "sidebar_visible": true } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            loaded.layout.filetree_visible,
+            "旧文件缺 filetree_visible 字段时应补 true"
+        );
+        assert_eq!(loaded.layout.sidebar_width, 200.0, "其余字段不受影响");
+        assert_eq!(loaded.layout.filetree_width, 240.0, "其余字段不受影响");
+    }
+
+    #[test]
+    fn 文件树可见性_字段级容错_类型非法降级true() {
+        // filetree_visible 写成非布尔类型时仅该字段降级 true，其余字段保留。
+        let p = temp_path("ft_lenient");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "sidebar_width": 200.0, "filetree_visible": "yes" } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            loaded.layout.filetree_visible,
+            "类型非法字段降级为默认值 true"
+        );
+        assert_eq!(loaded.layout.sidebar_width, 200.0, "好字段应保留");
     }
 }
