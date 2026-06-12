@@ -1134,7 +1134,17 @@ fn swap_target(rects: &[egui::Rect], src: usize, pos: egui::Pos2) -> Option<usiz
         .filter(|&dst| dst != src)
 }
 
-/// 侧栏内容：tab 条目列表 + 底部设置/新建按钮。
+/// 侧栏内容：顶部标题栏条（「会话」标签 + 小「＋」按钮）+ tab 条目列表（可滚动）。
+///
+/// R8 改造：
+/// - 删除底部「⚙ 设置」按钮（设置入口=头像菜单 Settings + Ctrl+,）
+/// - 删除底部「＋ 新建会话」按钮
+/// - 顶部新增标题栏条：左「会话」标签 + 右小「＋」按钮（tooltip 三语，Ctrl+T）
+///   → 点击=新建会话信号（复用原底部按钮信号路径）
+///
+/// R9 改造：
+/// - tab 条目列表用 ScrollArea::vertical() 包裹（会话多时可上下滚动）
+/// - ScrollArea id 固定（"sidebar_tab_scroll"），右键菜单/重命名/拖拽 id 仍绑各条目 entry.id
 fn sidebar_ui(
     ui: &mut egui::Ui,
     tabs: &[TabItem],
@@ -1143,111 +1153,164 @@ fn sidebar_ui(
     out: &mut ShellOutput,
 ) {
     let s = crate::i18n::strings();
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(s.sidebar_sessions)
-            .size(11.0)
-            .color(pal.fg_dim),
-    );
-    ui.add_space(4.0);
 
-    for entry in tabs {
-        // 重命名中的条目：行内编辑框替代按钮。Enter 提交、Esc 或
-        // 点击别处取消（egui 的 TextEdit 在这三种情况都会失焦）。
-        let is_renaming = st.renaming.as_ref().is_some_and(|(id, _)| *id == entry.id);
-        if is_renaming {
-            if let Some((_, buf)) = st.renaming.as_mut() {
-                let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
-                if st.rename_focus {
-                    resp.request_focus();
-                    st.rename_focus = false;
-                }
-                if resp.lost_focus() {
-                    // 区分结束方式：键盘（Enter 提交 / Esc 取消）结束时
-                    // main 把焦点还给终端；点击别处取消则不还——那次
-                    // 点击已按鼠标仲裁决定了焦点归属（点终端区 true、
-                    // 点面板/头像 false），强行翻回会让悬浮菜单开着时
-                    // 键盘直通 PTY。
-                    let by_key = ui.input(|i| {
-                        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)
-                    });
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        out.rename = Some((entry.id, buf.trim().to_owned()));
-                    }
-                    out.rename_ended_by_key = by_key;
-                    st.renaming = None;
-                }
-            }
-            continue;
+    // ── 顶部标题栏条（高 30px，与文件树工具条风格对齐）──────────────────
+    {
+        // 分配 30px 高的整行区域，内用 left_to_right 布局
+        let (title_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+        let mut title_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(title_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        // 左侧「会话」标签
+        title_ui.add(
+            egui::Label::new(
+                egui::RichText::new(s.sidebar_sessions)
+                    .size(12.0)
+                    .color(pal.fg_dim),
+            )
+            .selectable(false),
+        );
+        // 右侧「＋」按钮（小图标，painter 画 12×12 十字，hover 圆角底）
+        // 先用 RTL 子布局把按钮推到右端
+        let remaining = title_ui.available_rect_before_wrap();
+        let btn_size = egui::vec2(22.0, 22.0);
+        let btn_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                remaining.max.x - btn_size.x,
+                remaining.center().y - btn_size.y / 2.0,
+            ),
+            btn_size,
+        );
+        let btn_resp = title_ui.interact(
+            btn_rect,
+            title_ui.id().with("sidebar_new_session_plus"),
+            egui::Sense::click(),
+        );
+        // 绘制圆角底 hover 效果
+        if btn_resp.hovered() {
+            title_ui
+                .painter()
+                .rect_filled(btn_rect, 4.0, pal.bg_highlight);
         }
+        // 画 + 号（12×12，线宽 1.2）
+        {
+            let painter = title_ui.painter();
+            let c = btn_rect.center();
+            let r = 5.0_f32; // 半径 5 → 总长 10
+            let fg = if btn_resp.hovered() {
+                pal.fg
+            } else {
+                pal.fg_dim
+            };
+            let stroke = egui::Stroke::new(1.2, fg);
+            painter.line_segment([egui::pos2(c.x - r, c.y), egui::pos2(c.x + r, c.y)], stroke);
+            painter.line_segment([egui::pos2(c.x, c.y - r), egui::pos2(c.x, c.y + r)], stroke);
+        }
+        if btn_resp.on_hover_text(s.sidebar_new_session_tip).clicked() {
+            out.new_session = true;
+        }
+    }
+    ui.add_space(2.0);
 
-        // 激活条目用 selection 档（控件梯度最高档）：与悬停的
-        // bg_highlight 拉开一档，激活态一眼可辨（M3.7b 高对比）。
-        let fill = if entry.active {
-            pal.selection
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        let btn =
-            egui::Button::new(egui::RichText::new(format!("● {}", entry.title)).color(pal.fg))
+    // R9：会话列表包 ScrollArea，占满标题栏以下全部剩余高度。
+    // auto_shrink([false, false]) 保证面板未填满时 ScrollArea 也撑满，
+    // 避免 egui 把剩余空白分配给外层 ui 导致列表区域缩水。
+    // id 固定（"sidebar_tab_scroll"）保证 scroll offset 跨帧持久，
+    // 与条目 entry.id 无耦合，重命名/右键菜单/拖拽的 egui id 仍绑各自 entry.id。
+    egui::ScrollArea::vertical()
+        .id_salt("sidebar_tab_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for entry in tabs {
+                // 重命名中的条目：行内编辑框替代按钮。Enter 提交、Esc 或
+                // 点击别处取消（egui 的 TextEdit 在这三种情况都会失焦）。
+                let is_renaming = st.renaming.as_ref().is_some_and(|(id, _)| *id == entry.id);
+                if is_renaming {
+                    if let Some((_, buf)) = st.renaming.as_mut() {
+                        let resp =
+                            ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
+                        if st.rename_focus {
+                            resp.request_focus();
+                            st.rename_focus = false;
+                        }
+                        if resp.lost_focus() {
+                            // 区分结束方式：键盘（Enter 提交 / Esc 取消）结束时
+                            // main 把焦点还给终端；点击别处取消则不还——那次
+                            // 点击已按鼠标仲裁决定了焦点归属（点终端区 true、
+                            // 点面板/头像 false），强行翻回会让悬浮菜单开着时
+                            // 键盘直通 PTY。
+                            let by_key = ui.input(|i| {
+                                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)
+                            });
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                out.rename = Some((entry.id, buf.trim().to_owned()));
+                            }
+                            out.rename_ended_by_key = by_key;
+                            st.renaming = None;
+                        }
+                    }
+                    continue;
+                }
+
+                // 激活条目用 selection 档（控件梯度最高档）：与悬停的
+                // bg_highlight 拉开一档，激活态一眼可辨（M3.7b 高对比）。
+                let fill = if entry.active {
+                    pal.selection
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let btn = egui::Button::new(
+                    egui::RichText::new(format!("● {}", entry.title)).color(pal.fg),
+                )
                 .fill(fill)
                 .wrap_mode(egui::TextWrapMode::Truncate)
                 .min_size(egui::vec2(ui.available_width(), 30.0));
-        let mut resp = ui.add(btn);
-        if let Some(path) = &entry.hover_path {
-            // 默认名 = cwd：条目截断时悬停可看完整路径。
-            resp = resp.on_hover_text(path.clone());
-        }
-        if resp.clicked() {
-            out.activate = Some(entry.id);
-        }
-        resp.context_menu(|ui| {
-            let s = crate::i18n::strings();
-            if ui.button(s.menu_rename).clicked() {
-                st.renaming = Some((entry.id, entry.title.clone()));
-                st.rename_focus = true;
-                ui.close();
-            }
-            if ui.button(s.menu_close).clicked() {
-                out.close = Some(entry.id);
-                ui.close();
+                let mut resp = ui.add(btn);
+                if let Some(path) = &entry.hover_path {
+                    // 默认名 = cwd：条目截断时悬停可看完整路径。
+                    resp = resp.on_hover_text(path.clone());
+                }
+                if resp.clicked() {
+                    out.activate = Some(entry.id);
+                }
+                resp.context_menu(|ui| {
+                    let s = crate::i18n::strings();
+                    if ui.button(s.menu_rename).clicked() {
+                        st.renaming = Some((entry.id, entry.title.clone()));
+                        st.rename_focus = true;
+                        ui.close();
+                    }
+                    if ui.button(s.menu_close).clicked() {
+                        out.close = Some(entry.id);
+                        ui.close();
+                    }
+                });
+                // 未读小圆点（后台有新输出，切换到该 tab 时清除）。
+                if entry.unseen {
+                    let center = egui::pos2(resp.rect.right() - 10.0, resp.rect.center().y);
+                    ui.painter().circle_filled(center, 3.0, pal.accent);
+                }
+                // 窗格数指示（F5 批2）：多窗格 tab 在条目右侧标「N 格」
+                // （有未读点时左移让位）。
+                if entry.pane_count > 1 {
+                    let x = resp.rect.right() - if entry.unseen { 18.0 } else { 8.0 };
+                    ui.painter().text(
+                        egui::pos2(x, resp.rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        crate::i18n::fmt1(s.pane_count_fmt, entry.pane_count),
+                        egui::FontId::proportional(10.0),
+                        pal.fg_dim,
+                    );
+                }
             }
         });
-        // 未读小圆点（后台有新输出，切换到该 tab 时清除）。
-        if entry.unseen {
-            let center = egui::pos2(resp.rect.right() - 10.0, resp.rect.center().y);
-            ui.painter().circle_filled(center, 3.0, pal.accent);
-        }
-        // 窗格数指示（F5 批2）：多窗格 tab 在条目右侧标「N 格」
-        // （有未读点时左移让位）。
-        if entry.pane_count > 1 {
-            let x = resp.rect.right() - if entry.unseen { 18.0 } else { 8.0 };
-            ui.painter().text(
-                egui::pos2(x, resp.rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                crate::i18n::fmt1(s.pane_count_fmt, entry.pane_count),
-                egui::FontId::proportional(10.0),
-                pal.fg_dim,
-            );
-        }
-    }
 
-    // 底部（bottom_up：先加的在最底）：齿轮设置 → 新建会话。
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-        let s = crate::i18n::strings();
-        ui.add_space(2.0);
-        let gear = egui::Button::new(egui::RichText::new(s.sidebar_settings_btn).color(pal.fg_dim))
-            .min_size(egui::vec2(ui.available_width(), 26.0));
-        if ui.add(gear).on_hover_text(s.sidebar_settings_tip).clicked() {
-            out.settings_opened = true;
-        }
-        let plus =
-            egui::Button::new(egui::RichText::new(s.sidebar_new_session_btn).color(pal.fg_dim))
-                .min_size(egui::vec2(ui.available_width(), 28.0));
-        if ui.add(plus).clicked() {
-            out.new_session = true;
-        }
-    });
+    // R8：底部「⚙ 设置」和「＋ 新建会话」按钮已删除。
+    // 设置入口=头像菜单 Settings + Ctrl+,（两者均健在）。
+    // 新建会话入口=侧栏标题栏右端小「＋」按钮（Ctrl+T）。
 }
 
 #[cfg(test)]

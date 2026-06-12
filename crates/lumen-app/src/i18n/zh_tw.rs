@@ -14,9 +14,6 @@ pub static STRINGS: Strings = Strings {
     menu_rename: "重新命名",
     menu_close: "關閉",
     pane_count_fmt: "{} 格",
-    sidebar_settings_btn: "⚙ 設定",
-    sidebar_settings_tip: "設定 (Ctrl+,)",
-    sidebar_new_session_btn: "＋ 新增工作階段",
     pane_close_tip: "關閉窗格 (Ctrl+Shift+W)",
     pane_restore_tip: "還原窗格 (Ctrl+Shift+Enter)",
     pane_maximize_tip: "最大化窗格 (Ctrl+Shift+Enter)",
@@ -170,6 +167,8 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "名稱不能包含控制字元",
     validate_name_bad_chars: "名稱不能包含 \\ / : * ? \" < > | 字元",
     validate_name_trailing: "名稱不能以點或空格結尾",
+    // 側欄標題列（R8）
+    sidebar_new_session_tip: "新增工作階段 (Ctrl+T)",
     // 頂欄三視圖切換按鈕（問題7）
     topbar_sidebar_show_tip: "顯示工作階段欄",
     topbar_sidebar_hide_tip: "隱藏工作階段欄",

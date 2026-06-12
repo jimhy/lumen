@@ -958,6 +958,79 @@ impl Renderer {
                             bufs.push((li, buf, text_y, bottom_clamp, fp));
                         }
 
+                        // M4.1 批E：placeholder（空缓冲占位提示）+ ghost text 绘制。
+                        // 两者均用 fg_dim 色（前景色 50% alpha）。
+                        // glyphon 不支持 per-buffer 颜色覆写，用独立 Attrs color。
+                        if cv.kind == composer_view::FooterKind::Composer {
+                            let fg = self.theme.foreground;
+                            // fg_dim = 前景色 50% alpha（与外壳 fg_dim 同语义）。
+                            let dim_color = glyphon::Color::rgba(fg.0, fg.1, fg.2, 128);
+                            let dim_attrs = base_attrs.clone().color(dim_color);
+
+                            // placeholder：仅当所有行均为空时显示。
+                            let all_empty = cv.lines.iter().all(|l| l.is_empty());
+                            if all_empty {
+                                if let Some(ph) = &cv.placeholder {
+                                    if !ph.is_empty() {
+                                        let mut buf =
+                                            TextBuffer::new(&mut self.font_system, metrics);
+                                        buf.set_size(&mut self.font_system, None, Some(ch));
+                                        buf.set_text(
+                                            &mut self.font_system,
+                                            ph,
+                                            &dim_attrs,
+                                            Shaping::Advanced,
+                                            None,
+                                        );
+                                        // 占位文字与光标同行（行 0，光标在行首）
+                                        let text_y = footer_top + fp;
+                                        let bottom_clamp =
+                                            ((text_y + ch) as i32).min(target_h as i32);
+                                        // line_idx = usize::MAX - 1 区分 placeholder 行
+                                        bufs.push((usize::MAX - 1, buf, text_y, bottom_clamp, fp));
+                                    }
+                                }
+                            }
+
+                            // ghost text：光标在文末时在光标后追加渲染（fg_dim 色）。
+                            // 条件：cursor 行有 ghost 字段且光标字节偏移 ≥ 该行长度。
+                            if let Some(ghost) = &cv.ghost {
+                                if !ghost.is_empty() {
+                                    let (cur_line, cur_byte) = cv.cursor;
+                                    let line_text =
+                                        cv.lines.get(cur_line).map(|s| s.as_str()).unwrap_or("");
+                                    // 光标在文末（字节偏移 ≥ 行长度）
+                                    if cur_byte >= line_text.len() {
+                                        // ghost 文字的 x 位置 = 光标列 × cell_w + fp
+                                        let col = line_text.chars().count() as f32;
+                                        let ghost_x = fp + col * cw;
+                                        let ghost_y = footer_top + fp + cur_line as f32 * ch;
+                                        let bottom_clamp =
+                                            ((ghost_y + ch) as i32).min(target_h as i32);
+                                        // 超宽由 TextBounds 自然裁剪（right = target_w）
+                                        let mut buf =
+                                            TextBuffer::new(&mut self.font_system, metrics);
+                                        buf.set_size(&mut self.font_system, None, Some(ch));
+                                        buf.set_text(
+                                            &mut self.font_system,
+                                            ghost,
+                                            &dim_attrs,
+                                            Shaping::Advanced,
+                                            None,
+                                        );
+                                        // line_idx = usize::MAX - 2 区分 ghost 行
+                                        bufs.push((
+                                            usize::MAX - 2,
+                                            buf,
+                                            ghost_y,
+                                            bottom_clamp,
+                                            ghost_x,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
                         // M4.1 批D2：退出码角标文字（✓/✗ + 耗时）。
                         // 仅 Compose 态且有角标时绘制（Running 态不显示角标文字）。
                         if cv.kind == composer_view::FooterKind::Composer {

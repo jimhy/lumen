@@ -23,12 +23,8 @@ pub struct Strings {
     pub menu_close: &'static str,
     /// 窗格数指示，单参 `{}`：格数字
     pub pane_count_fmt: &'static str,
-    /// 齿轮按钮标签 "⚙ 设置"（⚙ 固定不翻）
-    pub sidebar_settings_btn: &'static str,
-    /// 齿轮按钮 tooltip "设置 (Ctrl+,)"
-    pub sidebar_settings_tip: &'static str,
-    /// 新建会话按钮 "＋ 新建会话"（＋ 固定不翻）
-    pub sidebar_new_session_btn: &'static str,
+    // sidebar_settings_btn / sidebar_settings_tip / sidebar_new_session_btn
+    // 已于 R8 删除（底部按钮区删除，入口改为头像菜单 + 侧栏标题栏小「＋」）。
     /// 窗格 ✕ tooltip
     pub pane_close_tip: &'static str,
     /// 还原窗格 tooltip（最大化态）
@@ -305,6 +301,10 @@ pub struct Strings {
     /// Fallback 态状态条文案（shell 集成未生效时显示）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub footer_fallback_text: &'static str,
+
+    // ── 侧栏标题栏（R8）─────────────────────────────────────────────────────
+    /// 侧栏标题栏「＋」按钮 tooltip（新建会话，含快捷键）
+    pub sidebar_new_session_tip: &'static str,
 
     // ── 顶栏三视图切换按钮（问题7）────────────────────────────────────
     /// 显示/隐藏会话栏 tooltip（展开态）

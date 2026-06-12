@@ -8,9 +8,6 @@ pub static STRINGS: Strings = Strings {
     menu_rename: "重命名",
     menu_close: "关闭",
     pane_count_fmt: "{} 格",
-    sidebar_settings_btn: "⚙ 设置",
-    sidebar_settings_tip: "设置 (Ctrl+,)",
-    sidebar_new_session_btn: "＋ 新建会话",
     pane_close_tip: "关闭窗格 (Ctrl+Shift+W)",
     pane_restore_tip: "还原窗格 (Ctrl+Shift+Enter)",
     pane_maximize_tip: "最大化窗格 (Ctrl+Shift+Enter)",
@@ -164,6 +161,8 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "名称不能包含控制字符",
     validate_name_bad_chars: "名称不能包含 \\ / : * ? \" < > | 字符",
     validate_name_trailing: "名称不能以点或空格结尾",
+    // 侧栏标题栏（R8）
+    sidebar_new_session_tip: "新建会话 (Ctrl+T)",
     // 顶栏三视图切换按钮（问题7）
     topbar_sidebar_show_tip: "显示会话栏",
     topbar_sidebar_hide_tip: "隐藏会话栏",

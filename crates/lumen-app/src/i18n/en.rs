@@ -8,9 +8,6 @@ pub static STRINGS: Strings = Strings {
     menu_rename: "Rename",
     menu_close: "Close",
     pane_count_fmt: "{} panes",
-    sidebar_settings_btn: "⚙ Settings",
-    sidebar_settings_tip: "Settings (Ctrl+,)",
-    sidebar_new_session_btn: "＋ New session",
     pane_close_tip: "Close pane (Ctrl+Shift+W)",
     pane_restore_tip: "Restore pane (Ctrl+Shift+Enter)",
     pane_maximize_tip: "Maximize pane (Ctrl+Shift+Enter)",
@@ -166,6 +163,8 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "Name cannot contain control characters",
     validate_name_bad_chars: "Name cannot contain \\ / : * ? \" < > | characters",
     validate_name_trailing: "Name cannot end with a dot or space",
+    // Sidebar title bar (R8)
+    sidebar_new_session_tip: "New session (Ctrl+T)",
     // Topbar view-toggle buttons (issue 7)
     topbar_sidebar_show_tip: "Show session sidebar",
     topbar_sidebar_hide_tip: "Hide session sidebar",
