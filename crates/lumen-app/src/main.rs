@@ -959,6 +959,34 @@ impl AppState {
                 }
 
                 TermAction::PasteClipboard => {
+                    // Compose 态粘贴进编辑器而非 PTY（海风哥第十三轮实测 bug：
+                    // keymap 注释早已声明此语义但 dispatch 从未分流，Ctrl+V
+                    // 一直直写命令行）。dispatch 内实时查模式（与 Submit 的
+                    // 二次门控同理，防按键时刻与执行时刻模式漂移）；编辑器
+                    // 路径复用 Edit(InsertText)：替换选区/undo/revision/重绘
+                    // 全部继承，多行文本直接落多行编辑（设计稿 §4 Ctrl+V 行）。
+                    #[cfg(feature = "input-editor")]
+                    {
+                        let mode = mode::effective_mode(
+                            &self.tabs[ti].panes[pi].term,
+                            self.force_fallback,
+                        );
+                        if mode == mode::InputMode::Compose {
+                            let text = self
+                                .clipboard
+                                .as_mut()
+                                .and_then(|c| c.get_text().ok())
+                                .unwrap_or_default();
+                            if !text.is_empty() {
+                                return self.dispatch(
+                                    action::Action::Edit(action::EditAction::InsertText(text)),
+                                    ti,
+                                    pi,
+                                );
+                            }
+                            return Vec::new();
+                        }
+                    }
                     self.tabs[ti].panes[pi].paste_clipboard(&mut self.clipboard);
                 }
 
