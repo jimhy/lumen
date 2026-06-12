@@ -5,11 +5,12 @@
 # 包装而非替换用户已有的 prompt / PSConsoleHostReadLine 定制）。
 
 # M4 输入编辑器前置驯化：
-# - PredictionSource None：ghost text 将由 Lumen 本地提供，禁用 shell 侧预测
-#   避免与输入区渲染冲突（Windows PowerShell 5.1 自带版无此参数，catch 兜底）。
 # - BellStyle None：蜂鸣干扰输入区感知，统一禁用。
+# - PredictionSource 保持用户默认（海风哥第二十轮拍板恢复）：经典直通模式
+#   下输入走 PSReadLine，其 History 联想是该模式的核心体验；编辑模式下
+#   Lumen 一次性整行提交（text+\r），PSReadLine 无输入间隙渲染建议，
+#   实测提交回显无 prediction 残影（残影回归点：块内命令行带灰色尾巴）。
 # 每条独立 try/catch——兼容无 PSReadLine 环境及参数不兼容的旧版本。
-try { Set-PSReadLineOption -PredictionSource None -ErrorAction Stop } catch {}
 try { Set-PSReadLineOption -BellStyle None -ErrorAction Stop } catch {}
 
 $Global:__LumenPrompt = $function:prompt
