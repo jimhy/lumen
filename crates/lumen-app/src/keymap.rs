@@ -103,6 +103,14 @@ pub struct GuardState {
     /// Compose 态光标是否在末行（↓ 触发历史导航，而非行间移动）。
     /// M4.1 批D2：仅在 input-editor feature 开启时有意义。
     pub compose_cursor_at_last_line: bool,
+    /// Compose 态光标是否在文档末尾（末行末字节偏移）。
+    /// M4.1 批3：→/End 键在此守卫 + ghost_exists 时产生 AcceptGhost 结果。
+    #[cfg(feature = "input-editor")]
+    pub compose_cursor_at_doc_end: bool,
+    /// 当前有效 ghost text 是否非空（前缀匹配历史联想结果，M4.1 批3）。
+    /// true = 有联想可接受；false = 无联想，→/End 正常移动光标。
+    #[cfg(feature = "input-editor")]
+    pub ghost_exists: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -355,7 +363,12 @@ pub fn lookup_input(
                     },
                 )));
             }
+            // →：光标在文末 + ghost 存在 + 无 Shift → 接受 ghost（M4.1 批3）
             if is_named(input, WinitNamedKey::ArrowRight) {
+                #[cfg(feature = "input-editor")]
+                if !shift && guard.compose_cursor_at_doc_end && guard.ghost_exists {
+                    return Some(LookupResult::AcceptGhost);
+                }
                 return Some(LookupResult::TerminalAction(Action::Edit(
                     EditAction::Move {
                         motion: Motion::GraphemeRight,
@@ -404,7 +417,12 @@ pub fn lookup_input(
                     },
                 )));
             }
+            // End：光标在文末 + ghost 存在 + 无 Shift → 接受 ghost（M4.1 批3）
             if is_named(input, WinitNamedKey::End) {
+                #[cfg(feature = "input-editor")]
+                if !shift && guard.compose_cursor_at_doc_end && guard.ghost_exists {
+                    return Some(LookupResult::AcceptGhost);
+                }
                 return Some(LookupResult::TerminalAction(Action::Edit(
                     EditAction::Move {
                         motion: Motion::LineEnd,
@@ -565,6 +583,10 @@ pub enum LookupResult {
     ComposeHistorySearch,
     /// Compose 态 Esc（关浮层/清选区/空操作）——main.rs 处理浮层清理。
     ComposeEsc,
+    /// Compose 态接受 ghost text（→/End 键在光标文末 + ghost 非空时）。
+    /// main.rs 收到此结果后取出 ghost 字符串，dispatch InsertText(ghost)。
+    /// M4.1 批3：ghost text 接受路径。
+    AcceptGhost,
 }
 
 /// 外壳级动作枚举（不走 dispatch，由 main.rs 外壳逻辑直接处理）。
@@ -1850,6 +1872,147 @@ mod tests {
                 )))
             ),
             "E9 铁律：AltScreen 态 Ctrl+C → Interrupt（不受 compose_buf_empty 影响）"
+        );
+    }
+
+    // ── M4.1 批3：ghost text 接受路径（→/End 在文末 + ghost 存在）──────
+
+    /// → 键：光标在文末 + ghost 存在 + 无 Shift → AcceptGhost
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn compose_right_文末_ghost存在_是_accept_ghost() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_doc_end: true,
+            ghost_exists: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowRight,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(result, Some(LookupResult::AcceptGhost)),
+            "Compose 态 → 文末 + ghost → AcceptGhost"
+        );
+    }
+
+    /// End 键：光标在文末 + ghost 存在 + 无 Shift → AcceptGhost
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn compose_end_文末_ghost存在_是_accept_ghost() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_doc_end: true,
+            ghost_exists: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::End,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(result, Some(LookupResult::AcceptGhost)),
+            "Compose 态 End 文末 + ghost → AcceptGhost"
+        );
+    }
+
+    /// → 键：光标在文末但 ghost 为空 → 正常 GraphemeRight（不接受 ghost）
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn compose_right_文末_ghost不存在_是_normal_move() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_doc_end: true,
+            ghost_exists: false,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowRight,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeRight,
+                        extend: false,
+                    }
+                )))
+            ),
+            "Compose 态 → 文末但无 ghost → 正常 GraphemeRight"
+        );
+    }
+
+    /// → 键：光标不在文末 + ghost 存在 → 正常 GraphemeRight（ghost 不拦截中间位置）
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn compose_right_非文末_ghost存在_是_normal_move() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_doc_end: false,
+            ghost_exists: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowRight,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeRight,
+                        extend: false,
+                    }
+                )))
+            ),
+            "Compose 态 → 非文末即使 ghost 存在也应正常移动"
+        );
+    }
+
+    /// Shift+→ 键：光标在文末 + ghost 存在 → 正常扩选（Shift 不接受 ghost）
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn compose_shift_right_文末_ghost存在_是_extend() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_doc_end: true,
+            ghost_exists: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowRight,
+            ModifiersState::SHIFT,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeRight,
+                        extend: true,
+                    }
+                )))
+            ),
+            "Compose 态 Shift+→ 文末 + ghost → 应扩选而非接受 ghost"
         );
     }
 }

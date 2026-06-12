@@ -10,6 +10,11 @@
 //!
 //! # 设计稿对应章节
 //! 设计稿 §2「输入区形态」列、§7.1「footer 输入区」、§7.4「节拍纪律」。
+//!
+//! # Ghost text（M4.1 批3）
+//! PSReadLine 内建预测已在 shell 侧禁用（Set-PSReadLineOption -PredictionSource None），
+//! 本模块实现历史前缀匹配 ghost text 作为替代，保留补全体验。
+//! ghost = history.find_ghost_prefix(current_text)，由 main.rs 计算后作为参数传入。
 
 use crate::i18n;
 use crate::mode::InputMode;
@@ -37,12 +42,15 @@ use lumen_renderer::composer_view::{ExitBadge, PreeditState};
 /// * `editor_view` - Compose 态时的编辑器只读视图（仅 Compose 态读取内容）。
 /// * `preedit` - IME 预编辑状态（M4.1 批D2，仅 Compose 态有效）。
 /// * `exit_badge` - 退出码角标（M4.1 批D2，仅 Compose 态显示）。
+/// * `ghost` - 历史联想后缀（M4.1 批3）：Compose 态 + 光标在文末时追加渲染；
+///   None 表示无联想（缓冲为空、多行或无前缀匹配）。
 #[cfg(feature = "input-editor")]
 pub fn compose_view_for_mode(
     mode: InputMode,
     editor_view: EditorView<'_>,
     preedit: Option<PreeditState>,
     exit_badge: Option<ExitBadge>,
+    ghost: Option<String>,
 ) -> ComposerView {
     let s = i18n::strings();
     match mode {
@@ -72,7 +80,7 @@ pub fn compose_view_for_mode(
                 preedit,     // M4.1 批D2：IME 预编辑
                 exit_badge,  // M4.1 批D2：退出码角标
                 placeholder, // M4.1 批E：占位提示（仅空编辑器显示）
-                ghost: None, // M4.1 批F（ghost text）：待批3填充
+                ghost,       // M4.1 批3：历史联想后缀（光标在文末时渲染）
             }
         }
         InputMode::Running => ComposerView::running(s.footer_running_text, s.footer_label_running),
@@ -115,7 +123,7 @@ mod tests {
         #[test]
         fn compose_模式_产出_composer_形态() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None);
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::Composer,
@@ -127,7 +135,7 @@ mod tests {
         #[test]
         fn compose_空编辑器_一行() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None);
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
             assert_eq!(v.lines.len(), 1, "空编辑器应有 1 行");
             assert_eq!(v.cursor, (0, 0), "空编辑器光标在原点");
         }
@@ -135,7 +143,7 @@ mod tests {
         #[test]
         fn running_模式_产出_statusbar_形态() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Running, editor.view(), None, None);
+            let v = compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::StatusBar,
@@ -147,7 +155,7 @@ mod tests {
         #[test]
         fn altscreen_模式_产出_hidden_形态() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::AltScreen, editor.view(), None, None);
+            let v = compose_view_for_mode(InputMode::AltScreen, editor.view(), None, None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::Hidden,
@@ -160,7 +168,7 @@ mod tests {
         fn fallback_模式_产出_statusbar_形态() {
             // 批D1：Fallback 不再隐藏，改为等高状态条显示"shell 集成未生效"
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None);
+            let v = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::StatusBar,
@@ -174,8 +182,10 @@ mod tests {
         fn compose_与_running_等高() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
-            let v_compose = compose_view_for_mode(InputMode::Compose, editor.view(), None, None);
-            let v_running = compose_view_for_mode(InputMode::Running, editor.view(), None, None);
+            let v_compose =
+                compose_view_for_mode(InputMode::Compose, editor.view(), None, None, None);
+            let v_running =
+                compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
             let h_c = footer_height_px(Some(&v_compose), 20.0, 6.0, 1000.0);
             let h_r = footer_height_px(Some(&v_running), 20.0, 6.0, 1000.0);
             assert_eq!(
@@ -189,7 +199,8 @@ mod tests {
         fn altscreen_高度为零() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
-            let v_alt = compose_view_for_mode(InputMode::AltScreen, editor.view(), None, None);
+            let v_alt =
+                compose_view_for_mode(InputMode::AltScreen, editor.view(), None, None, None);
             assert_eq!(
                 footer_height_px(Some(&v_alt), 20.0, 6.0, 1000.0),
                 0.0,
@@ -202,11 +213,40 @@ mod tests {
         fn fallback_与_running_等高() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
-            let v_fb = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None);
-            let v_run = compose_view_for_mode(InputMode::Running, editor.view(), None, None);
+            let v_fb = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None, None);
+            let v_run = compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
             let h_fb = footer_height_px(Some(&v_fb), 20.0, 6.0, 1000.0);
             let h_run = footer_height_px(Some(&v_run), 20.0, 6.0, 1000.0);
             assert_eq!(h_fb, h_run, "Fallback({h_fb}) 与 Running({h_run}) 应等高");
+        }
+
+        /// ghost text 传入 Compose 态时应被带入 ComposerView（M4.1 批3）。
+        #[test]
+        fn ghost_传入_compose_视图() {
+            let editor = empty_view();
+            let ghost = Some("tatus --short".to_owned());
+            let v =
+                compose_view_for_mode(InputMode::Compose, editor.view(), None, None, ghost.clone());
+            assert_eq!(v.ghost, ghost, "ghost 应被带入 ComposerView");
+        }
+
+        /// ghost text 在非 Compose 态（Running）时应不影响形态（Running 忽略 ghost）。
+        #[test]
+        fn ghost_非compose_态_不影响形态() {
+            let editor = empty_view();
+            let v = compose_view_for_mode(
+                InputMode::Running,
+                editor.view(),
+                None,
+                None,
+                Some("suffix".to_owned()),
+            );
+            // Running 态不消费 ghost，ComposerView::running 不含 ghost
+            assert_eq!(
+                v.kind,
+                lumen_renderer::composer_view::FooterKind::StatusBar,
+                "Running 态形态不受 ghost 影响"
+            );
         }
     }
 

@@ -417,6 +417,47 @@ impl HistoryStore {
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
+
+    /// 按前缀查找最佳历史联想（ghost text，M4.1 批3）。
+    ///
+    /// 规则：
+    /// - `prefix` 空串或多行（含换行）时返回 None（ghost text 仅对单行非空前缀有效）。
+    /// - 从最新条目向最旧逆序扫描，返回第一个**严格以 `prefix` 开头且不与 `prefix` 完全相等**的
+    ///   条目文本的「后缀部分」（即 `text[prefix.len()..]`）。
+    /// - 跳过多行条目（含 `\n` 的历史记录），保持 ghost text 单行干净。
+    /// - 未找到返回 None。
+    ///
+    /// # Arguments
+    /// * `prefix` - 当前输入框文本（UTF-8，光标在文末时使用）。
+    ///
+    /// # Returns
+    /// 命中时返回补全后缀（不含 prefix 本身），未命中返回 None。
+    ///
+    /// # Examples
+    /// ```
+    /// use lumen_app::history::HistoryStore;
+    ///
+    /// // HistoryStore::load() 用于真实环境；测试中可用 entries 手动注入。
+    /// ```
+    pub fn find_ghost_prefix(&self, prefix: &str) -> Option<String> {
+        // 空前缀 / 多行前缀不联想。
+        if prefix.is_empty() || prefix.contains('\n') {
+            return None;
+        }
+        // 逆序（最新 → 最旧）找第一个严格前缀匹配且不等于 prefix 的条目。
+        for entry in self.entries.iter().rev() {
+            // 跳过多行历史条目（保持 ghost 单行干净）。
+            if entry.text.contains('\n') {
+                continue;
+            }
+            // 严格前缀匹配：以 prefix 开头 + 条目内容 != prefix（避免 ghost 为空）。
+            if entry.text.starts_with(prefix) && entry.text != prefix {
+                let suffix = entry.text[prefix.len()..].to_owned();
+                return Some(suffix);
+            }
+        }
+        None
+    }
 }
 
 /// 去重并保留最近 `max` 条：同 text 的条目合并（保留 exit_code 非 None 的，
@@ -677,6 +718,126 @@ mod tests {
             store.entries[0].duration_ms,
             Some(150),
             "duration_ms 应被回填"
+        );
+    }
+
+    // ── find_ghost_prefix ghost text 前缀匹配 ───────────────────────
+
+    #[test]
+    fn ghost_空前缀_返回none() {
+        let mut store = make_store(PathBuf::from("test_ghost_empty.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "git status".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+        });
+        assert!(
+            store.find_ghost_prefix("").is_none(),
+            "空前缀不应产生 ghost text"
+        );
+    }
+
+    #[test]
+    fn ghost_多行前缀_返回none() {
+        let mut store = make_store(PathBuf::from("test_ghost_multiline.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "git status".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+        });
+        assert!(
+            store.find_ghost_prefix("git\nstatus").is_none(),
+            "多行前缀不应产生 ghost text"
+        );
+    }
+
+    #[test]
+    fn ghost_命中最新条目() {
+        let mut store = make_store(PathBuf::from("test_ghost_hit.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "git status".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+        });
+        store.entries.push(HistoryEntry {
+            text: "git diff".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 2,
+        });
+        // 最新条目是 "git diff"，前缀 "git " → 联想为 "diff"
+        let ghost = store.find_ghost_prefix("git ");
+        assert_eq!(
+            ghost.as_deref(),
+            Some("diff"),
+            "应联想最新匹配 'git diff' 的后缀 'diff'"
+        );
+    }
+
+    #[test]
+    fn ghost_完全相等_跳过() {
+        let mut store = make_store(PathBuf::from("test_ghost_equal.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "git status".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+        });
+        // 前缀 = 条目本身，应跳过（避免 ghost 为空串）
+        assert!(
+            store.find_ghost_prefix("git status").is_none(),
+            "前缀与条目完全相等时不应产生 ghost"
+        );
+    }
+
+    #[test]
+    fn ghost_跳过多行历史条目() {
+        let mut store = make_store(PathBuf::from("test_ghost_skip_multiline.jsonl"));
+        // 最新条目：多行（应跳过）
+        store.entries.push(HistoryEntry {
+            text: "git\nstatus".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 2,
+        });
+        // 次新条目：单行（应命中）
+        store.entries.push(HistoryEntry {
+            text: "git status --short".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+        });
+        let ghost = store.find_ghost_prefix("git s");
+        assert_eq!(
+            ghost.as_deref(),
+            Some("tatus --short"),
+            "应跳过多行条目命中次新单行条目"
+        );
+    }
+
+    #[test]
+    fn ghost_无匹配_返回none() {
+        let mut store = make_store(PathBuf::from("test_ghost_nomatch.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "ls -la".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+        });
+        assert!(
+            store.find_ghost_prefix("git").is_none(),
+            "无前缀匹配时应返回 None"
         );
     }
 

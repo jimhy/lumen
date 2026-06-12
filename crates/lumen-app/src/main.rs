@@ -419,6 +419,11 @@ struct AppState {
     /// feature = "input-editor" 门控（Fallback/无 feature 时历史功能禁用）。
     #[cfg(feature = "input-editor")]
     history: history::HistoryStore,
+    /// ghost text 缓存（M4.1 批3）：(编辑器 revision, 联想后缀)。
+    /// revision 变化时重算；不变时复用上帧结果，避免每帧遍历历史库。
+    /// feature = "input-editor" 门控。
+    #[cfg(feature = "input-editor")]
+    ghost_cache: (u64, Option<String>),
 }
 
 /// 提交文本编码为 PTY 载荷（M4.1 批D1/D2）——设计稿 §3.2 步骤 2。
@@ -983,6 +988,7 @@ impl AppState {
                 pane.editor.view(),
                 pane.preedit.clone(),
                 pane.exit_badge.clone(),
+                None, // ghost 仅用于渲染，高度计算不需要
             );
             let (_, cell_h) = self.renderer.cell_size();
             let fp = self.renderer.padding() * 0.4;
@@ -1798,6 +1804,8 @@ impl App {
             force_fallback: false,
             #[cfg(feature = "input-editor")]
             history: history_store,
+            #[cfg(feature = "input-editor")]
+            ghost_cache: (0, None),
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -2437,6 +2445,40 @@ impl ApplicationHandler<PtyWake> for App {
                     },
                     #[cfg(not(feature = "input-editor"))]
                     compose_cursor_at_last_line: true,
+                    // M4.1 批3：光标在文档末尾（末行字节偏移 = 末行长度）
+                    #[cfg(feature = "input-editor")]
+                    compose_cursor_at_doc_end: {
+                        let view = state.tabs[ti].panes[pi].editor.view();
+                        let cur = view.cursor();
+                        let lc = view.line_count();
+                        let at_last = cur.line == lc.saturating_sub(1);
+                        if at_last {
+                            // 末行最后字节偏移 = 末行字节长度
+                            let last_line_len = view
+                                .lines()
+                                .nth(lc.saturating_sub(1))
+                                .map(|l| l.len())
+                                .unwrap_or(0);
+                            cur.byte == last_line_len
+                        } else {
+                            false
+                        }
+                    },
+                    // M4.1 批3：ghost 是否非空（缓存命中时复用，否则重算）
+                    #[cfg(feature = "input-editor")]
+                    ghost_exists: {
+                        let rev = state.tabs[ti].panes[pi].editor.revision();
+                        if state.ghost_cache.0 != rev {
+                            let text = state.tabs[ti].panes[pi].editor.view().text();
+                            let ghost = if text.contains('\n') || text.is_empty() {
+                                None
+                            } else {
+                                state.history.find_ghost_prefix(&text)
+                            };
+                            state.ghost_cache = (rev, ghost);
+                        }
+                        state.ghost_cache.1.is_some()
+                    },
                 };
 
                 // 求值当前有效输入模式（纯推导，不缓存）。
@@ -2558,6 +2600,21 @@ impl ApplicationHandler<PtyWake> for App {
                         // 批D1：仅清选区；浮层（历史面板等）D2 接入。
                         state.tabs[ti].panes[pi].selection = None;
                         state.window.request_redraw();
+                    }
+
+                    // M4.1 批3：接受 ghost text（→/End 在文末 + ghost 非空）
+                    // 把 ghost 后缀 InsertText 进编辑器，ghost_cache 顺带失效（revision 变）。
+                    #[cfg(feature = "input-editor")]
+                    Some(keymap::LookupResult::AcceptGhost) => {
+                        if let Some(ghost) = state.ghost_cache.1.take() {
+                            state.ghost_cache.0 = 0; // 让缓存在下帧重算
+                            state.dispatch(
+                                action::Action::Edit(action::EditAction::InsertText(ghost)),
+                                ti,
+                                pi,
+                            );
+                            state.last_key_at = Some(Instant::now());
+                        }
                     }
 
                     Some(keymap::LookupResult::TerminalAction(action)) => {
@@ -3641,6 +3698,7 @@ impl ApplicationHandler<PtyWake> for App {
                                     pane.editor.view(),
                                     pane.preedit.clone(),
                                     pane.exit_badge.clone(),
+                                    None, // ghost 仅用于渲染，resize 高度计算不需要
                                 );
                                 let (_, cell_h) = state.renderer.cell_size();
                                 let fp = state.renderer.padding() * 0.4;
@@ -3750,6 +3808,24 @@ impl ApplicationHandler<PtyWake> for App {
                     // 不挂 PTY debounce。此处仅按模式组装视图数据，无副作用。
                     #[cfg(feature = "input-editor")]
                     let footer_view = {
+                        // M4.1 批3：ghost text 缓存（revision 变化时重算）。
+                        // 先独立更新缓存（不持有 focused 借用），再组装视图。
+                        {
+                            let ti2 = state.active_tab;
+                            let pi2 = state.tabs[ti2].focused;
+                            let rev = state.tabs[ti2].panes[pi2].editor.revision();
+                            if state.ghost_cache.0 != rev {
+                                let text =
+                                    state.tabs[ti2].panes[pi2].editor.view().text().to_owned();
+                                let ghost = if text.contains('\n') || text.is_empty() {
+                                    None
+                                } else {
+                                    state.history.find_ghost_prefix(&text)
+                                };
+                                state.ghost_cache = (rev, ghost);
+                            }
+                        }
+                        let ghost = state.ghost_cache.1.clone();
                         let focused = state.focused_pane();
                         let mode = mode::effective_mode(&focused.term, state.force_fallback);
                         composer::compose_view_for_mode(
@@ -3757,6 +3833,7 @@ impl ApplicationHandler<PtyWake> for App {
                             focused.editor.view(),
                             focused.preedit.clone(),
                             focused.exit_badge.clone(),
+                            ghost,
                         )
                     };
 
