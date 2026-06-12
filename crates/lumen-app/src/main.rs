@@ -42,7 +42,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 // M3.8 自绘标题栏：Windows 平台扩展（无边框阴影 / 圆角）。
 #[cfg(target_os = "windows")]
 use winit::platform::windows::WindowAttributesExtWindows;
@@ -80,6 +80,35 @@ const BG_DRAIN_CAP: usize = 256 * 1024;
 /// 避免把 TUI 重绘的中间状态（光标游走、半成品行）画到屏幕上。
 #[derive(Debug)]
 struct PtyWake;
+
+/// 从 PNG 字节流解码并构造 winit 窗口图标。
+///
+/// 解码失败（格式损坏、尺寸越界）时返回 `None` 并打印 warn，
+/// 不 panic——图标是视觉增强，缺失不影响功能。
+///
+/// # Examples
+///
+/// ```no_run
+/// let icon = load_icon(include_bytes!("../../../icons/lumen-icon-32.png"));
+/// // icon 可能为 None（损坏）；正常情况下为 Some(Icon)
+/// ```
+fn load_icon(bytes: &[u8]) -> Option<Icon> {
+    let img = match image::load_from_memory(bytes) {
+        Ok(i) => i.into_rgba8(),
+        Err(e) => {
+            log::warn!("窗口图标解码失败，跳过设置：{e}");
+            return None;
+        }
+    };
+    let (width, height) = img.dimensions();
+    match Icon::from_rgba(img.into_raw(), width, height) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            log::warn!("构造窗口 Icon 失败，跳过设置：{e}");
+            None
+        }
+    }
+}
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -1817,6 +1846,13 @@ impl App {
         // with_undecorated_shadow(true) 启用 DWM 阴影并允许 Win11 圆角识别；
         // 副作用：顶部 1px 黑线（顶栏背景色覆盖消除）。
         // 非 Windows 平台降级保留系统装饰（with_decorations 有 #[cfg(windows)] 处理）。
+        // 第二十二轮：运行时窗口图标（窗口左上角/Alt-Tab/任务栏运行态）。
+        // with_window_icon 设 32px 图标（符合 Windows ICON 推荐小图标尺寸）；
+        // with_taskbar_icon (Windows 专属扩展) 设 64px 大图标（任务栏/Alt-Tab 高 DPI）。
+        // 解码失败降级为 None（warn 已在 load_icon 内打印）。
+        let window_icon = load_icon(include_bytes!("../../../icons/lumen-icon-32.png"));
+        #[cfg(target_os = "windows")]
+        let taskbar_icon = load_icon(include_bytes!("../../../icons/lumen-icon-64.png"));
         #[cfg(target_os = "windows")]
         let attrs = {
             Window::default_attributes()
@@ -1825,12 +1861,15 @@ impl App {
                 .with_maximized(true)
                 .with_decorations(false)
                 .with_undecorated_shadow(true)
+                .with_window_icon(window_icon)
+                .with_taskbar_icon(taskbar_icon)
         };
         #[cfg(not(target_os = "windows"))]
         let attrs = Window::default_attributes()
             .with_title("Lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
-            .with_maximized(true);
+            .with_maximized(true)
+            .with_window_icon(window_icon);
         // 启动默认最大化（P17）：inner_size 保留为「取消最大化」后的还原尺寸。
         let window = Arc::new(event_loop.create_window(attrs).context("创建窗口失败")?);
         // workaround winit #4186：with_decorations(false) + with_resizable(true) 下
@@ -4729,9 +4768,32 @@ impl ApplicationHandler<PtyWake> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_order, estimate_restored_pane_px, maximized_overflow, width_worth_persisting,
-        PaneLayout,
+        drain_order, estimate_restored_pane_px, load_icon, maximized_overflow,
+        width_worth_persisting, PaneLayout,
     };
+
+    // ── 第二十二轮：运行时图标加载单元测试 ─────────────────────────────
+
+    #[test]
+    fn 图标加载_32px_解码成功() {
+        let bytes = include_bytes!("../../../icons/lumen-icon-32.png");
+        let icon = load_icon(bytes);
+        assert!(icon.is_some(), "lumen-icon-32.png 应解码成功");
+    }
+
+    #[test]
+    fn 图标加载_64px_解码成功() {
+        let bytes = include_bytes!("../../../icons/lumen-icon-64.png");
+        let icon = load_icon(bytes);
+        assert!(icon.is_some(), "lumen-icon-64.png 应解码成功");
+    }
+
+    #[test]
+    fn 图标加载_损坏字节_返回_none() {
+        // 非法字节流：load_icon 应返回 None 而非 panic。
+        let icon = load_icon(b"\x00\x01\x02\x03_not_a_png");
+        assert!(icon.is_none(), "损坏字节流应返回 None");
+    }
 
     /// 估算测试区域：与 layout.rs 测试同款 304x202（宽对 3 列、高对
     /// 2 排整除：上3下2 时上排格 100x100、下排格 151x100）。

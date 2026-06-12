@@ -71,6 +71,11 @@ windows-sys = { version = "0.61", features = [
 # 背景图片解码（P13）：纯 CPU 解码、不依赖系统图形库，支持 png/jpeg/webp/bmp。
 # default-features = false 只开必要格式，避免引入不必要的编解码器代码。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+# exe 资源图标嵌入（第二十二轮）：构建期把 lumen.ico 嵌入 PE 资源区，
+# 使文件管理器/快捷方式/任务栏显示正确图标。winresource 是 winres 的
+# 社区维护 fork，仅在 build.rs 中使用，零运行时依赖；MSVC 工具链已内置
+# rc.exe 编译器，无需额外安装。
+winresource = "0.1"
 # 文件对话框（P13）：Windows 原生 IFileOpenDialog，零外部 DLL 依赖。
 # default-features = false 关闭 async 后端等无用特性（同步对话框只需基础特性）。
 rfd = { version = "0.15", default-features = false }
