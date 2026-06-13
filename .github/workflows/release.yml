@@ -33,6 +33,11 @@ jobs:
     steps:
       - name: 检出
         uses: actions/checkout@v4
+        with:
+          # 取全历史 + tag 对象：否则浅克隆下 annotated tag 的注释取不到，
+          # 「提取更新说明」的 git for-each-ref %(contents) 会回退成 commit 消息。
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: 安装 Rust（stable）
         uses: dtolnay/rust-toolchain@stable
