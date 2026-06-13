@@ -66,6 +66,16 @@ pub struct TopbarOutput {
     pub open_settings: bool,
     /// 点击了 Keyboard shortcuts（打开设置页并定位该分类）。
     pub open_shortcuts: bool,
+    /// 头像菜单：点击了「检查更新」（无就绪更新时）→ main 起手动检查。
+    pub check_update: bool,
+    /// 头像菜单：点击了「更新到 vX」（有就绪更新时）→ main 显示更新弹窗。
+    pub open_update: bool,
+    /// 头像菜单：点击了「更新日志」→ main 打开 GitHub Releases。
+    pub open_whats_new: bool,
+    /// 头像菜单：点击了「文档」→ main 打开 GitHub 仓库 README。
+    pub open_documentation: bool,
+    /// 头像菜单：点击了「反馈」→ main 打开 GitHub Issues。
+    pub open_feedback: bool,
     /// 点击了 Log out。
     pub log_out: bool,
     /// 点击了「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
@@ -94,13 +104,15 @@ pub struct TopbarOutput {
     pub toggle_filetree: Option<bool>,
 }
 
-/// 顶栏三视图切换按钮的可见态（问题7）：将两个 bool 打包传入 [`show`]，
-/// 避免参数列表超过 clippy 7 参数限制。
+/// 顶栏额外状态（打包传入 [`show`]，避免参数列表超过 clippy 7 参数限制）。
 pub struct ViewState {
     /// 会话栏（①）当前是否可见。
     pub sidebar_visible: bool,
     /// 文件树（②）当前是否可见（与 Ctrl+B 同状态源）。
     pub filetree_visible: bool,
+    /// 头像菜单更新项：Some(版本号) = 有就绪更新（显示「更新到 vX」强调项），
+    /// None = 无更新（显示「检查更新」）。
+    pub update_version: Option<String>,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
@@ -271,10 +283,11 @@ pub fn show(
                 // ── 头像（紧贴窗控左侧，加右内边距 10px）──────────────────
                 ui.add_space(10.0);
                 let resp = avatar_button(ui, profile, pal);
+                let update_version = view.update_version.as_deref();
                 let _ = egui::Popup::menu(&resp)
                     .align(egui::RectAlign::BOTTOM_END)
                     .width(MENU_WIDTH)
-                    .show(|ui| menu_ui(ui, profile, pal, &mut out));
+                    .show(|ui| menu_ui(ui, profile, pal, update_version, &mut out));
                 ui.add_space(6.0);
 
                 // 「＋」新增窗格（F5）：满 MAX_PANES 时禁用 + 悬停提示。
@@ -557,46 +570,73 @@ fn avatar_button(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette) ->
     ))
 }
 
-/// 下拉菜单内容（参照截图，按登录态二选一）。
-fn menu_ui(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mut TopbarOutput) {
+/// 头像下拉菜单（对齐 Warp 分组样式）：
+/// 用户名 ┊ 更新组（更新到 vX / 检查更新 + 更新日志）┊ 设置组（设置 +
+/// 键盘快捷键）┊ 资源组（文档 + 反馈）┊ 账号组（登录 / 退出登录）。
+fn menu_ui(
+    ui: &mut egui::Ui,
+    profile: Option<&Profile>,
+    pal: &Palette,
+    update_version: Option<&str>,
+    out: &mut TopbarOutput,
+) {
     let s = i18n::strings();
-    match profile {
-        Some(p) => {
-            // 首行展示名：灰字不可点（参照截图 Jimhy Liu 行）。
-            ui.add_enabled(
-                false,
-                egui::Button::new(egui::RichText::new(&p.display_name).color(pal.fg_dim)),
-            );
-            if ui.button(s.menu_settings).clicked() {
-                out.open_settings = true;
-                ui.close();
-            }
-            if ui.button(s.menu_keyboard_shortcuts).clicked() {
-                out.open_shortcuts = true;
-                ui.close();
-            }
-            // Documentation 灰显占位（本期无文档站，§7 不做清单）。
-            ui.add_enabled(false, egui::Button::new(s.menu_documentation));
-            ui.separator();
-            if ui.button(s.menu_log_out).clicked() {
-                out.log_out = true;
-                ui.close();
-            }
+    // 顶部：已登录展示名（灰字不可点）+ 分隔线。
+    if let Some(p) = profile {
+        ui.add_enabled(
+            false,
+            egui::Button::new(egui::RichText::new(&p.display_name).color(pal.fg_dim)),
+        );
+        ui.separator();
+    }
+    // 更新组：有就绪更新 →「更新到 vX」(强调色，打开更新弹窗)；否则
+    // →「检查更新」(手动检查)。再加「更新日志」。
+    if let Some(ver) = update_version {
+        if ui
+            .button(egui::RichText::new(i18n::fmt1(s.menu_update_to_fmt, ver)).color(pal.accent))
+            .clicked()
+        {
+            out.open_update = true;
+            ui.close();
         }
-        None => {
-            if ui.button(s.menu_log_in).clicked() {
-                out.open_login = true;
-                ui.close();
-            }
-            if ui.button(s.menu_settings).clicked() {
-                out.open_settings = true;
-                ui.close();
-            }
-            if ui.button(s.menu_keyboard_shortcuts).clicked() {
-                out.open_shortcuts = true;
-                ui.close();
-            }
+    } else if ui.button(s.menu_check_update).clicked() {
+        out.check_update = true;
+        ui.close();
+    }
+    if ui.button(s.menu_whats_new).clicked() {
+        out.open_whats_new = true;
+        ui.close();
+    }
+    ui.separator();
+    // 设置组。
+    if ui.button(s.menu_settings).clicked() {
+        out.open_settings = true;
+        ui.close();
+    }
+    if ui.button(s.menu_keyboard_shortcuts).clicked() {
+        out.open_shortcuts = true;
+        ui.close();
+    }
+    ui.separator();
+    // 资源组：文档 / 反馈（打开 GitHub）。
+    if ui.button(s.menu_documentation).clicked() {
+        out.open_documentation = true;
+        ui.close();
+    }
+    if ui.button(s.menu_feedback).clicked() {
+        out.open_feedback = true;
+        ui.close();
+    }
+    ui.separator();
+    // 账号组：登录 / 退出登录。
+    if profile.is_some() {
+        if ui.button(s.menu_log_out).clicked() {
+            out.log_out = true;
+            ui.close();
         }
+    } else if ui.button(s.menu_log_in).clicked() {
+        out.open_login = true;
+        ui.close();
     }
 }
 
@@ -631,6 +671,7 @@ mod topbar_layout_tests {
                 ViewState {
                     sidebar_visible: true,
                     filetree_visible: true,
+                    update_version: None,
                 },
             );
             got = Some(tb.maximize_btn_rect.unwrap_or(egui::Rect::NOTHING));
@@ -669,6 +710,7 @@ mod topbar_layout_tests {
                 ViewState {
                     sidebar_visible: true,
                     filetree_visible: true,
+                    update_version: None,
                 },
             );
         });
@@ -719,6 +761,7 @@ mod topbar_layout_tests {
                 ViewState {
                     sidebar_visible: true,
                     filetree_visible: false,
+                    update_version: None,
                 },
             );
         });

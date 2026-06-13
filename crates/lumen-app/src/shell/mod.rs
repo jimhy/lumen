@@ -111,6 +111,9 @@ pub struct ShellInput<'a> {
     pub tabs: &'a [TabItem],
     /// 登录态（顶栏头像、头像菜单、设置页 Account 三处同源展示）。
     pub profile: Option<&'a crate::profile::Profile>,
+    /// 头像菜单更新项：Some(版本号) = 有就绪更新（显示「更新到 vX」），
+    /// None = 无更新（显示「检查更新」）。main 据 update_ready/available 构造。
+    pub update_version: Option<String>,
     /// 焦点窗格的 cwd（文件树跟随；OSC 9;9 上报）。
     pub cwd: Option<&'a std::path::Path>,
     /// 焦点窗格 shell 空闲（文件树 cd 注入闸门）。
@@ -272,10 +275,18 @@ pub struct ShellOutput {
     pub completion_accept: Option<usize>,
     /// 补全弹窗（M4.4 批1）：本帧请求关闭（Esc）。
     pub completion_closed: bool,
-    /// 设置页「更新」分区点击了「检查更新」按钮（F3）：main 起一次手动检查。
+    /// 设置页「更新」分区或头像菜单「检查更新」（F3）：main 起一次手动检查。
     pub update_check_now: bool,
     /// 设置页改了更新设置（auto_check 开关，F3）：main 进 need_save 落盘。
     pub settings_update_changed: bool,
+    /// 头像菜单「更新到 vX」：有就绪更新时显示更新弹窗（main 清 dismissed）。
+    pub open_update: bool,
+    /// 头像菜单「更新日志」：main 打开 GitHub Releases 页。
+    pub open_whats_new: bool,
+    /// 头像菜单「文档」：main 打开 GitHub 仓库 README。
+    pub open_documentation: bool,
+    /// 头像菜单「反馈」：main 打开 GitHub Issues。
+    pub open_feedback: bool,
 }
 
 /// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
@@ -346,6 +357,10 @@ pub fn show(
         completion_closed: false,
         update_check_now: false,
         settings_update_changed: false,
+        open_update: false,
+        open_whats_new: false,
+        open_documentation: false,
+        open_feedback: false,
     };
     // 生效主题的外壳色板（P12）：Lumen 双主题取手调静态板、其余主题
     // 派生（每帧少量色彩数学，开销可忽略）。
@@ -383,10 +398,27 @@ pub fn show(
         topbar::ViewState {
             sidebar_visible: app_settings.layout.sidebar_visible,
             filetree_visible: st.filetree.visible,
+            update_version: input.update_version.clone(),
         },
     );
     if tb.new_pane {
         out.new_pane = true;
+    }
+    // 头像菜单更新组 / 资源组动作转发。
+    if tb.check_update {
+        out.update_check_now = true;
+    }
+    if tb.open_update {
+        out.open_update = true;
+    }
+    if tb.open_whats_new {
+        out.open_whats_new = true;
+    }
+    if tb.open_documentation {
+        out.open_documentation = true;
+    }
+    if tb.open_feedback {
+        out.open_feedback = true;
     }
     if tb.reset_layout {
         out.layout_reset = true;

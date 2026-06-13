@@ -53,8 +53,16 @@ pub struct Strings {
     pub menu_settings: &'static str,
     /// 头像菜单 Keyboard shortcuts
     pub menu_keyboard_shortcuts: &'static str,
-    /// 头像菜单 Documentation（灰显占位）
+    /// 头像菜单 Documentation
     pub menu_documentation: &'static str,
+    /// 头像菜单：检查更新（无可用更新时）
+    pub menu_check_update: &'static str,
+    /// 头像菜单：更新到 vX.Y.Z（有就绪更新时，fmt1：版本号）
+    pub menu_update_to_fmt: &'static str,
+    /// 头像菜单：更新日志（打开 GitHub Releases）
+    pub menu_whats_new: &'static str,
+    /// 头像菜单：反馈（打开 GitHub Issues）
+    pub menu_feedback: &'static str,
     /// 头像菜单 Log out
     pub menu_log_out: &'static str,
     /// 头像菜单 Log in

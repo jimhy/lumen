@@ -23,6 +23,10 @@ pub static STRINGS: Strings = Strings {
     menu_settings: "Settings",
     menu_keyboard_shortcuts: "Keyboard shortcuts",
     menu_documentation: "Documentation",
+    menu_check_update: "Check for updates",
+    menu_update_to_fmt: "Update to {}",
+    menu_whats_new: "What's new",
+    menu_feedback: "Feedback",
     menu_log_out: "Log out",
     menu_log_in: "Log in",
     // Settings page

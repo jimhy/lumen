@@ -29,6 +29,10 @@ pub static STRINGS: Strings = Strings {
     menu_settings: "設定",
     menu_keyboard_shortcuts: "鍵盤快捷鍵",
     menu_documentation: "文件",
+    menu_check_update: "檢查更新",
+    menu_update_to_fmt: "更新到 {}",
+    menu_whats_new: "更新日誌",
+    menu_feedback: "回饋",
     menu_log_out: "登出",
     menu_log_in: "登入",
     // 設定頁

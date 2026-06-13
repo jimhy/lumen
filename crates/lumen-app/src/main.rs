@@ -4482,6 +4482,12 @@ impl ApplicationHandler<PtyWake> for App {
                     maximized: tab.maximized,
                     tabs: &entries,
                     profile: state.profile.as_ref(),
+                    // 头像菜单更新项：有就绪更新时给版本号（显示「更新到 vX」）。
+                    update_version: state
+                        .update_ready
+                        .is_some()
+                        .then(|| state.update_available.as_ref().map(|u| u.version.to_string()))
+                        .flatten(),
                     cwd: active_cwd.as_deref(),
                     shell_idle,
                     os_dark: state.os_dark,
@@ -5303,6 +5309,30 @@ impl ApplicationHandler<PtyWake> for App {
                         i18n::strings().update_toast_checking.to_owned(),
                     );
                     state.spawn_update_check(true);
+                }
+                // 头像菜单「更新到 vX」：重新显示已就绪的更新弹窗（清 dismissed）。
+                if shell_out.open_update {
+                    state.update_dismissed = false;
+                    state.window.request_redraw();
+                }
+                // 头像菜单资源组：打开 GitHub 页（复用 links::open / 系统默认浏览器）。
+                if shell_out.open_whats_new {
+                    links::open(&links::LinkTarget::Url(format!(
+                        "https://github.com/{}/releases",
+                        update::GITHUB_REPO
+                    )));
+                }
+                if shell_out.open_documentation {
+                    links::open(&links::LinkTarget::Url(format!(
+                        "https://github.com/{}#readme",
+                        update::GITHUB_REPO
+                    )));
+                }
+                if shell_out.open_feedback {
+                    links::open(&links::LinkTarget::Url(format!(
+                        "https://github.com/{}/issues",
+                        update::GITHUB_REPO
+                    )));
                 }
                 if need_save {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败
