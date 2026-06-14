@@ -1435,6 +1435,55 @@ impl AppState {
             .map(|(_, r)| *r)
     }
 
+    /// 「回到底部」浮动按钮的目标矩形（每个上滚超过一整屏的可见窗格各
+    /// 一个）。返回 `(SessionId, 按钮命中区逻辑矩形)`，按钮置于窗格底部
+    /// 居中；焦点窗格扣除 footer 高度，避免压在输入区上。
+    ///
+    /// 几何取自上一帧的 `pane_rects_px`（物理像素，连续帧间稳定，滞后
+    /// 一帧无感）；逻辑点 = 物理像素 / `pixels_per_point`。仅当某窗格往
+    /// 上滚动距离 `display_offset` 超过一整屏（`> rows`）才纳入——刚滚一
+    /// 两行不弹按钮，符合「超过 1 屏才提示」的诉求。`&self` 借用整个
+    /// state，故须在 `run_ui` 可变借用 `state.shell_state` 之前调用。
+    fn scroll_to_bottom_overlays(&self) -> Vec<(SessionId, egui::Rect)> {
+        // 按钮逻辑半径与距内容区下沿留白（点）。
+        const RADIUS: f32 = 16.0;
+        const GAP: f32 = 14.0;
+        let ppp = self.egui_ctx.pixels_per_point();
+        if ppp <= 0.0 {
+            return Vec::new();
+        }
+        let focus_sid = self.focused_pane().id;
+        // 焦点窗格 footer 高度（物理像素）；非 input-editor 构建无 footer。
+        #[cfg(feature = "input-editor")]
+        let footer_h_px = self
+            .focused_footer_rect_px()
+            .map_or(0.0, |(_, _, _, h)| h);
+        #[cfg(not(feature = "input-editor"))]
+        let footer_h_px = 0.0_f32;
+
+        let panes = &self.tabs[self.active_tab].panes;
+        let mut out = Vec::new();
+        for (sid, (x, y, w, h)) in &self.pane_rects_px {
+            let Some(pane) = panes.iter().find(|p| p.id == *sid) else {
+                continue;
+            };
+            let g = pane.term.grid();
+            // display_offset 以行计，0 = 在底部；超过一整屏才显示按钮。
+            if g.display_offset() <= g.rows() {
+                continue;
+            }
+            let footer = if *sid == focus_sid { footer_h_px } else { 0.0 };
+            let center_x = (x + w / 2.0) / ppp;
+            let bottom = (y + h - footer) / ppp;
+            let center = egui::pos2(center_x, bottom - GAP - RADIUS);
+            out.push((
+                *sid,
+                egui::Rect::from_center_size(center, egui::vec2(RADIUS * 2.0, RADIUS * 2.0)),
+            ));
+        }
+        out
+    }
+
     /// 把当前鼠标像素位置换算成**焦点窗格**的选区端点（绝对行号）。
     /// cell_at 接相对窗格原点的坐标并按窗格尺寸夹紧；焦点窗格矩形
     /// 未知（首帧布局前）时返回 None。
@@ -4465,12 +4514,25 @@ impl ApplicationHandler<PtyWake> for App {
                 > = if state.shell_state.completion.open && !completion_candidate_rows.is_empty() {
                     let scale = state.egui_ctx.pixels_per_point();
                     let win_h = state.window.inner_size().height as f32 / scale;
-                    // statusbar 高度 + footer 约 1 行高度（cell_h 估约 20px）
-                    let anchor_y = win_h
-                            - shell::statusbar::HEIGHT
-                            - 20.0  // footer 单行高度估算
-                            - 4.0; // 小间距
-                    let anchor_x = state.settings.layout.sidebar_width + 12.0;
+                    // 锚点（弹窗左下，向上展开）：x 对齐 footer 内光标列、
+                    // y 取 footer 顶部——补全弹窗左缘跟随光标（海风哥反馈）。
+                    // footer 矩形不可用（极端态）时回退「侧栏右缘 + 底部估算」。
+                    let (anchor_x, anchor_y) =
+                        if let Some((fx, fy, _, _)) = state.focused_footer_rect_px() {
+                            let fp = state.renderer.padding() * 0.4;
+                            let (cell_w, _) = state.renderer.cell_size();
+                            let pane = state.focused_pane();
+                            let ev = pane.editor.view();
+                            let cur = ev.cursor();
+                            let col = lumen_renderer::composer_view::footer_byte_to_col(
+                                ev.lines().nth(cur.line).unwrap_or_default(),
+                                cur.byte,
+                            ) as f32;
+                            ((fx + fp + col * cell_w) / scale, fy / scale)
+                        } else {
+                            let ay = win_h - shell::statusbar::HEIGHT - 20.0 - 4.0;
+                            (state.settings.layout.sidebar_width + 12.0, ay)
+                        };
                     Some(shell::completion_ui::CompletionView {
                         candidates: &completion_candidate_rows,
                         anchor: egui::pos2(anchor_x, anchor_y),
@@ -4508,6 +4570,10 @@ impl ApplicationHandler<PtyWake> for App {
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
                 };
+                // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
+                // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
+                let scroll_to_bottom_targets = state.scroll_to_bottom_overlays();
+                let mut scroll_to_bottom_req: Option<SessionId> = None;
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
                 // F3 更新弹窗配色（当前主题色板；app_settings 借用后用 disjoint
@@ -4562,6 +4628,58 @@ impl ApplicationHandler<PtyWake> for App {
                         app_settings,
                         is_maximized,
                     ));
+                    // ── 「回到底部」浮动按钮（窗格上滚超过一整屏时，底部
+                    // 居中的圆形向下箭头；点击回到最新输出）──
+                    for (sid, rect) in &scroll_to_bottom_targets {
+                        let resp = egui::Area::new(egui::Id::new((
+                            "lumen_scroll_to_bottom",
+                            *sid,
+                        )))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(rect.min)
+                        .show(ui.ctx(), |ui| {
+                            let (r, resp) =
+                                ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                            let hovered = resp.hovered();
+                            let p = ui.painter();
+                            let c = r.center();
+                            let radius = r.width() / 2.0;
+                            // 圆底：平时弹层灰、hover 强调色（Warp 式白底）。
+                            p.circle_filled(
+                                c,
+                                radius,
+                                if hovered { modal_pal.accent } else { modal_pal.bg_panel },
+                            );
+                            p.circle_stroke(
+                                c,
+                                radius,
+                                egui::Stroke::new(1.0, modal_pal.panel_outline),
+                            );
+                            // 向下箭头（竖杆 + 两撇箭头头），hover 反相配色。
+                            let arrow =
+                                if hovered { modal_pal.accent_fg } else { modal_pal.fg };
+                            let st = egui::Stroke::new(2.0, arrow);
+                            p.line_segment(
+                                [egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 5.0)],
+                                st,
+                            );
+                            p.line_segment(
+                                [egui::pos2(c.x - 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
+                                st,
+                            );
+                            p.line_segment(
+                                [egui::pos2(c.x + 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
+                                st,
+                            );
+                            resp
+                        });
+                        if resp.inner.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.inner.clicked() {
+                            scroll_to_bottom_req = Some(*sid);
+                        }
+                    }
                     if link_hover_active {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
@@ -4845,6 +4963,18 @@ impl ApplicationHandler<PtyWake> for App {
                     let ti = state.active_tab;
                     let pi = state.tabs[ti].focused;
                     state.dispatch(ctx_action, ti, pi);
+                }
+
+                // 「回到底部」按钮点击：对应窗格滚回最新输出并请求重绘。
+                if let Some(sid) = scroll_to_bottom_req {
+                    if let Some(p) = state.tabs[state.active_tab]
+                        .panes
+                        .iter_mut()
+                        .find(|p| p.id == sid)
+                    {
+                        p.term.grid_mut().scroll_to_bottom();
+                        state.window.request_redraw();
+                    }
                 }
 
                 // 底部状态栏「经典模式」按钮：复用 ToggleFallback 同路径（M4.1 批E）。

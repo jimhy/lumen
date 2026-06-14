@@ -81,10 +81,12 @@ pub fn show(
     }
 
     // ── 键盘事件（在 Area 之前读取，避免 Area 内部控件先消化）──────
-    ctx.input(|i| {
+    // 返回本帧 selected 是否由键盘移动（驱动 scroll_to_rect，使到底部的
+    // 选中项跟随滚动可见——海风哥反馈：到底部内容看不见）。
+    let kbd_moved = ctx.input(|i| {
         let n = candidates.len();
         if n == 0 {
-            return;
+            return false;
         }
 
         // ↑ 或 Shift+Tab：向上移动（循环）。
@@ -114,6 +116,8 @@ pub fn show(
         if i.key_pressed(egui::Key::Escape) {
             out.closed = true;
         }
+
+        up || down
     });
 
     // 已决定关闭则提前返回（不画弹窗）。
@@ -172,6 +176,11 @@ pub fn show(
 
                         let is_selected = idx == state.selected;
                         let is_hovered = resp.hovered();
+
+                        // 键盘移动选中项时滚动使其可见（含到底部时跟随滚动）。
+                        if is_selected && kbd_moved {
+                            ui.scroll_to_rect(row_rect, None);
+                        }
 
                         // 高亮背景（selected 或 hover）。
                         if is_selected || is_hovered {
