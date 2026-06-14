@@ -2312,6 +2312,18 @@ impl AppState {
             // 还原后其余窗格的离屏纹理还是隐藏前的旧画面：强制下一帧
             // 渲染（同 activate 的「超龄欠帧」手法——即使正处同步
             // 区间也不许把旧帧多留一帧）。
+            //
+            // 【补帧三件套·勿拆】「帧内清 maximized」必须配齐三件事：①此处
+            // 清 maximized ②给**所有**窗格设超龄 term_frame_due_since
+            // ③本 fn 末尾 request_redraw（见 2344 附近）。缘由：main 的
+            // resize 循环（6029-6055）以「矩形退化」为唯一判据跳过隐藏窗格
+            // ——本帧 run_ui 已按改前的 maximized=Some 算出隐藏窗格的
+            // NOTHING 占位矩形，故它们这帧被退化 guard 跳过、不被 resize
+            // （这正是防「还原帧把隐藏窗格 resize 成 1 列、每行截断丢内容」
+            // 的修复）；隐藏窗格改靠这里的超龄欠帧在**下一帧**按正确分屏
+            // 矩形补绘上屏。reset_pane_layout 的还原分支是同根因第二入口，
+            // 三件套须与此处保持一致；将来任何新增「帧内清 maximized」的
+            // 动作都得复制这套，否则隐藏窗格会被跳过却拿不到下一帧补绘。
             for s in &mut tab.panes {
                 s.term_frame_due_since = Some(
                     Instant::now()
@@ -2356,8 +2368,11 @@ impl AppState {
         let uniform = PaneLayout::uniform(tab.panes.len());
         if tab.maximized.is_some() {
             tab.maximized = None;
-            // 与 toggle_maximize_pane 的还原分支同款：隐藏窗格的纹理
-            // 还是旧画面，强制下一帧渲染。
+            // 与 toggle_maximize_pane 的还原分支同款（同根因第二入口）：
+            // 隐藏窗格的纹理还是旧画面，强制下一帧渲染。补帧三件套（清
+            // maximized + 给所有窗格设超龄 term_frame_due_since + 末尾
+            // request_redraw，见 2372 附近）须与 toggle_maximize_pane 保持
+            // 一致——缘由见那里的「补帧三件套·勿拆」注释。
             for s in &mut tab.panes {
                 s.term_frame_due_since = Some(
                     Instant::now()
@@ -6028,14 +6043,29 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.pane_rects_px.clear();
                     for (i, r) in shell_out.pane_rects.iter().enumerate() {
-                        // 最大化期间的隐藏窗格（P14）：shell 侧矩形为
-                        // NOTHING 占位——不重建离屏/不 resize（保持隐藏
-                        // 前的网格，后台输出按原尺寸消化）、不进鼠标/IME
-                        // 路由表。
-                        if state.tabs[state.active_tab]
-                            .maximized
-                            .is_some_and(|m| m != i)
-                        {
+                        // 隐藏窗格（P14 最大化）的矩形是退化占位
+                        // （egui::Rect::NOTHING，宽高为 -∞）：不重建离屏/不
+                        // resize（保持隐藏前的网格，后台输出按原尺寸消化）、
+                        // 不进鼠标/IME 路由表。
+                        //
+                        // 判定**以矩形本身为准、绝不读实时 `maximized` 状态**
+                        // ——这是「还原后其余窗格只剩每行首字符」串扰 bug 的
+                        // 根因修复：pane_rects 是 egui 按 run_ui 起点的
+                        // input.maximized 快照产出的权威几何，最大化态下隐藏
+                        // 窗格即 NOTHING。但点标题栏「还原」按钮会在**同一帧
+                        // run_ui 内**把 maximized 改回 None（见
+                        // shell_out.pane_maximize 处理），此刻本帧 pane_rects
+                        // 仍是改前的最大化布局（隐藏窗格仍 NOTHING）——若按
+                        // 实时 maximized 判跳过就会漏掉这些窗格，NOTHING 的
+                        // 负宽高被下方 .max(1.0) 夹成 1×1，把隐藏窗格的 grid
+                        // resize 成 1 列：row.resize(1) 截断每行到首字符、
+                        // scrollback 历史右侧内容永久丢失（海风哥实测截图）。
+                        // 退化矩形跳过、留待下一帧（maximized 变更必伴
+                        // request_redraw）按正确分屏矩形 resize。快捷键
+                        // Ctrl+Shift+Enter 改在事件层、下一帧才 run_ui，input
+                        // 与判定同源故不触发，仅按钮路径中招。
+                        let (rw, rh) = (r.width(), r.height());
+                        if !(rw.is_finite() && rh.is_finite() && rw >= 1.0 && rh >= 1.0) {
                             continue;
                         }
                         let x0 = (r.min.x * ppp).round();

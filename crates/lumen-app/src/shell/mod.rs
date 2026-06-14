@@ -736,6 +736,16 @@ pub fn show(
                 // 最大化期间的隐藏窗格（P14）：不画、矩形 NOTHING 占位
                 // 保持与 panes 的下标对位（main 据此跳过其矩形应用与
                 // 渲染——后台照常消化输出，同「非激活 tab」闸门）。
+                //
+                // 【契约·勿改】main.rs 的 resize 循环（6029-6055）以「矩形
+                // 退化与否」（NOTHING/非有限/宽高 < 1pt）为**唯一**判据跳过
+                // 隐藏窗格，刻意**不读**实时 maximized 状态——因为点标题栏
+                // 「还原」按钮会在同一帧 run_ui 内把 maximized 改回 None
+                // （shell_out.pane_maximize→toggle_maximize_pane），而本帧
+                // pane_rects 仍是改前的最大化布局。故此处隐藏窗格**必须**
+                // 产退化的 NOTHING；绝不可改成 0 尺寸或极小的「真」矩形，
+                // 否则会绕过那道 guard，重新引入「还原帧把隐藏窗格 resize
+                // 成 1 列、每行截断丢内容」的串扰 bug（海风哥实测过）。
                 if maximized.is_some_and(|m| m != i) {
                     out.pane_rects.push(egui::Rect::NOTHING);
                     continue;
