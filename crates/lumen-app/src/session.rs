@@ -83,6 +83,13 @@ impl Tab {
         &mut self.panes[i]
     }
 
+    /// 会话(tab)是否「忙」：任一窗格的终端标题含 Braille spinner 字符
+    /// （claude code 等 TUI 工作时在 OSC 0 标题里转圈，空闲则无）。供侧栏
+    /// 会话按钮的状态转圈指示（方案 A：标题 spinner = 忙/闲）。
+    pub fn is_busy(&self) -> bool {
+        self.panes.iter().any(|p| title_is_busy(p.term.title()))
+    }
+
     /// 展示标题（侧栏条目与窗口标题同源此函数）。取值优先级：
     /// 自定义名（用户重命名）> 焦点窗格 cwd（OSC 9;9 完整路径，
     /// cd 后跟随）> 焦点窗格 OSC 0/2 标题 > 「会话 N」（N = tab
@@ -438,6 +445,12 @@ impl Session {
             error!("粘贴写入 PTY 失败: {e:#}");
         }
     }
+}
+
+/// 终端标题是否含 Braille 点阵字符（U+2801–U+28FF）——claude code 等
+/// TUI 用它在 OSC 0 标题里画转圈 spinner 表示「正在工作」；据此判会话忙。
+fn title_is_busy(title: &str) -> bool {
+    title.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
 }
 
 /// 由代理 URL 构造标准代理环境变量并返回键值对。键为 HTTP_PROXY、

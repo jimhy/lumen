@@ -46,6 +46,9 @@ pub struct TabItem {
     /// 会话图标纹理（F7②：前台运行程序 exe 图标）；None 时回退自绘
     /// 终端字形（取不到图标/非 Windows）。
     pub icon: Option<egui::TextureId>,
+    /// 会话是否忙（claude 等 TUI 在工作，由其 OSC 0 标题 spinner 判定）：
+    /// 条目右侧画转圈 spinner。
+    pub busy: bool,
 }
 
 /// 跨帧保留的外壳 UI 状态。
@@ -1392,8 +1395,8 @@ fn sidebar_ui(
                 } else {
                     draw_session_icon(ui, icon_center, entry.active, pal);
                 }
-                // 右侧为未读点/窗格数预留宽度，避免文字压到它们。
-                let right_reserve = if entry.pane_count > 1 {
+                // 右侧为未读点/窗格数/状态指示预留宽度，避免文字压到它们。
+                let right_reserve: f32 = if entry.pane_count > 1 {
                     if entry.unseen {
                         40.0
                     } else {
@@ -1403,6 +1406,12 @@ fn sidebar_ui(
                     16.0
                 } else {
                     8.0
+                };
+                // 状态指示在最右居中，确保给它留出空间。
+                let right_reserve = if entry.busy {
+                    right_reserve.max(22.0)
+                } else {
+                    right_reserve
                 };
                 let text_left = rect.left() + ICON_COL;
                 let text_w = (rect.right() - right_reserve - text_left).max(10.0);
@@ -1448,8 +1457,19 @@ fn sidebar_ui(
                         ui.close();
                     }
                 });
+                // 会话忙指示（右侧垂直居中）：claude 等 TUI 工作时显示科技感
+                // 旋转点环（自绘渐变拖尾，比默认 Spinner 精致、跟随强调色）。
+                if entry.busy {
+                    draw_busy_spinner(
+                        ui,
+                        egui::pos2(rect.right() - 11.0, rect.center().y),
+                        6.0,
+                        pal.accent,
+                    );
+                }
                 // 未读小圆点（后台有新输出，切换到该 tab 时清除）——贴名称行右端。
-                if entry.unseen {
+                // 忙指示存在时让位（状态信息更及时）。
+                if entry.unseen && !entry.busy {
                     let center = egui::pos2(rect.right() - 10.0, rect.top() + 13.0);
                     ui.painter().circle_filled(center, 3.0, pal.accent);
                 }
@@ -1471,6 +1491,50 @@ fn sidebar_ui(
     // R8：底部「⚙ 设置」和「＋ 新建会话」按钮已删除。
     // 设置入口=头像菜单 Settings + Ctrl+,（两者均健在）。
     // 新建会话入口=侧栏标题栏右端小「＋」按钮（Ctrl+T）。
+}
+
+/// 会话「忙」指示：自绘科技感方形轨迹 spinner——一个小圆点沿**正方形
+/// 边框**匀速跑圈（上→右→下→左），后面跟一串逐点缩小变暗的拖尾。
+/// 速度由 egui 时间驱动（每帧 `request_repaint` 续动），跟随强调色。
+/// `half` 为正方形半边长。
+fn draw_busy_spinner(ui: &egui::Ui, center: egui::Pos2, half: f32, color: egui::Color32) {
+    ui.ctx().request_repaint(); // 驱动连续动画
+    let t = ui.input(|i| i.time) as f32;
+    let side = 2.0 * half; // 单边长
+    let perim = 4.0 * side; // 周长
+    // 沿正方形边框把「行进距离 d」映射到坐标（上边→右边→下边→左边）。
+    let point_at = |d: f32| -> egui::Pos2 {
+        let d = d.rem_euclid(perim);
+        let (l, top, r, bot) = (
+            center.x - half,
+            center.y - half,
+            center.x + half,
+            center.y + half,
+        );
+        if d < side {
+            egui::pos2(l + d, top) // 上边：左 → 右
+        } else if d < 2.0 * side {
+            egui::pos2(r, top + (d - side)) // 右边：上 → 下
+        } else if d < 3.0 * side {
+            egui::pos2(r - (d - 2.0 * side), bot) // 下边：右 → 左
+        } else {
+            egui::pos2(l, bot - (d - 3.0 * side)) // 左边：下 → 上
+        }
+    };
+    const TRAIL: usize = 6; // 拖尾点数（含头）
+    let head = t * perim * 0.55; // 每秒约 0.55 圈
+    let gap = perim * 0.07; // 拖尾点间距
+    for k in 0..TRAIL {
+        let frac = k as f32 / TRAIL as f32; // 0=头 … 接近 1=尾
+        let pos = point_at(head - k as f32 * gap);
+        let alpha = (((1.0 - frac) * 0.85 + 0.15) * 255.0) as u8; // 头亮尾暗
+        let dot_r = 0.5 + (1.0 - frac) * 0.65; // 头大尾小（整体缩小一半）
+        ui.painter().circle_filled(
+            pos,
+            dot_r,
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+        );
+    }
 }
 
 /// 侧栏会话条目左侧的终端图标（codicon terminal 风格）。

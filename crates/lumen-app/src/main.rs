@@ -4418,6 +4418,7 @@ impl ApplicationHandler<PtyWake> for App {
                             unseen: t.has_unseen(),
                             pane_count: t.panes.len(),
                             icon: state.session_icon_for(t.id),
+                            busy: t.is_busy(),
                         }
                     })
                     .collect();
