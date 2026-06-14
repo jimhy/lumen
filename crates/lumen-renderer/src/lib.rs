@@ -914,22 +914,21 @@ impl Renderer {
                     attrs
                 };
 
-                // 段构建：单字符段（宽字符 / 非 ASCII / 粗体 / 斜体）或 ASCII run。
+                // 段构建：单字符段（宽字符 / 非 ASCII）或 ASCII run。
                 //
-                // 粗体/斜体也走单字符段（各自钉 col*cw）：粗体/斜体字形的
-                // 字宽（advance）常 != 等宽 cell_w（系统缺 Cascadia Mono Bold
-                // 时尤甚，cosmic-text 回退到别的字体），批量成段会让段内文字
-                // 逐字漂移、与按网格列定位的下划线/光标/选区错位（海风哥反馈：
-                // 粗体红错误行里的链接下划线偏位）。普通文字 advance==cell_w
-                // 不漂、仍批量成段（不伤性能）。
+                // 注：F10 曾把粗体/斜体也改走单字符段（钉 col*cw，为修「粗体红
+                // 错误行里链接下划线偏位」）。但实测 Cascadia Mono/Code/系统等宽
+                // 等字体的粗体回退到更窄字体时，逐字钉 cell_w 会让粗体文字（如
+                // `ls` 着色的目录名）字间出现明显间隙（海风哥 2026-06-14 反馈，
+                // 06-12 版无此问题）。权衡后撤回：粗体/斜体与普通文字一致仍批量
+                // 成段（按字形自然 advance 相邻渲染、无间隙）；代价是粗体若
+                // advance != cell_w 会段内轻微漂移、其上链接下划线可能略偏（罕见，
+                // 可接受——远小于所有粗体文字带间隙）。
                 let start_col = c;
                 let mut line = String::new();
                 let mut spans: Vec<(usize, usize, Attrs)> = Vec::new();
 
-                if cell.flags.contains(CellFlags::WIDE)
-                    || !cell.ch.is_ascii()
-                    || cell.flags.intersects(CellFlags::BOLD | CellFlags::ITALIC)
-                {
+                if cell.flags.contains(CellFlags::WIDE) || !cell.ch.is_ascii() {
                     line.push(cell.ch);
                     spans.push((0, line.len(), cell_attrs(cell)));
                     c += if cell.flags.contains(CellFlags::WIDE) {
@@ -942,14 +941,12 @@ impl Renderer {
                     let mut run_attrs: Option<Attrs> = None;
                     while c < row_len {
                         let cell = &cells[c];
-                        // 宽字符/非 ASCII/粗体/斜体都打断 ASCII run（前两者本就
-                        // 单独成段；粗体/斜体改走单字符段以钉网格列、防漂移）。
-                        if cell.flags.intersects(
-                            CellFlags::WIDE
-                                | CellFlags::WIDE_SPACER
-                                | CellFlags::BOLD
-                                | CellFlags::ITALIC,
-                        ) || !cell.ch.is_ascii()
+                        // 宽字符/非 ASCII 打断 ASCII run（单独成段）。粗体/斜体
+                        // 不打断（与普通文字一起批量成段，见上方撤回说明）。
+                        if cell
+                            .flags
+                            .intersects(CellFlags::WIDE | CellFlags::WIDE_SPACER)
+                            || !cell.ch.is_ascii()
                         {
                             break;
                         }
