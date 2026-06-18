@@ -27,7 +27,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C, Role,
+    DenyReason, EndReason, FileTreeOp, FileTreeRow, PairingFailReason, RemoteC2S, RemoteFrame,
+    RemoteS2C, Role,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 use tungstenite::stream::MaybeTlsStream;
@@ -154,6 +155,12 @@ pub struct RemoteWs {
     mirror_selection: Option<Selection>,
     /// 控制端：镜像选区拖动中（左键按下到松开）。
     mirror_selecting: bool,
+    /// M5.3 part3c-1 控制端：被控端推来的文件树快照（远程视图侧栏只读渲染源）。
+    remote_filetree: Option<RemoteFileTree>,
+    /// 控制端：已采纳的文件树快照序列号（丢弃 `seq` 回退的陈旧/乱序快照）。
+    remote_ft_seq: u64,
+    /// 被控端：控制端转发来的文件树操作队列（main 每帧取走应用到本地文件树）。
+    pending_filetree_ops: Vec<FileTreeOp>,
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
@@ -172,6 +179,15 @@ pub struct RemoteWs {
 
 /// 控制端一帧镜像的渲染源（[`RemoteWs::mirror_render`] 产出）：跟随态借 live `mirror`，
 /// 回看态借填好窗口的 `hist_term`，连同该帧应画的光标（回看态光标隐藏）。
+/// M5.3 part3c-1 控制端缓存的被控端文件树快照（`root` + 可见行）。供远程视图侧栏
+/// 只读渲染（`shell::filetree::show_remote`）。
+pub struct RemoteFileTree {
+    /// 被控端树根的不透明展示字符串。
+    pub root: String,
+    /// 可见行（DFS 序、含 depth）。
+    pub rows: Vec<FileTreeRow>,
+}
+
 pub struct MirrorFrame<'a> {
     /// 本帧要渲染的终端（live 镜像或历史窗口 scratch）。
     pub term: &'a Terminal,
@@ -226,6 +242,7 @@ impl RemoteWs {
         self.pending_viewport = None;
         self.pending_history.clear();
         self.reset_history();
+        self.clear_remote_filetree();
         self.notices.clear();
     }
 
@@ -304,6 +321,7 @@ impl RemoteWs {
         self.pending_viewport = None;
         self.pending_history.clear();
         self.reset_history();
+        self.clear_remote_filetree();
     }
 
     /// 被控端：转发焦点窗格 PTY 输出字节给控制端（含会话起始的整屏快照重放）。
@@ -359,6 +377,36 @@ impl RemoteWs {
     /// 被控端：广播当前历史边界（会话起始随整屏快照发，控制端首次回看前即知可滚范围）。
     pub fn send_history_bounds(&self, base: u64, screen_top: u64) {
         self.send_frame(&RemoteFrame::HistoryBounds { base, screen_top });
+    }
+
+    // ── part3c-1 目录树同步收发 ────────────────────────────────────────────
+
+    /// 被控端：推送文件树可见行快照给控制端（指纹变化时整发；`seq` 单调递增）。
+    pub fn send_filetree_snapshot(&self, root: String, rows: Vec<FileTreeRow>, seq: u64) {
+        self.send_frame(&RemoteFrame::FileTreeSnapshot { root, rows, seq });
+    }
+
+    /// 被控端：取走待执行的文件树操作（main 应用到本地文件树 / 注入 cd / 打开）。
+    pub fn take_filetree_ops(&mut self) -> Vec<FileTreeOp> {
+        std::mem::take(&mut self.pending_filetree_ops)
+    }
+
+    /// 控制端：转发用户在远程只读树上的操作给被控端。
+    pub fn send_filetree_op(&self, op: FileTreeOp) {
+        self.send_frame(&RemoteFrame::FileTreeOp(op));
+    }
+
+    /// 控制端：当前缓存的被控端文件树快照（远程视图侧栏只读渲染源）。
+    #[must_use]
+    pub fn remote_filetree(&self) -> Option<&RemoteFileTree> {
+        self.remote_filetree.as_ref()
+    }
+
+    /// 清空文件树同步态（会话起止 / 断线；**不**在终端 Resize 时清——resize 不动文件树）。
+    fn clear_remote_filetree(&mut self) {
+        self.remote_filetree = None;
+        self.remote_ft_seq = 0;
+        self.pending_filetree_ops.clear();
     }
 
     /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
@@ -756,6 +804,22 @@ impl RemoteWs {
                     self.hist_bounds = Some((base, screen_top));
                 }
             }
+            // part3c-1 目录树同步：
+            RemoteFrame::FileTreeSnapshot { root, rows, seq } => {
+                // 仅控制端：丢弃 seq 回退的陈旧/乱序快照，否则整刷缓存。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller))
+                    && seq >= self.remote_ft_seq
+                {
+                    self.remote_ft_seq = seq;
+                    self.remote_filetree = Some(RemoteFileTree { root, rows });
+                }
+            }
+            RemoteFrame::FileTreeOp(op) => {
+                // 仅被控端：入队，main 取走应用到本地文件树。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_filetree_ops.push(op);
+                }
+            }
             RemoteFrame::Echo(_) => {}
         }
     }
@@ -774,6 +838,7 @@ impl RemoteWs {
                 self.pending_viewport = None;
                 self.pending_history.clear();
                 self.reset_history();
+                self.clear_remote_filetree();
                 if self.session.take().is_some() {
                     self.notices.push(Notice::SessionEnded(EndReason::PeerDisconnected));
                 }
@@ -836,6 +901,7 @@ impl RemoteWs {
                 let peer = peer_name.clone();
                 // 控制端：起一个无 PTY 的镜像 Terminal（被控端会随即发 Resize+快照）。
                 self.reset_history();
+                self.clear_remote_filetree();
                 self.mirror = (role == Role::Controller)
                     .then(|| Terminal::new(MIRROR_INIT_ROWS, MIRROR_INIT_COLS, MIRROR_SCROLLBACK));
                 self.session = Some(ActiveSession { peer_name, role });
@@ -848,6 +914,7 @@ impl RemoteWs {
                 self.pending_viewport = None;
                 self.pending_history.clear();
                 self.reset_history();
+                self.clear_remote_filetree();
                 self.notices.push(Notice::SessionEnded(reason));
             }
             // 数据面：part3a 镜像字节流 / part4 远程输入，按角色路由。

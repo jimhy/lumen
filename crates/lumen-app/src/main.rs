@@ -615,6 +615,10 @@ struct AppState {
     /// M5.3 part4b 控制端镜像区物理像素矩形 `(x, y, w, h)`：仅控制中+远程视图时为
     /// Some（每帧由终端区矩形换算），供鼠标命中→镜像选区的像素↔单元格换算。
     mirror_rect_px: Option<(f32, f32, f32, f32)>,
+    /// M5.3 part3c-1 被控端：上次推给控制端的文件树快照指纹（变化才整发，节流）。
+    filetree_snapshot_fp: Option<u64>,
+    /// 被控端：文件树快照序列号（单调递增，控制端据此丢弃乱序/陈旧快照）。
+    filetree_seq: u64,
     /// M5.3 part3b 控制端镜像离屏纹理的 egui 句柄（`MIRROR_OFFSCREEN_ID`，首次控制时
     /// 注册、后续复用）。控制中每帧把镜像 Terminal 渲染进它，shell 以 Image 铺满终端区。
     mirror_texture: Option<egui::TextureId>,
@@ -1015,9 +1019,24 @@ impl AppState {
                     remote_mirror::history_rows_vt(&pane.term, top, count);
                 self.remote_ws.send_history_rows(top, base, screen_top, lines);
             }
+            // part3c-1：文件树快照同步——可见行指纹变化才整发（节流）。
+            if let Some((root, rows)) = self.shell_state.filetree.snapshot_rows() {
+                let fp = shell::filetree::snapshot_fingerprint(&root, &rows);
+                if self.filetree_snapshot_fp != Some(fp) {
+                    self.filetree_snapshot_fp = Some(fp);
+                    self.filetree_seq = self.filetree_seq.wrapping_add(1);
+                    self.remote_ws
+                        .send_filetree_snapshot(root, rows, self.filetree_seq);
+                }
+            }
+            // part3c-1：应用控制端转发来的文件树操作（展开/折叠/cd/打开）。
+            for op in self.remote_ws.take_filetree_ops() {
+                self.apply_remote_filetree_op(op);
+            }
         } else {
             self.mirror_src = None;
             self.mirror_bounds_sent = None;
+            self.filetree_snapshot_fp = None;
         }
         // 被控端视口跟随（SSH 式）：应用控制端请求的视口尺寸，覆盖自身窗口尺寸；
         // 非被控时清除以恢复窗口尺寸（resize 循环据 remote_viewport 决定焦点窗格尺寸）。
@@ -1035,6 +1054,34 @@ impl AppState {
         }
         if changed || applied {
             self.window.request_redraw();
+        }
+    }
+
+    /// M5.3 part3c-1 被控端：施加控制端转发来的一条文件树操作。展开/折叠改本地
+    /// `FileTreeState`（懒加载由后续渲染 / 片5 离屏维护触发）；cd 走本地双击同链路
+    /// （shell 空闲才注入，忙则丢弃）；open 用系统默认程序打开。
+    fn apply_remote_filetree_op(&mut self, op: lumen_protocol::remote::FileTreeOp) {
+        use lumen_protocol::remote::FileTreeOp;
+        match op {
+            FileTreeOp::Expand(p) => self.shell_state.filetree.remote_expand(&p),
+            FileTreeOp::Collapse(p) => self.shell_state.filetree.remote_collapse(&p),
+            FileTreeOp::Cd(p) => {
+                let idle = self.tabs[self.active_tab]
+                    .focused_pane()
+                    .term
+                    .shell_waiting_input();
+                if idle {
+                    let cmd = shell::filetree::cd_command(std::path::Path::new(&p));
+                    let s = self.focused_pane_mut();
+                    s.term.grid_mut().scroll_to_bottom();
+                    if let Err(e) = s.write_user_input(&cmd) {
+                        error!("远程 cd 写 PTY 失败: {e:#}");
+                    }
+                } else {
+                    log::debug!("远程 cd 丢弃：被控端 shell 忙");
+                }
+            }
+            FileTreeOp::Open(p) => shell::filetree::open_with_default(std::path::Path::new(&p)),
         }
     }
 
@@ -3425,6 +3472,8 @@ impl App {
             mirror_src: None,
             mirror_bounds_sent: None,
             mirror_rect_px: None,
+            filetree_snapshot_fp: None,
+            filetree_seq: 0,
             remote_viewport: None,
             mirror_viewport_sent: None,
             mirror_texture: None,
@@ -5526,6 +5575,13 @@ impl ApplicationHandler<PtyWake> for App {
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
                     remote_mirror_tex,
+                    // part3c-1：控制中+远程视图时传被控端文件树快照，文件树栏改画只读镜像树。
+                    remote_filetree: if state.is_mirror_active() {
+                        state.remote_ws.remote_filetree()
+                    } else {
+                        None
+                    },
+                    remote_view_active: state.is_mirror_active(),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
@@ -6735,6 +6791,10 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序
                 // 打开（注入目标 = 焦点窗格）——
+                // part3c-1：控制端在远程只读树上的操作 → 转发给被控端。
+                if let Some(op) = shell_out.remote_filetree_op {
+                    state.remote_ws.send_filetree_op(op);
+                }
                 if let Some(dir) = shell_out.cd_dir {
                     // UI 已按 shell 空闲闸门过滤，这里直接注入。
                     let cmd = shell::filetree::cd_command(&dir);

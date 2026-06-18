@@ -99,6 +99,10 @@ pub enum EndReason {
 /// 控制端上滚回看时按视口窗口发 [`RemoteFrame::HistoryReq`]，被控端按绝对行号
 /// （`Grid::line_by_abs`）序列化对应行回 [`RemoteFrame::HistoryRows`]——「滚到哪屏拉哪屏」，
 /// 断线重连亦按需重拉，不再因镜像会话内 scrollback 丢失而看不到历史。
+///
+/// **part3c-1 目录树同步**：被控端文件树为唯一真相源，把当前**可见树行**扁平快照
+/// （[`FileTreeSnapshot`](RemoteFrame::FileTreeSnapshot)）推给控制端只读渲染；控制端点击
+/// 回传操作 [`FileTreeOp`]（展开/折叠/cd/打开）。路径全程不透明字符串往返、被控端解释。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteFrame {
     /// 回环测试帧：原样转发给对端，用于 part1 验证中继通路连通。
@@ -156,6 +160,62 @@ pub enum RemoteFrame {
         /// 可视区首行绝对行号。
         screen_top: u64,
     },
+    /// 被控端 → 控制端（part3c-1）：当前文件树**可见行**全量快照（会话起始 + 树变化
+    /// 时整发）。控制端只读渲染。MVP 全量发可见行（不做增量）。
+    FileTreeSnapshot {
+        /// 被控端当前树根（焦点窗格 cwd）的不透明展示字符串。
+        root: String,
+        /// 可见行（DFS 序、含 depth；展开的目录其子项紧随其后）。
+        rows: Vec<FileTreeRow>,
+        /// 单调递增序列号：控制端丢弃 `seq` 回退的陈旧/乱序快照（防 cwd 快切乱序）。
+        seq: u64,
+    },
+    /// 控制端 → 被控端（part3c-1）：文件树操作（path 取自快照、原样回传，被控端解释）。
+    FileTreeOp(FileTreeOp),
+}
+
+/// part3c-1 文件树节点种类（占位行也是可见行；控制端据此决定图标与可交互性）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTreeKind {
+    /// 目录（`expanded` = 是否已展开，决定三角朝向与下钻）。
+    Dir {
+        /// 是否已展开。
+        expanded: bool,
+    },
+    /// 普通文件。
+    File,
+    /// 后台读取中的「加载中…」占位行（不可交互）。
+    Loading,
+    /// 目录读取失败占位行（权限 / 网络盘断连，不可交互）。
+    Unreadable,
+    /// 单层超上限、剩余 N 项未显示的「溢出」占位行（不可交互）。
+    Overflow(u32),
+}
+
+/// part3c-1 文件树一个可见行（被控端扁平化产物；控制端按 `depth` 缩进画）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTreeRow {
+    /// 被控端不透明绝对路径（往返键：控制端只展示 + 原样回传，**不解析**）。
+    pub path: String,
+    /// 显示名（被控端算好的文件名 / 根整路径，控制端直接画，免跨平台 basename）。
+    pub name: String,
+    /// 树深度（根 = 0）。
+    pub depth: u32,
+    /// 节点种类。
+    pub kind: FileTreeKind,
+}
+
+/// part3c-1 控制端 → 被控端的文件树操作（`String` 为快照里的不透明路径，原样回传）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTreeOp {
+    /// 展开目录（被控端 `set_openness(true)` + 懒加载）。
+    Expand(String),
+    /// 折叠目录。
+    Collapse(String),
+    /// cd 到目录（受被控端 shell 忙闸门）。
+    Cd(String),
+    /// 系统默认程序打开文件。
+    Open(String),
 }
 
 impl RemoteFrame {
@@ -318,6 +378,57 @@ mod tests {
         for frame in [
             RemoteFrame::Output(vec![0x1b, b'[', b'2', b'J']),
             RemoteFrame::Resize { rows: 40, cols: 120 },
+        ] {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn 文件树帧经value往返() {
+        let snap = RemoteFrame::FileTreeSnapshot {
+            root: "C:\\Users\\hf".into(),
+            rows: vec![
+                FileTreeRow {
+                    path: "C:\\Users\\hf".into(),
+                    name: "hf".into(),
+                    depth: 0,
+                    kind: FileTreeKind::Dir { expanded: true },
+                },
+                FileTreeRow {
+                    path: "C:\\Users\\hf\\a.txt".into(),
+                    name: "a.txt".into(),
+                    depth: 1,
+                    kind: FileTreeKind::File,
+                },
+                FileTreeRow {
+                    path: "C:\\Users\\hf\\sub".into(),
+                    name: "sub".into(),
+                    depth: 1,
+                    kind: FileTreeKind::Dir { expanded: false },
+                },
+                FileTreeRow {
+                    path: String::new(),
+                    name: String::new(),
+                    depth: 2,
+                    kind: FileTreeKind::Loading,
+                },
+                FileTreeRow {
+                    path: String::new(),
+                    name: String::new(),
+                    depth: 2,
+                    kind: FileTreeKind::Overflow(42),
+                },
+            ],
+            seq: 7,
+        };
+        for frame in [
+            snap,
+            RemoteFrame::FileTreeOp(FileTreeOp::Expand("C:\\Users\\hf\\sub".into())),
+            RemoteFrame::FileTreeOp(FileTreeOp::Collapse("C:\\Users\\hf".into())),
+            RemoteFrame::FileTreeOp(FileTreeOp::Cd("C:\\tmp".into())),
+            RemoteFrame::FileTreeOp(FileTreeOp::Open("C:\\Users\\hf\\a.txt".into())),
         ] {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
