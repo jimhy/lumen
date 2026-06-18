@@ -1767,6 +1767,8 @@ pub struct RemoteFileTreeOutput {
     pub dir_clicks: Vec<usize>,
     /// 「显示隐藏项」勾选变化（main 闭包后 set + 重列根）。
     pub toggle_hidden: Option<bool>,
+    /// 本帧双击的文件的被控端路径（#5：main 起 Fetch → 传到控制端本地默认程序打开）。
+    pub fetch_open: Option<String>,
 }
 
 /// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树（只读渲染）。
@@ -1868,9 +1870,16 @@ fn remote_panel_ui(
                             }
                         }
                         RemoteRowKind::File => {
-                            // 片3 接双击 → Fetch 传到控制端本地打开（#5）。悬停看全路径。
-                            ui.selectable_label(false, egui::RichText::new(&row.name).color(pal.fg))
+                            // 双击 → Fetch 传到控制端本地默认程序打开（#5）。悬停看全路径。
+                            let resp = ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new(&row.name).color(pal.fg),
+                                )
                                 .on_hover_text(&row.path);
+                            if resp.double_clicked() {
+                                out.fetch_open = Some(row.path.clone());
+                            }
                         }
                         RemoteRowKind::Loading => {
                             remote_placeholder_row(ui, pal, s.filetree_loading);

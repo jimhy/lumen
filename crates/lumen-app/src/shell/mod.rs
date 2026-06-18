@@ -296,6 +296,8 @@ pub struct ShellOutput {
     pub remote_dir_clicks: Vec<usize>,
     /// 控制端远程树：「显示隐藏项」勾选变化（main set + 重列根）。
     pub remote_toggle_hidden: Option<bool>,
+    /// 控制端远程树：双击文件的被控端路径（main 起 Fetch → 传到本地默认程序打开，#5）。
+    pub remote_fetch_open: Option<String>,
     /// 文件树：节点拖放到某窗格，把路径文本插入该窗格命令行（不带
     /// 回车，转义见 filetree::path_insert_text）。元组为 (落点所在
     /// 窗格下标, 路径)；落点不在任何窗格（间隙/区外）时整体为 None。
@@ -420,6 +422,7 @@ pub fn show(
         open_file: None,
         remote_dir_clicks: Vec::new(),
         remote_toggle_hidden: None,
+        remote_fetch_open: None,
         insert_path: None,
         copy_text: None,
         filetree_dialog_closed: false,
@@ -735,6 +738,7 @@ pub fn show(
         out.filetree_width = rout.panel_width;
         out.remote_dir_clicks = rout.dir_clicks;
         out.remote_toggle_hidden = rout.toggle_hidden;
+        out.remote_fetch_open = rout.fetch_open;
         (rout.panel_width, rout.panel_rect, None) // 远程树无拖放
     } else {
         let ft = filetree::show(

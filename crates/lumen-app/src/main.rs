@@ -954,6 +954,10 @@ impl AppState {
             return;
         }
         let changed = self.remote_ws.poll();
+        // 控制端：清理停滞的在途 Fetch（超时删半成品临时文件）。仅在有事件唤醒 pump_remote
+        // 时运行（传输中 FileChunk 持续唤醒、足以及时清理）；对端彻底静默时退而依赖会话结束
+        // (clear) 与下次启动 (start 清目录) 兜底，临时文件不会无界堆积。
+        self.remote_ws.sweep_fetch_stalls();
         // 被控端：执行控制端转发来的远程输入（本地输入优先仲裁）。
         let mut applied = false;
         let remote_input = self.remote_ws.take_input();
@@ -2977,7 +2981,7 @@ impl AppState {
 
 /// 远程控制一次性通知 → toast（分级 + 本地化文案，按机器可读原因细分）。M5.3 part2b。
 fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, String) {
-    use lumen_protocol::remote::{DenyReason, EndReason, PairingFailReason, Role};
+    use lumen_protocol::remote::{DenyReason, EndReason, FsErr, PairingFailReason, Role};
     use remote_ws::Notice;
     use shell::toast::ToastKind;
     let s = i18n::strings();
@@ -3019,6 +3023,14 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
                 EndReason::PeerLeft => s.remote_toast_session_ended,
             };
             (ToastKind::Info, text.to_string())
+        }
+        Notice::FetchStarted => (ToastKind::Info, s.remote_fetch_started.to_string()),
+        Notice::FetchFailed(err) => {
+            let text = match err {
+                FsErr::TooLarge => s.remote_fetch_too_large,
+                _ => s.remote_fetch_failed,
+            };
+            (ToastKind::Warn, text.to_string())
         }
     }
 }
@@ -6761,6 +6773,10 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if let Some(show) = shell_out.remote_toggle_hidden {
                     state.remote_ws.set_remote_show_hidden(show);
+                }
+                // #5：双击远程文件 → 起 Fetch（传到控制端临时文件 → 本地默认程序打开）。
+                if let Some(path) = shell_out.remote_fetch_open {
+                    state.remote_ws.start_fetch_open(path);
                 }
                 if let Some(dir) = shell_out.cd_dir {
                     // UI 已按 shell 空闲闸门过滤，这里直接注入。

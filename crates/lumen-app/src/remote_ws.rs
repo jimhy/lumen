@@ -19,6 +19,7 @@
 //!
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
     DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C,
-    Role,
+    Role, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 use tungstenite::stream::MaybeTlsStream;
@@ -58,6 +59,9 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+/// part3c-2 控制端在途 Fetch 的停滞超时：超过这么久没收到新块即判传输中断、清临时文件
+/// （正常传输每收一块刷新计时；仅防对端静默卡死，非总时长上限）。
+const FETCH_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 控制端待配对态：已发起请求、正等用户输入被控端展示的配对码。
 #[derive(Debug, Clone)]
@@ -108,6 +112,10 @@ pub enum Notice {
     },
     /// 会话结束（对端离开 / 断线 / 被取代）。
     SessionEnded(EndReason),
+    /// part3c-2：开始从被控端获取文件（双击远程文件，传输中）。
+    FetchStarted,
+    /// part3c-2：获取文件失败（读失败 / 过大 / 传输中断）。
+    FetchFailed(FsErr),
 }
 
 /// 后台线程 → 主线程事件。
@@ -169,6 +177,11 @@ pub struct RemoteWs {
     svc_tx: Option<Sender<SvcReply>>,
     /// 被控端：文件服务回包接收端（main 在 `pump_remote` 经 [`Self::drain_service`] 排空发回）。
     svc_rx: Option<Receiver<SvcReply>>,
+    /// 控制端：在途 Fetch（接收方）：req_id → 落临时文件的任务（#5 打开 / 片4 下载）。
+    inflight_fetch: HashMap<u64, FetchJob>,
+    /// 被控端：在途 Fetch 源（发送方）：req_id → 给 worker 发「可再发一块」许可的句柄
+    /// （每收一个 [`RemoteFrame::FileChunkAck`] +1，滑动窗口背压）。
+    inflight_fetch_src: HashMap<u64, FetchSrcJob>,
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
@@ -483,9 +496,9 @@ impl RemoteFileTree {
     }
 }
 
-/// 被控端文件服务后台线程 → 主线程的回包（主线程在 `pump_remote` 排空后发回控制端）。
+/// 被控端文件服务后台线程 → 主线程的回包（主线程在 `pump_remote` 排空后处理）。
 enum SvcReply {
-    /// ListDir 读目录结果。
+    /// ListDir 读目录结果（主线程发回 [`RemoteFrame::ListDirResult`]）。
     ListDir {
         req_id: u64,
         path: String,
@@ -493,6 +506,34 @@ enum SvcReply {
         overflow: u32,
         err: Option<FsErr>,
     },
+    /// Fetch 源 worker 已结束（文件读完 / 出错 / 被中止）：主线程移除 `inflight_fetch_src`
+    /// 该项（worker 自己经 `cmd_tx` 直发 `FileBegin/Chunk/End/Err`，此信号仅用于清理 map）。
+    FetchSrcDone { req_id: u64 },
+}
+
+/// 控制端在途 Fetch 任务（接收方）：把被控端分块传来的文件字节顺序写入临时文件，
+/// 收完用本地默认程序打开（#5）。
+struct FetchJob {
+    /// 被控端源文件不透明路径（双击去重键：同文件已在途则跳过）。
+    src_path: String,
+    /// 临时文件用的安全 basename（被控端 `DirEntry.name` 清洗，保留扩展名）。
+    name: String,
+    /// 落地临时文件路径（[`RemoteFrame::FileBegin`] 时确定并创建）。
+    tmp_path: Option<std::path::PathBuf>,
+    /// 已打开的临时文件句柄（`FileBegin` 后 `Some`）。
+    file: Option<std::fs::File>,
+    /// 下一个期望块序号（连续性校验）。
+    next_seq: u32,
+    /// 已写入字节累计（控制端硬上限：超 [`FETCH_MAX_LEN`] 即中止，不轻信被控端的上限）。
+    written: u64,
+    /// 上次收到块的时刻（停滞超时清理；`FileBegin` 与每块刷新）。
+    last_at: Instant,
+}
+
+/// 被控端在途 Fetch 源（发送方）：仅持给 worker 发许可的句柄，worker 经 `cmd_tx` 直发帧。
+struct FetchSrcJob {
+    /// 每收一个 [`RemoteFrame::FileChunkAck`] 发一个许可，worker 领许可才读发下一块（背压）。
+    permit_tx: Sender<()>,
 }
 
 /// 取路径末段作显示名（`C:\Users\hf` → `hf`；盘符根 `C:\` 等无末段时返回整串）。
@@ -501,6 +542,111 @@ fn last_path_segment(path: &str) -> String {
         .find(|seg| !seg.is_empty())
         .unwrap_or(path)
         .to_owned()
+}
+
+/// 把任意名字清洗成安全文件名（非 `[A-Za-z0-9._-]` 一律换 `_`；空则 `file`）。临时文件命名
+/// 用（沿用 `update::installer_dest` 思路，扩展名通常纯 alnum 得以保留，本地默认程序按其匹配）。
+fn sanitize_basename(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "file".to_owned()
+    } else {
+        s
+    }
+}
+
+/// `io::Error` → 机器可读 [`FsErr`]（控制端本地化提示用）。
+fn io_err_to_fs(e: &std::io::Error) -> FsErr {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => FsErr::NotFound,
+        std::io::ErrorKind::PermissionDenied => FsErr::PermissionDenied,
+        _ => FsErr::Io,
+    }
+}
+
+/// 被控端 Fetch 源后台线程：打开文件 → 发 `FileBegin` → 受许可（ACK 窗口）逐块读发
+/// `FileChunk` → `FileEnd`。出错发 `FileErr`。帧经 `cmd_tx` 直投 WS 出站（不经主线程，
+/// 避免每块一次主线程往返）；许可通道关闭（会话结束 / 主线程清 `inflight_fetch_src`）即中止。
+fn fetch_src_worker(
+    req_id: u64,
+    path: &str,
+    cmd_tx: &Sender<RemoteC2S>,
+    permit_rx: &Receiver<()>,
+) {
+    let send = |frame: &RemoteFrame| {
+        if let Ok(v) = frame.to_value() {
+            let _ = cmd_tx.send(RemoteC2S::Relay(v));
+        }
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            send(&RemoteFrame::FileErr {
+                req_id,
+                err: io_err_to_fs(&e),
+            });
+            return;
+        }
+    };
+    // metadata 失败视为不可信（不能兜底为 0 而绕过上限）：直接报错中止。
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            send(&RemoteFrame::FileErr {
+                req_id,
+                err: io_err_to_fs(&e),
+            });
+            return;
+        }
+    };
+    if len > FETCH_MAX_LEN {
+        send(&RemoteFrame::FileErr {
+            req_id,
+            err: FsErr::TooLarge,
+        });
+        return;
+    }
+    send(&RemoteFrame::FileBegin {
+        req_id,
+        total_len: len,
+    });
+    let mut seq: u32 = 0;
+    let mut buf = vec![0u8; FILE_CHUNK];
+    loop {
+        // 领许可：控制端 ACK 驱动；通道关闭（会话结束 / 被清理）即中止。
+        if permit_rx.recv().is_err() {
+            return;
+        }
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                send(&RemoteFrame::FileErr {
+                    req_id,
+                    err: io_err_to_fs(&e),
+                });
+                return;
+            }
+        };
+        if n == 0 {
+            send(&RemoteFrame::FileEnd { req_id });
+            return;
+        }
+        send(&RemoteFrame::FileChunk {
+            req_id,
+            seq,
+            data: buf[..n].to_vec(),
+        });
+        seq = seq.wrapping_add(1);
+    }
 }
 
 pub struct MirrorFrame<'a> {
@@ -527,6 +673,10 @@ impl RemoteWs {
         wake_pending: Arc<AtomicBool>,
     ) {
         self.stop();
+        // part3c-2 #5：清上次会话残留的远程打开临时文件。成功打开的副本在会话结束时被外部
+        // 程序占用、删不掉（fetch_end 不删），故启动时整目录 best-effort 清一次（删不掉的
+        // 旧文件留到下次）——同时兜底所有中止路径删除失败的半成品。
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("lumen_remote_open"));
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         // 被控端文件服务回包通道（worker 线程 → 主线程；纯主线程内部，不经 WS 后台线程）。
@@ -846,12 +996,16 @@ impl RemoteWs {
         });
     }
 
-    /// 被控端：排空文件服务后台回包，发回控制端（main 每帧 `pump_remote` 调）。
-    pub fn drain_service(&self) {
-        let Some(rx) = self.svc_rx.as_ref() else {
-            return;
-        };
-        while let Ok(reply) = rx.try_recv() {
+    /// 被控端：排空文件服务后台回包（main 每帧 `pump_remote` 调）。先收齐释放 `svc_rx` 借用，
+    /// 再处理（ListDir 发回控制端、FetchSrcDone 清 `inflight_fetch_src`）。
+    pub fn drain_service(&mut self) {
+        let mut replies = Vec::new();
+        if let Some(rx) = self.svc_rx.as_ref() {
+            while let Ok(r) = rx.try_recv() {
+                replies.push(r);
+            }
+        }
+        for reply in replies {
             match reply {
                 SvcReply::ListDir {
                     req_id,
@@ -866,7 +1020,175 @@ impl RemoteWs {
                     overflow,
                     err,
                 }),
+                SvcReply::FetchSrcDone { req_id } => {
+                    self.inflight_fetch_src.remove(&req_id);
+                }
             }
+        }
+    }
+
+    // ── part3c-2 文件读取（Fetch）：#5 打开 / 片4 下载源端读取 ────────────────
+
+    /// 控制端：双击远程文件 → 起一个 Fetch，传完用本地默认程序打开（#5）。同一文件已在途
+    /// 则跳过（防连点起多份临时文件 + 多次拉起本地程序）。
+    pub fn start_fetch_open(&mut self, path: String) {
+        if self.inflight_fetch.values().any(|j| j.src_path == path) {
+            return;
+        }
+        let req_id = self.next_req_id();
+        let name = last_path_segment(&path);
+        self.inflight_fetch.insert(
+            req_id,
+            FetchJob {
+                src_path: path.clone(),
+                name,
+                tmp_path: None,
+                file: None,
+                next_seq: 0,
+                written: 0,
+                last_at: Instant::now(),
+            },
+        );
+        self.notices.push(Notice::FetchStarted);
+        self.send_frame(&RemoteFrame::FetchReq { req_id, path });
+    }
+
+    /// 控制端：收 `FileBegin` → 在临时目录建落地文件（名字加 `req_id` 前缀防多文件撞名）。
+    fn fetch_begin(&mut self, req_id: u64) {
+        let Some(name) = self.inflight_fetch.get(&req_id).map(|j| j.name.clone()) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join("lumen_remote_open");
+        let _ = std::fs::create_dir_all(&dir);
+        let tmp = dir.join(format!("{req_id}-{}", sanitize_basename(&name)));
+        match std::fs::File::create(&tmp) {
+            Ok(f) => {
+                if let Some(job) = self.inflight_fetch.get_mut(&req_id) {
+                    job.file = Some(f);
+                    job.tmp_path = Some(tmp);
+                    job.next_seq = 0; // 重置连续性计数（防异常重发 FileBegin 后误判乱序）。
+                    job.written = 0;
+                    job.last_at = Instant::now();
+                }
+            }
+            Err(e) => {
+                log::error!("创建临时文件失败 {}: {e}", tmp.display());
+                // 经 fetch_abort 统一收口：移除在途 + 弹失败 + 发 FetchCancel 让被控端回收源 worker。
+                self.fetch_abort(req_id, FsErr::Io);
+            }
+        }
+    }
+
+    /// 控制端：收 `FileChunk` → 连续性校验 + 累计字节硬上限后顺序写临时文件，回
+    /// `FileChunkAck`（背压）。`Some(err)` = 中止原因（乱序 / 写失败 = `Io`，超上限 = `TooLarge`）。
+    fn fetch_chunk(&mut self, req_id: u64, seq: u32, data: &[u8]) {
+        let abort: Option<FsErr> = {
+            let Some(job) = self.inflight_fetch.get_mut(&req_id) else {
+                return;
+            };
+            let Some(file) = job.file.as_mut() else {
+                return; // FileBegin 失败/未到：忽略（清理已在别处）。
+            };
+            if seq != job.next_seq {
+                log::warn!("Fetch 块乱序 req={req_id} seq={seq} 期望={}", job.next_seq);
+                Some(FsErr::Io)
+            } else if let Err(e) = file.write_all(data) {
+                log::error!("写临时文件失败: {e}");
+                Some(FsErr::Io)
+            } else {
+                job.next_seq = job.next_seq.wrapping_add(1);
+                job.written = job
+                    .written
+                    .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                job.last_at = Instant::now();
+                // 控制端硬上限：不轻信被控端的 FETCH_MAX_LEN（其 metadata 可能失败兜底为 0）。
+                if job.written > FETCH_MAX_LEN {
+                    Some(FsErr::TooLarge)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(err) = abort {
+            self.fetch_abort(req_id, err);
+        } else {
+            self.send_frame(&RemoteFrame::FileChunkAck { req_id, seq });
+        }
+    }
+
+    /// 控制端：收 `FileEnd` → flush + 关句柄 + 用系统默认程序打开（#5）。
+    fn fetch_end(&mut self, req_id: u64) {
+        let Some(mut job) = self.inflight_fetch.remove(&req_id) else {
+            return;
+        };
+        let Some(mut file) = job.file.take() else {
+            // FileBegin 未成功就 End：清理半成品。
+            if let Some(tmp) = job.tmp_path.take() {
+                let _ = std::fs::remove_file(tmp);
+            }
+            return;
+        };
+        let _ = file.flush();
+        drop(file); // 关句柄后再交系统程序（Windows 打开前须释放写锁）。
+        if let Some(tmp) = job.tmp_path {
+            crate::shell::filetree::open_with_default(&tmp);
+        }
+    }
+
+    /// 控制端：中止一个在途 Fetch（乱序 / 写失败 / 超上限 / 对端 `FileErr` / 停滞超时 / 建临时
+    /// 文件失败）：关句柄、删半成品临时文件、弹失败提示，并发 `FetchCancel` 让被控端即时回收
+    /// 源 worker（不滞留到会话结束）。
+    fn fetch_abort(&mut self, req_id: u64, err: FsErr) {
+        if let Some(mut job) = self.inflight_fetch.remove(&req_id) {
+            job.file = None; // 关句柄（Windows 删前须释放）。
+            if let Some(tmp) = job.tmp_path.take() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        self.send_frame(&RemoteFrame::FetchCancel { req_id });
+        self.notices.push(Notice::FetchFailed(err));
+    }
+
+    /// 控制端：清理停滞（超 [`FETCH_STALL_TIMEOUT`] 没收到新块）的在途 Fetch。
+    pub fn sweep_fetch_stalls(&mut self) {
+        let stalled: Vec<u64> = self
+            .inflight_fetch
+            .iter()
+            .filter(|(_, j)| j.last_at.elapsed() > FETCH_STALL_TIMEOUT)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in stalled {
+            log::warn!("Fetch req={id} 停滞超时，中止清理");
+            self.fetch_abort(id, FsErr::Io);
+        }
+    }
+
+    /// 被控端：收 `FetchReq` → 起一个源 worker（后台逐块读、ACK 窗口背压），帧经 `cmd_tx`
+    /// 直发。预授 `FETCH_WINDOW` 个许可作为滑动窗口起始额度。
+    fn start_fetch_src(&mut self, req_id: u64, path: String) {
+        let Some(cmd_tx) = self.cmd_tx.clone() else {
+            return;
+        };
+        let (permit_tx, permit_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..FETCH_WINDOW {
+            let _ = permit_tx.send(());
+        }
+        self.inflight_fetch_src
+            .insert(req_id, FetchSrcJob { permit_tx });
+        let svc_tx = self.svc_tx.clone();
+        thread::spawn(move || {
+            fetch_src_worker(req_id, &path, &cmd_tx, &permit_rx);
+            // 通知主线程清理 map 项（worker 已自经 cmd_tx 发完 FileEnd/FileErr）。
+            if let Some(tx) = svc_tx {
+                let _ = tx.send(SvcReply::FetchSrcDone { req_id });
+            }
+        });
+    }
+
+    /// 被控端：收 `FileChunkAck` → 给对应源 worker 发一个许可（控制端每收一块即放行下一块）。
+    fn fetch_src_ack(&self, req_id: u64) {
+        if let Some(job) = self.inflight_fetch_src.get(&req_id) {
+            let _ = job.permit_tx.send(()); // worker 已退出 → 通道关 → 忽略。
         }
     }
 
@@ -875,8 +1197,16 @@ impl RemoteWs {
         self.remote_filetree = None;
         self.remote_root_sent = None;
         self.pending_listdir.clear();
-        // svc_rx 里可能残留旧会话的 ListDir 回包：排空丢弃（新会话 req_id 体系不同，
-        // 且 remote_filetree 已 None，apply_dir_entries 不会被调；这里仅防回包堆积）。
+        // 控制端在途 Fetch：关句柄 + 删半成品临时文件。
+        for (_, mut job) in self.inflight_fetch.drain() {
+            job.file = None;
+            if let Some(tmp) = job.tmp_path.take() {
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
+        // 被控端在途 Fetch 源：drop permit_tx → worker 领许可失败自行退出。
+        self.inflight_fetch_src.clear();
+        // svc_rx 里可能残留旧会话回包：排空丢弃（新会话 req_id 体系不同、且态已清）。
         if let Some(rx) = self.svc_rx.as_ref() {
             while rx.try_recv().is_ok() {}
         }
@@ -1316,14 +1646,49 @@ impl RemoteWs {
                     }
                 }
             }
-            // 片3：Fetch*；片4/5：Put*/MkDir*。当前未实现，忽略。
-            RemoteFrame::FetchReq { .. }
-            | RemoteFrame::FileBegin { .. }
-            | RemoteFrame::FileChunk { .. }
-            | RemoteFrame::FileChunkAck { .. }
-            | RemoteFrame::FileEnd { .. }
-            | RemoteFrame::FileErr { .. }
-            | RemoteFrame::PutBegin { .. }
+            // ── part3c-2 文件读取 Fetch（#5 打开 / 片4 下载）────────────────
+            RemoteFrame::FetchReq { req_id, path } => {
+                // 仅被控端：起源 worker（后台读 + ACK 背压）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.start_fetch_src(req_id, path);
+                }
+            }
+            RemoteFrame::FetchCancel { req_id } => {
+                // 仅被控端：控制端中止该 Fetch → 移除源任务（drop 许可通道 → worker 自退、
+                // 即时释放文件句柄 / 线程）。worker 已自然退出时为幂等无操作。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.inflight_fetch_src.remove(&req_id);
+                }
+            }
+            RemoteFrame::FileBegin { req_id, .. } => {
+                // 仅控制端：建临时落地文件。total_len 仅供进度，finalize 以 FileEnd 为准。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.fetch_begin(req_id);
+                }
+            }
+            RemoteFrame::FileChunk { req_id, seq, data } => {
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.fetch_chunk(req_id, seq, &data);
+                }
+            }
+            RemoteFrame::FileChunkAck { req_id, .. } => {
+                // 仅被控端：放行源 worker 下一块（滑动窗口背压）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.fetch_src_ack(req_id);
+                }
+            }
+            RemoteFrame::FileEnd { req_id } => {
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.fetch_end(req_id);
+                }
+            }
+            RemoteFrame::FileErr { req_id, err } => {
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.fetch_abort(req_id, err);
+                }
+            }
+            // 片4/5：Put*/MkDir*。当前未实现，忽略。
+            RemoteFrame::PutBegin { .. }
             | RemoteFrame::PutReady { .. }
             | RemoteFrame::PutChunk { .. }
             | RemoteFrame::PutChunkAck { .. }
@@ -1712,6 +2077,56 @@ mod tests {
         assert!(!ft.has_listing(0), "重列清缓存");
         assert!(ft.is_open(0), "重列后根仍默认展开");
         assert!(!ft.set_show_hidden(true), "同值不重列");
+    }
+
+    #[test]
+    fn fetch_basename_清洗() {
+        assert_eq!(sanitize_basename("a.txt"), "a.txt");
+        assert_eq!(sanitize_basename("report-v2.md"), "report-v2.md");
+        // 非 [alnum._-] 一律换 _（路径分隔符 / 通配符 / CJK）。
+        assert_eq!(sanitize_basename("x/y\\z?.exe"), "x_y_z_.exe");
+        assert_eq!(sanitize_basename("中文.txt"), "__.txt");
+        assert_eq!(sanitize_basename(""), "file");
+    }
+
+    #[test]
+    fn fetch_io错误映射() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(io_err_to_fs(&Error::from(ErrorKind::NotFound)), FsErr::NotFound);
+        assert_eq!(
+            io_err_to_fs(&Error::from(ErrorKind::PermissionDenied)),
+            FsErr::PermissionDenied
+        );
+        assert_eq!(io_err_to_fs(&Error::from(ErrorKind::Other)), FsErr::Io);
+    }
+
+    #[test]
+    fn fetch_控制端写临时文件_乱序中止() {
+        // 直接驱动控制端接收态（不经线程 / WS）：start → begin → 按序块 → 乱序块中止。
+        let mut ws = RemoteWs::default();
+        ws.start_fetch_open("/some/dir/a.txt".into()); // send_frame 无 cmd_tx → no-op
+        let req = *ws.inflight_fetch.keys().next().expect("有在途 Fetch");
+        ws.fetch_begin(req);
+        let tmp = ws
+            .inflight_fetch
+            .get(&req)
+            .and_then(|j| j.tmp_path.clone())
+            .expect("FileBegin 建了临时文件");
+        assert!(tmp.exists(), "临时文件已创建");
+        // 按序两块顺序写入。
+        ws.fetch_chunk(req, 0, b"hello ");
+        ws.fetch_chunk(req, 1, b"world");
+        assert_eq!(ws.inflight_fetch.get(&req).map(|j| j.next_seq), Some(2));
+        // 乱序块（seq=3，期望 2）→ 中止：移除在途 + 删半成品 + FetchFailed 通知。
+        ws.fetch_chunk(req, 3, b"X");
+        assert!(!ws.inflight_fetch.contains_key(&req), "中止后移除在途");
+        assert!(!tmp.exists(), "中止删半成品临时文件");
+        assert!(
+            ws.take_notices()
+                .iter()
+                .any(|n| matches!(n, Notice::FetchFailed(_))),
+            "应弹 FetchFailed"
+        );
     }
 
     #[test]

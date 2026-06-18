@@ -200,6 +200,13 @@ pub enum RemoteFrame {
         /// 被控端不透明文件路径。
         path: String,
     },
+    /// 控制端 → 被控端：中止一个在途 Fetch（接收方乱序 / 写失败 / 停滞超时 / 建临时文件失败）。
+    /// 被控端据此移除源任务（drop 许可通道 → 源 worker 领许可失败自退、即时释放文件句柄 /
+    /// 线程，无需等会话结束）。对端已自然结束（worker 已退）时为幂等无操作。
+    FetchCancel {
+        /// 关联请求号。
+        req_id: u64,
+    },
     /// 被控端 → 控制端：文件首帧（先于任何 [`FileChunk`](RemoteFrame::FileChunk)；`total_len`
     /// 仅供进度，finalize 以 [`FileEnd`](RemoteFrame::FileEnd) 为准，防读盘期文件被追加的 TOCTOU）。
     FileBegin {
@@ -581,6 +588,7 @@ mod tests {
                 req_id: 5,
                 path: "C:\\a.bin".into(),
             },
+            RemoteFrame::FetchCancel { req_id: 5 },
             RemoteFrame::FileBegin {
                 req_id: 5,
                 total_len: 1234,

@@ -228,6 +228,12 @@ pub struct Strings {
     pub filetree_loading: &'static str,
     /// part3c-2 远程树工具条「显示隐藏项」勾选框
     pub remote_show_hidden: &'static str,
+    /// part3c-2 #5：开始从被控端获取文件 toast
+    pub remote_fetch_started: &'static str,
+    /// part3c-2 #5：获取文件失败 toast
+    pub remote_fetch_failed: &'static str,
+    /// part3c-2 #5：文件过大无法获取 toast
+    pub remote_fetch_too_large: &'static str,
     // 新建对话框
     /// "新建文件夹" 对话框标题
     pub filetree_create_dir_title: &'static str,
