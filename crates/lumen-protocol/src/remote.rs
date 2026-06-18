@@ -109,6 +109,9 @@ pub enum RemoteFrame {
         /// 列数。
         cols: u16,
     },
+    /// 控制端 → 被控端：用户输入的 VT 编码字节（按键 / 中断等）。被控端写入焦点
+    /// 窗格 PTY（受「本地输入优先」仲裁：被控端本地用户刚输入过则丢弃，part4）。
+    Input(Vec<u8>),
 }
 
 impl RemoteFrame {

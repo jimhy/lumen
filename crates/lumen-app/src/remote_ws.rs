@@ -121,6 +121,9 @@ pub struct RemoteWs {
     /// M5.3 part3a 控制端镜像：被控端整屏状态在本地用无 PTY 的 `Terminal` 复现
     /// （`advance` 喂入被控端转发的 PTY 字节）。仅 `role==Controller` 会话期间存在。
     mirror: Option<Terminal>,
+    /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
+    /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
+    pending_input: Vec<Vec<u8>>,
     /// 待消费的一次性通知（main 取走弹 toast）。
     notices: Vec<Notice>,
     /// UI → 后台 出站命令发送端。
@@ -161,6 +164,7 @@ impl RemoteWs {
         self.incoming = None;
         self.session = None;
         self.mirror = None;
+        self.pending_input.clear();
         self.notices.clear();
     }
 
@@ -221,6 +225,7 @@ impl RemoteWs {
         self.send(RemoteC2S::EndSession);
         self.session = None;
         self.mirror = None;
+        self.pending_input.clear();
     }
 
     /// 被控端：转发焦点窗格 PTY 输出字节给控制端（含会话起始的整屏快照重放）。
@@ -232,6 +237,22 @@ impl RemoteWs {
     /// 尺寸的 `Output` 之前）。
     pub fn send_resize(&self, rows: u16, cols: u16) {
         self.send_frame(&RemoteFrame::Resize { rows, cols });
+    }
+
+    /// 控制端：把用户输入的 VT 字节转发给被控端（part4）。
+    pub fn send_input(&self, bytes: &[u8]) {
+        self.send_frame(&RemoteFrame::Input(bytes.to_vec()));
+    }
+
+    /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
+    #[must_use]
+    pub fn is_controlling(&self) -> bool {
+        matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller))
+    }
+
+    /// 被控端：取走待执行的远程输入（main 仲裁后写焦点窗格 PTY）。
+    pub fn take_input(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_input)
     }
 
     /// 控制端：当前镜像 Terminal（`role==Controller` 会话期间 Some），供渲染读取。
@@ -255,23 +276,31 @@ impl RemoteWs {
         }
     }
 
-    /// 控制端：把收到的数据面帧作用到镜像 Terminal（仅控制会话期间）。
-    fn apply_mirror(&mut self, value: &serde_json::Value) {
-        let Some(mirror) = self.mirror.as_mut() else {
-            return; // 非控制端会话：无镜像，丢弃（part3 只单向被控端→控制端）。
-        };
+    /// 作用一帧数据面：控制端的 `Output`/`Resize` → 镜像 Terminal；被控端的
+    /// `Input` → 待执行输入队列（main 仲裁后写 PTY）。按本端角色路由。
+    fn apply_relay(&mut self, value: &serde_json::Value) {
         let Ok(frame) = RemoteFrame::from_value(value) else {
-            log::debug!("镜像帧解析失败（可能是更高版本对端的未知变体），丢弃");
+            log::debug!("数据面帧解析失败（可能是更高版本对端的未知变体），丢弃");
             return;
         };
         match frame {
             RemoteFrame::Resize { rows, cols } => {
-                mirror.resize(usize::from(rows).max(1), usize::from(cols).max(1));
+                if let Some(mirror) = self.mirror.as_mut() {
+                    mirror.resize(usize::from(rows).max(1), usize::from(cols).max(1));
+                }
             }
             RemoteFrame::Output(bytes) => {
-                mirror.advance(&bytes);
-                // 镜像无 PTY，不回写应答（DSR/DA 等）；排空避免无界增长。
-                let _ = mirror.take_responses();
+                if let Some(mirror) = self.mirror.as_mut() {
+                    mirror.advance(&bytes);
+                    // 镜像无 PTY，不回写应答（DSR/DA 等）；排空避免无界增长。
+                    let _ = mirror.take_responses();
+                }
+            }
+            RemoteFrame::Input(bytes) => {
+                // 仅被控端会话期间接受（控制端不应收到 Input）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_input.push(bytes);
+                }
             }
             RemoteFrame::Echo(_) => {}
         }
@@ -287,6 +316,7 @@ impl RemoteWs {
                 self.pairing = None;
                 self.incoming = None;
                 self.mirror = None;
+                self.pending_input.clear();
                 if self.session.take().is_some() {
                     self.notices.push(Notice::SessionEnded(EndReason::PeerDisconnected));
                 }
@@ -356,10 +386,11 @@ impl RemoteWs {
             RemoteS2C::SessionEnded { reason } => {
                 self.session = None;
                 self.mirror = None;
+                self.pending_input.clear();
                 self.notices.push(Notice::SessionEnded(reason));
             }
-            // 数据面（part3a：被控端整屏状态字节流）→ 作用到镜像 Terminal。
-            RemoteS2C::Relay(value) => self.apply_mirror(&value),
+            // 数据面：part3a 镜像字节流 / part4 远程输入，按角色路由。
+            RemoteS2C::Relay(value) => self.apply_relay(&value),
         }
     }
 }

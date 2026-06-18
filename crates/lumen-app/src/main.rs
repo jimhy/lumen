@@ -104,6 +104,10 @@ const BG_DRAIN_CAP: usize = 256 * 1024;
 #[derive(Debug)]
 struct PtyWake;
 
+/// M5.3 part4 本地输入优先仲裁窗口：被控端本地用户在此窗口内有过输入，则丢弃控制端
+/// 转发来的远程输入（本地输入优先，海风哥拍板）。
+const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// 从 PNG 字节流解码并构造 winit 窗口图标。
 ///
 /// 解码失败（格式损坏、尺寸越界）时返回 `None` 并打印 warn，
@@ -1099,7 +1103,10 @@ impl AppState {
             // ── Term：本批完整实现 ─────────────────────────────────────
             Action::Term(ta) => match ta {
                 TermAction::Interrupt => {
-                    if let Err(e) = self.tabs[ti].panes[pi].write_user_input(b"\x03") {
+                    // M5.3 part4：控制中则把中断（Ctrl+C）转发给被控端。
+                    if self.remote_ws.is_controlling() {
+                        self.remote_ws.send_input(b"\x03");
+                    } else if let Err(e) = self.tabs[ti].panes[pi].write_user_input(b"\x03") {
                         log::error!("写入 PTY 失败（Interrupt）: {e:#}");
                     }
                 }
@@ -4368,22 +4375,34 @@ impl ApplicationHandler<PtyWake> for App {
                     }
 
                     Some(keymap::LookupResult::PassThrough) => {
-                        // 兜底直通：encode_key / encode_key_win32 编码后写 PTY。
-                        let use_win32 = state.tabs[ti].panes[pi].term.win32_input()
-                            && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
-                        let bytes = if use_win32 {
-                            input::encode_key_win32(&event, state.modifiers, true)
-                        } else {
-                            input::encode_key(&event, state.modifiers)
-                        };
-                        if let Some(bytes) = bytes {
-                            state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
-                            let write_t0 = Instant::now();
-                            if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
-                                error!("写入 PTY 失败: {e:#}");
+                        // M5.3 part4：控制中则把按键编码转发给被控端，不写本地窗格。
+                        // （win32-input 模式为 env 门控边角，转发统一用标准 encode_key；
+                        // IME/粘贴转发留 part4b。）
+                        if state.remote_ws.is_controlling() {
+                            if let Some(bytes) = input::encode_key(&event, state.modifiers) {
+                                state.remote_ws.send_input(&bytes);
                             }
-                            state.last_key_at = Some(write_t0);
-                            state.perf_log(format_args!("key 写入耗时 {:?}", write_t0.elapsed()));
+                        } else {
+                            // 兜底直通：encode_key / encode_key_win32 编码后写 PTY。
+                            let use_win32 = state.tabs[ti].panes[pi].term.win32_input()
+                                && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
+                            let bytes = if use_win32 {
+                                input::encode_key_win32(&event, state.modifiers, true)
+                            } else {
+                                input::encode_key(&event, state.modifiers)
+                            };
+                            if let Some(bytes) = bytes {
+                                state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                                let write_t0 = Instant::now();
+                                if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
+                                    error!("写入 PTY 失败: {e:#}");
+                                }
+                                state.last_key_at = Some(write_t0);
+                                state.perf_log(format_args!(
+                                    "key 写入耗时 {:?}",
+                                    write_t0.elapsed()
+                                ));
+                            }
                         }
                     }
                 }
@@ -4959,6 +4978,31 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                     })
                     .collect();
+                // M5.3 part4 被控端：执行控制端转发来的远程输入（受「本地输入优先」
+                // 仲裁：被控端本地用户最近 REMOTE_INPUT_ARBITRATION 内输入过则丢弃）。
+                // 放在借 `tab` 之前（此处 state.tabs 空闲）；取的是上一帧 poll 收下的
+                // 输入（1 帧延迟可忽略）。
+                {
+                    let remote_input = state.remote_ws.take_input();
+                    if !remote_input.is_empty() {
+                        let local_busy = state
+                            .last_key_at
+                            .is_some_and(|t| t.elapsed() < REMOTE_INPUT_ARBITRATION);
+                        if local_busy {
+                            log::debug!("本地输入优先：丢弃 {} 段远程输入", remote_input.len());
+                        } else {
+                            let ti = state.active_tab;
+                            let pi = state.tabs[ti].focused;
+                            for bytes in remote_input {
+                                state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                                if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
+                                    error!("远程输入写 PTY 失败: {e:#}");
+                                }
+                            }
+                            state.window.request_redraw();
+                        }
+                    }
+                }
                 let tab = &state.tabs[state.active_tab];
                 // 本帧布局对应的窗格 id 快照：下方动作（关 tab/增删窗
                 // 格）可能改变结构，矩形与窗格的对应关系以此校验。
