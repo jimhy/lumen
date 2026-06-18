@@ -10,6 +10,7 @@ mod background;
 mod cloud;
 // M5.2 远程设备状态（心跳 + 设备列表后台线程）。
 mod remote;
+mod remote_ws;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
 mod completion;
@@ -588,6 +589,8 @@ struct AppState {
     egui_ctx: egui::Context,
     /// M5.2 远程设备状态（心跳 + 设备列表）。
     remote: remote::RemoteState,
+    /// M5.3 远程控制 WS 引擎（配对 / 会话 / 数据面中继；part2a 引擎，UI part2b）。
+    remote_ws: remote_ws::RemoteWs,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     /// 各窗格离屏纹理的 egui 句柄（键 = 会话 id；离屏重建后原地
@@ -3166,6 +3169,7 @@ impl App {
             update_proxy: Arc::new(std::sync::Mutex::new(init_proxy)),
             egui_ctx,
             remote: remote::RemoteState::default(),
+            remote_ws: remote_ws::RemoteWs::default(),
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
@@ -5036,14 +5040,20 @@ impl ApplicationHandler<PtyWake> for App {
                     None
                 };
                 // M5.2：已登录但远程线程未起（启动时已登录 / 刚登录）→ 启动；
-                // 每帧收取后台心跳/设备列表回包。
+                // 每帧收取后台心跳/设备列表回包。M5.3：远程控制 WS 同生命周期。
                 if !state.remote.is_running() {
                     if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
                         let ctx = state.egui_ctx.clone();
                         state.remote.start(tok, ctx);
                     }
                 }
+                if !state.remote_ws.is_running() {
+                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
+                        state.remote_ws.start(tok, state.egui_ctx.clone());
+                    }
+                }
                 let _ = state.remote.poll();
+                let _ = state.remote_ws.poll();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -6217,6 +6227,8 @@ impl ApplicationHandler<PtyWake> for App {
                     state.profile = None;
                     // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
                     state.remote.stop();
+                    // M5.3：停止远程控制 WS 引擎，清远程会话/配对态。
+                    state.remote_ws.stop();
                 }
 
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序
