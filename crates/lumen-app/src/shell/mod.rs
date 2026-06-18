@@ -292,8 +292,7 @@ pub struct ShellOutput {
     pub cd_dir: Option<std::path::PathBuf>,
     /// 文件树：激活了文件，用系统默认程序打开。
     pub open_file: Option<std::path::PathBuf>,
-    /// M5.3 part3c-1：控制端在远程只读文件树上的操作（main 转发给被控端）。
-    pub remote_filetree_op: Option<lumen_protocol::remote::FileTreeOp>,
+    // M5.3 part3c-2：控制端远程树动作（ListDir/Fetch/复制粘贴）的 output 字段在片2+ 加入。
     /// 文件树：节点拖放到某窗格，把路径文本插入该窗格命令行（不带
     /// 回车，转义见 filetree::path_insert_text）。元组为 (落点所在
     /// 窗格下标, 路径)；落点不在任何窗格（间隙/区外）时整体为 None。
@@ -416,7 +415,6 @@ pub fn show(
         new_session: false,
         cd_dir: None,
         open_file: None,
-        remote_filetree_op: None,
         insert_path: None,
         copy_text: None,
         filetree_dialog_closed: false,
@@ -715,27 +713,22 @@ pub fn show(
 
     // 中间一栏：文件树（可折叠 + 可拖宽 P10；树根跟随激活会话 cwd）。
     // 开合/拖宽改变终端区宽度，沿用同一条矩形变化链路。
-    // M5.3 part3c-1：控制中+远程视图时改画**被控端只读镜像树**（复用同一栏位/开合/宽度），
-    // 点击产出 FileTreeOp 经 main 转发；否则画本地树。`panel_width/rect` 两路同构，
-    // 下方描边/拖宽手柄逻辑无需分支。
+    // M5.3 part3c-2：控制中+远程视图时改画**被控端 Option B 浏览树**（复用同一栏位/开合/宽度）；
+    // 否则画本地树。`panel_width/rect` 两路同构，下方描边/拖宽手柄逻辑无需分支。
+    // 片1 为占位桩（仅按 RootChanged 的 cwd 画占位）；片2 换成交互式浏览树。
     let (ft_panel_width, ft_panel_rect, ft_external_drop) = if input.remote_view_active {
-        // 远程视图：一律画被控端只读树。快照未到（会话起始瞬间 / 被控端窗格未上报 cwd）
-        // 时传空 root/rows → show_remote 画「等待 cwd」占位、不产 op，绝不回落本地树
-        // （否则点击会 cd/打开控制端本机，本地/远程串扰）。
-        let (tree_root, rows): (&str, &[lumen_protocol::remote::FileTreeRow]) = input
-            .remote_filetree
-            .map_or(("", &[]), |rft| (rft.root.as_str(), rft.rows.as_slice()));
+        // 远程视图：一律画被控端树。cwd 未到（会话起始瞬间 / 被控端首个提示符前）时
+        // 传空 root → 画「等待 cwd」占位，绝不回落本地树（否则点击串扰控制端本机）。
+        let tree_root: &str = input.remote_filetree.and_then(|ft| ft.root()).unwrap_or("");
         let rout = filetree::show_remote(
             root,
             tree_root,
-            rows,
             st.filetree.visible,
             pal,
             app_settings.layout.filetree_width,
         );
-        out.remote_filetree_op = rout.op;
         out.filetree_width = rout.panel_width;
-        (rout.panel_width, rout.panel_rect, None) // 远程只读树无拖放
+        (rout.panel_width, rout.panel_rect, None) // 远程树无拖放
     } else {
         let ft = filetree::show(
             root,
@@ -803,7 +796,7 @@ pub fn show(
             .push(edge_rect(root.available_rect_before_wrap().min.x, root));
     }
     // 本地树的 cd_dir/open_file/copy_text/dialog/toasts 已在上面 else 分支消费；
-    // 远程只读树无这些产出（仅 remote_filetree_op，已在 if 分支收集）。
+    // 远程树（片1 占位桩）暂无这些产出，片2+ 在 if 分支收集 ListDir/Fetch/复制粘贴动作。
 
     // ── 底部状态栏（M4.1 批E）：Panel::bottom 必须在 CentralPanel 之前声明
     // （egui 面板布局：bottom/top > left/right > central，声明顺序决定剩余区域压缩方向）。

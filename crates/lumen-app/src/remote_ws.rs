@@ -27,8 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, EndReason, FileTreeOp, FileTreeRow, PairingFailReason, RemoteC2S, RemoteFrame,
-    RemoteS2C, Role,
+    DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C, Role,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 use tungstenite::stream::MaybeTlsStream;
@@ -155,12 +154,11 @@ pub struct RemoteWs {
     mirror_selection: Option<Selection>,
     /// 控制端：镜像选区拖动中（左键按下到松开）。
     mirror_selecting: bool,
-    /// M5.3 part3c-1 控制端：被控端推来的文件树快照（远程视图侧栏只读渲染源）。
+    /// M5.3 part3c-2 控制端：Option B 远程树状态（按需浏览被控端文件系统）。片1 为占位桩
+    /// （仅记被控端 cwd），片2 换成完整状态机（自有展开态 + 目录缓存 + 在途 ListDir）。
     remote_filetree: Option<RemoteFileTree>,
-    /// 控制端：已采纳的文件树快照序列号（丢弃 `seq` 回退的陈旧/乱序快照）。
-    remote_ft_seq: u64,
-    /// 被控端：控制端转发来的文件树操作队列（main 每帧取走应用到本地文件树）。
-    pending_filetree_ops: Vec<FileTreeOp>,
+    /// 被控端：已推给控制端的当前 cwd（去重 [`RemoteFrame::RootChanged`]，cwd 变才重发）。
+    remote_root_sent: Option<String>,
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
@@ -179,13 +177,20 @@ pub struct RemoteWs {
 
 /// 控制端一帧镜像的渲染源（[`RemoteWs::mirror_render`] 产出）：跟随态借 live `mirror`，
 /// 回看态借填好窗口的 `hist_term`，连同该帧应画的光标（回看态光标隐藏）。
-/// M5.3 part3c-1 控制端缓存的被控端文件树快照（`root` + 可见行）。供远程视图侧栏
-/// 只读渲染（`shell::filetree::show_remote`）。
+/// M5.3 part3c-2 控制端 Option B 远程树（**片1 占位桩**：仅记被控端 cwd 画占位；
+/// 片2 换成完整状态机——自有展开态 `TreeViewState` + 按被控端路径缓存的目录 listing +
+/// 在途 `ListDir` 请求跟踪）。
 pub struct RemoteFileTree {
-    /// 被控端树根的不透明展示字符串。
-    pub root: String,
-    /// 可见行（DFS 序、含 depth）。
-    pub rows: Vec<FileTreeRow>,
+    /// 被控端焦点窗格 cwd（来源 [`RemoteFrame::RootChanged`]）。`None` = 等待 cwd。
+    root: Option<String>,
+}
+
+impl RemoteFileTree {
+    /// 被控端当前 cwd（占位渲染用；片2 后为树根）。
+    #[must_use]
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
 }
 
 pub struct MirrorFrame<'a> {
@@ -379,24 +384,19 @@ impl RemoteWs {
         self.send_frame(&RemoteFrame::HistoryBounds { base, screen_top });
     }
 
-    // ── part3c-1 目录树同步收发 ────────────────────────────────────────────
+    // ── part3c-2 Option B 目录树收发 ───────────────────────────────────────
 
-    /// 被控端：推送文件树可见行快照给控制端（指纹变化时整发；`seq` 单调递增）。
-    pub fn send_filetree_snapshot(&self, root: String, rows: Vec<FileTreeRow>, seq: u64) {
-        self.send_frame(&RemoteFrame::FileTreeSnapshot { root, rows, seq });
+    /// 被控端：焦点窗格 cwd 变化即推 [`RemoteFrame::RootChanged`]（去重：同 cwd 不重发）。
+    /// 控制端据此重置远程树根。替代 Option A 的整树快照推送。
+    pub fn send_root_changed(&mut self, path: String) {
+        if self.remote_root_sent.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        self.remote_root_sent = Some(path.clone());
+        self.send_frame(&RemoteFrame::RootChanged { path });
     }
 
-    /// 被控端：取走待执行的文件树操作（main 应用到本地文件树 / 注入 cd / 打开）。
-    pub fn take_filetree_ops(&mut self) -> Vec<FileTreeOp> {
-        std::mem::take(&mut self.pending_filetree_ops)
-    }
-
-    /// 控制端：转发用户在远程只读树上的操作给被控端。
-    pub fn send_filetree_op(&self, op: FileTreeOp) {
-        self.send_frame(&RemoteFrame::FileTreeOp(op));
-    }
-
-    /// 控制端：当前缓存的被控端文件树快照（远程视图侧栏只读渲染源）。
+    /// 控制端：当前 Option B 远程树状态（远程视图侧栏渲染源）。
     #[must_use]
     pub fn remote_filetree(&self) -> Option<&RemoteFileTree> {
         self.remote_filetree.as_ref()
@@ -405,8 +405,7 @@ impl RemoteWs {
     /// 清空文件树同步态（会话起止 / 断线；**不**在终端 Resize 时清——resize 不动文件树）。
     fn clear_remote_filetree(&mut self) {
         self.remote_filetree = None;
-        self.remote_ft_seq = 0;
-        self.pending_filetree_ops.clear();
+        self.remote_root_sent = None;
     }
 
     /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
@@ -804,22 +803,31 @@ impl RemoteWs {
                     self.hist_bounds = Some((base, screen_top));
                 }
             }
-            // part3c-1 目录树同步：
-            RemoteFrame::FileTreeSnapshot { root, rows, seq } => {
-                // 仅控制端：丢弃 seq 回退的陈旧/乱序快照，否则整刷缓存。
-                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller))
-                    && seq >= self.remote_ft_seq
-                {
-                    self.remote_ft_seq = seq;
-                    self.remote_filetree = Some(RemoteFileTree { root, rows });
+            // ── part3c-2 Option B 目录树 + 双向传输（按角色路由）──────────────
+            RemoteFrame::RootChanged { path } => {
+                // 仅控制端：被控端焦点窗格 cwd 变 → 重置远程树根。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    // 片1 桩：仅记根画占位；片2 换成状态机 set_root（清缓存 + epoch+1）。
+                    self.remote_filetree = Some(RemoteFileTree { root: Some(path) });
                 }
             }
-            RemoteFrame::FileTreeOp(op) => {
-                // 仅被控端：入队，main 取走应用到本地文件树。
-                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
-                    self.pending_filetree_ops.push(op);
-                }
-            }
+            // 片2：ListDir/ListDirResult；片3：Fetch*；片4/5：Put*/MkDir*。当前未实现，忽略。
+            RemoteFrame::ListDir { .. }
+            | RemoteFrame::ListDirResult { .. }
+            | RemoteFrame::FetchReq { .. }
+            | RemoteFrame::FileBegin { .. }
+            | RemoteFrame::FileChunk { .. }
+            | RemoteFrame::FileChunkAck { .. }
+            | RemoteFrame::FileEnd { .. }
+            | RemoteFrame::FileErr { .. }
+            | RemoteFrame::PutBegin { .. }
+            | RemoteFrame::PutReady { .. }
+            | RemoteFrame::PutChunk { .. }
+            | RemoteFrame::PutChunkAck { .. }
+            | RemoteFrame::PutEnd { .. }
+            | RemoteFrame::PutResult { .. }
+            | RemoteFrame::MkDir { .. }
+            | RemoteFrame::MkDirResult { .. } => {}
             RemoteFrame::Echo(_) => {}
         }
     }

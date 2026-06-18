@@ -339,90 +339,9 @@ impl FileTreeState {
         }
     }
 
-    // ── M5.3 part3c-1 远程目录树同步：被控端快照抽取 + 远程操作入口 ──────────
-
-    /// 抽取当前**可见行**快照（DFS 按 ltreeview 展开态下钻）：供被控端推给控制端
-    /// 只读渲染。纯遍历内存态（不读盘、不派发后台任务），可每帧调。根未上报（无
-    /// cwd）返回 `None`。
-    #[must_use]
-    pub fn snapshot_rows(&self) -> Option<(String, Vec<lumen_protocol::remote::FileTreeRow>)> {
-        let root = self.root.as_ref()?;
-        let mut rows = Vec::new();
-        self.snapshot_visit(0, 0, &mut rows); // 根 id 恒为 0（见 reset_nodes）
-        Some((root.display().to_string(), rows))
-    }
-
-    /// DFS 访问节点 `id`：压一行，若为展开目录则递归其 listing 子节点。
-    fn snapshot_visit(&self, id: usize, depth: u32, rows: &mut Vec<lumen_protocol::remote::FileTreeRow>) {
-        use lumen_protocol::remote::{FileTreeKind, FileTreeRow};
-        let Some(info) = self.nodes.get(id) else {
-            return;
-        };
-        // 缺省展开态与渲染侧 add_node 的 default_open(id==0) 对齐：ltreeview 的
-        // is_open 在用户手动开合前对默认展开的根返回 None（默认值不回写状态），若直接
-        // ==Some(true) 会把根报成未展开且不下钻子项 → 控制端持续看到空树。
-        let expanded = self.tree.is_open(&id).unwrap_or(id == 0);
-        let kind = match info.kind {
-            NodeKind::Dir => FileTreeKind::Dir { expanded },
-            NodeKind::File => FileTreeKind::File,
-            NodeKind::Loading => FileTreeKind::Loading,
-            NodeKind::Unreadable => FileTreeKind::Unreadable,
-            NodeKind::Overflow(n) => FileTreeKind::Overflow(u32::try_from(n).unwrap_or(u32::MAX)),
-        };
-        rows.push(FileTreeRow {
-            path: info.path.display().to_string(),
-            name: display_name(&info.path),
-            depth,
-            kind,
-        });
-        if matches!(info.kind, NodeKind::Dir) && expanded {
-            if let Some(listing) = self.listings.get(&id) {
-                for &child in &listing.children {
-                    self.snapshot_visit(child, depth + 1, rows);
-                }
-            }
-        }
-    }
-
-    /// 按不透明路径找 **Dir** 节点 id——**从根沿 listings DFS**，只命中当前可达节点。
-    /// 不用裸 `nodes` 线性扫描：`refresh_dir`（本地新建/删除后）会留下同路径的孤儿旧
-    /// 节点（不在任何 listing 里），线性扫描可能命中孤儿致 `set_openness` 落空、远程展开
-    /// 静默失效；DFS 只走 listings 引用的可达节点，与快照下钻同一集合。
-    fn find_dir_by_path(&self, path: &str) -> Option<usize> {
-        self.find_dir_visit(0, path)
-    }
-
-    fn find_dir_visit(&self, id: usize, path: &str) -> Option<usize> {
-        let info = self.nodes.get(id)?;
-        if matches!(info.kind, NodeKind::Dir) && info.path.to_string_lossy() == path {
-            return Some(id);
-        }
-        // 只下钻已加载 listing 的子节点（孤儿不被任何 listing 引用，天然跳过）。
-        if let Some(listing) = self.listings.get(&id) {
-            for &child in &listing.children {
-                if let Some(found) = self.find_dir_visit(child, path) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-
-    /// 远程展开目录：仅置展开态（`set_openness(true)`）。懒加载靠下一帧 `tree_ui`
-    /// 渲染时 `ensure_listing` 触发（与本地点开三角同链路）；被控端文件树栏不可见时
-    /// 由 part3c-1 片5 的离屏维护补齐。
-    pub fn remote_expand(&mut self, path: &str) {
-        if let Some(id) = self.find_dir_by_path(path) {
-            self.tree.set_openness(id, true);
-        }
-    }
-
-    /// 远程折叠目录。
-    pub fn remote_collapse(&mut self, path: &str) {
-        if let Some(id) = self.find_dir_by_path(path) {
-            self.tree.set_openness(id, false);
-        }
-    }
+    // M5.3 part3c-2：Option A 的快照抽取 / 远程展开入口（snapshot_rows / snapshot_visit /
+    // find_dir_by_path / remote_expand / remote_collapse）已删。Option B 下被控端不再持远程
+    // 展开态，控制端自持的远程树状态机（含路径反查 DFS）见 remote_ws::RemoteFileTree（片2）。
 
     /// 树根跟随激活会话 cwd：变化（切 tab / cd / 首次上报）时整树重置
     /// ——节点表、目录缓存、展开与选中状态全部重建（规格：根变化时
@@ -1803,47 +1722,26 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// M5.3 part3c-1：快照内容指纹（root + 每行 path/depth/种类/展开态的 hash）。被控端
-/// `pump_remote` 每帧比对——仅指纹变化才序列化 + 推送快照（节流），覆盖 cwd 变 / 展开折叠 /
-/// 懒加载回包（Loading→真实子项）等全部可见行变化。
-#[must_use]
-pub fn snapshot_fingerprint(root: &str, rows: &[lumen_protocol::remote::FileTreeRow]) -> u64 {
-    use lumen_protocol::remote::FileTreeKind;
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut h);
-    for r in rows {
-        r.path.hash(&mut h);
-        r.depth.hash(&mut h);
-        std::mem::discriminant(&r.kind).hash(&mut h);
-        match &r.kind {
-            FileTreeKind::Dir { expanded } => expanded.hash(&mut h),
-            FileTreeKind::Overflow(n) => n.hash(&mut h),
-            _ => {}
-        }
-    }
-    h.finish()
-}
-
-/// M5.3 part3c-1 控制端远程视图：只读渲染被控端推来的文件树快照的产出。
+/// M5.3 part3c-2 控制端远程视图渲染产出（片1 仅面板尺寸；片2 加 listdir_reqs / fetch_open /
+/// 复制粘贴 / 显示隐藏开关等交互产出）。
 #[derive(Default)]
 pub struct RemoteFileTreeOutput {
     /// 面板实际宽度（mod.rs 持久化 + 描边用；隐藏时 None）。
     pub panel_width: Option<f32>,
     /// 面板矩形（mod.rs 描边 / 拖宽手柄用；隐藏时 None）。
     pub panel_rect: Option<egui::Rect>,
-    /// 本帧用户在远程树上产生的一条操作（main 转发给被控端；至多一条/帧）。
-    pub op: Option<lumen_protocol::remote::FileTreeOp>,
 }
 
-/// M5.3 part3c-1：控制端远程视图——只读渲染被控端推来的文件树**可见行**快照
-/// （不读盘、无 worker、无懒加载——纯按 `rows` + `depth` 画扁平树）。点击产出 `FileTreeOp`
-/// 经 main 转发被控端。面板外壳（id `lumen_filetree` / 宽度 / 折叠 / 描边）与本地
-/// [`show`] 同款，使 mod.rs 描边/拖宽手柄逻辑无需分支。
+/// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树。
+///
+/// **片1 占位桩**：Option A 的只读扁平快照树已删，Option B 交互式浏览树（自有展开态 +
+/// 按需 `ListDir` + 文件双击 Fetch 打开 + 复制粘贴）在片2 实装。当前仅按 `tree_root`
+/// （被控端 cwd，来自 `RootChanged`）画一行根 + 「浏览树构建中」占位，使面板外壳
+/// （id `lumen_filetree` / 宽度 / 折叠 / 描边）与本地 [`show`] 同款，mod.rs 描边/拖宽手柄
+/// 逻辑无需分支。
 pub fn show_remote(
     root_ui: &mut egui::Ui,
     tree_root: &str,
-    rows: &[lumen_protocol::remote::FileTreeRow],
     visible: bool,
     pal: &theme::Palette,
     width: f32,
@@ -1860,22 +1758,15 @@ pub fn show_remote(
                     .fill(pal.filetree_fill)
                     .inner_margin(egui::Margin::symmetric(6, 8)),
             )
-            .show_inside(root_ui, |ui| remote_panel_ui(ui, tree_root, rows, pal, &mut out));
+            .show_inside(root_ui, |ui| remote_panel_ui(ui, tree_root, pal));
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
     }
     out
 }
 
-/// 远程只读树面板内容：根名工具条（只读）+ 扁平行（按 depth 缩进）。
-fn remote_panel_ui(
-    ui: &mut egui::Ui,
-    tree_root: &str,
-    rows: &[lumen_protocol::remote::FileTreeRow],
-    pal: &theme::Palette,
-    out: &mut RemoteFileTreeOutput,
-) {
-    use lumen_protocol::remote::{FileTreeKind, FileTreeOp};
+/// 远程树面板内容（片1 桩）：根名工具条 + 「浏览树构建中」占位。
+fn remote_panel_ui(ui: &mut egui::Ui, tree_root: &str, pal: &theme::Palette) {
     let s = crate::i18n::strings();
     // 工具条：被控端树根名（basename，悬停看全路径）。空 = 等待 cwd 占位。
     let root_name = tree_root
@@ -1891,58 +1782,16 @@ fn remote_panel_ui(
         ui.add(egui::Label::new(egui::RichText::new(label).strong().color(pal.fg)).truncate())
             .on_hover_text(tree_root);
     });
-    ui.add_space(4.0);
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for row in rows {
-                ui.horizontal(|ui| {
-                    ui.add_space(row.depth as f32 * 14.0);
-                    match &row.kind {
-                        FileTreeKind::Dir { expanded } => {
-                            let tri = if *expanded { "▾" } else { "▸" };
-                            let resp = ui.selectable_label(
-                                false,
-                                egui::RichText::new(format!("{tri} {}", row.name)).color(pal.fg),
-                            );
-                            // 双击 → cd（cd 后被控端 cwd 变、整树重发，先发的展开无副作用）；
-                            // 单击 → 展开/折叠切换。
-                            if resp.double_clicked() {
-                                out.op = Some(FileTreeOp::Cd(row.path.clone()));
-                            } else if resp.clicked() {
-                                out.op = Some(if *expanded {
-                                    FileTreeOp::Collapse(row.path.clone())
-                                } else {
-                                    FileTreeOp::Expand(row.path.clone())
-                                });
-                            }
-                        }
-                        FileTreeKind::File => {
-                            let resp = ui.selectable_label(
-                                false,
-                                egui::RichText::new(&row.name).color(pal.fg),
-                            );
-                            if resp.double_clicked() {
-                                out.op = Some(FileTreeOp::Open(row.path.clone()));
-                            }
-                        }
-                        // 占位行：灰斜体、不可交互。
-                        FileTreeKind::Loading => placeholder_row(ui, pal, s.filetree_loading),
-                        FileTreeKind::Unreadable => placeholder_row(ui, pal, s.filetree_unreadable),
-                        FileTreeKind::Overflow(n) => {
-                            placeholder_row(ui, pal, &crate::i18n::fmt1(s.filetree_overflow_fmt, *n));
-                        }
-                    }
-                });
-            }
-        });
-}
-
-/// 远程只读树的占位行（加载中 / 无法读取 / 溢出）：灰斜体、不产操作。
-fn placeholder_row(ui: &mut egui::Ui, pal: &theme::Palette, text: &str) {
-    ui.add(egui::Label::new(
-        egui::RichText::new(text).italics().color(pal.fg_dim),
-    ));
+    ui.add_space(8.0);
+    if !tree_root.is_empty() {
+        // 片1 桩占位：片2 换成 ltreeview 交互式浏览树。
+        ui.add(egui::Label::new(
+            egui::RichText::new("浏览树构建中…")
+                .size(11.0)
+                .italics()
+                .color(pal.fg_dim),
+        ));
+    }
 }
 
 /// 新建文件/文件夹的名字校验（Windows 文件名规则 + 注入防御）。
@@ -2118,74 +1967,9 @@ fn reap_in_background(mut child: std::process::Child) {
 mod tests {
     use super::*;
 
-    #[test]
-    // FileTreeState 含 mpsc channel 等字段，无法用结构体字面量构造，只能 default 后改。
-    #[allow(clippy::field_reassign_with_default)]
-    fn 快照按展开态扁平化与指纹() {
-        use lumen_protocol::remote::FileTreeKind;
-        let mut ft = FileTreeState::default();
-        ft.root = Some(PathBuf::from("/root"));
-        ft.nodes = vec![
-            NodeInfo { path: PathBuf::from("/root"), kind: NodeKind::Dir },
-            NodeInfo { path: PathBuf::from("/root/a.txt"), kind: NodeKind::File },
-            NodeInfo { path: PathBuf::from("/root/sub"), kind: NodeKind::Dir },
-        ];
-        ft.listings.insert(0, DirListing { children: vec![1, 2] });
-        ft.tree.set_openness(0, true); // 根展开，sub(2) 不展开
-
-        let (root, rows) = ft.snapshot_rows().expect("有根");
-        assert_eq!(rows.len(), 3, "根展开 → 根 + 2 子项");
-        assert_eq!(rows[0].depth, 0);
-        assert!(matches!(rows[0].kind, FileTreeKind::Dir { expanded: true }));
-        assert_eq!(rows[1].name, "a.txt");
-        assert_eq!(rows[1].depth, 1);
-        assert!(matches!(rows[1].kind, FileTreeKind::File));
-        assert_eq!(rows[2].name, "sub");
-        assert!(matches!(rows[2].kind, FileTreeKind::Dir { expanded: false }));
-
-        // 展开态变化 → 指纹变。
-        let fp1 = snapshot_fingerprint(&root, &rows);
-        ft.tree.set_openness(2, true);
-        let (root2, rows2) = ft.snapshot_rows().expect("有根");
-        assert_ne!(fp1, snapshot_fingerprint(&root2, &rows2), "展开态变化指纹应变");
-
-        // 远程折叠根 → 只剩根一行。
-        ft.remote_collapse("/root");
-        assert_eq!(ft.snapshot_rows().expect("有根").1.len(), 1);
-
-        // 无根 → None。
-        ft.root = None;
-        assert!(ft.snapshot_rows().is_none());
-    }
-
-    #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    fn 快照根默认展开含子项() {
-        // 回归 #1：根默认展开（is_open 未记录时 unwrap_or(id==0)），不靠手动 set_openness——
-        // 否则控制端会持续看到只有根一行的空树。
-        use lumen_protocol::remote::FileTreeKind;
-        let mut ft = FileTreeState::default();
-        ft.root = Some(PathBuf::from("/r"));
-        ft.nodes = vec![
-            NodeInfo { path: PathBuf::from("/r"), kind: NodeKind::Dir },
-            NodeInfo { path: PathBuf::from("/r/f"), kind: NodeKind::File },
-        ];
-        ft.listings.insert(0, DirListing { children: vec![1] });
-        // 不调 set_openness(0, true)。
-        let (_root, rows) = ft.snapshot_rows().expect("有根");
-        assert!(
-            matches!(rows[0].kind, FileTreeKind::Dir { expanded: true }),
-            "根默认展开"
-        );
-        assert_eq!(rows.len(), 2, "根默认展开 → 含子项");
-        // 非根目录默认折叠（find 经 DFS 仍可达 → 远程展开）。
-        ft.nodes.push(NodeInfo { path: PathBuf::from("/r/sub"), kind: NodeKind::Dir });
-        ft.listings.get_mut(&0).unwrap().children.push(2);
-        let (_r, rows2) = ft.snapshot_rows().expect("有根");
-        assert!(matches!(rows2[2].kind, FileTreeKind::Dir { expanded: false }), "子目录默认折叠");
-        ft.remote_expand("/r/sub"); // DFS 从根可达
-        assert_eq!(ft.tree.is_open(&2), Some(true), "远程展开命中可达节点");
-    }
+    // part3c-2：Option A 的「快照按展开态扁平化与指纹」「快照根默认展开含子项」两测试
+    // 已删（snapshot_rows / snapshot_fingerprint / remote_expand 等被删）。Option B 的控制端
+    // 远程树状态机单测在片2 随 remote_ws::RemoteFileTree 一并补。
 
     #[test]
     fn cd命令_普通路径() {

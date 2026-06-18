@@ -100,9 +100,11 @@ pub enum EndReason {
 /// （`Grid::line_by_abs`）序列化对应行回 [`RemoteFrame::HistoryRows`]——「滚到哪屏拉哪屏」，
 /// 断线重连亦按需重拉，不再因镜像会话内 scrollback 丢失而看不到历史。
 ///
-/// **part3c-1 目录树同步**：被控端文件树为唯一真相源，把当前**可见树行**扁平快照
-/// （[`FileTreeSnapshot`](RemoteFrame::FileTreeSnapshot)）推给控制端只读渲染；控制端点击
-/// 回传操作 [`FileTreeOp`]（展开/折叠/cd/打开）。路径全程不透明字符串往返、被控端解释。
+/// **part3c-2 Option B 目录树 + 双向文件传输**（替代 part3c-1 的 Option A 快照推送）：
+/// 控制端按需浏览被控端文件系统（[`ListDir`](RemoteFrame::ListDir) / [`RootChanged`](RemoteFrame::RootChanged)），
+/// 自持展开态（不同步）；文件读取 [`FetchReq`](RemoteFrame::FetchReq)（分块 + ACK 背压，打开 / 下载）；
+/// 文件写入 [`PutBegin`](RemoteFrame::PutBegin)（两阶段 + 撞名决议 + 背压，上传）。被控端只服务无
+/// 状态读/写原语，所有递归 / 复制粘贴 / 打开由控制端编排。路径全程不透明字符串往返、被控端解释。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteFrame {
     /// 回环测试帧：原样转发给对端，用于 part1 验证中继通路连通。
@@ -160,63 +162,216 @@ pub enum RemoteFrame {
         /// 可视区首行绝对行号。
         screen_top: u64,
     },
-    /// 被控端 → 控制端（part3c-1）：当前文件树**可见行**全量快照（会话起始 + 树变化
-    /// 时整发）。控制端只读渲染。MVP 全量发可见行（不做增量）。
-    FileTreeSnapshot {
-        /// 被控端当前树根（焦点窗格 cwd）的不透明展示字符串。
-        root: String,
-        /// 可见行（DFS 序、含 depth；展开的目录其子项紧随其后）。
-        rows: Vec<FileTreeRow>,
-        /// 单调递增序列号：控制端丢弃 `seq` 回退的陈旧/乱序快照（防 cwd 快切乱序）。
-        seq: u64,
+    // ── part3c-2 Option B 目录树：控制端按需浏览被控端文件系统 + 双向文件传输 ──────
+    //    替代已删的 Option A `FileTreeSnapshot` / `FileTreeOp`：被控端只服务无状态读/写
+    //    原语，所有展开态 / 递归 / 复制粘贴 / 打开由控制端编排，被控端保持简单、不持远程态。
+    /// 被控端 → 控制端：焦点窗格 cwd 变化即推（会话起始也推一次）。控制端据此重置树根
+    /// （清空缓存 + 代次 +1）。修 #4：cwd 变即换根，不等快照重发慢链。
+    RootChanged {
+        /// 被控端焦点窗格 cwd 的不透明展示字符串（控制端只展示 + 原样回传，不解析）。
+        path: String,
     },
-    /// 控制端 → 被控端（part3c-1）：文件树操作（path 取自快照、原样回传，被控端解释）。
-    FileTreeOp(FileTreeOp),
+    /// 控制端 → 被控端：列目录。`req_id` 关联应答（多目录可并发在途）。
+    ListDir {
+        /// 控制端单调递增请求号（0 保留为哨兵无效）。
+        req_id: u64,
+        /// 被控端不透明目录路径（取自 [`RootChanged`](RemoteFrame::RootChanged) 或 [`DirEntry`]）。
+        path: String,
+        /// 是否包含隐藏项（远程「文件管理」语义：控制端可选显示 `.env` 等）。
+        show_hidden: bool,
+    },
+    /// 被控端 → 控制端：[`ListDir`](RemoteFrame::ListDir) 应答（`err=Some` 时 `entries` 为空）。
+    ListDirResult {
+        /// 与请求对齐。
+        req_id: u64,
+        /// 原样回带请求目录路径：控制端按 path 走 `find_dir_by_path` + `pending` 双键校验。
+        path: String,
+        /// 被控端读出的子项（目录在前 + 不分大小写排序 + 单层封顶）。
+        entries: Vec<DirEntry>,
+        /// 单层超上限截断后未显示的项数（`>0` 时控制端画「溢出」占位）。
+        overflow: u32,
+        /// 读失败原因；`Some` 时 `entries` 空、`overflow=0`。
+        err: Option<FsErr>,
+    },
+    /// 控制端 → 被控端：请求读取整个文件字节（被控端按 [`FILE_CHUNK`] 分块、受 ACK 窗口节流）。
+    FetchReq {
+        /// 关联请求号。
+        req_id: u64,
+        /// 被控端不透明文件路径。
+        path: String,
+    },
+    /// 被控端 → 控制端：文件首帧（先于任何 [`FileChunk`](RemoteFrame::FileChunk)；`total_len`
+    /// 仅供进度，finalize 以 [`FileEnd`](RemoteFrame::FileEnd) 为准，防读盘期文件被追加的 TOCTOU）。
+    FileBegin {
+        /// 关联请求号。
+        req_id: u64,
+        /// 文件总字节数（进度用）。
+        total_len: u64,
+    },
+    /// 被控端 → 控制端：一块文件字节（`seq` 自 0 连续递增，控制端校验连续性）。
+    FileChunk {
+        /// 关联请求号。
+        req_id: u64,
+        /// 块序号（自 0 连续）。
+        seq: u32,
+        /// 原始字节（≤ [`FILE_CHUNK`]）。
+        data: Vec<u8>,
+    },
+    /// 控制端 → 被控端：确认已收 `seq`，被控端方可发 `seq + FETCH_WINDOW` 之后的块（滑动窗口背压）。
+    FileChunkAck {
+        /// 关联请求号。
+        req_id: u64,
+        /// 已确认收到的块序号。
+        seq: u32,
+    },
+    /// 被控端 → 控制端：文件传完（控制端据此 finalize / 打开 / 写盘）。
+    FileEnd {
+        /// 关联请求号。
+        req_id: u64,
+    },
+    /// 被控端 → 控制端：读文件任意阶段出错，终止该 `req_id`。
+    FileErr {
+        /// 关联请求号。
+        req_id: u64,
+        /// 错误原因。
+        err: FsErr,
+    },
+    /// 控制端 → 被控端：开始写一个文件（上传）。`dir`+`name` 由被控端 `Path::join` 自拼
+    /// （控制端不拼分隔符，杜绝跨平台分隔符歧义）。
+    PutBegin {
+        /// 关联请求号。
+        req_id: u64,
+        /// 目标目录（不透明，取自远程树节点 path）。
+        dir: String,
+        /// 文件名（控制端本地 basename；被控端 `validate_entry_name` 校验 + 子树断言）。
+        name: String,
+        /// 文件总字节数。
+        total_len: u64,
+        /// 撞名策略。
+        overwrite: PutOverwrite,
+    },
+    /// 被控端 → 控制端：能否继续。`conflict=Some` → 控制端弹覆盖提示后重发
+    /// `PutBegin(Force/Skip)`；`err=Some` → 致命错误（不可写 / 名字非法 / 路径穿越被拒）。
+    PutReady {
+        /// 关联请求号。
+        req_id: u64,
+        /// 撞名详情（`Probe` 命中已存在目标时）。
+        conflict: Option<PutConflict>,
+        /// 致命错误。
+        err: Option<FsErr>,
+    },
+    /// 控制端 → 被控端：一块上传字节（`seq` 自 0 连续）。被控端顺序写临时文件。
+    PutChunk {
+        /// 关联请求号。
+        req_id: u64,
+        /// 块序号（自 0 连续）。
+        seq: u32,
+        /// 原始字节（≤ [`FILE_CHUNK`]）。
+        data: Vec<u8>,
+    },
+    /// 被控端 → 控制端：确认已落盘 `seq`，控制端方可发后续窗口块
+    /// （背压，对称于 [`FileChunkAck`](RemoteFrame::FileChunkAck)）。
+    PutChunkAck {
+        /// 关联请求号。
+        req_id: u64,
+        /// 已落盘的块序号。
+        seq: u32,
+    },
+    /// 控制端 → 被控端：上传结束 → 被控端 flush + 原子 rename 临时文件到目标。
+    PutEnd {
+        /// 关联请求号。
+        req_id: u64,
+    },
+    /// 被控端 → 控制端：写入最终结果。
+    PutResult {
+        /// 关联请求号。
+        req_id: u64,
+        /// 写入 / 跳过。
+        status: PutStatus,
+        /// 失败原因（失败时 `Some`）。
+        err: Option<FsErr>,
+    },
+    /// 控制端 → 被控端：在 `dir` 下创建子目录 `name`（递归上传建目录结构；幂等）。
+    MkDir {
+        /// 关联请求号。
+        req_id: u64,
+        /// 父目录（不透明）。
+        dir: String,
+        /// 子目录名（被控端校验 + 子树断言）。
+        name: String,
+    },
+    /// 被控端 → 控制端：[`MkDir`](RemoteFrame::MkDir) 结果（已存在视为成功，`err=None`）。
+    MkDirResult {
+        /// 关联请求号。
+        req_id: u64,
+        /// 失败原因。
+        err: Option<FsErr>,
+    },
 }
 
-/// part3c-1 文件树节点种类（占位行也是可见行；控制端据此决定图标与可交互性）。
+/// part3c-2 Option B 目录条目（被控端 `read_dir_worker` 产物，控制端只展示 + 原样回传）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FileTreeKind {
-    /// 目录（`expanded` = 是否已展开，决定三角朝向与下钻）。
-    Dir {
-        /// 是否已展开。
-        expanded: bool,
-    },
-    /// 普通文件。
-    File,
-    /// 后台读取中的「加载中…」占位行（不可交互）。
-    Loading,
-    /// 目录读取失败占位行（权限 / 网络盘断连，不可交互）。
-    Unreadable,
-    /// 单层超上限、剩余 N 项未显示的「溢出」占位行（不可交互）。
-    Overflow(u32),
-}
-
-/// part3c-1 文件树一个可见行（被控端扁平化产物；控制端按 `depth` 缩进画）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileTreeRow {
-    /// 被控端不透明绝对路径（往返键：控制端只展示 + 原样回传，**不解析**）。
+pub struct DirEntry {
+    /// 被控端不透明完整路径（往返键：控制端不解析、不 basename、不 join）。
     pub path: String,
-    /// 显示名（被控端算好的文件名 / 根整路径，控制端直接画，免跨平台 basename）。
+    /// 显示名（被控端 `display_name` 算好，控制端直接画）。
     pub name: String,
-    /// 树深度（根 = 0）。
-    pub depth: u32,
-    /// 节点种类。
-    pub kind: FileTreeKind,
+    /// 是否目录（控制端据此画三角 / 决定可下钻；不让控制端自己 stat）。
+    pub is_dir: bool,
 }
 
-/// part3c-1 控制端 → 被控端的文件树操作（`String` 为快照里的不透明路径，原样回传）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FileTreeOp {
-    /// 展开目录（被控端 `set_openness(true)` + 懒加载）。
-    Expand(String),
-    /// 折叠目录。
-    Collapse(String),
-    /// cd 到目录（受被控端 shell 忙闸门）。
-    Cd(String),
-    /// 系统默认程序打开文件。
-    Open(String),
+/// 文件系统操作错误（机器可读，控制端本地化提示；风格同 [`DenyReason`] / [`EndReason`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FsErr {
+    /// 路径不存在。
+    NotFound,
+    /// 权限不足。
+    PermissionDenied,
+    /// 期望目录但实为文件。
+    NotADirectory,
+    /// 期望文件但实为目录。
+    IsADirectory,
+    /// 文件超 [`FETCH_MAX_LEN`]（Fetch）/ 名字非法 / 路径穿越被拒（Put）等拒绝类错误。
+    TooLarge,
+    /// 其它 IO 错误（粗粒度兜底）。
+    Io,
 }
+
+/// Put 撞名策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PutOverwrite {
+    /// 首次探测：被控端只回 [`PutReady`](RemoteFrame::PutReady)`{conflict}`，不写。
+    Probe,
+    /// 用户确认覆盖：被控端写并原子替换。
+    Force,
+    /// 用户选不覆盖：被控端直接回 [`PutResult`](RemoteFrame::PutResult)`{Skipped}`。
+    Skip,
+}
+
+/// Put 撞名详情（`Probe` 命中已存在目标时回带）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutConflict {
+    /// 已存在目标是否为目录（目录 vs 文件覆盖语义不同，控制端据此措辞）。
+    pub is_dir: bool,
+    /// 已存在文件字节数（控制端提示「覆盖 N 字节」）。
+    pub existing_len: u64,
+}
+
+/// Put 最终写入结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PutStatus {
+    /// 已写入（覆盖或新建）。
+    Written,
+    /// 按用户选择跳过。
+    Skipped,
+}
+
+/// 文件传输单块原始字节上限（serde 数字数组膨胀后 ~256 KiB << 4 MiB 帧上限；不引 base64 保零依赖）。
+pub const FILE_CHUNK: usize = 64 * 1024;
+/// 在途未 ACK 块窗口（背压：发送端最多领先对端 `FETCH_WINDOW` 块）。
+pub const FETCH_WINDOW: u32 = 4;
+/// 单文件 Fetch 字节上限（防控制端临时盘塞满；超出回 [`FsErr::TooLarge`]）。
+pub const FETCH_MAX_LEN: u64 = 2 * 1024 * 1024 * 1024;
 
 impl RemoteFrame {
     /// 序列化为不透明 JSON 值，包进 [`RemoteC2S::Relay`] / [`RemoteS2C::Relay`]。
@@ -386,50 +541,106 @@ mod tests {
     }
 
     #[test]
-    fn 文件树帧经value往返() {
-        let snap = RemoteFrame::FileTreeSnapshot {
-            root: "C:\\Users\\hf".into(),
-            rows: vec![
-                FileTreeRow {
-                    path: "C:\\Users\\hf".into(),
-                    name: "hf".into(),
-                    depth: 0,
-                    kind: FileTreeKind::Dir { expanded: true },
-                },
-                FileTreeRow {
-                    path: "C:\\Users\\hf\\a.txt".into(),
-                    name: "a.txt".into(),
-                    depth: 1,
-                    kind: FileTreeKind::File,
-                },
-                FileTreeRow {
-                    path: "C:\\Users\\hf\\sub".into(),
-                    name: "sub".into(),
-                    depth: 1,
-                    kind: FileTreeKind::Dir { expanded: false },
-                },
-                FileTreeRow {
-                    path: String::new(),
-                    name: String::new(),
-                    depth: 2,
-                    kind: FileTreeKind::Loading,
-                },
-                FileTreeRow {
-                    path: String::new(),
-                    name: String::new(),
-                    depth: 2,
-                    kind: FileTreeKind::Overflow(42),
-                },
-            ],
-            seq: 7,
-        };
-        for frame in [
-            snap,
-            RemoteFrame::FileTreeOp(FileTreeOp::Expand("C:\\Users\\hf\\sub".into())),
-            RemoteFrame::FileTreeOp(FileTreeOp::Collapse("C:\\Users\\hf".into())),
-            RemoteFrame::FileTreeOp(FileTreeOp::Cd("C:\\tmp".into())),
-            RemoteFrame::FileTreeOp(FileTreeOp::Open("C:\\Users\\hf\\a.txt".into())),
-        ] {
+    fn option_b_帧经value往返() {
+        // part3c-2 Option B 浏览 + 双向传输全部新变体的 value 往返（含字节块 / 撞名 / 错误）。
+        let frames = vec![
+            RemoteFrame::RootChanged {
+                path: "C:\\Users\\hf".into(),
+            },
+            RemoteFrame::ListDir {
+                req_id: 1,
+                path: "C:\\Users\\hf".into(),
+                show_hidden: true,
+            },
+            RemoteFrame::ListDirResult {
+                req_id: 1,
+                path: "C:\\Users\\hf".into(),
+                entries: vec![
+                    DirEntry {
+                        path: "C:\\Users\\hf\\sub".into(),
+                        name: "sub".into(),
+                        is_dir: true,
+                    },
+                    DirEntry {
+                        path: "C:\\Users\\hf\\a.txt".into(),
+                        name: "a.txt".into(),
+                        is_dir: false,
+                    },
+                ],
+                overflow: 3,
+                err: None,
+            },
+            RemoteFrame::ListDirResult {
+                req_id: 2,
+                path: "C:\\x".into(),
+                entries: vec![],
+                overflow: 0,
+                err: Some(FsErr::PermissionDenied),
+            },
+            RemoteFrame::FetchReq {
+                req_id: 5,
+                path: "C:\\a.bin".into(),
+            },
+            RemoteFrame::FileBegin {
+                req_id: 5,
+                total_len: 1234,
+            },
+            RemoteFrame::FileChunk {
+                req_id: 5,
+                seq: 0,
+                data: vec![0, 255, 13, 10],
+            },
+            RemoteFrame::FileChunkAck { req_id: 5, seq: 0 },
+            RemoteFrame::FileEnd { req_id: 5 },
+            RemoteFrame::FileErr {
+                req_id: 5,
+                err: FsErr::TooLarge,
+            },
+            RemoteFrame::PutBegin {
+                req_id: 9,
+                dir: "C:\\dst".into(),
+                name: "f.txt".into(),
+                total_len: 7,
+                overwrite: PutOverwrite::Probe,
+            },
+            RemoteFrame::PutReady {
+                req_id: 9,
+                conflict: Some(PutConflict {
+                    is_dir: false,
+                    existing_len: 42,
+                }),
+                err: None,
+            },
+            RemoteFrame::PutReady {
+                req_id: 9,
+                conflict: None,
+                err: Some(FsErr::Io),
+            },
+            RemoteFrame::PutChunk {
+                req_id: 9,
+                seq: 0,
+                data: vec![1, 2, 3],
+            },
+            RemoteFrame::PutChunkAck { req_id: 9, seq: 0 },
+            RemoteFrame::PutEnd { req_id: 9 },
+            RemoteFrame::PutResult {
+                req_id: 9,
+                status: PutStatus::Written,
+                err: None,
+            },
+            RemoteFrame::PutResult {
+                req_id: 9,
+                status: PutStatus::Skipped,
+                err: None,
+            },
+            RemoteFrame::MkDir {
+                req_id: 10,
+                dir: "C:\\dst".into(),
+                name: "sub".into(),
+            },
+            RemoteFrame::MkDirResult { req_id: 10, err: None },
+        ];
+        for frame in frames {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
             assert_eq!(back, frame);
@@ -469,5 +680,18 @@ mod tests {
         assert_eq!(v, future);
         // 旧版本客户端尝试强类型还原才会失败（应 warn 后丢弃）。
         assert!(RemoteFrame::from_value(&v).is_err());
+
+        // part3c-2：含原始字节块的真实帧同样被服务端原样搬运（无需识别内层即可中继）。
+        let chunk = RemoteFrame::FileChunk {
+            req_id: 1,
+            seq: 0,
+            data: vec![0, 255, 1, 2],
+        };
+        let cv = chunk.to_value().expect("to_value");
+        let RemoteC2S::Relay(inner) = RemoteC2S::Relay(cv.clone()) else {
+            panic!("应为 Relay");
+        };
+        assert_eq!(inner, cv);
+        assert_eq!(RemoteFrame::from_value(&inner).expect("还原"), chunk);
     }
 }
