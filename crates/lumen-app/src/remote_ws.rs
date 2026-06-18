@@ -17,12 +17,6 @@
 //! 事件并推进 UI 态，登出 [`RemoteWs::stop`]。本模块（part2a）只做**引擎 + 状态
 //! 机**；配对弹窗 / 被控横幅 / 设备「连接」入口等 UI 在 part2b 消费这里暴露的态。
 //!
-//! NOTE（part2a 暂态）：本模块暴露给 part2b 的 UI-facing API（[`RemoteWs::pairing`]
-//! / [`RemoteWs::incoming`] / [`RemoteWs::session`] 态、`request_control` 等命令、
-//! [`Notice`] 通知）当前仅 part2a 引擎内部与单测引用，主循环尚未渲染。故本模块整体
-//! `allow(dead_code)`；**part2b 接好 UI 后移除此 allow**，由编译器确认全部消费。
-#![allow(dead_code)]
-
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -45,22 +39,10 @@ const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
-/// WS 连接状态（UI 显示连接中/已连/断开）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConnState {
-    /// 未连接（未登录 / 已停止）。
-    #[default]
-    Disconnected,
-    /// 正在连接 / 断线重连中。
-    Connecting,
-    /// 已连接（presence 在线）。
-    Connected,
-}
-
 /// 控制端待配对态：已发起请求、正等用户输入被控端展示的配对码。
 #[derive(Debug, Clone)]
 pub struct PairingPrompt {
-    /// 目标（被控端）设备 id。
+    /// 目标（被控端）设备 id（提交 [`RemoteC2S::SubmitPairing`] 时回填）。
     pub target_device_id: String,
     /// 目标设备显示名。
     pub target_name: String,
@@ -68,28 +50,20 @@ pub struct PairingPrompt {
     pub last_error: Option<PairingFailReason>,
     /// 剩余尝试次数（仅在收到 [`RemoteS2C::PairingResult`] 后有意义）。
     pub attempts_left: Option<u32>,
-    /// 配对失效时刻（UI 倒计时 / 超时自动 dismiss）。
-    pub expires_at: Instant,
 }
 
 /// 被控端来件态：有控制端请求控制本机，醒目展示配对码 + 可拒绝。
 #[derive(Debug, Clone)]
 pub struct IncomingControl {
-    /// 控制端设备 id。
-    pub controller_device_id: String,
     /// 控制端设备显示名。
     pub controller_name: String,
     /// 本机展示给对方转述的 9 位配对码。
     pub pairing_code: String,
-    /// 配对失效时刻。
-    pub expires_at: Instant,
 }
 
 /// 活跃会话态（控制中 / 被控中）。
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
-    /// 对端设备 id。
-    pub peer_device_id: String,
     /// 对端设备显示名。
     pub peer_name: String,
     /// 本端角色（[`Role::Controller`] = 控制中；[`Role::Controlled`] = 被控中）。
@@ -105,8 +79,13 @@ pub enum Notice {
     PairingCancelled(DenyReason),
     /// 配对码连错作废 / 过期。
     PairingFailed(PairingFailReason),
-    /// 会话已建立（含本端角色）。
-    SessionStarted(Role),
+    /// 会话已建立（本端角色 + 对端设备名）。
+    SessionStarted {
+        /// 本端角色。
+        role: Role,
+        /// 对端设备显示名。
+        peer: String,
+    },
     /// 会话结束（对端离开 / 断线 / 被取代）。
     SessionEnded(EndReason),
 }
@@ -124,8 +103,6 @@ enum WsEvent {
 /// 客户端远程控制 WS 引擎（主线程持有）。
 #[derive(Default)]
 pub struct RemoteWs {
-    /// 连接状态。
-    conn: ConnState,
     /// 控制端：待输入配对码态（part2b 渲染弹窗）。
     pub pairing: Option<PairingPrompt>,
     /// 被控端：来件配对态（part2b 渲染横幅 + 配对码）。
@@ -152,7 +129,6 @@ impl RemoteWs {
         self.cmd_tx = Some(cmd_tx);
         self.evt_rx = Some(evt_rx);
         self.stop = Some(stop.clone());
-        self.conn = ConnState::Connecting;
         if let Err(e) = thread::Builder::new()
             .name("lumen-remote-ws".into())
             .spawn(move || worker(&token, &cmd_rx, &evt_tx, &stop, &ctx))
@@ -169,7 +145,6 @@ impl RemoteWs {
         self.cmd_tx = None;
         self.evt_rx = None;
         self.stop = None;
-        self.conn = ConnState::Disconnected;
         self.pairing = None;
         self.incoming = None;
         self.session = None;
@@ -180,12 +155,6 @@ impl RemoteWs {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.stop.is_some()
-    }
-
-    /// 当前连接状态。
-    #[must_use]
-    pub fn conn_state(&self) -> ConnState {
-        self.conn
     }
 
     /// 每帧调用：收取后台事件、推进 UI 态。返回是否有更新（请求重绘用）。
@@ -250,9 +219,9 @@ impl RemoteWs {
     /// 处理一条后台事件。
     fn apply(&mut self, ev: WsEvent) {
         match ev {
-            WsEvent::Connected => self.conn = ConnState::Connected,
+            // 连接建立：presence 上线（后台线程已处理重连，主线程无需记状态）。
+            WsEvent::Connected => {}
             WsEvent::Disconnected => {
-                self.conn = ConnState::Connecting; // 后台会自动重连
                 // 断线即丢弃进行中的配对/会话态（服务端侧亦已拆除）。
                 self.pairing = None;
                 self.incoming = None;
@@ -269,29 +238,25 @@ impl RemoteWs {
         match msg {
             RemoteS2C::Welcome { .. } | RemoteS2C::Pong => {}
             RemoteS2C::ControlRequested {
-                controller_device_id,
                 controller_name,
                 pairing_code,
-                expires_in_secs,
+                ..
             } => {
                 self.incoming = Some(IncomingControl {
-                    controller_device_id,
                     controller_name,
                     pairing_code,
-                    expires_at: expires_at(expires_in_secs),
                 });
             }
             RemoteS2C::PairingNeeded {
                 target_device_id,
                 target_name,
-                expires_in_secs,
+                ..
             } => {
                 self.pairing = Some(PairingPrompt {
                     target_device_id,
                     target_name,
                     last_error: None,
                     attempts_left: None,
-                    expires_at: expires_at(expires_in_secs),
                 });
             }
             RemoteS2C::PairingResult {
@@ -315,18 +280,13 @@ impl RemoteWs {
                 self.notices.push(Notice::PairingCancelled(reason));
             }
             RemoteS2C::SessionStarted {
-                peer_device_id,
-                peer_name,
-                role,
+                peer_name, role, ..
             } => {
                 self.pairing = None;
                 self.incoming = None;
-                self.session = Some(ActiveSession {
-                    peer_device_id,
-                    peer_name,
-                    role,
-                });
-                self.notices.push(Notice::SessionStarted(role));
+                let peer = peer_name.clone();
+                self.session = Some(ActiveSession { peer_name, role });
+                self.notices.push(Notice::SessionStarted { role, peer });
             }
             RemoteS2C::SessionEnded { reason } => {
                 self.session = None;
@@ -336,13 +296,6 @@ impl RemoteWs {
             RemoteS2C::Relay(_) => {}
         }
     }
-}
-
-/// 由「相对秒」算失效时刻（饱和加，避免极端值溢出）。
-fn expires_at(secs: u32) -> Instant {
-    Instant::now()
-        .checked_add(Duration::from_secs(u64::from(secs)))
-        .unwrap_or_else(Instant::now)
 }
 
 /// 后台线程主体：连接 → 跑读写循环 → 断线退避重连，直到 `stop`。
@@ -509,7 +462,6 @@ mod tests {
     #[test]
     fn 默认态与停止() {
         let mut ws = RemoteWs::default();
-        assert_eq!(ws.conn_state(), ConnState::Disconnected);
         assert!(!ws.is_running());
         assert!(ws.pairing.is_none() && ws.incoming.is_none() && ws.session.is_none());
         // stop 在未启动时应安全（幂等）。
@@ -559,7 +511,7 @@ mod tests {
         assert_eq!(s.role, Role::Controller);
         assert!(matches!(
             ws.take_notices().as_slice(),
-            [Notice::SessionStarted(Role::Controller)]
+            [Notice::SessionStarted { role: Role::Controller, .. }]
         ));
         ws.apply_server(RemoteS2C::SessionEnded {
             reason: EndReason::PeerLeft,
@@ -587,6 +539,5 @@ mod tests {
         // 断线：来件/会话态清掉。
         ws.apply(WsEvent::Disconnected);
         assert!(ws.incoming.is_none());
-        assert_eq!(ws.conn_state(), ConnState::Connecting);
     }
 }

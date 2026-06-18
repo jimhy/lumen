@@ -2759,6 +2759,54 @@ impl AppState {
     }
 }
 
+/// 远程控制一次性通知 → toast（分级 + 本地化文案，按机器可读原因细分）。M5.3 part2b。
+fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, String) {
+    use lumen_protocol::remote::{DenyReason, EndReason, PairingFailReason, Role};
+    use remote_ws::Notice;
+    use shell::toast::ToastKind;
+    let s = i18n::strings();
+    match n {
+        Notice::ControlDenied(reason) => {
+            let text = match reason {
+                DenyReason::Offline => s.remote_denied_offline,
+                DenyReason::AlreadyControlled | DenyReason::TargetPairing => s.remote_denied_busy,
+                DenyReason::RejectedByUser => s.remote_denied_rejected,
+                _ => s.remote_denied_generic,
+            };
+            (ToastKind::Warn, text.to_string())
+        }
+        Notice::PairingCancelled(reason) => {
+            let text = match reason {
+                DenyReason::Expired => s.remote_toast_pairing_expired,
+                _ => s.remote_toast_pairing_cancelled,
+            };
+            (ToastKind::Warn, text.to_string())
+        }
+        Notice::PairingFailed(reason) => {
+            let text = match reason {
+                PairingFailReason::Expired => s.remote_toast_pairing_expired,
+                _ => s.remote_pairing_failed,
+            };
+            (ToastKind::Warn, text.to_string())
+        }
+        Notice::SessionStarted { role, peer } => {
+            let tpl = match role {
+                Role::Controller => s.remote_toast_controlling_fmt,
+                Role::Controlled => s.remote_toast_controlled_fmt,
+            };
+            (ToastKind::Info, i18n::fmt1(tpl, peer))
+        }
+        Notice::SessionEnded(reason) => {
+            let text = match reason {
+                EndReason::PeerDisconnected => s.remote_toast_peer_offline,
+                EndReason::Replaced => s.remote_toast_replaced,
+                EndReason::PeerLeft => s.remote_toast_session_ended,
+            };
+            (ToastKind::Info, text.to_string())
+        }
+    }
+}
+
 /// 无边框窗口外缘 resize 命中检测（左/右/下及下方两角）：鼠标物理坐标
 /// `mouse_pos` 落在客户区外缘约 6 逻辑像素带内时返回对应 [`ResizeDirection`]。
 /// Windows 无边框窗口客户区铺满整窗、系统不再对边缘做 NCHITTEST resize
@@ -5085,6 +5133,9 @@ impl ApplicationHandler<PtyWake> for App {
                     completion_view: None,
                     remote_devices: &state.remote.devices,
                     active_device_id: state.remote.active_device_id.as_deref(),
+                    remote_pairing: state.remote_ws.pairing.as_ref(),
+                    remote_incoming: state.remote_ws.incoming.as_ref(),
+                    remote_session: state.remote_ws.session.as_ref(),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
@@ -5707,6 +5758,31 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if let Some(id) = shell_out.delete_device {
                     state.remote.delete_device(id);
+                }
+                // —— M5.3 远程控制动作：连接 / 配对 / 拒绝 / 断开 ——
+                if let Some(id) = shell_out.connect_device {
+                    state.remote_ws.request_control(id);
+                }
+                if let Some(code) = shell_out.submit_pairing_code {
+                    state.remote_ws.submit_pairing(code);
+                }
+                if shell_out.cancel_pairing {
+                    state.remote_ws.cancel_pairing();
+                }
+                if shell_out.decline_control {
+                    state.remote_ws.decline();
+                }
+                if shell_out.end_remote_session {
+                    state.remote_ws.end_session();
+                }
+                // 远程控制一次性通知 → toast（弹窗在 egui 帧后 push，需请求重绘）。
+                let remote_notices = state.remote_ws.take_notices();
+                if !remote_notices.is_empty() {
+                    for n in &remote_notices {
+                        let (kind, text) = remote_notice_toast(n);
+                        state.shell_state.toast.push(kind, text);
+                    }
+                    state.window.request_redraw();
                 }
                 if let Some((id, name)) = shell_out.rename {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id) {

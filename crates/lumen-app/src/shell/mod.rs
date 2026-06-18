@@ -13,6 +13,7 @@ pub mod filetree;
 pub mod history_search_ui;
 pub mod layout;
 pub mod login_ui;
+pub mod remote_ui;
 pub mod settings_ui;
 pub mod statusbar;
 pub mod theme;
@@ -81,6 +82,8 @@ pub struct ShellState {
     pub renaming_device: Option<(String, String)>,
     /// 设备重命名刚开始，下一帧把焦点交给编辑框。
     rename_device_focus: bool,
+    /// 远程控制配对 UI 跨帧状态（M5.3 part2b：配对码输入缓冲/焦点）。
+    pub remote_ui: remote_ui::RemoteUiState,
 }
 
 /// 激活 tab 中一个窗格的展示数据（终端工作区分屏用，F5）。
@@ -156,6 +159,12 @@ pub struct ShellInput<'a> {
     pub remote_devices: &'a [lumen_protocol::DeviceRecord],
     /// 当前选中的远程设备 id（高亮用）。
     pub active_device_id: Option<&'a str>,
+    /// M5.3 远程控制：控制端待配对态（Some = 渲染配对码输入模态）。
+    pub remote_pairing: Option<&'a crate::remote_ws::PairingPrompt>,
+    /// M5.3 远程控制：被控端来件控制请求态（Some = 渲染来件横幅 + 配对码）。
+    pub remote_incoming: Option<&'a crate::remote_ws::IncomingControl>,
+    /// M5.3 远程控制：活跃会话态（Some = 渲染「被控中 / 控制中」横幅）。
+    pub remote_session: Option<&'a crate::remote_ws::ActiveSession>,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -221,6 +230,16 @@ pub struct ShellOutput {
     pub delete_device: Option<String>,
     /// 设备改名编辑本帧以键盘结束（main 把焦点还终端，仿会话重命名）。
     pub rename_device_ended_by_key: bool,
+    /// M5.3：发起控制某设备（双击在线设备 / 右键「连接」）→ main 调 request_control。
+    pub connect_device: Option<String>,
+    /// M5.3：控制端提交配对码 → main 调 submit_pairing。
+    pub submit_pairing_code: Option<String>,
+    /// M5.3：控制端取消配对（关弹窗）→ main 调 cancel_pairing。
+    pub cancel_pairing: bool,
+    /// M5.3：被控端拒绝来件控制请求 → main 调 decline。
+    pub decline_control: bool,
+    /// M5.3：任一端结束当前远程会话 → main 调 end_session。
+    pub end_remote_session: bool,
     /// 分隔条拖动中：(分隔条, 指针位置（逻辑点）)。main 据此把对应
     /// 边界拖到指针处（绝对定位无累积漂移；最小尺寸钳制在 layout）。
     pub divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
@@ -365,6 +384,11 @@ pub fn show(
         rename_device: None,
         delete_device: None,
         rename_device_ended_by_key: false,
+        connect_device: None,
+        submit_pairing_code: None,
+        cancel_pairing: false,
+        decline_control: false,
+        end_remote_session: false,
         divider_drag: None,
         divider_drag_ended: false,
         divider_reset: None,
@@ -1391,6 +1415,29 @@ pub fn show(
         }
     }
 
+    // —— M5.3 远程控制 UI：配对模态（控制端）+ 顶部状态横幅（被控/控制）——
+    if let Some(prompt) = input.remote_pairing {
+        let r_out = remote_ui::pairing_modal(root.ctx(), &mut st.remote_ui, prompt, pal);
+        if let Some(code) = r_out.submit_code {
+            out.submit_pairing_code = Some(code);
+        }
+        if r_out.cancel_pairing {
+            out.cancel_pairing = true;
+        }
+    } else {
+        // 无待配对：复位输入缓冲（被拒/成功/取消后回到干净态）。
+        st.remote_ui.reset();
+    }
+    {
+        let b_out = remote_ui::banner(root.ctx(), input.remote_incoming, input.remote_session, pal);
+        if b_out.decline {
+            out.decline_control = true;
+        }
+        if b_out.end_session {
+            out.end_remote_session = true;
+        }
+    }
+
     // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录之上，toast 之下）——
     // completion_view 由 main 每帧传入；Some = 显示弹窗，None = 不显示。
     if let Some(cv) = &input.completion_view {
@@ -1831,13 +1878,21 @@ fn remote_device_list_ui(
                         .truncate(),
                 );
 
-                // 仅在线设备可选中（离线不可连接）。
+                // 仅在线设备可选中（离线不可连接）。单击选中、双击发起控制。
                 if resp.clicked() && dev.online {
                     out.activate_device = Some(dev.id.clone());
+                }
+                if resp.double_clicked() && dev.online {
+                    out.connect_device = Some(dev.id.clone());
                 }
                 resp = resp.on_hover_text(format!("{} · {}", dev.os, dev.app_version));
                 resp.context_menu(|ui| {
                     let s = crate::i18n::strings();
+                    // 在线设备：右键「连接」（控制）置顶。
+                    if dev.online && ui.button(s.remote_menu_connect).clicked() {
+                        out.connect_device = Some(dev.id.clone());
+                        ui.close();
+                    }
                     if ui.button(s.menu_rename).clicked() {
                         st.renaming_device = Some((dev.id.clone(), dev.name.clone()));
                         st.rename_device_focus = true;

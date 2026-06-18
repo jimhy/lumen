@@ -365,6 +365,56 @@ pub struct Strings {
     pub remote_empty: &'static str,
     /// 右键删除设备
     pub remote_menu_delete: &'static str,
+    /// 右键/双击连接（控制）设备（M5.3）
+    pub remote_menu_connect: &'static str,
+    /// 配对弹窗标题
+    pub remote_pairing_title: &'static str,
+    /// 配对弹窗提示（{}=被控端设备名）
+    pub remote_pairing_prompt_fmt: &'static str,
+    /// 配对码输入框 hint
+    pub remote_pairing_hint: &'static str,
+    /// 配对弹窗连接按钮
+    pub remote_pairing_connect: &'static str,
+    /// 配对弹窗取消按钮
+    pub remote_pairing_cancel: &'static str,
+    /// 配对码错误（{}=剩余尝试次数）
+    pub remote_pairing_invalid_fmt: &'static str,
+    /// 被控来件横幅（{}=控制端设备名）
+    pub remote_incoming_fmt: &'static str,
+    /// 配对码标签
+    pub remote_incoming_code: &'static str,
+    /// 拒绝控制按钮
+    pub remote_decline: &'static str,
+    /// 正在被控横幅（{}=控制端设备名）
+    pub remote_being_controlled_fmt: &'static str,
+    /// 正在控制横幅（{}=被控端设备名）
+    pub remote_controlling_fmt: &'static str,
+    /// 断开会话按钮
+    pub remote_disconnect: &'static str,
+    /// toast：会话已建立（控制端，{}=对端名）
+    pub remote_toast_controlling_fmt: &'static str,
+    /// toast：会话已建立（被控端，{}=对端名）
+    pub remote_toast_controlled_fmt: &'static str,
+    /// toast：会话已结束
+    pub remote_toast_session_ended: &'static str,
+    /// toast：请求被拒——目标离线
+    pub remote_denied_offline: &'static str,
+    /// toast：请求被拒——对方忙（已被控/配对中）
+    pub remote_denied_busy: &'static str,
+    /// toast：请求被拒——对方拒绝
+    pub remote_denied_rejected: &'static str,
+    /// toast：请求被拒——其他（跨账户/自控/本端忙/超时等）
+    pub remote_denied_generic: &'static str,
+    /// toast：配对失败（次数用尽）
+    pub remote_pairing_failed: &'static str,
+    /// toast：配对/会话超时
+    pub remote_toast_pairing_expired: &'static str,
+    /// toast：控制请求被取消（控制端撤销）
+    pub remote_toast_pairing_cancelled: &'static str,
+    /// toast：会话结束——对端断线
+    pub remote_toast_peer_offline: &'static str,
+    /// toast：会话结束——本设备在别处登录被取代
+    pub remote_toast_replaced: &'static str,
     /// 还原窗格大小禁用 tooltip（单窗格时）
     pub topbar_reset_layout_disabled_tip: &'static str,
 
