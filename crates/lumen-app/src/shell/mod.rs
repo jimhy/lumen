@@ -77,6 +77,10 @@ pub struct ShellState {
     pub completion: completion_ui::CompletionUiState,
     /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
     pub toast: toast::ToastState,
+    /// 进行中的远程设备重命名（M5.2）：(设备 id, 编辑中文本)。编辑期间键盘归 egui。
+    pub renaming_device: Option<(String, String)>,
+    /// 设备重命名刚开始，下一帧把焦点交给编辑框。
+    rename_device_focus: bool,
 }
 
 /// 激活 tab 中一个窗格的展示数据（终端工作区分屏用，F5）。
@@ -148,6 +152,10 @@ pub struct ShellInput<'a> {
     /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
     /// 候选列表由 main 在 render 前计算好。
     pub completion_view: Option<completion_ui::CompletionView<'a>>,
+    /// 远程设备列表（M5.2；仅远程 tab 渲染，服务端已按 last_seen 倒序）。
+    pub remote_devices: &'a [lumen_protocol::DeviceRecord],
+    /// 当前选中的远程设备 id（高亮用）。
+    pub active_device_id: Option<&'a str>,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -205,6 +213,14 @@ pub struct ShellOutput {
     pub toggle_filetree: Option<bool>,
     /// 本地/远程视图切换（M5.2）：main 写 settings.layout.view_mode + 存盘。
     pub toggle_view_mode: Option<bool>,
+    /// 选中了某远程设备（M5.2）：main 记 active_device_id。
+    pub activate_device: Option<String>,
+    /// 提交远程设备改名（M5.2）：(设备 id, 新名)。
+    pub rename_device: Option<(String, String)>,
+    /// 删除远程设备（M5.2）：设备 id。
+    pub delete_device: Option<String>,
+    /// 设备改名编辑本帧以键盘结束（main 把焦点还终端，仿会话重命名）。
+    pub rename_device_ended_by_key: bool,
     /// 分隔条拖动中：(分隔条, 指针位置（逻辑点）)。main 据此把对应
     /// 边界拖到指针处（绝对定位无累积漂移；最小尺寸钳制在 layout）。
     pub divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
@@ -343,6 +359,10 @@ pub fn show(
         toggle_sidebar: None,
         toggle_filetree: None,
         toggle_view_mode: None,
+        activate_device: None,
+        rename_device: None,
+        delete_device: None,
+        rename_device_ended_by_key: false,
         divider_drag: None,
         divider_drag_ended: false,
         divider_reset: None,
@@ -519,6 +539,71 @@ pub fn show(
         let y = root.available_rect_before_wrap().y_range();
         egui::Rect::from_x_y_ranges(edge_x - grab..=edge_x + grab, y)
     };
+    // 远程设备列表（M5.2）：仅远程 tab 显示，置于会话栏左侧（第三列）。
+    if app_settings.layout.view_mode {
+        let rl_resp = egui::Panel::left("lumen_remote_list")
+            .default_size(crate::settings::REMOTE_LIST_WIDTH_DEFAULT)
+            .size_range(
+                crate::settings::REMOTE_LIST_WIDTH_MIN..=crate::settings::REMOTE_LIST_WIDTH_MAX,
+            )
+            .resizable(true)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg_dark)
+                    .inner_margin(egui::Margin::symmetric(8, 10)),
+            )
+            .show_inside(root, |ui| {
+                remote_device_list_ui(
+                    ui,
+                    input.remote_devices,
+                    input.active_device_id,
+                    st,
+                    pal,
+                    &mut out,
+                )
+            });
+        // 轮廓描边（四边，像素对齐）。
+        {
+            use egui::emath::GuiRounding as _;
+            let ppp = root.pixels_per_point();
+            let r = rl_resp.response.rect.round_to_pixels(ppp);
+            let hw = 0.5 / ppp;
+            let stroke = egui::Stroke::new(1.0 / ppp, pal.panel_outline);
+            let p = root.painter();
+            p.line_segment(
+                [
+                    egui::pos2(r.min.x + hw, r.min.y),
+                    egui::pos2(r.min.x + hw, r.max.y),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(r.max.x - hw, r.min.y),
+                    egui::pos2(r.max.x - hw, r.max.y),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(r.min.x, r.min.y + hw),
+                    egui::pos2(r.max.x, r.min.y + hw),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(r.min.x, r.max.y - hw),
+                    egui::pos2(r.max.x, r.max.y - hw),
+                ],
+                stroke,
+            );
+        }
+        out.panel_resize_rects
+            .push(edge_rect(rl_resp.response.rect.max.x, root));
+    }
+
     if app_settings.layout.sidebar_visible {
         // 可拖宽（P10）。default_size 只在 egui 无面板记忆（首帧）时生效
         // = 还原持久化宽度；此后宽度由 egui 面板自管，实际值经
@@ -1596,6 +1681,167 @@ fn sidebar_ui(
     // R8：底部「⚙ 设置」和「＋ 新建会话」按钮已删除。
     // 设置入口=头像菜单 Settings + Ctrl+,（两者均健在）。
     // 新建会话入口=侧栏标题栏右端小「＋」按钮（Ctrl+T）。
+}
+
+/// 远程设备列表（M5.2）：在线置顶 / 离线置底、本机标记、选中高亮、
+/// 右键改名 / 删除。结构仿会话侧栏 [`sidebar_ui`]，简化为两行条目。
+fn remote_device_list_ui(
+    ui: &mut egui::Ui,
+    devices: &[lumen_protocol::DeviceRecord],
+    active_id: Option<&str>,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+) {
+    let s = crate::i18n::strings();
+
+    // 标题栏条（高 30px，与会话栏标题对齐）。
+    {
+        let (title_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+        let mut title_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(title_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        title_ui.add(
+            egui::Label::new(
+                egui::RichText::new(s.remote_list_title)
+                    .size(12.0)
+                    .color(pal.fg_dim),
+            )
+            .selectable(false),
+        );
+    }
+    ui.add_space(2.0);
+
+    // 排序：在线置顶、离线置底（各组内保持服务端 last_seen 倒序）。
+    let mut order: Vec<usize> = (0..devices.len()).collect();
+    order.sort_by_key(|&i| !devices[i].online);
+
+    egui::ScrollArea::vertical()
+        .id_salt("remote_device_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if devices.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(s.remote_empty)
+                        .size(11.0)
+                        .color(pal.fg_dim),
+                );
+                return;
+            }
+            for &i in &order {
+                let dev = &devices[i];
+                // 重命名中：行内编辑框（仿会话重命名仲裁）。
+                let is_renaming = st
+                    .renaming_device
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == dev.id);
+                if is_renaming {
+                    if let Some((_, buf)) = st.renaming_device.as_mut() {
+                        let resp =
+                            ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
+                        if st.rename_device_focus {
+                            resp.request_focus();
+                            st.rename_device_focus = false;
+                        }
+                        if resp.lost_focus() {
+                            let by_key = ui.input(|i| {
+                                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)
+                            });
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                out.rename_device = Some((dev.id.clone(), buf.trim().to_owned()));
+                            }
+                            out.rename_device_ended_by_key = by_key;
+                            st.renaming_device = None;
+                        }
+                    }
+                    continue;
+                }
+
+                const ROW_H: f32 = 44.0;
+                const DOT_COL: f32 = 22.0;
+                let active = active_id == Some(dev.id.as_str());
+                let (rect, mut resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ROW_H),
+                    egui::Sense::click(),
+                );
+                let bg = if active {
+                    pal.selection
+                } else if resp.hovered() {
+                    pal.bg_highlight
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                if bg != egui::Color32::TRANSPARENT {
+                    ui.painter().rect_filled(rect, 2.0, bg);
+                }
+                // 左侧在线圆点（绿=在线，灰=离线）。
+                let dot_c = egui::pos2(rect.left() + DOT_COL / 2.0, rect.center().y);
+                let dot_color = if dev.online {
+                    egui::Color32::from_rgb(0x3f, 0xb9, 0x50)
+                } else {
+                    pal.fg_dim
+                };
+                ui.painter().circle_filled(dot_c, 4.0, dot_color);
+                // 名称行 + 状态行。
+                let text_left = rect.left() + DOT_COL;
+                let text_w = (rect.right() - 8.0 - text_left).max(10.0);
+                let text_rect = egui::Rect::from_min_size(
+                    egui::pos2(text_left, rect.center().y - 15.0),
+                    egui::vec2(text_w, 30.0),
+                );
+                let mut text_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                text_ui.spacing_mut().item_spacing.y = 2.0;
+                let name_color = if dev.online { pal.fg } else { pal.fg_dim };
+                text_ui.add(
+                    egui::Label::new(egui::RichText::new(&dev.name).size(13.0).color(name_color))
+                        .selectable(false)
+                        .truncate(),
+                );
+                let status = if dev.is_self {
+                    let on = if dev.online {
+                        s.remote_online
+                    } else {
+                        s.remote_offline
+                    };
+                    format!("{on} · {}", s.remote_this_device)
+                } else if dev.online {
+                    s.remote_online.to_string()
+                } else {
+                    format!("{}（{}）", s.remote_offline, s.remote_unavailable)
+                };
+                text_ui.add(
+                    egui::Label::new(egui::RichText::new(status).size(11.0).color(pal.fg_dim))
+                        .selectable(false)
+                        .truncate(),
+                );
+
+                // 仅在线设备可选中（离线不可连接）。
+                if resp.clicked() && dev.online {
+                    out.activate_device = Some(dev.id.clone());
+                }
+                resp = resp.on_hover_text(format!("{} · {}", dev.os, dev.app_version));
+                resp.context_menu(|ui| {
+                    let s = crate::i18n::strings();
+                    if ui.button(s.menu_rename).clicked() {
+                        st.renaming_device = Some((dev.id.clone(), dev.name.clone()));
+                        st.rename_device_focus = true;
+                        ui.close();
+                    }
+                    if ui.button(s.remote_menu_delete).clicked() {
+                        out.delete_device = Some(dev.id.clone());
+                        ui.close();
+                    }
+                });
+            }
+        });
 }
 
 /// 会话「忙」指示：自绘科技感方形轨迹 spinner——一个小圆点沿**正方形

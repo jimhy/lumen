@@ -345,6 +345,20 @@ pub struct Strings {
     pub topbar_tab_local: &'static str,
     /// 顶栏「远程」tab（M5.2）
     pub topbar_tab_remote: &'static str,
+    /// 远程设备列表标题（M5.2）
+    pub remote_list_title: &'static str,
+    /// 设备在线
+    pub remote_online: &'static str,
+    /// 设备离线
+    pub remote_offline: &'static str,
+    /// 本机标记
+    pub remote_this_device: &'static str,
+    /// 离线不可连接
+    pub remote_unavailable: &'static str,
+    /// 暂无设备
+    pub remote_empty: &'static str,
+    /// 右键删除设备
+    pub remote_menu_delete: &'static str,
     /// 还原窗格大小禁用 tooltip（单窗格时）
     pub topbar_reset_layout_disabled_tip: &'static str,
 

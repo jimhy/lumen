@@ -190,6 +190,13 @@ pub static STRINGS: Strings = Strings {
     topbar_reset_layout_tip: "恢复窗格默认大小",
     topbar_tab_local: "本地",
     topbar_tab_remote: "远程",
+    remote_list_title: "设备",
+    remote_online: "在线",
+    remote_offline: "离线",
+    remote_this_device: "本机",
+    remote_unavailable: "不可连接",
+    remote_empty: "暂无设备",
+    remote_menu_delete: "删除设备",
     topbar_reset_layout_disabled_tip: "单窗格无需复位",
 
     // F3 热更

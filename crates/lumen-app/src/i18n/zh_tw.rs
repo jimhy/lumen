@@ -196,6 +196,13 @@ pub static STRINGS: Strings = Strings {
     topbar_reset_layout_tip: "還原窗格預設大小",
     topbar_tab_local: "本地",
     topbar_tab_remote: "遠端",
+    remote_list_title: "裝置",
+    remote_online: "線上",
+    remote_offline: "離線",
+    remote_this_device: "本機",
+    remote_unavailable: "無法連線",
+    remote_empty: "暫無裝置",
+    remote_menu_delete: "刪除裝置",
     topbar_reset_layout_disabled_tip: "單一窗格無需復位",
 
     // F3 熱更

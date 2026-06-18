@@ -192,6 +192,13 @@ pub static STRINGS: Strings = Strings {
     topbar_reset_layout_tip: "Reset pane sizes",
     topbar_tab_local: "Local",
     topbar_tab_remote: "Remote",
+    remote_list_title: "Devices",
+    remote_online: "Online",
+    remote_offline: "Offline",
+    remote_this_device: "This device",
+    remote_unavailable: "Unavailable",
+    remote_empty: "No devices",
+    remote_menu_delete: "Delete device",
     topbar_reset_layout_disabled_tip: "Only one pane, nothing to reset",
 
     // F3 auto-update

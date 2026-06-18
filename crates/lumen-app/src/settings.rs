@@ -41,6 +41,10 @@ pub const FILETREE_WIDTH_MIN: f32 = 160.0;
 pub const FILETREE_WIDTH_MAX: f32 = 480.0;
 /// 中间文件树栏默认宽度。
 pub const FILETREE_WIDTH_DEFAULT: f32 = 220.0;
+/// 远程设备列表栏宽度范围与默认（M5.2，会话栏左侧第三列）。
+pub const REMOTE_LIST_WIDTH_MIN: f32 = 150.0;
+pub const REMOTE_LIST_WIDTH_MAX: f32 = 360.0;
+pub const REMOTE_LIST_WIDTH_DEFAULT: f32 = 200.0;
 
 /// 当前 settings.json 模式版本：v2 起（P12）`appearance.theme` 为
 /// 主题注册表 id 字符串（旧版为 ThemeChoice 枚举的 kebab-case 序列

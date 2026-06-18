@@ -8,6 +8,8 @@ mod background;
 // 同步等方法在 M5.2+ 才接线，故暂允许 dead_code（脚手架，非真死代码）。
 #[allow(dead_code)]
 mod cloud;
+// M5.2 远程设备状态（心跳 + 设备列表后台线程）。
+mod remote;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
 mod completion;
@@ -584,6 +586,8 @@ struct AppState {
 
     // —— egui 外壳 ——
     egui_ctx: egui::Context,
+    /// M5.2 远程设备状态（心跳 + 设备列表）。
+    remote: remote::RemoteState,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     /// 各窗格离屏纹理的 egui 句柄（键 = 会话 id；离屏重建后原地
@@ -3156,6 +3160,7 @@ impl App {
             update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
             update_proxy: Arc::new(std::sync::Mutex::new(init_proxy)),
             egui_ctx,
+            remote: remote::RemoteState::default(),
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
@@ -5025,6 +5030,15 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     None
                 };
+                // M5.2：已登录但远程线程未起（启动时已登录 / 刚登录）→ 启动；
+                // 每帧收取后台心跳/设备列表回包。
+                if !state.remote.is_running() {
+                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
+                        let ctx = state.egui_ctx.clone();
+                        state.remote.start(tok, ctx);
+                    }
+                }
+                let _ = state.remote.poll();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -5054,6 +5068,8 @@ impl ApplicationHandler<PtyWake> for App {
                     completion_view: completion_view_owned,
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
+                    remote_devices: &state.remote.devices,
+                    active_device_id: state.remote.active_device_id.as_deref(),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
@@ -5625,10 +5641,12 @@ impl ApplicationHandler<PtyWake> for App {
                 // 直通 PTY（Esc 关不掉菜单、打字进 shell）。
                 if state.shell_state.renaming.is_some()
                     || state.shell_state.pane_renaming.is_some()
+                    || state.shell_state.renaming_device.is_some()
                 {
                     state.terminal_focused = false;
                 } else if (was_renaming && shell_out.rename_ended_by_key)
                     || (was_pane_renaming && shell_out.pane_rename_ended_by_key)
+                    || shell_out.rename_device_ended_by_key
                 {
                     state.terminal_focused = true;
                 }
@@ -5646,6 +5664,7 @@ impl ApplicationHandler<PtyWake> for App {
                 } else if state.was_popup_open
                     && state.shell_state.renaming.is_none()
                     && state.shell_state.pane_renaming.is_none()
+                    && state.shell_state.renaming_device.is_none()
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
@@ -5663,6 +5682,16 @@ impl ApplicationHandler<PtyWake> for App {
                             state.activate(idx);
                         }
                     }
+                }
+                // —— M5.2 远程设备动作：选中 / 改名 / 删除 ——
+                if let Some(id) = shell_out.activate_device {
+                    state.remote.active_device_id = Some(id);
+                }
+                if let Some((id, name)) = shell_out.rename_device {
+                    state.remote.rename_device(id, name);
+                }
+                if let Some(id) = shell_out.delete_device {
+                    state.remote.delete_device(id);
                 }
                 if let Some((id, name)) = shell_out.rename {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id) {
@@ -6070,6 +6099,10 @@ impl ApplicationHandler<PtyWake> for App {
                 // M5.2：本地/远程 tab 切换 → 写 settings 并触发存盘。
                 let view_mode_changed = if let Some(v) = shell_out.toggle_view_mode {
                     state.settings.layout.view_mode = v;
+                    // 切到远程视图：请求后台立即刷新一次设备列表。
+                    if v {
+                        state.remote.request_refresh();
+                    }
                     true
                 } else {
                     false
@@ -6172,6 +6205,8 @@ impl ApplicationHandler<PtyWake> for App {
                     profile::Profile::delete();
                     info!("已登出（profile.json 已删除）");
                     state.profile = None;
+                    // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
+                    state.remote.stop();
                 }
 
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序
