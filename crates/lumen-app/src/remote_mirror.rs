@@ -120,6 +120,10 @@ pub struct MirrorView {
     pub lines: Vec<String>,
     /// 光标 (行, 列)（可见区内 0-based）。
     pub cursor: (usize, usize),
+    /// 被控端终端列数（控制端按此等比缩放铺满显示区）。
+    pub cols: usize,
+    /// 被控端终端行数。
+    pub rows: usize,
 }
 
 /// 从镜像 [`Terminal`] 提取可见区文本视图。
@@ -127,6 +131,7 @@ pub struct MirrorView {
 pub fn mirror_view(term: &Terminal) -> MirrorView {
     let grid = term.grid();
     let cols = grid.cols();
+    let rows = grid.rows();
     let lines = grid
         .visible_rows()
         .map(|row| {
@@ -143,6 +148,8 @@ pub fn mirror_view(term: &Terminal) -> MirrorView {
     MirrorView {
         lines,
         cursor: (grid.cursor.row, grid.cursor.col),
+        cols,
+        rows,
     }
 }
 

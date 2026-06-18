@@ -255,41 +255,48 @@ pub fn paint_mirror(
         ))
         .with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, pal.bg_dark);
+    if view.cols == 0 || view.rows == 0 {
+        return;
+    }
 
-    let font = egui::FontId::monospace(13.0);
-    // 量一个等宽字符的尺寸（避免 egui Fonts 的 &mut 取用限制）。
-    let sample = painter.layout_no_wrap("M".to_owned(), font.clone(), pal.fg);
-    let char_w = sample.size().x.max(1.0);
-    let line_h = sample.size().y.max(1.0);
     let pad = 4.0;
-    // 显示区能容纳的行/列上限：被控端可能比控制端窗口宽/高，超出的不绘制
-    // （主动限制——否则 egui 仍会对整行布局再被 clip 裁掉，纯浪费 CPU）。
-    let max_rows = (((rect.height() - 2.0 * pad) / line_h).floor()).max(0.0) as usize;
-    let max_cols = (((rect.width() - 2.0 * pad) / char_w).floor()).max(0.0) as usize;
+    let avail_w = (rect.width() - 2.0 * pad).max(1.0);
+    let avail_h = (rect.height() - 2.0 * pad).max(1.0);
 
-    for (i, line) in view.lines.iter().take(max_rows).enumerate() {
+    // 在参考字号量等宽 cell 尺寸比例，再求能把被控端 cols×rows **等比铺满**显示区
+    // 的最大字号（取宽/高两个约束的较小者，保持宽高比、不拉伸、不裁内容；居中）。
+    let ref_size = 16.0;
+    let sample = painter.layout_no_wrap("M".to_owned(), egui::FontId::monospace(ref_size), pal.fg);
+    let cw_ref = sample.size().x.max(1.0);
+    let lh_ref = sample.size().y.max(1.0);
+    let s_w = avail_w * ref_size / (view.cols as f32 * cw_ref);
+    let s_h = avail_h * ref_size / (view.rows as f32 * lh_ref);
+    let font_size = s_w.min(s_h).clamp(6.0, 40.0);
+    let font = egui::FontId::monospace(font_size);
+    let char_w = cw_ref * font_size / ref_size;
+    let line_h = lh_ref * font_size / ref_size;
+
+    // 居中（铺满主轴、另一轴 letterbox 对称）。
+    let grid_w = view.cols as f32 * char_w;
+    let grid_h = view.rows as f32 * line_h;
+    let ox = rect.left() + pad + (avail_w - grid_w).max(0.0) / 2.0;
+    let oy = rect.top() + pad + (avail_h - grid_h).max(0.0) / 2.0;
+
+    for (i, line) in view.lines.iter().enumerate() {
         if line.is_empty() {
             continue;
         }
-        // 按可见列数截断，避免把超宽整行丢给 painter 布局。
-        let shown: String = line.chars().take(max_cols).collect();
-        if shown.is_empty() {
-            continue;
-        }
-        let pos = egui::pos2(rect.left() + pad, rect.top() + pad + i as f32 * line_h);
-        painter.text(pos, egui::Align2::LEFT_TOP, shown, font.clone(), pal.fg);
+        let pos = egui::pos2(ox, oy + i as f32 * line_h);
+        painter.text(pos, egui::Align2::LEFT_TOP, line, font.clone(), pal.fg);
     }
 
-    // 光标块（半透明 accent）：行、列都在可见范围内才画。
+    // 光标块（半透明 accent）。
     let (cr, cc) = view.cursor;
-    if cr < max_rows && cc < max_cols {
-        let cx = rect.left() + pad + cc as f32 * char_w;
-        let cy = rect.top() + pad + cr as f32 * line_h;
+    if cr < view.rows && cc < view.cols {
+        let cx = ox + cc as f32 * char_w;
+        let cy = oy + cr as f32 * line_h;
         painter.rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(cx, cy),
-                egui::vec2(char_w.max(2.0), line_h),
-            ),
+            egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(char_w.max(2.0), line_h)),
             0.0,
             pal.accent.gamma_multiply(0.5),
         );
