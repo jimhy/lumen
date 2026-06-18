@@ -1017,10 +1017,15 @@ impl AppState {
             }
             // part3c-2 Option B：焦点窗格 cwd 变即推 RootChanged（替代 Option A 整树快照）；
             // 控制端据此重置远程树根。cwd 未知（首个提示符前）不推，控制端维持「等待 cwd」。
-            // 片1 仅推根；片2 加 take_listdir_reqs/spawn_list_dir 按需读目录服务。
             if let Some(cwd) = self.tabs[ti].cwd_path() {
                 self.remote_ws.send_root_changed(cwd);
             }
+            // part3c-2 Option B 文件服务：控制端按需 ListDir → 被控端后台读盘 → 回包发回。
+            // 读盘走后台线程（慢速网络盘不冻 UI），结果经 svc 通道由 drain_service 发回。
+            for (req_id, path, show_hidden) in self.remote_ws.take_listdir_reqs() {
+                self.remote_ws.spawn_list_dir(req_id, path, show_hidden);
+            }
+            self.remote_ws.drain_service();
         } else {
             self.mirror_src = None;
             self.mirror_bounds_sent = None;
@@ -6749,7 +6754,14 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序
                 // 打开（注入目标 = 焦点窗格）——
-                // part3c-2：控制端远程树动作（ListDir/Fetch/复制粘贴）在片2+ 接入此处。
+                // part3c-2：控制端远程树交互（只读渲染收集，此处以 &mut 施加）——
+                // 目录点击 → 翻转展开（纯本地，未缓存则发 ListDir）；显示隐藏项 → 重列根。
+                for id in shell_out.remote_dir_clicks {
+                    state.remote_ws.remote_dir_clicked(id);
+                }
+                if let Some(show) = shell_out.remote_toggle_hidden {
+                    state.remote_ws.set_remote_show_hidden(show);
+                }
                 if let Some(dir) = shell_out.cd_dir {
                     // UI 已按 shell 空闲闸门过滤，这里直接注入。
                     let cmd = shell::filetree::cd_command(&dir);

@@ -292,7 +292,10 @@ pub struct ShellOutput {
     pub cd_dir: Option<std::path::PathBuf>,
     /// 文件树：激活了文件，用系统默认程序打开。
     pub open_file: Option<std::path::PathBuf>,
-    // M5.3 part3c-2：控制端远程树动作（ListDir/Fetch/复制粘贴）的 output 字段在片2+ 加入。
+    /// M5.3 part3c-2 控制端远程树：本帧被点击的目录节点 id（main 翻转展开 + 按需 ListDir）。
+    pub remote_dir_clicks: Vec<usize>,
+    /// 控制端远程树：「显示隐藏项」勾选变化（main set + 重列根）。
+    pub remote_toggle_hidden: Option<bool>,
     /// 文件树：节点拖放到某窗格，把路径文本插入该窗格命令行（不带
     /// 回车，转义见 filetree::path_insert_text）。元组为 (落点所在
     /// 窗格下标, 路径)；落点不在任何窗格（间隙/区外）时整体为 None。
@@ -415,6 +418,8 @@ pub fn show(
         new_session: false,
         cd_dir: None,
         open_file: None,
+        remote_dir_clicks: Vec::new(),
+        remote_toggle_hidden: None,
         insert_path: None,
         copy_text: None,
         filetree_dialog_closed: false,
@@ -717,17 +722,19 @@ pub fn show(
     // 否则画本地树。`panel_width/rect` 两路同构，下方描边/拖宽手柄逻辑无需分支。
     // 片1 为占位桩（仅按 RootChanged 的 cwd 画占位）；片2 换成交互式浏览树。
     let (ft_panel_width, ft_panel_rect, ft_external_drop) = if input.remote_view_active {
-        // 远程视图：一律画被控端树。cwd 未到（会话起始瞬间 / 被控端首个提示符前）时
-        // 传空 root → 画「等待 cwd」占位，绝不回落本地树（否则点击串扰控制端本机）。
-        let tree_root: &str = input.remote_filetree.and_then(|ft| ft.root()).unwrap_or("");
+        // 远程视图：一律画被控端 Option B 浏览树（只读渲染）。cwd 未到时画占位，绝不回落
+        // 本地树（否则点击串扰控制端本机）。交互意图（展开点击 / 显示隐藏）收集到 rout，
+        // 由 main 闭包后以 &mut state.remote_ws 施加。
         let rout = filetree::show_remote(
             root,
-            tree_root,
+            input.remote_filetree,
             st.filetree.visible,
             pal,
             app_settings.layout.filetree_width,
         );
         out.filetree_width = rout.panel_width;
+        out.remote_dir_clicks = rout.dir_clicks;
+        out.remote_toggle_hidden = rout.toggle_hidden;
         (rout.panel_width, rout.panel_rect, None) // 远程树无拖放
     } else {
         let ft = filetree::show(

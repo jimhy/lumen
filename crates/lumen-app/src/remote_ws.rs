@@ -27,7 +27,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C, Role,
+    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C,
+    Role,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 use tungstenite::stream::MaybeTlsStream;
@@ -154,11 +155,20 @@ pub struct RemoteWs {
     mirror_selection: Option<Selection>,
     /// 控制端：镜像选区拖动中（左键按下到松开）。
     mirror_selecting: bool,
-    /// M5.3 part3c-2 控制端：Option B 远程树状态（按需浏览被控端文件系统）。片1 为占位桩
-    /// （仅记被控端 cwd），片2 换成完整状态机（自有展开态 + 目录缓存 + 在途 ListDir）。
+    /// M5.3 part3c-2 控制端：Option B 远程树状态（按需浏览被控端文件系统；自有展开态 +
+    /// 目录缓存 + 在途 ListDir）。
     remote_filetree: Option<RemoteFileTree>,
     /// 被控端：已推给控制端的当前 cwd（去重 [`RemoteFrame::RootChanged`]，cwd 变才重发）。
     remote_root_sent: Option<String>,
+    /// 控制端：请求号分配器（单调递增，跳 0 哨兵；ListDir/Fetch/Put 全局共用）。
+    req_seq: u64,
+    /// 被控端：控制端发来的待处理 ListDir 请求 `(req_id, path, show_hidden)`，main 取走后
+    /// 后台读盘（[`Self::spawn_list_dir`]）。
+    pending_listdir: Vec<(u64, String, bool)>,
+    /// 被控端：文件服务后台线程 → 主线程的回包发送端（[`Self::start`] 建，worker 克隆）。
+    svc_tx: Option<Sender<SvcReply>>,
+    /// 被控端：文件服务回包接收端（main 在 `pump_remote` 经 [`Self::drain_service`] 排空发回）。
+    svc_rx: Option<Receiver<SvcReply>>,
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
@@ -175,22 +185,322 @@ pub struct RemoteWs {
     stop: Option<Arc<AtomicBool>>,
 }
 
-/// 控制端一帧镜像的渲染源（[`RemoteWs::mirror_render`] 产出）：跟随态借 live `mirror`，
-/// 回看态借填好窗口的 `hist_term`，连同该帧应画的光标（回看态光标隐藏）。
-/// M5.3 part3c-2 控制端 Option B 远程树（**片1 占位桩**：仅记被控端 cwd 画占位；
-/// 片2 换成完整状态机——自有展开态 `TreeViewState` + 按被控端路径缓存的目录 listing +
-/// 在途 `ListDir` 请求跟踪）。
+/// M5.3 part3c-2 控制端 Option B 远程树：**按需浏览被控端文件系统**的状态机。
+///
+/// 替代 part3c-1 的 Option A（被控端推「可见行 + 展开态」快照）。控制端自持展开态
+/// （`open`，**不与被控端同步** → 修 #6）+ 按被控端不透明路径缓存目录 `listings`
+/// （展开未缓存目录即发 [`RemoteFrame::ListDir`]、被控端直接读盘回 → 修 #2/#3/#4）。
+/// 节点 id = `nodes` 下标，根恒为 id 0 且默认展开。换根（[`RemoteFrame::RootChanged`]）
+/// 整体重置（清空 `nodes`/`listings`/`open`/`pending`）。乱序 / 陈旧 / 换根后到达的
+/// [`RemoteFrame::ListDirResult`] 被三重丢弃：① `reset_to_root` 清空 `pending` →
+/// `apply_dir_entries` 的 `pending.get(dir_id)==Some(req_id)` 双键不命中；② `req_seq`
+/// 进程级单调（从不在 start/stop/clear 重置）使换根前后 `req_id` 永不相等；③ `find_dir`
+/// 只沿 `listings` 可达节点匹配路径。渲染**只读**（[`Self::visible_rows`]），点击经
+/// `RemoteFileTreeOutput` 闭包后由 [`RemoteWs`] 以 `&mut` 施加——规避 `ShellInput` 的
+/// `&remote_ws` 借用与渲染 `&mut` 的冲突。
+#[derive(Default)]
 pub struct RemoteFileTree {
-    /// 被控端焦点窗格 cwd（来源 [`RemoteFrame::RootChanged`]）。`None` = 等待 cwd。
+    /// 被控端焦点窗格 cwd（树根；来源 [`RemoteFrame::RootChanged`]）。`None` = 等待 cwd。
     root: Option<String>,
+    /// 节点表（append-only，换根重建；id = 下标，根恒为 0）。
+    nodes: Vec<RemoteNode>,
+    /// 已读目录的子项缓存：dir id → listing（折叠后保留，再展开秒开）。
+    listings: HashMap<usize, RemoteDirListing>,
+    /// 控制端自持展开态（dir id 集合；根 id 0 初始即在内）。
+    open: HashSet<usize>,
+    /// 在途 ListDir：dir id → req_id（双键校验，丢弃陈旧 / 乱序应答）。
+    pending: HashMap<usize, u64>,
+    /// 远程「显示隐藏项」开关（工具条勾选；经 `ListDir.show_hidden` 下发）。
+    show_hidden: bool,
+}
+
+/// 远程树一个真实节点（目录 / 文件；占位行不入表，渲染时合成）。
+struct RemoteNode {
+    /// 被控端不透明路径（往返键 + 显示）。
+    path: String,
+    /// 显示名（被控端 `display_name` 算好）。
+    name: String,
+    /// 是否目录。
+    is_dir: bool,
+}
+
+/// 已读目录的 listing（子节点 + 溢出 / 不可读元信息，占位行渲染时据此合成）。
+struct RemoteDirListing {
+    /// 子节点 id（目录在前，被控端已排序）。
+    children: Vec<usize>,
+    /// 单层截断未显示项数（`>0` 画「溢出」占位）。
+    overflow: u32,
+    /// 读目录失败（画「无法读取」占位）。
+    unreadable: bool,
+}
+
+/// 远程树可见行（[`RemoteFileTree::visible_rows`] 产出，供 `show_remote` 只读渲染）。
+pub struct RemoteRow {
+    /// 真实节点 id（占位行为 `usize::MAX`，不可点）。
+    pub id: usize,
+    /// 不透明路径（占位行为空）。
+    pub path: String,
+    /// 显示名（占位行为空，渲染查 i18n 文案）。
+    pub name: String,
+    /// 缩进深度（根 = 0）。
+    pub depth: u32,
+    /// 行种类。
+    pub kind: RemoteRowKind,
+}
+
+/// 远程树行种类。
+pub enum RemoteRowKind {
+    /// 目录（`open` 决定三角朝向与是否下钻）。
+    Dir {
+        /// 是否展开。
+        open: bool,
+    },
+    /// 文件。
+    File,
+    /// 「加载中…」占位（该目录 ListDir 在途）。
+    Loading,
+    /// 「无法读取」占位（被控端读目录失败）。
+    Unreadable,
+    /// 「还有 N 项未显示」溢出占位。
+    Overflow(u32),
+}
+
+impl RemoteRow {
+    fn placeholder(depth: u32, kind: RemoteRowKind) -> Self {
+        Self {
+            id: usize::MAX,
+            path: String::new(),
+            name: String::new(),
+            depth,
+            kind,
+        }
+    }
 }
 
 impl RemoteFileTree {
-    /// 被控端当前 cwd（占位渲染用；片2 后为树根）。
+    /// 换根（被控端 cwd 变）：根不同才整体重置，返回是否真的换了。
+    fn set_root(&mut self, path: String) -> bool {
+        if self.root.as_deref() == Some(path.as_str()) {
+            return false;
+        }
+        self.root = Some(path);
+        self.reset_to_root();
+        true
+    }
+
+    /// 重建节点表（换根 / 切显示隐藏项）：清空缓存 / 展开态 / 在途请求，重置为「根 +
+    /// 根默认展开」（root 为 None 时只清空）。清空 `pending` 即令旧 ListDir 应答失配作废
+    /// （配合 `req_seq` 进程级单调 + `find_dir` 路径可达，三重丢弃陈旧 / 乱序应答）。
+    fn reset_to_root(&mut self) {
+        self.nodes.clear();
+        self.listings.clear();
+        self.open.clear();
+        self.pending.clear();
+        if let Some(root) = &self.root {
+            let name = last_path_segment(root);
+            self.nodes.push(RemoteNode {
+                path: root.clone(),
+                name,
+                is_dir: true,
+            });
+            self.open.insert(0); // 根默认展开
+        }
+    }
+
+    /// 切「显示隐藏项」：变化才重列（重置回根，调用方随后 re-request 根 listing）。
+    fn set_show_hidden(&mut self, show: bool) -> bool {
+        if self.show_hidden == show {
+            return false;
+        }
+        self.show_hidden = show;
+        self.reset_to_root();
+        true
+    }
+
+    /// 应答 ListDir：按 `dir_path` DFS 找 dir id（只命中可达节点），`pending` 双键校验后把
+    /// 子项填进 listing（陈旧 / 乱序 / 换根后的应答静默丢弃）。
+    fn apply_dir_entries(
+        &mut self,
+        req_id: u64,
+        dir_path: &str,
+        entries: Vec<DirEntry>,
+        overflow: u32,
+        err: Option<FsErr>,
+    ) {
+        let Some(dir_id) = self.find_dir(dir_path) else {
+            return;
+        };
+        if self.pending.get(&dir_id) != Some(&req_id) {
+            return; // 双键不匹配：陈旧 / 乱序 / 已被换根作废。
+        }
+        self.pending.remove(&dir_id);
+        if err.is_some() {
+            self.listings.insert(
+                dir_id,
+                RemoteDirListing {
+                    children: Vec::new(),
+                    overflow: 0,
+                    unreadable: true,
+                },
+            );
+            return;
+        }
+        let mut children = Vec::with_capacity(entries.len());
+        for e in entries {
+            let cid = self.push_node(RemoteNode {
+                path: e.path,
+                name: e.name,
+                is_dir: e.is_dir,
+            });
+            children.push(cid);
+        }
+        self.listings.insert(
+            dir_id,
+            RemoteDirListing {
+                children,
+                overflow,
+                unreadable: false,
+            },
+        );
+    }
+
+    fn push_node(&mut self, node: RemoteNode) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
+    /// 按不透明路径找 **Dir** 节点 id——从根沿 listings DFS，只命中当前可达节点
+    /// （append-only 表里被覆盖的旧 listing 节点不被任何 listing 引用，天然跳过）。
+    fn find_dir(&self, path: &str) -> Option<usize> {
+        self.find_dir_visit(0, path)
+    }
+
+    fn find_dir_visit(&self, id: usize, path: &str) -> Option<usize> {
+        let node = self.nodes.get(id)?;
+        if node.is_dir && node.path == path {
+            return Some(id);
+        }
+        if let Some(listing) = self.listings.get(&id) {
+            for &child in &listing.children {
+                if let Some(found) = self.find_dir_visit(child, path) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    // —— 展开态 / 节点查询（供 RemoteWs 编排点击与 ListDir 请求）——
+    fn is_open(&self, id: usize) -> bool {
+        self.open.contains(&id)
+    }
+    fn set_open(&mut self, id: usize, open: bool) {
+        if open {
+            self.open.insert(id);
+        } else {
+            self.open.remove(&id);
+        }
+    }
+    fn has_listing(&self, id: usize) -> bool {
+        self.listings.contains_key(&id)
+    }
+    fn is_pending(&self, id: usize) -> bool {
+        self.pending.contains_key(&id)
+    }
+    fn mark_pending(&mut self, id: usize, req_id: u64) {
+        self.pending.insert(id, req_id);
+    }
+    fn clear_pending(&mut self, id: usize) {
+        self.pending.remove(&id);
+    }
+    fn node_path(&self, id: usize) -> Option<&str> {
+        self.nodes.get(id).map(|n| n.path.as_str())
+    }
+    fn node_is_dir(&self, id: usize) -> bool {
+        self.nodes.get(id).is_some_and(|n| n.is_dir)
+    }
+
+    /// 树根的不透明路径（工具条标题 + 悬停看全路径）。`None` = 等待 cwd。
     #[must_use]
-    pub fn root(&self) -> Option<&str> {
+    pub fn root_label(&self) -> Option<&str> {
         self.root.as_deref()
     }
+
+    /// 「显示隐藏项」当前开关（工具条勾选框回显）。
+    #[must_use]
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    /// 当前可见行（DFS 按展开态下钻；展开但 listing 未到画「加载中」占位）。供只读渲染。
+    #[must_use]
+    pub fn visible_rows(&self) -> Vec<RemoteRow> {
+        let mut rows = Vec::new();
+        if !self.nodes.is_empty() {
+            self.visit(0, 0, &mut rows);
+        }
+        rows
+    }
+
+    fn visit(&self, id: usize, depth: u32, rows: &mut Vec<RemoteRow>) {
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
+        let open = node.is_dir && self.open.contains(&id);
+        rows.push(RemoteRow {
+            id,
+            path: node.path.clone(),
+            name: node.name.clone(),
+            depth,
+            kind: if node.is_dir {
+                RemoteRowKind::Dir { open }
+            } else {
+                RemoteRowKind::File
+            },
+        });
+        if !open {
+            return;
+        }
+        if self.pending.contains_key(&id) {
+            rows.push(RemoteRow::placeholder(depth + 1, RemoteRowKind::Loading));
+        } else if let Some(listing) = self.listings.get(&id) {
+            for &child in &listing.children {
+                self.visit(child, depth + 1, rows);
+            }
+            if listing.unreadable {
+                rows.push(RemoteRow::placeholder(depth + 1, RemoteRowKind::Unreadable));
+            }
+            if listing.overflow > 0 {
+                rows.push(RemoteRow::placeholder(
+                    depth + 1,
+                    RemoteRowKind::Overflow(listing.overflow),
+                ));
+            }
+        } else {
+            // 展开但既无 listing 又非 pending（点击当帧、主线程尚未发 ListDir）：临时占位。
+            rows.push(RemoteRow::placeholder(depth + 1, RemoteRowKind::Loading));
+        }
+    }
+}
+
+/// 被控端文件服务后台线程 → 主线程的回包（主线程在 `pump_remote` 排空后发回控制端）。
+enum SvcReply {
+    /// ListDir 读目录结果。
+    ListDir {
+        req_id: u64,
+        path: String,
+        entries: Vec<DirEntry>,
+        overflow: u32,
+        err: Option<FsErr>,
+    },
+}
+
+/// 取路径末段作显示名（`C:\Users\hf` → `hf`；盘符根 `C:\` 等无末段时返回整串）。
+fn last_path_segment(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(path)
+        .to_owned()
 }
 
 pub struct MirrorFrame<'a> {
@@ -219,9 +529,13 @@ impl RemoteWs {
         self.stop();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        // 被控端文件服务回包通道（worker 线程 → 主线程；纯主线程内部，不经 WS 后台线程）。
+        let (svc_tx, svc_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         self.cmd_tx = Some(cmd_tx);
         self.evt_rx = Some(evt_rx);
+        self.svc_tx = Some(svc_tx);
+        self.svc_rx = Some(svc_rx);
         self.stop = Some(stop.clone());
         if let Err(e) = thread::Builder::new()
             .name("lumen-remote-ws".into())
@@ -247,7 +561,11 @@ impl RemoteWs {
         self.pending_viewport = None;
         self.pending_history.clear();
         self.reset_history();
+        // 先 clear（其内排空 svc_rx 丢弃在途回包）再断 svc 通道——否则 svc_rx 已 None
+        // 时排空成死代码（与 end_session/Disconnected 路径行为不一致）。
         self.clear_remote_filetree();
+        self.svc_tx = None;
+        self.svc_rx = None;
         self.notices.clear();
     }
 
@@ -386,6 +704,15 @@ impl RemoteWs {
 
     // ── part3c-2 Option B 目录树收发 ───────────────────────────────────────
 
+    /// 控制端：分配下一个请求号（单调递增，跳 0 哨兵；ListDir/Fetch/Put 全局共用）。
+    fn next_req_id(&mut self) -> u64 {
+        self.req_seq = self.req_seq.wrapping_add(1);
+        if self.req_seq == 0 {
+            self.req_seq = 1;
+        }
+        self.req_seq
+    }
+
     /// 被控端：焦点窗格 cwd 变化即推 [`RemoteFrame::RootChanged`]（去重：同 cwd 不重发）。
     /// 控制端据此重置远程树根。替代 Option A 的整树快照推送。
     pub fn send_root_changed(&mut self, path: String) {
@@ -402,10 +729,157 @@ impl RemoteWs {
         self.remote_filetree.as_ref()
     }
 
+    /// 控制端：用户点击远程树某目录行 → 翻转展开态（纯本地，不发帧 → 修 #6）；若新展开
+    /// 且该目录尚未缓存 / 在途，则发 [`RemoteFrame::ListDir`] 按需拉取（修 #2/#3/#4）。
+    pub fn remote_dir_clicked(&mut self, id: usize) {
+        // 先在受限作用域内翻转展开态、取出「需发 ListDir」的 (path, show_hidden)，释放 ft 借用。
+        let need = {
+            let Some(ft) = self.remote_filetree.as_mut() else {
+                return;
+            };
+            if !ft.node_is_dir(id) {
+                return;
+            }
+            let now_open = !ft.is_open(id);
+            ft.set_open(id, now_open);
+            if now_open {
+                if !ft.has_listing(id) && !ft.is_pending(id) {
+                    let show_hidden = ft.show_hidden();
+                    ft.node_path(id).map(|p| (p.to_owned(), show_hidden))
+                } else {
+                    None
+                }
+            } else {
+                // 折叠一个仍在途且未缓存的目录（应答可能因会话切换 / 通道关闭永不达）：清
+                // 其 pending，使再次展开能重新发 ListDir（否则 is_pending 恒真、永卡加载中）。
+                if ft.is_pending(id) && !ft.has_listing(id) {
+                    ft.clear_pending(id);
+                }
+                None
+            }
+        };
+        if let Some((path, show_hidden)) = need {
+            let req_id = self.next_req_id();
+            if let Some(ft) = self.remote_filetree.as_mut() {
+                ft.mark_pending(id, req_id);
+            }
+            self.send_frame(&RemoteFrame::ListDir {
+                req_id,
+                path,
+                show_hidden,
+            });
+        }
+    }
+
+    /// 控制端：切「显示隐藏项」开关。变化即重列（折叠回根 + 清缓存）并重发根 ListDir。
+    pub fn set_remote_show_hidden(&mut self, show: bool) {
+        let changed = self
+            .remote_filetree
+            .as_mut()
+            .is_some_and(|ft| ft.set_show_hidden(show));
+        if changed {
+            self.request_root_listing();
+        }
+    }
+
+    /// 控制端：为当前树根（id 0）发 ListDir（换根 / 切隐藏项后；已缓存 / 在途则跳过）。
+    fn request_root_listing(&mut self) {
+        let need = self.remote_filetree.as_ref().and_then(|ft| {
+            if ft.has_listing(0) || ft.is_pending(0) {
+                return None;
+            }
+            ft.node_path(0).map(|p| (p.to_owned(), ft.show_hidden()))
+        });
+        let Some((path, show_hidden)) = need else {
+            return;
+        };
+        let req_id = self.next_req_id();
+        if let Some(ft) = self.remote_filetree.as_mut() {
+            ft.mark_pending(0, req_id);
+        }
+        self.send_frame(&RemoteFrame::ListDir {
+            req_id,
+            path,
+            show_hidden,
+        });
+    }
+
+    /// 被控端：取走待处理的 ListDir 请求（main 后台读盘服务）。
+    pub fn take_listdir_reqs(&mut self) -> Vec<(u64, String, bool)> {
+        std::mem::take(&mut self.pending_listdir)
+    }
+
+    /// 被控端：后台线程读目录（绝不在主循环同步 IO——慢速网络盘会冻结整个应用），
+    /// 结果经 `svc_tx` 回主线程，由 [`Self::drain_service`] 发回控制端。
+    ///
+    /// TODO(片3 文件服务统一)：当前每请求起一条 OS 线程、无并发上限（review MED-1）。正常
+    /// 负载下控制端的 `has_listing`/`is_pending` 闸使每目录至多请求一次、量极小；但慢速网络
+    /// 盘上大量展开会堆线程。片3 引入 Fetch/Put 大文件传输时，把读目录 / 读文件 / 写文件统
+    /// 一收敛为「常驻 service 线程 + 有界任务队列 + inflight 上限」，与历史服务的同步有界精神
+    /// 一致。威胁模型上控制端已是配对鉴权方（本可在被控端跑任意命令），不构成提权，故片2 不阻断。
+    pub fn spawn_list_dir(&self, req_id: u64, path: String, show_hidden: bool) {
+        let Some(tx) = self.svc_tx.clone() else {
+            return;
+        };
+        thread::spawn(move || {
+            let reply = match crate::shell::filetree::list_dir_entries(
+                std::path::Path::new(&path),
+                show_hidden,
+            ) {
+                Ok((entries, overflow)) => SvcReply::ListDir {
+                    req_id,
+                    path,
+                    entries,
+                    overflow: u32::try_from(overflow).unwrap_or(u32::MAX),
+                    err: None,
+                },
+                Err(()) => SvcReply::ListDir {
+                    req_id,
+                    path,
+                    entries: Vec::new(),
+                    overflow: 0,
+                    err: Some(FsErr::Io),
+                },
+            };
+            // UI 先退出时通道已关：发送失败静默忽略。
+            let _ = tx.send(reply);
+        });
+    }
+
+    /// 被控端：排空文件服务后台回包，发回控制端（main 每帧 `pump_remote` 调）。
+    pub fn drain_service(&self) {
+        let Some(rx) = self.svc_rx.as_ref() else {
+            return;
+        };
+        while let Ok(reply) = rx.try_recv() {
+            match reply {
+                SvcReply::ListDir {
+                    req_id,
+                    path,
+                    entries,
+                    overflow,
+                    err,
+                } => self.send_frame(&RemoteFrame::ListDirResult {
+                    req_id,
+                    path,
+                    entries,
+                    overflow,
+                    err,
+                }),
+            }
+        }
+    }
+
     /// 清空文件树同步态（会话起止 / 断线；**不**在终端 Resize 时清——resize 不动文件树）。
     fn clear_remote_filetree(&mut self) {
         self.remote_filetree = None;
         self.remote_root_sent = None;
+        self.pending_listdir.clear();
+        // svc_rx 里可能残留旧会话的 ListDir 回包：排空丢弃（新会话 req_id 体系不同，
+        // 且 remote_filetree 已 None，apply_dir_entries 不会被调；这里仅防回包堆积）。
+        if let Some(rx) = self.svc_rx.as_ref() {
+            while rx.try_recv().is_ok() {}
+        }
     }
 
     /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
@@ -805,16 +1279,45 @@ impl RemoteWs {
             }
             // ── part3c-2 Option B 目录树 + 双向传输（按角色路由）──────────────
             RemoteFrame::RootChanged { path } => {
-                // 仅控制端：被控端焦点窗格 cwd 变 → 重置远程树根。
+                // 仅控制端：被控端焦点窗格 cwd 变 → 换根（清缓存 + pending）并按需拉根 listing。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
-                    // 片1 桩：仅记根画占位；片2 换成状态机 set_root（清缓存 + epoch+1）。
-                    self.remote_filetree = Some(RemoteFileTree { root: Some(path) });
+                    let changed = {
+                        let ft = self
+                            .remote_filetree
+                            .get_or_insert_with(RemoteFileTree::default);
+                        ft.set_root(path)
+                    };
+                    if changed {
+                        self.request_root_listing();
+                    }
                 }
             }
-            // 片2：ListDir/ListDirResult；片3：Fetch*；片4/5：Put*/MkDir*。当前未实现，忽略。
-            RemoteFrame::ListDir { .. }
-            | RemoteFrame::ListDirResult { .. }
-            | RemoteFrame::FetchReq { .. }
+            RemoteFrame::ListDir {
+                req_id,
+                path,
+                show_hidden,
+            } => {
+                // 仅被控端：入队，main 后台读盘服务（spawn_list_dir）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_listdir.push((req_id, path, show_hidden));
+                }
+            }
+            RemoteFrame::ListDirResult {
+                req_id,
+                path,
+                entries,
+                overflow,
+                err,
+            } => {
+                // 仅控制端：双键校验后填进对应目录的 listing（陈旧 / 乱序丢弃）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    if let Some(ft) = self.remote_filetree.as_mut() {
+                        ft.apply_dir_entries(req_id, &path, entries, overflow, err);
+                    }
+                }
+            }
+            // 片3：Fetch*；片4/5：Put*/MkDir*。当前未实现，忽略。
+            RemoteFrame::FetchReq { .. }
             | RemoteFrame::FileBegin { .. }
             | RemoteFrame::FileChunk { .. }
             | RemoteFrame::FileChunkAck { .. }
@@ -1114,6 +1617,101 @@ mod tests {
         // stop 在未启动时应安全（幂等）。
         ws.stop();
         assert!(!ws.is_running());
+    }
+
+    #[test]
+    fn 远程树_换根_按需listdir_双键去重() {
+        let mut ft = RemoteFileTree::default();
+        assert!(ft.visible_rows().is_empty(), "无根无行");
+        // 换根：根 id 0、默认展开、整体重置；同根不重置。
+        assert!(ft.set_root("/r".into()));
+        assert!(!ft.set_root("/r".into()), "同根不重置");
+        let rows = ft.visible_rows();
+        assert_eq!(rows.len(), 2, "根 + 临时加载占位（开但未缓存非 pending）");
+        assert!(matches!(rows[0].kind, RemoteRowKind::Dir { open: true }));
+        assert_eq!(rows[0].name, "r");
+        // 标记根在途 → 可见行为 根 + Loading。
+        ft.mark_pending(0, 7);
+        assert!(matches!(ft.visible_rows()[1].kind, RemoteRowKind::Loading));
+        // 陈旧 req_id 应答被双键丢弃（仍 pending）。
+        ft.apply_dir_entries(
+            999,
+            "/r",
+            vec![DirEntry {
+                path: "/r/a".into(),
+                name: "a".into(),
+                is_dir: false,
+            }],
+            0,
+            None,
+        );
+        assert!(ft.is_pending(0), "req_id 不匹配 → 仍 pending");
+        // 正确 req_id：填充子项（目录在前 + 文件 + 溢出占位）。
+        ft.apply_dir_entries(
+            7,
+            "/r",
+            vec![
+                DirEntry {
+                    path: "/r/sub".into(),
+                    name: "sub".into(),
+                    is_dir: true,
+                },
+                DirEntry {
+                    path: "/r/a.txt".into(),
+                    name: "a.txt".into(),
+                    is_dir: false,
+                },
+            ],
+            3,
+            None,
+        );
+        assert!(!ft.is_pending(0));
+        let rows = ft.visible_rows();
+        assert_eq!(rows.len(), 4, "根 + sub + a.txt + 溢出");
+        assert!(matches!(rows[1].kind, RemoteRowKind::Dir { open: false }));
+        assert_eq!(rows[1].name, "sub");
+        assert!(matches!(rows[2].kind, RemoteRowKind::File));
+        assert!(matches!(rows[3].kind, RemoteRowKind::Overflow(3)));
+        // 展开 sub（DFS find 可达）：填其 listing，x 在 depth 2 可见。
+        let sub_id = rows[1].id;
+        ft.set_open(sub_id, true);
+        ft.mark_pending(sub_id, 8);
+        ft.apply_dir_entries(
+            8,
+            "/r/sub",
+            vec![DirEntry {
+                path: "/r/sub/x".into(),
+                name: "x".into(),
+                is_dir: false,
+            }],
+            0,
+            None,
+        );
+        let rows = ft.visible_rows();
+        assert_eq!(rows.len(), 5, "根 + sub(开) + x + a.txt + 溢出");
+        assert_eq!(rows[2].name, "x");
+        assert_eq!(rows[2].depth, 2);
+        // 折叠 sub（纯本地）：x 不再可见。
+        ft.set_open(sub_id, false);
+        assert_eq!(ft.visible_rows().len(), 4);
+    }
+
+    #[test]
+    fn 远程树_读失败占位_显示隐藏重列() {
+        let mut ft = RemoteFileTree::default();
+        ft.set_root("/r".into());
+        ft.mark_pending(0, 1);
+        ft.apply_dir_entries(1, "/r", Vec::new(), 0, Some(FsErr::PermissionDenied));
+        assert!(matches!(
+            ft.visible_rows()[1].kind,
+            RemoteRowKind::Unreadable
+        ));
+        // 切「显示隐藏项」：重列（清缓存、回根），返回 true；同值不重列。
+        assert!(ft.set_show_hidden(true));
+        assert!(ft.show_hidden());
+        assert!(!ft.has_listing(0), "重列清缓存");
+        assert!(ft.is_open(0), "重列后根仍默认展开");
+        assert!(!ft.set_show_hidden(true), "同值不重列");
     }
 
     #[test]

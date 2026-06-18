@@ -1586,12 +1586,22 @@ fn ensure_listing(load: &mut LoadCtx<'_>, id: usize) {
     });
 }
 
-/// 后台线程的目录读取：过滤隐藏项 → 目录在前文件在后、各按名排序
-/// （不区分大小写；小写键在收集时一次算好，避免比较器里 O(n log n)
-/// 次重复分配）→ 截断到单层上限。枚举本身受 [`ENUM_HARD_CAP`] 封顶，
-/// 超出时溢出计数是下界。读失败（权限/网络盘断连）返回 `Err`，由
-/// UI 侧画「无法读取」占位，不 panic。
+/// 本地文件树用：读目录并过滤隐藏项（[`read_dir_worker_ex`] 的 `show_hidden=false` 包装）。
 fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
+    read_dir_worker_ex(dir, false)
+}
+
+/// 后台线程的目录读取：`show_hidden=false` 过滤隐藏项 → 目录在前文件在后、各按名排序
+/// （不区分大小写；小写键在收集时一次算好，避免比较器里 O(n log n) 次重复分配）→ 截断到
+/// 单层上限。枚举本身受 [`ENUM_HARD_CAP`] 封顶，超出时溢出计数是下界。读失败（权限/
+/// 网络盘断连）返回 `Err`，由 UI 侧画「无法读取」占位，不 panic。
+///
+/// `show_hidden`：part3c-2 远程「文件管理」语义下控制端可选显示 `.env`/`.gitignore` 等
+/// （本地树恒传 `false` 维持现状）。
+pub(crate) fn read_dir_worker_ex(
+    dir: &Path,
+    show_hidden: bool,
+) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
@@ -1610,7 +1620,7 @@ fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        if is_hidden(&name, &meta) {
+        if !show_hidden && is_hidden(&name, &meta) {
             continue;
         }
         entries.push((name.to_lowercase(), is_dir(&meta), entry.path()));
@@ -1623,6 +1633,29 @@ fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
         entries.into_iter().map(|(_, d, path)| (path, d)).collect(),
         overflow,
     ))
+}
+
+/// part3c-2 被控端 ListDir 服务：读目录并转成协议 [`lumen_protocol::remote::DirEntry`]
+/// （path 不透明 + 被控端算好 display_name + is_dir），供 `RemoteWs::spawn_list_dir` 后台调。
+///
+/// TODO(片3，review MED-2)：`path` 经 `Path::display()` 有损转成 `String`，非 UTF-8 路径
+/// （Windows 罕见 UTF-16 非法代理 / Unix 任意字节名）回喂 `read_dir` 会失配 → 该子目录不可
+/// 展开。本项目被控端为 Windows、几乎全 UTF-8 可表示，故 MVP 接受此限制；若日后支持
+/// Unix 被控端或要严谨，把协议 `path` 改为 `Vec<u8>`（OsStr 字节）不透明键，与文件传输一并改。
+pub(crate) fn list_dir_entries(
+    dir: &Path,
+    show_hidden: bool,
+) -> Result<(Vec<lumen_protocol::remote::DirEntry>, usize), ()> {
+    let (entries, overflow) = read_dir_worker_ex(dir, show_hidden)?;
+    let out = entries
+        .into_iter()
+        .map(|(path, is_dir)| lumen_protocol::remote::DirEntry {
+            path: path.display().to_string(),
+            name: display_name(&path),
+            is_dir,
+        })
+        .collect();
+    Ok((out, overflow))
 }
 
 /// 后台线程的搜索扫描：自树根 BFS（浅层结果优先），文件名不分大小写
@@ -1722,26 +1755,30 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// M5.3 part3c-2 控制端远程视图渲染产出（片1 仅面板尺寸；片2 加 listdir_reqs / fetch_open /
-/// 复制粘贴 / 显示隐藏开关等交互产出）。
+/// M5.3 part3c-2 控制端远程视图渲染产出（**只读渲染**——交互意图收集到此，main 闭包后
+/// 以 `&mut state.remote_ws` 施加，规避 `ShellInput` 的 `&remote_ws` 借用冲突）。
 #[derive(Default)]
 pub struct RemoteFileTreeOutput {
     /// 面板实际宽度（mod.rs 持久化 + 描边用；隐藏时 None）。
     pub panel_width: Option<f32>,
     /// 面板矩形（mod.rs 描边 / 拖宽手柄用；隐藏时 None）。
     pub panel_rect: Option<egui::Rect>,
+    /// 本帧被点击的目录节点 id（翻转展开态：纯本地、未缓存则触发 ListDir）。
+    pub dir_clicks: Vec<usize>,
+    /// 「显示隐藏项」勾选变化（main 闭包后 set + 重列根）。
+    pub toggle_hidden: Option<bool>,
 }
 
-/// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树。
+/// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树（只读渲染）。
 ///
-/// **片1 占位桩**：Option A 的只读扁平快照树已删，Option B 交互式浏览树（自有展开态 +
-/// 按需 `ListDir` + 文件双击 Fetch 打开 + 复制粘贴）在片2 实装。当前仅按 `tree_root`
-/// （被控端 cwd，来自 `RootChanged`）画一行根 + 「浏览树构建中」占位，使面板外壳
-/// （id `lumen_filetree` / 宽度 / 折叠 / 描边）与本地 [`show`] 同款，mod.rs 描边/拖宽手柄
-/// 逻辑无需分支。
+/// 按 [`RemoteFileTree::visible_rows`] 画当前可见行（自有展开态驱动三角 → 修 #1；含文件
+/// 行 → 修 #2；点目录收集到 `out.dir_clicks` → main 翻转展开 + 按需 `ListDir` → 修 #3/#4；
+/// 展开/折叠纯本地不发帧 → 修 #6）。面板外壳（id `lumen_filetree` / 宽度 / 折叠 / 描边）
+/// 与本地 [`show`] 同款，mod.rs 描边/拖宽手柄逻辑无需分支。`ft=None`（会话起始 / 等待
+/// cwd）画占位、绝不回落本地树。
 pub fn show_remote(
     root_ui: &mut egui::Ui,
-    tree_root: &str,
+    ft: Option<&crate::remote_ws::RemoteFileTree>,
     visible: bool,
     pal: &theme::Palette,
     width: f32,
@@ -1758,40 +1795,107 @@ pub fn show_remote(
                     .fill(pal.filetree_fill)
                     .inner_margin(egui::Margin::symmetric(6, 8)),
             )
-            .show_inside(root_ui, |ui| remote_panel_ui(ui, tree_root, pal));
+            .show_inside(root_ui, |ui| remote_panel_ui(ui, ft, pal, &mut out));
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
     }
     out
 }
 
-/// 远程树面板内容（片1 桩）：根名工具条 + 「浏览树构建中」占位。
-fn remote_panel_ui(ui: &mut egui::Ui, tree_root: &str, pal: &theme::Palette) {
+/// 远程树面板内容：根名工具条 + 「显示隐藏项」勾选 + 可见行（按 depth 缩进，三角由
+/// 控制端自有展开态驱动）。
+fn remote_panel_ui(
+    ui: &mut egui::Ui,
+    ft: Option<&crate::remote_ws::RemoteFileTree>,
+    pal: &theme::Palette,
+    out: &mut RemoteFileTreeOutput,
+) {
+    use crate::remote_ws::RemoteRowKind;
     let s = crate::i18n::strings();
-    // 工具条：被控端树根名（basename，悬停看全路径）。空 = 等待 cwd 占位。
-    let root_name = tree_root
-        .rsplit(['/', '\\'])
-        .find(|seg| !seg.is_empty())
-        .unwrap_or(tree_root);
+    let root_label = ft.and_then(crate::remote_ws::RemoteFileTree::root_label);
+    // 工具条：树根名（basename，悬停看全路径）+ 「显示隐藏项」勾选。空 = 等待 cwd。
     ui.horizontal(|ui| {
-        let label = if tree_root.is_empty() {
-            s.filetree_waiting_cwd.to_string()
-        } else {
-            root_name.to_string()
-        };
+        let label = root_label.map_or_else(
+            || s.filetree_waiting_cwd.to_string(),
+            |r| {
+                r.rsplit(['/', '\\'])
+                    .find(|seg| !seg.is_empty())
+                    .unwrap_or(r)
+                    .to_string()
+            },
+        );
         ui.add(egui::Label::new(egui::RichText::new(label).strong().color(pal.fg)).truncate())
-            .on_hover_text(tree_root);
+            .on_hover_text(root_label.unwrap_or(""));
     });
-    ui.add_space(8.0);
-    if !tree_root.is_empty() {
-        // 片1 桩占位：片2 换成 ltreeview 交互式浏览树。
-        ui.add(egui::Label::new(
-            egui::RichText::new("浏览树构建中…")
+    // cwd 未到：占位，不画树（绝不回落本机树）。
+    let Some(ft) = ft.filter(|f| f.root_label().is_some()) else {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(s.filetree_waiting_cwd)
                 .size(11.0)
-                .italics()
                 .color(pal.fg_dim),
-        ));
+        );
+        return;
+    };
+    // 「显示隐藏项」勾选（变化经 out.toggle_hidden 回传 main）。
+    let mut show_hidden = ft.show_hidden();
+    if ui
+        .checkbox(&mut show_hidden, egui::RichText::new(s.remote_show_hidden).size(11.0))
+        .changed()
+    {
+        out.toggle_hidden = Some(show_hidden);
     }
+    ui.add_space(2.0);
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for row in ft.visible_rows() {
+                ui.horizontal(|ui| {
+                    ui.add_space(row.depth as f32 * 14.0);
+                    match row.kind {
+                        RemoteRowKind::Dir { open } => {
+                            let tri = if open { "▾" } else { "▸" };
+                            let resp = ui
+                                .selectable_label(
+                                    false,
+                                    egui::RichText::new(format!("{tri} {}", row.name))
+                                        .color(pal.fg),
+                                )
+                                .on_hover_text(&row.path);
+                            // 点击 → 翻转展开（main 施加；未缓存则发 ListDir）。修 #3/#4/#6。
+                            if resp.clicked() {
+                                out.dir_clicks.push(row.id);
+                            }
+                        }
+                        RemoteRowKind::File => {
+                            // 片3 接双击 → Fetch 传到控制端本地打开（#5）。悬停看全路径。
+                            ui.selectable_label(false, egui::RichText::new(&row.name).color(pal.fg))
+                                .on_hover_text(&row.path);
+                        }
+                        RemoteRowKind::Loading => {
+                            remote_placeholder_row(ui, pal, s.filetree_loading);
+                        }
+                        RemoteRowKind::Unreadable => {
+                            remote_placeholder_row(ui, pal, s.filetree_unreadable);
+                        }
+                        RemoteRowKind::Overflow(n) => {
+                            remote_placeholder_row(
+                                ui,
+                                pal,
+                                &crate::i18n::fmt1(s.filetree_overflow_fmt, n),
+                            );
+                        }
+                    }
+                });
+            }
+        });
+}
+
+/// 远程树占位行（加载中 / 无法读取 / 溢出）：灰斜体、不可交互。
+fn remote_placeholder_row(ui: &mut egui::Ui, pal: &theme::Palette, text: &str) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(text).italics().color(pal.fg_dim),
+    ));
 }
 
 /// 新建文件/文件夹的名字校验（Windows 文件名规则 + 注入防御）。

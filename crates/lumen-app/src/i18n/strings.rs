@@ -226,6 +226,8 @@ pub struct Strings {
     pub filetree_unreadable: &'static str,
     /// "加载中…" 占位
     pub filetree_loading: &'static str,
+    /// part3c-2 远程树工具条「显示隐藏项」勾选框
+    pub remote_show_hidden: &'static str,
     // 新建对话框
     /// "新建文件夹" 对话框标题
     pub filetree_create_dir_title: &'static str,

@@ -113,6 +113,7 @@ pub static STRINGS: Strings = Strings {
     filetree_overflow_fmt: "… {} more items not shown",
     filetree_unreadable: "Cannot read",
     filetree_loading: "Loading…",
+    remote_show_hidden: "Show hidden",
     filetree_create_dir_title: "New folder",
     filetree_create_file_title: "New file",
     filetree_create_location_fmt: "In {}",

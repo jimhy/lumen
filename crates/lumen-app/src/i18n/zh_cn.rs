@@ -111,6 +111,7 @@ pub static STRINGS: Strings = Strings {
     filetree_overflow_fmt: "…还有 {} 项未显示",
     filetree_unreadable: "无法读取",
     filetree_loading: "加载中…",
+    remote_show_hidden: "显示隐藏项",
     filetree_create_dir_title: "新建文件夹",
     filetree_create_file_title: "新建文件",
     filetree_create_location_fmt: "位于 {}",
