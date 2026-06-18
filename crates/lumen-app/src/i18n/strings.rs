@@ -180,6 +180,12 @@ pub struct Strings {
     pub login_register_btn: &'static str,
     /// 确认密码输入框 hint（注册模式）
     pub login_password_confirm_hint: &'static str,
+    /// 服务器地址输入框 hint（M5.2 局域网两机互联）
+    pub server_url_placeholder: &'static str,
+    /// 服务器设置分组标题
+    pub server_section: &'static str,
+    /// 服务器地址帮助说明
+    pub server_hint: &'static str,
     /// 切到注册的链接（登录模式底部）
     pub login_to_register: &'static str,
     /// 切到登录的链接（注册模式底部）

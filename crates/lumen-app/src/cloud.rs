@@ -7,6 +7,7 @@
 //! 同一设备记录（避免在服务端重复登记设备）。
 
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use lumen_protocol::{
@@ -17,11 +18,48 @@ use lumen_protocol::{
 /// 本地开发默认服务端地址（可由环境变量 `LUMEN_SERVER_URL` 覆盖）。
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
 
-/// 取服务端基址（去掉尾部 `/`）。
+/// 进程内的服务端基址（懒初始化：环境变量 > 持久化文件 > 默认）。
+static SERVER_URL: RwLock<Option<String>> = RwLock::new(None);
+
+/// 取服务端基址（已规整：去尾 `/`、缺协议补 `http://`）。
+///
+/// 首次读取时按「`LUMEN_SERVER_URL` 环境变量 > 持久化文件 > 默认」初始化；
+/// 之后由 [`set_server_url`]（登录界面输入）覆盖。供 `login_ui` / `remote` 共用。
 pub fn server_url() -> String {
-    let raw = std::env::var("LUMEN_SERVER_URL").unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
-    raw.trim_end_matches('/').to_string()
+    if let Some(u) = SERVER_URL.read().ok().and_then(|g| g.clone()) {
+        return u;
+    }
+    let initial = std::env::var("LUMEN_SERVER_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
+    let normalized = normalize_url(&initial);
+    if let Ok(mut g) = SERVER_URL.write() {
+        *g = Some(normalized.clone());
+    }
+    normalized
 }
+
+/// 设置服务端基址（设置页输入用）：更新进程内全局。持久化由 settings.json 负责。
+pub fn set_server_url(url: &str) {
+    let normalized = normalize_url(url);
+    if let Ok(mut g) = SERVER_URL.write() {
+        *g = Some(normalized);
+    }
+}
+
+/// 规整地址：去首尾空白与尾 `/`；用户只填 `IP:端口` 时自动补 `http://`；空则回默认。
+fn normalize_url(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/');
+    if s.is_empty() {
+        DEFAULT_SERVER_URL.to_string()
+    } else if s.starts_with("http://") || s.starts_with("https://") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    }
+}
+
 
 /// 网络/协议错误。
 #[derive(Debug, Clone)]

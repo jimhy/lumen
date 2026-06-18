@@ -317,6 +317,8 @@ pub struct ShellOutput {
     pub settings_update_changed: bool,
     /// 设置页改了网络代理（开关/地址）：main 落盘并刷新生效代理镜像。
     pub settings_proxy_changed: bool,
+    /// 设置页 Network 改了服务端地址（M5.2）：main 落盘 + 应用 cloud 全局。
+    pub settings_server_url_changed: bool,
     /// 头像菜单「更新到 vX」：有就绪更新时显示更新弹窗（main 清 dismissed）。
     pub open_update: bool,
     /// 头像菜单「更新日志」：main 打开 GitHub Releases 页。
@@ -403,6 +405,7 @@ pub fn show(
         update_check_now: false,
         settings_update_changed: false,
         settings_proxy_changed: false,
+        settings_server_url_changed: false,
         open_update: false,
         open_whats_new: false,
         open_documentation: false,
@@ -1356,6 +1359,7 @@ pub fn show(
         out.update_check_now = s_out.update_check_now;
         out.settings_update_changed = s_out.update_changed;
         out.settings_proxy_changed = s_out.proxy_changed;
+        out.settings_server_url_changed = s_out.server_url_changed;
         if s_out.log_out {
             out.logged_out = true;
         }

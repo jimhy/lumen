@@ -26,18 +26,13 @@ use crate::state::AppState;
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let config = Config::from_env();
-    // 安全闸门：默认 JWT 密钥仅允许本地回环；非回环地址用默认密钥拒绝启动。
+    // 安全告警：默认 JWT 密钥不安全（任何人可伪造 token）。局域网测试可容忍，
+    // 公网部署务必经 LUMEN_JWT_SECRET 设强随机值。
     if config.uses_default_jwt_secret() {
-        if config.is_loopback_bind() {
-            tracing::warn!(
-                "正在使用默认 JWT 密钥（仅限本地开发）；生产部署务必设置 LUMEN_JWT_SECRET 为强随机值！"
-            );
-        } else {
-            anyhow::bail!(
-                "拒绝启动：监听非回环地址 {} 却使用默认 JWT 密钥；请设置 LUMEN_JWT_SECRET",
-                config.bind_addr
-            );
-        }
+        tracing::warn!(
+            "⚠ 正在使用默认 JWT 密钥（不安全，仅限本地/局域网测试）；监听 {}。公网部署务必设置 LUMEN_JWT_SECRET！",
+            config.bind_addr
+        );
     }
     tracing::info!("连接数据库 …");
     let pool = db::create_pool(&config.database_url)?;

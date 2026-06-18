@@ -31,7 +31,8 @@ impl Config {
                 "postgres://lumen_user:lumen_password@127.0.0.1:5544/lumen?sslmode=disable"
                     .to_string()
             }),
-            bind_addr: env::var("LUMEN_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string()),
+            bind_addr: env::var("LUMEN_BIND_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:8787".to_string()),
             jwt_secret: env::var("LUMEN_JWT_SECRET")
                 .unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_string()),
             token_ttl_secs: env::var("LUMEN_TOKEN_TTL_SECS")
@@ -48,11 +49,5 @@ impl Config {
     /// 是否仍在用默认（不安全）JWT 密钥。
     pub fn uses_default_jwt_secret(&self) -> bool {
         self.jwt_secret == DEFAULT_JWT_SECRET
-    }
-
-    /// 监听地址是否为本机回环（默认密钥仅在回环时可容忍）。
-    pub fn is_loopback_bind(&self) -> bool {
-        let a = self.bind_addr.trim();
-        a.starts_with("127.") || a.starts_with("localhost") || a.starts_with("[::1]")
     }
 }

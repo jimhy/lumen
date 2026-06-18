@@ -2861,6 +2861,11 @@ impl App {
 
         // —— 设置加载与应用（settings.json；缺失/损坏降级默认值）——
         let app_settings = settings::Settings::load();
+        // M5.2：把持久化的服务端地址应用到 cloud 全局（非空才覆盖，空则回退
+        // 环境变量/默认）。供登录/心跳/设备列表读取。
+        if !app_settings.server_url.trim().is_empty() {
+            cloud::set_server_url(&app_settings.server_url);
+        }
         // F6 多语言：启动后立即将全局语言设为设置中存储的语言。
         i18n::set_language(app_settings.language);
         // 系统深浅模式（P12 Sync with OS）：winit 报不出来（None）按
@@ -6114,6 +6119,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_language_changed
                     || shell_out.settings_update_changed
                     || shell_out.settings_proxy_changed
+                    || shell_out.settings_server_url_changed
                     || sidebar_changed
                     || filetree_changed
                     || view_mode_changed;
@@ -6129,6 +6135,10 @@ impl ApplicationHandler<PtyWake> for App {
                     if let Ok(mut g) = state.update_proxy.lock() {
                         *g = state.settings.proxy.effective_url().map(str::to_owned);
                     }
+                }
+                // M5.2：服务端地址改动 → 应用到 cloud 全局（下次登录/心跳即用）。
+                if shell_out.settings_server_url_changed {
+                    cloud::set_server_url(&state.settings.server_url);
                 }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
                 // 手动检查清掉「已消解/已知版本」状态：用户主动检查即视为想重新

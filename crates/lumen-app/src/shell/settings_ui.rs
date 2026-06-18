@@ -161,6 +161,8 @@ pub struct SettingsOutput {
     pub update_changed: bool,
     /// Network 页改了代理设置（开关 / 地址）：main 落盘并刷新生效代理。
     pub proxy_changed: bool,
+    /// Network 页改了服务端地址（M5.2）：main 落盘 + 应用到 cloud 全局。
+    pub server_url_changed: bool,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -1000,6 +1002,23 @@ fn about(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut Se
 /// `out.proxy_changed` 回 main 落盘并刷新生效代理（下次出网请求即用）。
 fn network(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut SettingsOutput) {
     let s = i18n::strings();
+    // 服务端地址（M5.2 远程控制 / 局域网两机互联）。
+    heading(ui, pal, s.server_section);
+    let srv = ui.add(
+        egui::TextEdit::singleline(&mut settings.server_url)
+            .hint_text(s.server_url_placeholder)
+            .desired_width(360.0),
+    );
+    if srv.changed() {
+        out.server_url_changed = true;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(s.server_hint)
+            .size(11.0)
+            .color(pal.fg_dim),
+    );
+    ui.add_space(16.0);
     heading(ui, pal, s.proxy_section);
     ui.horizontal(|ui| {
         if toggle_switch(ui, &mut settings.proxy.enabled, pal).changed() {

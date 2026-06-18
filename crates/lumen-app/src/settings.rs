@@ -261,6 +261,10 @@ pub struct Settings {
     /// 与状态栏切换按钮同路径）——切换时同步写盘，重启后恢复。
     #[serde(default)]
     pub classic_mode: bool,
+    /// 远程服务端地址（M5.2；空 = 用环境变量/默认）。两机互联时填运行
+    /// server 那台的 IP:端口（自动补 `http://`）。
+    #[serde(default)]
+    pub server_url: String,
     /// 热更设置（F3）：`#[serde(default)]` 旧文件无此节时补默认值。
     #[serde(default)]
     pub update: UpdateSettings,
@@ -277,6 +281,7 @@ impl Default for Settings {
             layout: LayoutSettings::default(),
             language: crate::i18n::Language::default(),
             classic_mode: false,
+            server_url: String::new(),
             update: UpdateSettings::default(),
             proxy: ProxySettings::default(),
         }
@@ -481,6 +486,8 @@ impl Settings {
         );
         // classic_mode：旧文件（第十八轮前）无此字段时静默补 false（默认正常模式）。
         s.classic_mode = lenient_field(root, "classic_mode", "classic_mode", false, path);
+        // server_url（M5.2）：旧文件缺字段补空串（回退环境变量/默认）。
+        s.server_url = lenient_field(root, "server_url", "server_url", String::new(), path);
         // update（F3）：旧文件缺整节时静默补默认值；逐字段宽松解析。
         if let Some(up) = root.get("update") {
             if up.is_object() {
@@ -744,6 +751,7 @@ mod tests {
             },
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,
+            server_url: String::new(),
             update: UpdateSettings {
                 auto_check: false,
                 skip_version: Some("v9.9.9".to_owned()),
