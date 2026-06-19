@@ -469,6 +469,11 @@ impl RemoteFileTree {
     fn clear_pending(&mut self, id: usize) {
         self.pending.remove(&id);
     }
+    /// 作废一个目录的缓存（刷新用）：删 listing + 在途，下次按需重拉。
+    fn clear_listing(&mut self, id: usize) {
+        self.listings.remove(&id);
+        self.pending.remove(&id);
+    }
     fn node_path(&self, id: usize) -> Option<&str> {
         self.nodes.get(id).map(|n| n.path.as_str())
     }
@@ -1139,6 +1144,34 @@ impl RemoteWs {
                 }
                 None
             }
+        };
+        if let Some((path, show_hidden)) = need {
+            let req_id = self.next_req_id();
+            if let Some(ft) = self.remote_filetree.as_mut() {
+                ft.mark_pending(id, req_id);
+            }
+            self.send_frame(&RemoteFrame::ListDir {
+                req_id,
+                path,
+                show_hidden,
+            });
+        }
+    }
+
+    /// 控制端：用户点目录行的「刷新」图标 → 作废该目录缓存、保持展开、重发 ListDir 拉最新内容
+    /// （被控端新增 / 删除文件后，控制端已缓存的目录可借此刷新；问题 #6）。
+    pub fn remote_refresh_dir(&mut self, id: usize) {
+        let need = {
+            let Some(ft) = self.remote_filetree.as_mut() else {
+                return;
+            };
+            if !ft.node_is_dir(id) {
+                return;
+            }
+            ft.clear_listing(id); // 删旧缓存 + 在途
+            ft.set_open(id, true); // 保持展开以便看到刷新结果
+            let show_hidden = ft.show_hidden();
+            ft.node_path(id).map(|p| (p.to_owned(), show_hidden))
         };
         if let Some((path, show_hidden)) = need {
             let req_id = self.next_req_id();

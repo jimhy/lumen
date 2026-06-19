@@ -114,6 +114,7 @@ pub static STRINGS: Strings = Strings {
     filetree_unreadable: "Cannot read",
     filetree_loading: "Loading…",
     remote_show_hidden: "Show hidden",
+    remote_refresh_dir_tip: "Refresh this folder",
     remote_fetch_started: "Fetching file from controlled device…",
     remote_fetch_failed: "Failed to fetch file",
     remote_fetch_too_large: "File too large to fetch",

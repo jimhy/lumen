@@ -1820,6 +1820,8 @@ pub struct RemoteFileTreeOutput {
     pub copy_files: Option<(String, String, bool)>,
     /// 本帧右键「粘贴到此目录」的远程目录 path（上传目标；片5 接入）。
     pub paste_into: Option<String>,
+    /// 本帧点了「刷新」图标的目录节点 id（重拉该目录最新内容；新增文件可见）。
+    pub refresh_dir: Option<usize>,
 }
 
 /// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树（只读渲染）。
@@ -1905,75 +1907,136 @@ fn remote_panel_ui(
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for row in ft.visible_rows() {
-                ui.horizontal(|ui| {
-                    ui.add_space(row.depth as f32 * 14.0);
-                    match row.kind {
-                        RemoteRowKind::Dir { open } => {
-                            let tri = if open { "▾" } else { "▸" };
-                            let resp = ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new(format!("{tri} {}", row.name))
-                                        .color(pal.fg),
-                                )
-                                .on_hover_text(&row.path);
-                            // 右键：复制（下载源）/ 粘贴到此目录（上传目标，can_paste 时）。
-                            resp.context_menu(|ui| {
-                                ui.set_min_width(150.0);
-                                if ui.button(s.remote_menu_copy).clicked() {
-                                    out.copy_files =
-                                        Some((row.path.clone(), row.name.clone(), true));
-                                    ui.close();
+            // 每行 push_id(i) 给唯一 id：否则各行 selectable_label 的右键菜单 id 冲突，
+            // 右键任一行都弹**第一行**的菜单（修 #4：复制永远复制第一个）。
+            for (i, row) in ft.visible_rows().into_iter().enumerate() {
+                ui.push_id(i, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(row.depth as f32 * 14.0);
+                        match row.kind {
+                            RemoteRowKind::Dir { open } => {
+                                // 三角用 painter 画——`▾`/`▸` 字形在 UI 字体里缺失会渲染成
+                                // tofu 方块（修 #1）。点三角或名字都翻转展开。
+                                let (tri_rect, tri_resp) = ui
+                                    .allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::click());
+                                paint_tri(ui.painter(), tri_rect, open, pal.fg_dim);
+                                let resp = ui
+                                    .selectable_label(
+                                        false,
+                                        egui::RichText::new(&row.name).color(pal.fg),
+                                    )
+                                    .on_hover_text(&row.path);
+                                if resp.clicked() || tri_resp.clicked() {
+                                    out.dir_clicks.push(row.id);
                                 }
-                                if can_paste && ui.button(s.remote_menu_paste).clicked() {
-                                    out.paste_into = Some(row.path.clone());
-                                    ui.close();
+                                // #6 刷新图标：悬停目录行时名字右侧出现，点击重拉该目录最新内容。
+                                let (rf_rect, rf_resp) = ui
+                                    .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                                if resp.hovered() || tri_resp.hovered() || rf_resp.hovered() {
+                                    paint_refresh_small(ui.painter(), rf_rect, pal.fg_dim);
+                                    if rf_resp.on_hover_text(s.remote_refresh_dir_tip).clicked() {
+                                        out.refresh_dir = Some(row.id);
+                                    }
                                 }
-                            });
-                            // 点击 → 翻转展开（main 施加；未缓存则发 ListDir）。修 #3/#4/#6。
-                            if resp.clicked() {
-                                out.dir_clicks.push(row.id);
+                                // 右键：复制（下载源）/ 粘贴到此目录（上传目标，can_paste 时）。
+                                resp.context_menu(|ui| {
+                                    ui.set_min_width(150.0);
+                                    if ui.button(s.remote_menu_copy).clicked() {
+                                        out.copy_files =
+                                            Some((row.path.clone(), row.name.clone(), true));
+                                        ui.close();
+                                    }
+                                    if can_paste && ui.button(s.remote_menu_paste).clicked() {
+                                        out.paste_into = Some(row.path.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            RemoteRowKind::File => {
+                                // 双击 → Fetch 传到控制端本地默认程序打开（#5）。悬停看全路径。
+                                let resp = ui
+                                    .selectable_label(
+                                        false,
+                                        egui::RichText::new(&row.name).color(pal.fg),
+                                    )
+                                    .on_hover_text(&row.path);
+                                // 右键：复制（下载源 → 文件剪贴板 Remote 侧）。
+                                resp.context_menu(|ui| {
+                                    ui.set_min_width(150.0);
+                                    if ui.button(s.remote_menu_copy).clicked() {
+                                        out.copy_files =
+                                            Some((row.path.clone(), row.name.clone(), false));
+                                        ui.close();
+                                    }
+                                });
+                                if resp.double_clicked() {
+                                    out.fetch_open = Some(row.path.clone());
+                                }
+                            }
+                            RemoteRowKind::Loading => {
+                                remote_placeholder_row(ui, pal, s.filetree_loading);
+                            }
+                            RemoteRowKind::Unreadable => {
+                                remote_placeholder_row(ui, pal, s.filetree_unreadable);
+                            }
+                            RemoteRowKind::Overflow(n) => {
+                                remote_placeholder_row(
+                                    ui,
+                                    pal,
+                                    &crate::i18n::fmt1(s.filetree_overflow_fmt, n),
+                                );
                             }
                         }
-                        RemoteRowKind::File => {
-                            // 双击 → Fetch 传到控制端本地默认程序打开（#5）。悬停看全路径。
-                            let resp = ui
-                                .selectable_label(
-                                    false,
-                                    egui::RichText::new(&row.name).color(pal.fg),
-                                )
-                                .on_hover_text(&row.path);
-                            // 右键：复制（下载源 → 文件剪贴板 Remote 侧）。
-                            resp.context_menu(|ui| {
-                                ui.set_min_width(150.0);
-                                if ui.button(s.remote_menu_copy).clicked() {
-                                    out.copy_files =
-                                        Some((row.path.clone(), row.name.clone(), false));
-                                    ui.close();
-                                }
-                            });
-                            if resp.double_clicked() {
-                                out.fetch_open = Some(row.path.clone());
-                            }
-                        }
-                        RemoteRowKind::Loading => {
-                            remote_placeholder_row(ui, pal, s.filetree_loading);
-                        }
-                        RemoteRowKind::Unreadable => {
-                            remote_placeholder_row(ui, pal, s.filetree_unreadable);
-                        }
-                        RemoteRowKind::Overflow(n) => {
-                            remote_placeholder_row(
-                                ui,
-                                pal,
-                                &crate::i18n::fmt1(s.filetree_overflow_fmt, n),
-                            );
-                        }
-                    }
+                    });
                 });
             }
         });
+}
+
+/// 远程树目录三角（painter 画，避免 `▾`/`▸` 字形缺失渲染成 tofu）：`open`=朝下、否则朝右。
+fn paint_tri(painter: &egui::Painter, rect: egui::Rect, open: bool, color: egui::Color32) {
+    let c = rect.center();
+    let r = 3.5_f32;
+    let pts = if open {
+        vec![
+            egui::pos2(c.x - r, c.y - r * 0.5),
+            egui::pos2(c.x + r, c.y - r * 0.5),
+            egui::pos2(c.x, c.y + r * 0.8),
+        ]
+    } else {
+        vec![
+            egui::pos2(c.x - r * 0.5, c.y - r),
+            egui::pos2(c.x - r * 0.5, c.y + r),
+            egui::pos2(c.x + r * 0.8, c.y),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
+/// 远程树目录行悬停时的小刷新图标（painter 画约 280° 圆弧 + 箭头）。
+fn paint_refresh_small(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = 4.0_f32;
+    let stroke = egui::Stroke::new(1.3, color);
+    let seg = 10usize;
+    let (start, sweep) = (60.0_f32, 280.0_f32);
+    let pts: Vec<egui::Pos2> = (0..=seg)
+        .map(|i| {
+            let a = (start + sweep * (i as f32 / seg as f32)).to_radians();
+            egui::pos2(c.x + r * a.cos(), c.y - r * a.sin())
+        })
+        .collect();
+    for w in pts.windows(2) {
+        painter.line_segment([w[0], w[1]], stroke);
+    }
+    // 末端箭头（沿弧切线方向两短线）。
+    if let (Some(&tip), Some(&prev)) = (pts.last(), pts.get(pts.len().wrapping_sub(2))) {
+        let dir = (tip - prev).normalized();
+        let perp = egui::vec2(-dir.y, dir.x);
+        let al = 2.6_f32;
+        painter.line_segment([tip, tip - dir * al + perp * al * 0.7], stroke);
+        painter.line_segment([tip, tip - dir * al - perp * al * 0.7], stroke);
+    }
 }
 
 /// 远程树占位行（加载中 / 无法读取 / 溢出）：灰斜体、不可交互。

@@ -314,6 +314,8 @@ pub struct ShellOutput {
     pub remote_toggle_hidden: Option<bool>,
     /// 控制端远程树：双击文件的被控端路径（main 起 Fetch → 传到本地默认程序打开，#5）。
     pub remote_fetch_open: Option<String>,
+    /// 控制端远程树：点了「刷新」图标的目录节点 id（main 重拉该目录最新内容）。
+    pub remote_refresh_dir: Option<usize>,
     /// part3c-2 #7：复制文件 / 文件夹到剪贴板 (来源侧, path, name, is_dir)。
     pub file_copy: Option<(crate::remote_ws::ClipSide, String, String, bool)>,
     /// part3c-2 #7：粘贴到某目录 (目标侧, 目录 path)（main 据剪贴板侧 × 目标侧定方向）。
@@ -445,6 +447,7 @@ pub fn show(
         remote_dir_clicks: Vec::new(),
         remote_toggle_hidden: None,
         remote_fetch_open: None,
+        remote_refresh_dir: None,
         file_copy: None,
         file_paste: None,
         overwrite_choice: None,
@@ -767,6 +770,7 @@ pub fn show(
         out.remote_dir_clicks = rout.dir_clicks;
         out.remote_toggle_hidden = rout.toggle_hidden;
         out.remote_fetch_open = rout.fetch_open;
+        out.remote_refresh_dir = rout.refresh_dir;
         // 复制远程项 → 剪贴板 Remote 侧（下载源）；粘贴到远程目录 → Remote 目标（上传，片5）。
         out.file_copy = rout
             .copy_files

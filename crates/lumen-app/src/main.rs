@@ -5599,13 +5599,16 @@ impl ApplicationHandler<PtyWake> for App {
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
                     remote_mirror_tex,
-                    // part3c-1：控制中+远程视图时传被控端文件树快照，文件树栏改画只读镜像树。
-                    remote_filetree: if state.is_mirror_active() {
+                    // part3c-2：**远程视图（远程 tab）** 一律画远程树——未控制时 remote_filetree
+                    // 为 None → 画「等待 cwd」占位，绝不回落本机树（修 #2：未连接设备时远程 tab
+                    // 显示本地树）。注意用 view_mode（远程 tab 选中）而非 is_mirror_active
+                    // （= 控制中 且 远程 tab），否则未控制时回落本地树。
+                    remote_filetree: if state.settings.layout.view_mode {
                         state.remote_ws.remote_filetree()
                     } else {
                         None
                     },
-                    remote_view_active: state.is_mirror_active(),
+                    remote_view_active: state.settings.layout.view_mode,
                     // part3c-2 #7：文件剪贴板来源侧 + 待决覆盖冲突项数（驱动菜单 / 覆盖模态）。
                     file_clipboard_side: state.remote_ws.file_clipboard().map(|c| c.side),
                     overwrite_conflict_count: state
@@ -6826,6 +6829,9 @@ impl ApplicationHandler<PtyWake> for App {
                 // 目录点击 → 翻转展开（纯本地，未缓存则发 ListDir）；显示隐藏项 → 重列根。
                 for id in shell_out.remote_dir_clicks {
                     state.remote_ws.remote_dir_clicked(id);
+                }
+                if let Some(id) = shell_out.remote_refresh_dir {
+                    state.remote_ws.remote_refresh_dir(id);
                 }
                 if let Some(show) = shell_out.remote_toggle_hidden {
                     state.remote_ws.set_remote_show_hidden(show);

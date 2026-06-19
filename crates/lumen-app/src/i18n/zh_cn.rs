@@ -112,6 +112,7 @@ pub static STRINGS: Strings = Strings {
     filetree_unreadable: "无法读取",
     filetree_loading: "加载中…",
     remote_show_hidden: "显示隐藏项",
+    remote_refresh_dir_tip: "刷新此目录",
     remote_fetch_started: "正在从被控端获取文件…",
     remote_fetch_failed: "获取文件失败",
     remote_fetch_too_large: "文件过大，无法获取",
