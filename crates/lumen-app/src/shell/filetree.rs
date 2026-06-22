@@ -2099,7 +2099,21 @@ fn remote_panel_ui(
             for (i, row) in ft.visible_rows().into_iter().enumerate() {
                 let id_salt: (u8, usize) = if row.id == usize::MAX { (0, i) } else { (1, row.id) };
                 ui.push_id(id_salt, |ui| {
+                    // 整行选中高亮（与本地 ltreeview 一致）：在 horizontal 内最前画满行宽的背景（同层
+                    // 先画 = 垫底，覆盖三角 / 名字 / 刷新 / 空白，而非只高亮文字）。占位行（id=MAX）不参与。
+                    let is_sel = row.id != usize::MAX && ft.selected() == Some(row.id);
                     ui.horizontal(|ui| {
+                        if is_sel {
+                            let row_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                            );
+                            ui.painter().rect_filled(
+                                row_rect,
+                                2.0,
+                                ui.visuals().selection.bg_fill,
+                            );
+                        }
                         ui.add_space(row.depth as f32 * 12.0);
                         match row.kind {
                             RemoteRowKind::Dir { open } => {
@@ -2118,12 +2132,18 @@ fn remote_panel_ui(
                                     egui::Id::new(("lumen_remote_tri", row.id)),
                                     egui::Sense::click(),
                                 );
-                                paint_tri(ui.painter(), tri_rect, open, pal.fg_dim);
-                                let is_sel = ft.selected() == Some(row.id);
+                                paint_tri(
+                                    ui.painter(),
+                                    tri_rect,
+                                    open,
+                                    if is_sel { pal.fg } else { pal.fg_dim },
+                                );
                                 let name_resp = ui
-                                    .selectable_label(
-                                        is_sel,
-                                        egui::RichText::new(&row.name).color(pal.fg),
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.name).color(pal.fg),
+                                        )
+                                        .selectable(false),
                                     )
                                     .on_hover_text(&row.path);
                                 let row_resp = ui.interact(
@@ -2174,11 +2194,12 @@ fn remote_panel_ui(
                             }
                             RemoteRowKind::File => {
                                 // 双击 → Fetch 传到控制端本地默认程序打开（#5）。悬停看全路径。
-                                let is_sel = ft.selected() == Some(row.id);
                                 let name_resp = ui
-                                    .selectable_label(
-                                        is_sel,
-                                        egui::RichText::new(&row.name).color(pal.fg),
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.name).color(pal.fg),
+                                        )
+                                        .selectable(false),
                                     )
                                     .on_hover_text(&row.path);
                                 // 同 Dir 分支：交互走显式 id 句柄（auto-id 相撞会让点击/双击/菜单错乱）。

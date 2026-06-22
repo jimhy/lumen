@@ -403,6 +403,11 @@ pub fn show(
     app_settings: &mut crate::settings::Settings,
     is_maximized: bool,
 ) -> ShellOutput {
+    // 远程视图但未连上任何设备：隐藏会话栏 / 文件树栏，命令行区中央显示「未连接任何设备」占位。
+    let is_remote_unconnected = input.remote_view_active
+        && !input.remote_session.is_some_and(|sess| {
+            matches!(sess.role, lumen_protocol::remote::Role::Controller)
+        });
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
         pane_rects: Vec::new(),
@@ -683,7 +688,7 @@ pub fn show(
             .push(edge_rect(rl_resp.response.rect.max.x, root));
     }
 
-    if app_settings.layout.sidebar_visible {
+    if app_settings.layout.sidebar_visible && !is_remote_unconnected {
         // 可拖宽（P10）。default_size 只在 egui 无面板记忆（首帧）时生效
         // = 还原持久化宽度；此后宽度由 egui 面板自管，实际值经
         // sidebar_width 报回 main，松手时写盘。
@@ -772,7 +777,7 @@ pub fn show(
         let rout = filetree::show_remote(
             root,
             input.remote_filetree,
-            st.filetree.visible,
+            st.filetree.visible && !is_remote_unconnected,
             pal,
             app_settings.layout.filetree_width,
             can_paste,
@@ -918,6 +923,18 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
+
+            // 远程视图未连接任何设备：中央居中显示占位，跳过所有终端 / 镜像渲染。
+            if is_remote_unconnected {
+                ui.painter().text(
+                    area.center(),
+                    egui::Align2::CENTER_CENTER,
+                    crate::i18n::strings().remote_not_connected,
+                    egui::FontId::proportional(16.0),
+                    pal.fg_dim,
+                );
+                return;
+            }
 
             // M5.3 part3b：控制端镜像——终端工作区改画远端镜像纹理（Middle 层叠在本地
             // 窗格之上，铺满 area）。本地窗格仍在下方渲染，被遮盖即可。纹理内容由 main
