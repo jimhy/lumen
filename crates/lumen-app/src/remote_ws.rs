@@ -29,10 +29,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneOpKind, PaneSnapshot,
-    PaneViewport, PutConflict, PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame,
-    RemoteOpErr, RemoteS2C, Role, SessionId, TabId, TabState, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
-    LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
+    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneOpKind,
+    PaneSnapshot, PaneViewport, PutConflict, PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S,
+    RemoteFrame, RemoteOpErr, RemoteS2C, Role, SessionId, TabId, TabState, FETCH_MAX_LEN,
+    FETCH_WINDOW, FILE_CHUNK, LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 
@@ -42,6 +42,7 @@ use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 use winit::event_loop::EventLoopProxy;
 
 use crate::cloud::server_url;
+use crate::p2p::{P2pEngine, P2pEvent, SignalPayload};
 use crate::PtyWake;
 
 /// 控制端镜像 Terminal 的 scrollback 上限（行）。被控端转发的实时输出滚出可见区后
@@ -374,6 +375,10 @@ pub struct RemoteWs {
     pending_viewport: Option<(u16, u16)>,
     /// 待消费的一次性通知（main 取走弹 toast）。
     notices: Vec<Notice>,
+    /// M6 P2P 直连引擎（会话期存在；QUIC 打洞 + mTLS 握手）。Phase 2 仅建链并发 Ready 信令，
+    /// **不切数据面**（数据面仍全走中继）；Phase 3 起据 `is_connected` 在 `send_frame` 选路。
+    /// 经 `reset_multi_session` 统一拆除（会话结束 / 断连）。
+    p2p: Option<P2pEngine>,
     /// UI → 后台 出站命令发送端。
     cmd_tx: Option<Sender<RemoteC2S>>,
     /// 后台 → UI 事件接收端。
@@ -1207,6 +1212,8 @@ impl RemoteWs {
         self.last_tab_states.clear();
         self.pending_new_tab.clear();
         self.pending_close_tab.clear();
+        // M6：会话结束 / 断连 → 停 P2P 引擎（Drop 发停机信号 + join 后台线程）。
+        self.p2p = None;
     }
 
     /// 控制端：多窗格镜像各窗格（渲染序）；空 = 单窗格模式（走 [`Self::mirror_render`]）。
@@ -1384,7 +1391,27 @@ impl RemoteWs {
         for ev in events {
             self.apply(ev);
         }
-        changed
+        // M6：排空 P2P 引擎事件（发信令 → send_frame / 直连建立提示）。
+        let p2p_events = self.p2p.as_ref().map(P2pEngine::poll).unwrap_or_default();
+        let p2p_changed = !p2p_events.is_empty();
+        for ev in p2p_events {
+            self.apply_p2p_event(ev);
+        }
+        changed || p2p_changed
+    }
+
+    /// 处理一条 P2P 引擎事件：发信令（转 `send_frame(P2pSignal)`，经现有 Relay 通路盲转，服务端
+    /// 零改动）/ 直连建立提示（Phase 2 仅日志，数据面仍走中继）。
+    fn apply_p2p_event(&mut self, ev: P2pEvent) {
+        match ev {
+            P2pEvent::SendSignal { kind, payload } => match serde_json::to_string(&payload) {
+                Ok(s) => self.send_frame(&RemoteFrame::P2pSignal { kind, payload: s }),
+                Err(e) => log::error!("P2pSignal payload 序列化失败: {e}"),
+            },
+            P2pEvent::Connected => {
+                log::info!("P2P 直连已建立（Phase 2：数据面仍走中继，Phase 3 起切换）");
+            }
+        }
     }
 
     /// 取走待消费通知（main 弹 toast 用）。
@@ -4342,10 +4369,16 @@ impl RemoteWs {
                 }
             }
             RemoteFrame::Echo(_) => {}
-            // M6 P2P 直连信令（Phase 0 协议地基已立信封；Phase 2 起在此分发给 P2P 线程的
-            // 打洞状态机——交换候选/指纹、协商建立 QUIC 直连或回退中继）。Phase 0 暂不处理，
-            // 由穷尽匹配占位（见 docs/M6-P2P直连-QUIC打洞-设计-2026-06-23.md §4）。
-            RemoteFrame::P2pSignal { .. } => {}
+            // M6 P2P 直连信令：解析 payload（候选 + 证书 + nonce）后转给 P2P 打洞状态机
+            // （交换候选/证书、协商建立 QUIC 直连或回退中继）。未起引擎 / payload 非法则丢弃。
+            RemoteFrame::P2pSignal { kind, payload } => {
+                if let Some(p2p) = &self.p2p {
+                    match serde_json::from_str::<SignalPayload>(&payload) {
+                        Ok(sp) => p2p.peer_signal(kind, sp),
+                        Err(e) => log::debug!("P2pSignal payload 解析失败，丢弃: {e}"),
+                    }
+                }
+            }
         }
     }
 
@@ -4452,6 +4485,9 @@ impl RemoteWs {
                 self.mirror = (role == Role::Controller)
                     .then(|| Terminal::new(MIRROR_INIT_ROWS, MIRROR_INIT_COLS, MIRROR_SCROLLBACK));
                 self.session = Some(ActiveSession { peer_name, role });
+                // M6：会话建立 → 启动 P2P 打洞引擎（控制端发 Offer，被控端等 Offer 回 Answer）。
+                // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。
+                self.p2p = Some(P2pEngine::start(role, stun_host_from_server()));
                 self.notices.push(Notice::SessionStarted { role, peer });
             }
             RemoteS2C::SessionEnded { reason } => {
@@ -4592,6 +4628,17 @@ fn connect_ws(token: &str) -> anyhow::Result<WebSocket<MaybeTlsStream<TcpStream>
     let (mut socket, _resp) = tungstenite::connect(req)?;
     set_read_timeout(socket.get_mut(), Some(READ_TIMEOUT));
     Ok(socket)
+}
+
+/// 从 server 基址推导 STUN 反射端地址（同主机、UDP 8788）：`http://host:8787` → `host:8788`。
+/// 用于 P2P 端点发现（自建 STUN 反射，见 `server/lumen-server/src/stun.rs`，默认端口 8788；
+/// 若 server 经 `LUMEN_STUN_BIND_ADDR` 改端口，此处需同步——Phase 2 先用默认端口）。
+fn stun_host_from_server() -> String {
+    let url = server_url();
+    let after_scheme = url.split("://").nth(1).unwrap_or(url.as_str());
+    let host = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = host.split(':').next().unwrap_or(host);
+    format!("{host}:8788")
 }
 
 /// 把 HTTP(S) 基址转成 WS(S) URL 并拼上远程控制路径。

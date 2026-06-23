@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lumen_protocol::remote::{P2pSignalKind, Role};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -46,29 +47,16 @@ const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 /// RFC 5389 magic cookie（固定常量，区分 STUN 与其他 UDP 流量、参与 XOR 编码）。
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 
-/// 一个候选端点（打洞时逐个尝试；经信令 `Offer`/`Answer` 与对端交换，见设计 §4）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
-    /// 候选地址（LAN：本机网卡地址；STUN：公网映射地址）。
-    pub addr: SocketAddr,
-    /// 来源类型。
-    pub kind: CandidateKind,
-}
-
-/// [`Candidate`] 来源。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandidateKind {
-    /// 本机网卡的 LAN 地址（同子网 / VPN 直连用）。
-    Local,
-    /// STUN 反射得到的公网映射地址（跨 NAT 打洞用）。
-    Stun,
-}
-
 /// 主线程 → P2P 线程的命令。
 #[derive(Debug)]
 enum P2pCmd {
-    /// 收集本端候选端点（LAN + STUN 公网映射），结果经 [`P2pEvent::Candidates`] 回主线程。
-    Discover,
+    /// 对端经信令通道（[`super::RemoteFrame::P2pSignal`]）发来的信令，喂给打洞状态机。
+    PeerSignal {
+        /// 信令阶段。
+        kind: P2pSignalKind,
+        /// 阶段负载（候选 + 证书 + nonce）。
+        payload: SignalPayload,
+    },
     /// 优雅停机（亦可经 drop `cmd_tx` 触发 `recv()==None`）。
     Stop,
 }
@@ -76,8 +64,15 @@ enum P2pCmd {
 /// P2P 线程 → 主线程的事件（主线程 [`P2pEngine::poll`] 排空）。
 #[derive(Debug, Clone)]
 pub enum P2pEvent {
-    /// 本端候选端点收集完成（可能只含 LAN——STUN 不可达时）。
-    Candidates(Vec<Candidate>),
+    /// 引擎请求经信令通道把一条 P2pSignal 发给对端（main 转 `send_frame(P2pSignal)`）。
+    SendSignal {
+        /// 信令阶段。
+        kind: P2pSignalKind,
+        /// 阶段负载。
+        payload: SignalPayload,
+    },
+    /// 直连已建立（Phase 2 仅日志 / 提示；Phase 3 起据此切数据面）。
+    Connected,
 }
 
 /// P2P 直连引擎句柄（主线程持有；与 `RemoteWs` 对称的启停 + poll 生命周期）。
@@ -86,8 +81,8 @@ pub struct P2pEngine {
     cmd_tx: UnboundedSender<P2pCmd>,
     /// P2P 线程 → 主线程事件端。
     evt_rx: Receiver<P2pEvent>,
-    /// 直连数据面就绪标志（Phase 3 置位；主线程 `send_frame` 据此选路 P2P/中继）。
-    ready: Arc<AtomicBool>,
+    /// 直连已建立标志（P2P 线程握手成功置位；Phase 3 起主线程 `send_frame` 据此选路 P2P/中继）。
+    connected: Arc<AtomicBool>,
     /// 停机标志（与 `Stop` 命令双保险）。
     stop: Arc<AtomicBool>,
     /// 后台线程句柄（stop / drop 时 join）。
@@ -95,31 +90,33 @@ pub struct P2pEngine {
 }
 
 impl P2pEngine {
-    /// 启动 P2P 后台线程（线程内建 current-thread tokio runtime）。`stun_host` 为端点发现用的
-    /// STUN 服务器（host:port；可传 [`DEFAULT_STUN`]）。Phase 1 仅备引擎，**不自动接入数据面**。
+    /// 启动 P2P 打洞引擎（线程内建 current-thread tokio runtime）。`role` 决定 Offer/Answer 流向
+    /// （[`Role::Controller`] 主动发 Offer）；`stun_host` 为端点发现用的 STUN 服务器（host:port，
+    /// 空串 = 不探 STUN、仅用 LAN 候选）。
     #[must_use]
-    pub fn start(stun_host: String) -> Self {
+    pub fn start(role: Role, stun_host: String) -> Self {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let ready = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
+        let conn_thread = Arc::clone(&connected);
         let handle = thread::Builder::new()
             .name("lumen-p2p".into())
-            .spawn(move || run(cmd_rx, &evt_tx, &stop_thread, &stun_host))
+            .spawn(move || run(role, stun_host, cmd_rx, &evt_tx, &stop_thread, &conn_thread))
             .ok();
         Self {
             cmd_tx,
             evt_rx,
-            ready,
+            connected,
             stop,
             handle,
         }
     }
 
-    /// 请求收集本端候选端点（异步，结果经 [`Self::poll`] 取 [`P2pEvent::Candidates`]）。
-    pub fn request_discovery(&self) {
-        let _ = self.cmd_tx.send(P2pCmd::Discover);
+    /// 把对端经信令通道发来的 P2pSignal 投给打洞状态机。
+    pub fn peer_signal(&self, kind: P2pSignalKind, payload: SignalPayload) {
+        let _ = self.cmd_tx.send(P2pCmd::PeerSignal { kind, payload });
     }
 
     /// 非阻塞排空 P2P 线程事件（主线程每帧调用）。
@@ -131,9 +128,9 @@ impl P2pEngine {
         out
     }
 
-    /// 直连数据面是否就绪（Phase 3 起有意义；Phase 1 恒 `false`）。
-    pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+    /// 直连是否已建立（Phase 3 起主线程数据面选路读此）。
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
     }
 
     /// 优雅停机并 join 后台线程。
@@ -153,19 +150,58 @@ impl P2pEngine {
 
 impl Drop for P2pEngine {
     fn drop(&mut self) {
+        // 非阻塞停机：置停机标志 + 投 Stop，后台线程在当前 await 点（STUN / 握手）结束后自行退出。
+        // **故意不 join**——避免主线程在 STUN/打洞窗口被 join 阻塞造成 UI 卡顿；线程持有的 quinn
+        // endpoint 绑临时端口，自行收尾不影响新会话。`stop()` 提供需要时的阻塞式停机。
         self.signal_stop();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.handle.take();
     }
 }
 
-/// P2P 后台线程主体：建 current-thread runtime，`block_on` 异步主循环。
+/// 生成一次打洞会话的 nonce（时间 + 计数器混合，区分并发打洞，非密码学随机）。
+fn gen_nonce() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (TXN_COUNTER.fetch_add(1, Ordering::Relaxed) << 32)
+}
+
+/// 对一条对端信令负载发起打洞（spawn 异步 punch；`punching` 守卫避免重复打洞）。成功的连接经
+/// `res_tx` 回主循环保活。
+fn spawn_punch(
+    de: &DirectEndpoint,
+    peer: SignalPayload,
+    res_tx: &UnboundedSender<quinn::Connection>,
+    punching: &mut bool,
+) {
+    if *punching {
+        return;
+    }
+    *punching = true;
+    let ep = de.endpoint.clone();
+    let cert = de.cert.clone();
+    let peer_cert = CertificateDer::from(peer.cert_der);
+    let cands = peer.candidates;
+    let tx = res_tx.clone();
+    tokio::spawn(async move {
+        match punch(&ep, &cert, &peer_cert, &cands, PUNCH_TIMEOUT).await {
+            Some(conn) => {
+                let _ = tx.send(conn);
+            }
+            None => log::info!("P2P 打洞失败/超时，继续走中继"),
+        }
+    });
+}
+
+/// P2P 后台线程主体：建 current-thread runtime，构建直连端点 + 跑打洞信令状态机。
 fn run(
+    role: Role,
+    stun_host: String,
     mut cmd_rx: UnboundedReceiver<P2pCmd>,
     evt_tx: &Sender<P2pEvent>,
     stop: &AtomicBool,
-    stun_host: &str,
+    connected: &AtomicBool,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -178,43 +214,74 @@ fn run(
         }
     };
     rt.block_on(async move {
-        // quinn client Endpoint 在 runtime 内创建——验证「tokio 隔离 + quinn 可活」（Phase 2 复用
-        // 此 endpoint 发起 connect + 加 server 侧自签证书做打洞握手）。失败不致命：STUN 仍可探端点。
-        match quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
-            Ok(ep) => log::debug!("P2P quinn client endpoint 就绪 @ {:?}", ep.local_addr()),
-            Err(e) => log::warn!("P2P quinn endpoint 创建失败: {e}"),
-        }
-        while !stop.load(Ordering::SeqCst) {
-            match cmd_rx.recv().await {
-                Some(P2pCmd::Discover) => {
-                    let cands = collect_candidates(stun_host).await;
-                    log::debug!("P2P 候选端点收集完成：{cands:?}");
-                    let _ = evt_tx.send(P2pEvent::Candidates(cands));
+        let stun = if stun_host.is_empty() {
+            None
+        } else {
+            Some(stun_host.as_str())
+        };
+        let de = match build_endpoint(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), stun).await {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("P2P endpoint 构建失败，放弃直连（中继不受影响）: {e}");
+                while let Some(cmd) = cmd_rx.recv().await {
+                    if matches!(cmd, P2pCmd::Stop) {
+                        break;
+                    }
                 }
-                Some(P2pCmd::Stop) | None => break,
+                return;
+            }
+        };
+        log::debug!("P2P 本端候选端点: {:?}", de.candidates);
+        let my_payload = SignalPayload {
+            candidates: de.candidates.clone(),
+            cert_der: de.cert.cert_der.clone(),
+            nonce: gen_nonce(),
+        };
+        // 控制端主动发 Offer；被控端收到 Offer 后回 Answer（见 PeerSignal 处理）。
+        if role == Role::Controller {
+            let _ = evt_tx.send(P2pEvent::SendSignal {
+                kind: P2pSignalKind::Offer,
+                payload: my_payload.clone(),
+            });
+        }
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<quinn::Connection>();
+        let mut conn_keep: Option<quinn::Connection> = None;
+        let mut punching = false;
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(P2pCmd::PeerSignal { kind, payload }) => match kind {
+                        P2pSignalKind::Offer => {
+                            // 被控端：回 Answer 并开始打洞。
+                            let _ = evt_tx.send(P2pEvent::SendSignal {
+                                kind: P2pSignalKind::Answer,
+                                payload: my_payload.clone(),
+                            });
+                            spawn_punch(&de, payload, &res_tx, &mut punching);
+                        }
+                        P2pSignalKind::Answer => spawn_punch(&de, payload, &res_tx, &mut punching),
+                        P2pSignalKind::Ready => log::debug!("P2P 对端 Ready"),
+                        P2pSignalKind::Fallback => log::info!("P2P 对端宣告回退中继"),
+                    },
+                    Some(P2pCmd::Stop) | None => break,
+                },
+                Some(conn) = res_rx.recv() => {
+                    log::info!("P2P 直连已通 → {}（Phase 2 不切数据面，仍走中继）", conn.remote_address());
+                    connected.store(true, Ordering::SeqCst);
+                    let _ = evt_tx.send(P2pEvent::Connected);
+                    let _ = evt_tx.send(P2pEvent::SendSignal {
+                        kind: P2pSignalKind::Ready,
+                        payload: my_payload.clone(),
+                    });
+                    conn_keep = Some(conn); // 保活直连（Phase 3 据此切数据面）。
+                }
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
             }
         }
+        drop(conn_keep);
     });
-}
-
-/// 收集本端候选端点：本机 LAN 地址 + STUN 反射的公网映射地址（STUN 不可达时仅返回 LAN）。
-async fn collect_candidates(stun_host: &str) -> Vec<Candidate> {
-    let mut cands = Vec::new();
-    if let Some(ip) = local_lan_addr() {
-        cands.push(Candidate {
-            addr: SocketAddr::new(ip, 0),
-            kind: CandidateKind::Local,
-        });
-    }
-    if let Some(public) = discover_public_addr(stun_host, STUN_TIMEOUT).await {
-        cands.push(Candidate {
-            addr: public,
-            kind: CandidateKind::Stun,
-        });
-    } else {
-        log::info!("P2P STUN 未探到公网端点（{stun_host} 不可达 / 对称 NAT），仅 LAN 候选");
-    }
-    cands
 }
 
 /// 取本机出口网卡的 LAN 地址（connect-trick：UDP `connect` 到外部地址**不实际发包**，仅令内核选
@@ -745,9 +812,17 @@ mod tests {
 
     #[test]
     fn 引擎启停_不panic() {
-        let mut eng = P2pEngine::start(DEFAULT_STUN.to_string());
-        assert!(!eng.is_ready(), "Phase 1 直连未就绪");
-        eng.request_discovery(); // 不等待结果（可能联网慢）；仅验证投递 + 停机不 panic。
+        // 空 STUN → 不联网；仅验证起线程 + 停机不 panic（无对端信令故不会握手）。
+        let mut eng = P2pEngine::start(Role::Controller, String::new());
+        assert!(!eng.is_connected(), "未握手前不应已连接");
+        eng.peer_signal(
+            P2pSignalKind::Fallback,
+            SignalPayload {
+                candidates: vec![],
+                cert_der: vec![],
+                nonce: 1,
+            },
+        );
         eng.stop();
     }
 
