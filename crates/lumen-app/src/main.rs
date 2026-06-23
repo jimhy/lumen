@@ -632,6 +632,10 @@ struct AppState {
     /// M5.3 part4b 控制端镜像区物理像素矩形 `(x, y, w, h)`：仅控制中+远程视图时为
     /// Some（每帧由终端区矩形换算），供鼠标命中→镜像选区的像素↔单元格换算。
     mirror_rect_px: Option<(f32, f32, f32, f32)>,
+    /// M5.3 part3d Phase 4 多窗格镜像各窗格**内容矩形**物理像素 `(session_id, x, y, w, h)`：每帧由
+    /// `shell_out.mirror_pane_rects` 换算（按 `mirror_panes` 渲染序配对 session_id）。供鼠标命中→
+    /// 点哪个窗格（点击选焦点 + per-pane 选区换算）。多窗格镜像激活时填，否则清空。
+    mirror_pane_rects_px: Vec<(session::SessionId, f32, f32, f32, f32)>,
     /// M5.3 part3c-2 #7：粘贴检测到同名、等用户在覆盖模态拍板的待决下载（None = 无待决）。
     pending_paste: Option<PendingPaste>,
     /// 粘贴完成后待刷新的目标目录 `(is_remote, dir)`：粘贴写文件到目录后，文件树缓存未更新、新
@@ -1010,23 +1014,34 @@ impl AppState {
                 self.remote_ws.subscribe_tab(first);
             }
         }
-        // 被控端：执行控制端转发来的远程输入（本地输入优先仲裁）。
+        // 被控端：执行控制端转发来的远程输入（Phase 4：按 (tab_id, session_id) 路由到目标窗格 PTY +
+        // **per-pane** 本地输入优先仲裁）。仲裁口径：仅当远程输入目标窗格 == 被控端**当前正在打字的窗格**
+        // （激活 tab 的焦点窗格）且最近有本地输入时丢弃——这样窗格 A 本地打字不会误丢发往窗格 B 的远程
+        // 输入（跨窗格零干扰）。目标窗格按 id 查（非下标，关窗格 Vec 重排，D1）。
         let mut applied = false;
         let remote_input = self.remote_ws.take_input();
         if !remote_input.is_empty() {
-            let local_busy = self
+            let local_recent = self
                 .last_key_at
                 .is_some_and(|t| t.elapsed() < REMOTE_INPUT_ARBITRATION);
-            if local_busy {
-                log::debug!("本地输入优先：丢弃 {} 段远程输入", remote_input.len());
-            } else {
-                let ti = self.active_tab;
-                let pi = self.tabs[ti].focused;
-                for bytes in remote_input {
-                    self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
-                    if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&bytes) {
-                        error!("远程输入写 PTY 失败: {e:#}");
-                    }
+            let local_pane = {
+                let tab = &self.tabs[self.active_tab];
+                (tab.id, tab.focused_pane().id)
+            };
+            for (tab_id, sid, bytes) in remote_input {
+                if local_recent && (tab_id, sid) == local_pane {
+                    log::debug!("本地输入优先：丢弃发往窗格 {sid} 的远程输入");
+                    continue;
+                }
+                let Some(ti) = self.tabs.iter().position(|t| t.id == tab_id) else {
+                    continue; // 目标会话已关，丢弃。
+                };
+                let Some(pi) = self.tabs[ti].panes.iter().position(|p| p.id == sid) else {
+                    continue; // 目标窗格已关，丢弃。
+                };
+                self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&bytes) {
+                    error!("远程输入写窗格 {sid} PTY 失败: {e:#}");
                 }
                 applied = true;
             }
@@ -1220,18 +1235,32 @@ impl AppState {
             } else {
                 self.mirror_src = None;
             }
-            // part3d：应答控制端回看请求——从**订阅会话**焦点窗格按绝对行号序列化历史行回传。
-            // count 上限与控制端请求共用 HISTORY_CHUNK_MAX，避免截断致 inflight 泄漏。
+            // part3d：应答控制端回看请求——按绝对行号从目标窗格序列化历史行回传。`target=None` 走
+            // 旧 HistoryRows（单窗格镜像焦点窗格）；`Some(sid)` 走 HistoryRowsForPane（多窗格指定窗格，
+            // 按 id 查、非下标，D1）。各窗格 base/screen_top 独立（绝对行号体系按窗格独立）。
             let reqs = self.remote_ws.take_history_reqs();
             if !reqs.is_empty() {
                 if let Some(sub_id) = self.remote_ws.sub_target() {
                     if let Some(ti) = self.tabs.iter().position(|t| t.id == sub_id) {
-                        for (top, count) in reqs {
+                        for (target, top, count) in reqs {
                             let count = usize::from(count.min(remote_ws::HISTORY_CHUNK_MAX));
-                            let pane = self.tabs[ti].focused_pane();
+                            let term = match target {
+                                Some(sid) => match self.tabs[ti].panes.iter().find(|p| p.id == sid) {
+                                    Some(p) => &p.term,
+                                    None => continue, // 目标窗格已关，丢弃该请求。
+                                },
+                                None => &self.tabs[ti].focused_pane().term,
+                            };
                             let (lines, base, screen_top) =
-                                remote_mirror::history_rows_vt(&pane.term, top, count);
-                            self.remote_ws.send_history_rows(top, base, screen_top, lines);
+                                remote_mirror::history_rows_vt(term, top, count);
+                            match target {
+                                Some(sid) => self
+                                    .remote_ws
+                                    .send_history_rows_for_pane(sid, top, base, screen_top, lines),
+                                None => {
+                                    self.remote_ws.send_history_rows(top, base, screen_top, lines)
+                                }
+                            }
                         }
                     }
                 }
@@ -1548,11 +1577,11 @@ impl AppState {
                 TermAction::CopySelection => {
                     // M5.3 part4b 镜像态：复制显示的镜像终端选区到本地剪贴板。
                     if self.is_mirror_active() {
-                        if let Some(text) = self.remote_ws.copy_mirror_selection() {
+                        if let Some(text) = self.remote_ws.copy_mirror_active() {
                             // 仅写入成功才清选区——失败/不可用时保留，便于重试。
                             match self.clipboard.as_mut().map(|c| c.set_text(text)) {
                                 Some(Ok(())) => {
-                                    self.remote_ws.clear_mirror_selection();
+                                    self.remote_ws.clear_mirror_active_selection();
                                     self.window.request_redraw();
                                 }
                                 Some(Err(e)) => error!("写剪贴板失败: {e}"),
@@ -2163,6 +2192,54 @@ impl AppState {
             ly,
             (rw.round() as u32).max(1),
             (rh.round() as u32).max(1),
+            0.0,
+        ))
+    }
+
+    /// Phase 4 多窗格镜像：鼠标所在镜像窗格的 `(session_id, x, y, w, h)`（内容矩形物理像素）；
+    /// 不在任何窗格内返回 None。命中区用每帧填的 `mirror_pane_rects_px`。
+    fn mirror_pane_at_mouse(&self) -> Option<(session::SessionId, f32, f32, f32, f32)> {
+        let (mx, my) = self.mouse_pos;
+        self.mirror_pane_rects_px
+            .iter()
+            .copied()
+            .find(|(_, x, y, w, h)| {
+                mx >= f64::from(*x)
+                    && my >= f64::from(*y)
+                    && mx < f64::from(x + w)
+                    && my < f64::from(y + h)
+            })
+    }
+
+    /// Phase 4 多窗格镜像：鼠标在某镜像窗格内则返回 `(session_id, row, col)`（相对该窗格内容矩形、
+    /// 按该窗格离屏尺寸换算，用于点选焦点 + per-pane 拖选）；不在任何窗格返回 None。
+    fn mirror_pane_cell_at_mouse(&self) -> Option<(session::SessionId, usize, usize)> {
+        let (sid, x, y, w, h) = self.mirror_pane_at_mouse()?;
+        let (lx, ly) = (self.mouse_pos.0 - f64::from(x), self.mouse_pos.1 - f64::from(y));
+        let (row, col) = self.renderer.cell_at_with_footer(
+            lx,
+            ly,
+            (w.round() as u32).max(1),
+            (h.round() as u32).max(1),
+            0.0,
+        );
+        Some((sid, row, col))
+    }
+
+    /// Phase 4 多窗格镜像：把鼠标位置 clamp 到**指定窗格** `sid` 的内容矩形换算 `(row, col)`（拖选用，
+    /// 拖出该窗格由 `cell_at_with_footer` 内部夹紧到边缘行列、不跳别格）。窗格矩形未知返回 None。
+    fn mirror_pane_cell_clamped(&self, sid: session::SessionId) -> Option<(usize, usize)> {
+        let (_, x, y, w, h) = self
+            .mirror_pane_rects_px
+            .iter()
+            .copied()
+            .find(|(s, ..)| *s == sid)?;
+        let (lx, ly) = (self.mouse_pos.0 - f64::from(x), self.mouse_pos.1 - f64::from(y));
+        Some(self.renderer.cell_at_with_footer(
+            lx,
+            ly,
+            (w.round() as u32).max(1),
+            (h.round() as u32).max(1),
             0.0,
         ))
     }
@@ -4185,6 +4262,7 @@ impl App {
             mirror_src: None,
             mirror_bounds_sent: None,
             mirror_rect_px: None,
+            mirror_pane_rects_px: Vec::new(),
             pending_paste: None,
             local_copy_rx: None,
             clip_fetch_rx: None,
@@ -5158,7 +5236,7 @@ impl ApplicationHandler<PtyWake> for App {
                 let mirror_active = state.is_mirror_active();
                 let guard = keymap::GuardState {
                     has_selection: if mirror_active {
-                        state.remote_ws.has_mirror_selection()
+                        state.remote_ws.has_mirror_active_selection()
                     } else {
                         state.tabs[ti].panes[pi]
                             .selection
@@ -5516,13 +5594,25 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // M5.3 part4b 镜像拖选：控制中+远程视图、拖选进行中则更新选区终点，
                 // 端点作用于显示的镜像终端（clamped：拖出镜像区收在边缘行列，不冻结）。
-                if state.is_mirror_active() && state.remote_ws.mirror_selecting() {
-                    if let Some((row, col)) = state.mirror_cell_clamped() {
-                        if state.remote_ws.mirror_sel_update(row, col) {
-                            state.window.request_redraw();
+                if state.is_mirror_active() {
+                    // 多窗格 per-pane 拖选：clamp 到拖选起始窗格矩形（不跨格）。
+                    if let Some(sid) = state.remote_ws.mirror_pane_selecting_sid() {
+                        if let Some((row, col)) = state.mirror_pane_cell_clamped(sid) {
+                            if state.remote_ws.mirror_pane_sel_update(row, col) {
+                                state.window.request_redraw();
+                            }
                         }
+                        return;
                     }
-                    return;
+                    // 单窗格镜像既有拖选。
+                    if state.remote_ws.mirror_selecting() {
+                        if let Some((row, col)) = state.mirror_cell_clamped() {
+                            if state.remote_ws.mirror_sel_update(row, col) {
+                                state.window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
                 }
 
                 // ── footer 拖选跟踪（第十一轮，input-editor feature）────
@@ -5631,7 +5721,17 @@ impl ApplicationHandler<PtyWake> for App {
                         && !state.mouse_on_pane_divider()
                         && !state.mouse_on_panel_resize()
                     {
-                        if let Some((row, col)) = state.mirror_cell_at_mouse() {
+                        // Phase 4 多窗格：点哪个镜像窗格 → 选它做**焦点**（输入/回看/复制/IME 目标）+
+                        // 起该窗格 per-pane 拖选。单窗格镜像走既有 part4b 单选区。
+                        if !state.remote_ws.mirror_panes().is_empty() {
+                            if let Some((sid, row, col)) = state.mirror_pane_cell_at_mouse() {
+                                state.terminal_focused = true;
+                                state.remote_ws.set_mirror_active_pane(sid);
+                                state.remote_ws.mirror_pane_sel_start(sid, row, col);
+                                state.window.request_redraw();
+                                return;
+                            }
+                        } else if let Some((row, col)) = state.mirror_cell_at_mouse() {
                             state.terminal_focused = true;
                             state.remote_ws.mirror_sel_start(row, col);
                             state.window.request_redraw();
@@ -5742,7 +5842,12 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
 
-                    // M5.3 part4b 镜像拖选结束（空选区=仅点击则清掉）。
+                    // M5.3 part4b 镜像拖选结束（空选区=仅点击则清掉）。多窗格 per-pane / 单窗格各一路。
+                    if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
+                        state.remote_ws.mirror_pane_sel_end();
+                        state.window.request_redraw();
+                        return;
+                    }
                     if state.is_mirror_active() && state.remote_ws.mirror_selecting() {
                         state.remote_ws.mirror_sel_end();
                         state.window.request_redraw();
@@ -5785,11 +5890,14 @@ impl ApplicationHandler<PtyWake> for App {
                 (MouseButton::Right, ElementState::Pressed) => {
                     // M5.3 part4b 镜像右键：有选区→复制到本地剪贴板；无选区→粘贴转发给
                     // 被控端（沿用本地终端右键惯例）。仅命中镜像区时拦截。
-                    if state.is_mirror_active() && state.mirror_cell_at_mouse().is_some() {
-                        if let Some(text) = state.remote_ws.copy_mirror_selection() {
+                    if state.is_mirror_active()
+                        && (state.mirror_pane_at_mouse().is_some()
+                            || state.mirror_cell_at_mouse().is_some())
+                    {
+                        if let Some(text) = state.remote_ws.copy_mirror_active() {
                             // 仅写入成功才清选区——失败/剪贴板不可用时保留，便于重试。
                             match state.clipboard.as_mut().map(|c| c.set_text(text)) {
-                                Some(Ok(())) => state.remote_ws.clear_mirror_selection(),
+                                Some(Ok(())) => state.remote_ws.clear_mirror_active_selection(),
                                 Some(Err(e)) => error!("写剪贴板失败: {e}"),
                                 None => log::warn!("剪贴板不可用，复制跳过"),
                             }
@@ -6381,6 +6489,7 @@ impl ApplicationHandler<PtyWake> for App {
                         || (None, shell::layout::PaneLayout::uniform(n)),
                         |l| (l.maximized.map(|m| m as usize), l.layout.clone()),
                     );
+                    let focused_idx = state.remote_ws.mirror_active_pane_idx();
                     let panes: Vec<shell::MirrorPaneView> = state
                         .remote_ws
                         .mirror_panes()
@@ -6393,7 +6502,7 @@ impl ApplicationHandler<PtyWake> for App {
                             })
                         })
                         .collect();
-                    Some(shell::MirrorMultiInput { panes, layout, maximized })
+                    Some(shell::MirrorMultiInput { panes, layout, maximized, focused_idx })
                 } else {
                     // 退出多窗格：释放全部 per-pane 纹理 + 离屏（延后注销）。
                     while let Some(tex) = state.mirror_pane_textures.pop() {
@@ -7132,6 +7241,24 @@ impl ApplicationHandler<PtyWake> for App {
                     let tr = shell_out.term_rect;
                     state.mirror_rect_px =
                         Some((tr.min.x * ppp, tr.min.y * ppp, tr.width() * ppp, tr.height() * ppp));
+                    // Phase 4：多窗格各格内容矩形物理像素 + session_id（鼠标命中→点焦点 / per-pane 选区）。
+                    state.mirror_pane_rects_px.clear();
+                    for (i, mp) in state.remote_ws.mirror_panes().iter().enumerate() {
+                        let r = shell_out
+                            .mirror_pane_rects
+                            .get(i)
+                            .copied()
+                            .unwrap_or(egui::Rect::NOTHING);
+                        if r.width() >= 1.0 && r.height() >= 1.0 {
+                            state.mirror_pane_rects_px.push((
+                                mp.session_id,
+                                r.min.x * ppp,
+                                r.min.y * ppp,
+                                r.width() * ppp,
+                                r.height() * ppp,
+                            ));
+                        }
+                    }
                     // 多窗格：据各格内容矩形像素 + 控制端 cell 算 grid_size_for → SubViewport（去重）。
                     // 单窗格走 mirror（hist 系统），不在此同步尺寸。
                     if let Some(tab_id) = state.remote_ws.subscribed_tab() {
@@ -7190,6 +7317,7 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 } else {
                     state.mirror_rect_px = None;
+                    state.mirror_pane_rects_px.clear();
                 }
                 // 远程控制一次性通知 → toast（弹窗在 egui 帧后 push，需请求重绘）。
                 let remote_notices = state.remote_ws.take_notices();
@@ -8442,6 +8570,18 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.is_mirror_active() && !state.remote_ws.mirror_panes().is_empty() {
                     let ppp = state.egui_ctx.pixels_per_point();
                     let n = state.remote_ws.mirror_panes().len();
+                    let focused_idx = state.remote_ws.mirror_active_pane_idx();
+                    // Phase 4 焦点窗格回看：回看态先按焦点窗格网格拉缺失历史 + 建 hist_term scratch
+                    // （之后焦点窗格改渲 hist_term）。非回看态无操作。
+                    if state.remote_ws.mirror_pane_in_hist() {
+                        if let Some(fi) = focused_idx {
+                            let (rows, cols) = {
+                                let g = state.remote_ws.mirror_panes()[fi].term.grid();
+                                (g.rows(), g.cols())
+                            };
+                            state.remote_ws.prepare_focused_pane_hist(rows, cols);
+                        }
+                    }
                     for i in 0..n {
                         // 离屏尺寸 = shell 回传的**该格内容矩形像素**（控制端 cell 大小渲染、1:1 贴图：
                         // 文字恒定清晰不缩放）。被控端网格大于该格 → 渲染时自然裁右/下；小于 → 留白。
@@ -8456,11 +8596,21 @@ impl ApplicationHandler<PtyWake> for App {
                         let w = ((rect.width() * ppp).round() as u32).max(1);
                         let h = ((rect.height() * ppp).round() as u32).max(1);
                         let oid = mirror_pane_offscreen_id(i);
-                        let cur = {
-                            let g = state.remote_ws.mirror_panes()[i].term.grid();
-                            // 每格显示各自光标（焦点不同步，故不按焦点门控）。
+                        // 焦点窗格在回看态 → 渲染 hist_term scratch（光标隐藏）；否则渲染 live 窗格 term。
+                        let in_hist_here =
+                            focused_idx == Some(i) && state.remote_ws.mirror_pane_in_hist();
+                        let term = match (in_hist_here, state.remote_ws.mirror_hist_term()) {
+                            (true, Some(ht)) => ht,
+                            _ => &state.remote_ws.mirror_panes()[i].term,
+                        };
+                        let cur = if in_hist_here {
+                            (0, 0, false) // 回看态光标隐藏。
+                        } else {
+                            let g = term.grid();
                             (g.cursor.row, g.cursor.col, g.cursor.visible)
                         };
+                        // per-pane 选区高亮（part4b 多窗格；Selection 为 Copy）。
+                        let sel_i = state.remote_ws.mirror_panes()[i].selection;
                         if state.renderer.ensure_offscreen(oid, w, h) {
                             if let (Some(view), Some(&tex)) = (
                                 state.renderer.offscreen_view(oid),
@@ -8474,14 +8624,9 @@ impl ApplicationHandler<PtyWake> for App {
                                 );
                             }
                         }
-                        if let Err(e) = state.renderer.render(
-                            oid,
-                            &state.remote_ws.mirror_panes()[i].term,
-                            None,
-                            cur,
-                            None,
-                            None,
-                        ) {
+                        if let Err(e) =
+                            state.renderer.render(oid, term, sel_i.as_ref(), cur, None, None)
+                        {
                             error!("多窗格镜像渲染失败: {e:#}");
                         }
                     }

@@ -136,7 +136,22 @@ pub enum RemoteFrame {
     },
     /// 控制端 → 被控端：用户输入的 VT 编码字节（按键 / 中断等）。被控端写入焦点
     /// 窗格 PTY（受「本地输入优先」仲裁：被控端本地用户刚输入过则丢弃，part4）。
+    /// **part3d Phase 1–3 休眠**（无 id 落到被控端激活会话、违背只读）；Phase 4 起用带双 id 的
+    /// [`Self::InputWithId`] 路由到订阅窗格，此变体保留收处理臂、由版本门挡住的 v1 对端休眠无害。
     Input(Vec<u8>),
+    /// 控制端 → 被控端（part3d Phase 4）：把输入 VT 字节写到**指定**会话的**指定窗格**（控制端自选
+    /// 焦点窗格、与被控端焦点解耦，需求 e）。被控端按 `(tab_id, session_id)` 查窗格 PTY 写入，受
+    /// 「本地输入优先」**per-pane** 仲裁（仅当该窗格正被被控端本地用户输入时丢弃）。`data` 走 base64
+    /// （见 [`b64`]，与 [`OutputWithId`](RemoteFrame::OutputWithId) 一致，免 JSON 数字数组膨胀）。
+    InputWithId {
+        /// 目标会话 id。
+        tab_id: TabId,
+        /// 目标窗格 id（路由键，**非下标**，D1）。
+        session_id: SessionId,
+        /// 用户输入的 VT 编码字节。
+        #[serde(with = "b64")]
+        data: Vec<u8>,
+    },
     /// 控制端 → 被控端：请求被控端焦点窗格 resize 到此行列（SSH 式：远端跟随控制
     /// 端视图尺寸，被控端 shell/程序按此重排，控制端满屏渲染、零 letterbox）。被控
     /// 期间覆盖被控端自身窗口尺寸；断开后恢复（part3 视口协商）。
@@ -155,6 +170,19 @@ pub enum RemoteFrame {
         /// 请求行数。
         count: u16,
     },
+    /// 控制端 → 被控端（part3d Phase 4 per-pane 回看）：请求**指定窗格**的历史行 `[top, top+count)`
+    /// （绝对行号）。多窗格镜像上滚回看用——控制端一时刻只对**焦点窗格**回看（`mirror_focused_sid`）。
+    /// 被控端按 `(tab_id, session_id)` 查窗格 grid 序列化对应行回 [`HistoryRowsForPane`](RemoteFrame::HistoryRowsForPane)。
+    HistoryReqForPane {
+        /// 目标会话 id。
+        tab_id: TabId,
+        /// 目标窗格 id（路由键，非下标）。
+        session_id: SessionId,
+        /// 起始绝对行号。
+        top: u64,
+        /// 请求行数。
+        count: u16,
+    },
     /// 被控端 → 控制端：应答 [`Self::HistoryReq`]。`lines[i]` 是绝对行 `top + i` 的
     /// VT 序列化（每行一段绝对 SGR 字节，空 `Vec` = 该行空白 / 越界）。同时回带当前
     /// 历史边界，使控制端夹紧回看范围并随实时输出推进。
@@ -164,6 +192,21 @@ pub enum RemoteFrame {
         /// 被控端当前最旧保留行的绝对行号（更旧的已被 scrollback 淘汰）。
         base: u64,
         /// 被控端当前可视区首行（screen row 0）的绝对行号。
+        screen_top: u64,
+        /// 逐行 VT 字节。
+        lines: Vec<Vec<u8>>,
+    },
+    /// 被控端 → 控制端（part3d Phase 4）：应答 [`HistoryReqForPane`](RemoteFrame::HistoryReqForPane)。
+    /// 携 `session_id` 供控制端校验「是否仍是当前焦点窗格的回看」——切焦点窗格后到达的陈旧应答按
+    /// `session_id != mirror_focused_sid` 丢弃，避免串台（绝对行号体系按**该窗格**独立 `base/screen_top`）。
+    HistoryRowsForPane {
+        /// 所属窗格 id（控制端校验键）。
+        session_id: SessionId,
+        /// 起始绝对行号（与请求对齐）。
+        top: u64,
+        /// 该窗格当前最旧保留行绝对行号。
+        base: u64,
+        /// 该窗格当前可视区首行绝对行号。
         screen_top: u64,
         /// 逐行 VT 字节。
         lines: Vec<Vec<u8>>,
@@ -887,6 +930,34 @@ mod tests {
                 tab_id: 7,
                 row_weights: vec![0.3, 0.7],
                 col_weights: vec![vec![0.5, 0.5], vec![0.4, 0.6]],
+            },
+        ] {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn part4_输入与per_pane回看帧经value往返() {
+        for frame in [
+            RemoteFrame::InputWithId {
+                tab_id: 3,
+                session_id: 7,
+                data: vec![0x03, b'l', b's', b'\r'],
+            },
+            RemoteFrame::HistoryReqForPane {
+                tab_id: 3,
+                session_id: 7,
+                top: 1200,
+                count: 40,
+            },
+            RemoteFrame::HistoryRowsForPane {
+                session_id: 7,
+                top: 1200,
+                base: 1000,
+                screen_top: 1400,
+                lines: vec![vec![b'a'], vec![]],
             },
         ] {
             let v = frame.to_value().expect("to_value");

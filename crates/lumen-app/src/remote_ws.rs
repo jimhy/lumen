@@ -135,6 +135,12 @@ pub struct MirrorPane {
     pub session_id: SessionId,
     /// 镜像终端（无 PTY，控制端主题就地解析颜色）。
     pub term: Terminal,
+    /// 控制端 part4b per-pane 选区（拖选/复制；与 `term` 同坐标系，渲染器据此画高亮）。`None`=无选区。
+    pub selection: Option<Selection>,
+    /// 该窗格回看边界初值 `(base, screen_top)`（被控端绝对行号，来自 `SubscriptionStarted` 快照）。
+    /// 切焦点到本窗格时据此设 `hist_bounds` 起步回看，随后由 `HistoryRowsForPane` 应答刷新精确值。
+    pub hist_base: u64,
+    pub hist_screen_top: u64,
 }
 
 /// part3d Phase 3c 控制端多窗格镜像的结构（比例布局 + 最大化）。**比例双向同步、但焦点不同步**：
@@ -247,8 +253,10 @@ pub struct RemoteWs {
     hist_built: Option<(u64, u64)>,
     /// 控制端：历史缓存版本号（每次写入历史行 +1，驱动 `hist_term` 按需重建）。
     hist_version: u64,
-    /// 被控端：待应答的历史行请求 `(top, count)`（main 从焦点窗格 term 序列化后应答）。
-    pending_history: Vec<(u64, u16)>,
+    /// 被控端：待应答的历史行请求 `(目标窗格, top, count)`。`None` = 单窗格镜像的焦点窗格（旧
+    /// [`RemoteFrame::HistoryReq`]，回 [`RemoteFrame::HistoryRows`]）；`Some(sid)` = 多窗格指定窗格
+    /// （[`RemoteFrame::HistoryReqForPane`]，回 [`RemoteFrame::HistoryRowsForPane`]）。
+    pending_history: Vec<(Option<SessionId>, u64, u16)>,
     // ── part3d 多会话 × 多窗格镜像（Phase 1 MVP：列表 + 订阅，单 mirror 只读）──────────
     /// 控制端：被控端推来的会话(tab)列表 + 概览状态（远程视图侧栏渲染源；来源
     /// [`RemoteFrame::TabListSnapshot`] / `TabCreated` / `TabClosed` / `TabUpdated`）。
@@ -265,6 +273,14 @@ pub struct RemoteWs {
     mirror_panes: Vec<MirrorPane>,
     /// 控制端：多窗格镜像布局（复刻被控端 `PaneLayout`+焦点+最大化；`mirror_panes` 非空时有效）。
     mirror_layout: Option<MirrorLayout>,
+    /// 控制端：part3d Phase 4 多窗格镜像里**控制端自选的焦点窗格** session_id（与被控端焦点解耦，
+    /// 需求 e）。驱动：输入转发目标（[`RemoteFrame::InputWithId`]）、per-pane 回看目标、IME 光标源、
+    /// 复制源、渲染高亮。**用 SessionId 非下标**（关窗格 Vec 重排，D1）。订阅/结构变时初始化为
+    /// 被控端焦点窗格、之后由控制端点击改；单窗格镜像（`mirror_panes` 空）不用此字段（走 `mirror`）。
+    mirror_active_pane: Option<SessionId>,
+    /// 控制端：part4b 多窗格当前正在拖选的窗格 session_id（左键按下到松开；保拖动跨帧操作同一窗格、
+    /// 中途滑出不换格）。`None`=未拖选。
+    mirror_pane_selecting: Option<SessionId>,
     /// 控制端：上次发给被控端的订阅会话各窗格目标尺寸（Phase 3 尺寸同步去重；变化才发
     /// [`RemoteFrame::SubViewport`]）。
     last_sub_viewport: Option<SubViewportReq>,
@@ -342,9 +358,9 @@ pub struct RemoteWs {
     inflight_put_meta: HashMap<u64, PutMeta>,
     /// 控制端：进行中的片5 上传编排（本地 → 被控端递归传输）；同一时刻一个。
     upload: Option<UploadWalk>,
-    /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
-    /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
-    pending_input: Vec<Vec<u8>>,
+    /// M5.3 part4 被控端待执行的远程输入 `(tab_id, session_id, 字节)`（控制端 [`RemoteFrame::InputWithId`]
+    /// 转发来）：main 每帧取走、按双 id 查目标窗格、经 **per-pane**「本地输入优先」仲裁后写入该窗格 PTY。
+    pending_input: Vec<(TabId, SessionId, Vec<u8>)>,
     /// M5.3 被控端待应用的远程视口尺寸（控制端请求；SSH 式跟随）：main 取走后
     /// 把焦点窗格 resize 到此 (rows, cols)。仅保留最新值。
     pending_viewport: Option<(u16, u16)>,
@@ -1172,6 +1188,8 @@ impl RemoteWs {
         self.mirror_focus_sid = None;
         self.mirror_panes.clear();
         self.mirror_layout = None;
+        self.mirror_active_pane = None;
+        self.mirror_pane_selecting = None;
         self.last_sub_viewport = None;
         self.pending_sub_viewport = None;
         self.pending_sub_layout = None;
@@ -1200,6 +1218,34 @@ impl RemoteWs {
     /// 套 API），下一帧 `pane_rects` 变 → `SubViewport` 让后台被控端 resize 到此比例。
     pub fn mirror_layout_mut(&mut self) -> Option<&mut MirrorLayout> {
         self.mirror_layout.as_mut()
+    }
+
+    /// 控制端：焦点窗格在 `mirror_panes` 中的渲染下标（shell 据此高亮；按 session_id 查、非缓存下标）。
+    #[must_use]
+    pub fn mirror_active_pane_idx(&self) -> Option<usize> {
+        let sid = self.mirror_active_pane?;
+        self.mirror_panes.iter().position(|p| p.session_id == sid)
+    }
+
+    /// 控制端：设焦点窗格（点击镜像窗格）。变化时复位回看态（绝对行号体系按窗格独立，切窗格须重置），
+    /// 由调用方据被控端在 `SubscriptionStarted` 给的该窗格 `(base, screen_top)` 重设边界。无效 id（不在
+    /// 当前 `mirror_panes`）忽略。返回是否真的切换了焦点窗格。
+    pub fn set_mirror_active_pane(&mut self, session_id: SessionId) -> bool {
+        if self.mirror_active_pane == Some(session_id) {
+            return false;
+        }
+        let Some(bounds) = self
+            .mirror_panes
+            .iter()
+            .find(|p| p.session_id == session_id)
+            .map(|p| (p.hist_base, p.hist_screen_top))
+        else {
+            return false;
+        };
+        self.mirror_active_pane = Some(session_id);
+        self.reset_history(); // 切焦点窗格：清旧窗格回看态（hist_top/cache/term），避免绝对行串台。
+        self.hist_bounds = Some(bounds); // 据新焦点窗格快照边界起步回看（随 HistoryRowsForPane 刷新）。
+        true
     }
 
     /// 控制端：发订阅会话各窗格目标尺寸给被控端（Phase 3 尺寸同步；与上次相同则不发）。被控端据此
@@ -1305,6 +1351,8 @@ impl RemoteWs {
                 self.mirror = None;
                 self.mirror_panes.clear();
                 self.mirror_layout = None;
+                self.mirror_active_pane = None;
+        self.mirror_pane_selecting = None;
                 self.reset_history();
             }
         }
@@ -1381,12 +1429,31 @@ impl RemoteWs {
 
     /// 控制端：把用户输入的 VT 字节转发给被控端（所有按键 / Ctrl+C / win32 / IME / 粘贴的收口）。
     ///
-    /// **part3d Phase 1–3：纯只读，本方法不发送任何输入**——多会话模型下若沿用旧 part4a 逻辑，
-    /// 输入会落到被控端**当前激活会话**（而非控制端订阅查看的会话），既违背「只读」又会误改
-    /// 被控端正在用的别处 shell（海风哥两机实测确认）。Phase 4 恢复发送，并按 `(tab_id, session_id)`
-    /// 路由到**订阅窗格**、配合本地输入优先仲裁。当前直接吞掉输入（不发、不动回看态）。
+    /// **part3d Phase 4**：按 `(subscribed_tab, 焦点窗格 session_id)` 包成 [`RemoteFrame::InputWithId`]
+    /// 发给被控端，被控端按双 id 路由到对应窗格 PTY（与被控端焦点解耦，需求 e）。目标窗格 = 多窗格镜像
+    /// 取 `mirror_active_pane`（控制端自选），单窗格镜像取 `mirror_focus_sid`。未订阅 / 无焦点窗格则丢弃
+    /// （不发，杜绝旧 part4a「落到被控端激活会话」的缺陷）。回看态下转发即 snap 回跟随底部，使用户看到回显。
     pub fn send_input(&mut self, bytes: &[u8]) {
-        let _ = bytes; // Phase 4 起按订阅窗格路由转发。
+        if !self.is_controlling() || bytes.is_empty() {
+            return;
+        }
+        let Some(tab_id) = self.subscribed_tab else {
+            return;
+        };
+        let target = if self.mirror_panes.is_empty() {
+            self.mirror_focus_sid
+        } else {
+            self.mirror_active_pane
+        };
+        let Some(session_id) = target else {
+            return;
+        };
+        self.hist_top = None; // 转发输入 → 回跟随实时底部（看到回显）。
+        self.send_frame(&RemoteFrame::InputWithId {
+            tab_id,
+            session_id,
+            data: bytes.to_vec(),
+        });
     }
 
     // part3d：控制端 SSH 式视口跟随已移除（多会话模型下被控端焦点不动、订阅会话可为后台
@@ -1398,9 +1465,28 @@ impl RemoteWs {
         self.pending_viewport.take()
     }
 
-    /// 被控端：取走待应答的历史行请求（main 从焦点窗格 term 序列化后回 `HistoryRows`）。
-    pub fn take_history_reqs(&mut self) -> Vec<(u64, u16)> {
+    /// 被控端：取走待应答的历史行请求 `(目标窗格, top, count)`（main 据目标窗格序列化后应答：
+    /// `None` 回 `HistoryRows`、`Some(sid)` 回 `HistoryRowsForPane`）。
+    pub fn take_history_reqs(&mut self) -> Vec<(Option<SessionId>, u64, u16)> {
         std::mem::take(&mut self.pending_history)
+    }
+
+    /// 被控端：应答 per-pane 历史行请求（携 `session_id` 供控制端校验是否仍是焦点窗格回看）。
+    pub fn send_history_rows_for_pane(
+        &self,
+        session_id: SessionId,
+        top: u64,
+        base: u64,
+        screen_top: u64,
+        lines: Vec<Vec<u8>>,
+    ) {
+        self.send_frame(&RemoteFrame::HistoryRowsForPane {
+            session_id,
+            top,
+            base,
+            screen_top,
+            lines,
+        });
     }
 
     /// 被控端：应答历史行请求（`lines[i]` 对应绝对行 `top+i`；回带当前历史边界）。
@@ -3156,8 +3242,8 @@ impl RemoteWs {
         matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled))
     }
 
-    /// 被控端：取走待执行的远程输入（main 仲裁后写焦点窗格 PTY）。
-    pub fn take_input(&mut self) -> Vec<Vec<u8>> {
+    /// 被控端：取走待执行的远程输入 `(tab_id, session_id, 字节)`（main 按双 id 查窗格 + per-pane 仲裁后写 PTY）。
+    pub fn take_input(&mut self) -> Vec<(TabId, SessionId, Vec<u8>)> {
         std::mem::take(&mut self.pending_input)
     }
 
@@ -3165,7 +3251,8 @@ impl RemoteWs {
     /// 按**绝对行**锚定窗口——被控端实时输出推进时回看内容不被推走（标准终端回滚行为）。
     /// 滚回底部即恢复「跟随实时」。返回是否改变了视图（驱动重绘）。
     pub fn scroll_mirror(&mut self, lines: isize) -> bool {
-        if self.mirror.is_none() {
+        // 单窗格借 `mirror`，多窗格借**焦点窗格**（`mirror_active_pane`）；都无则无可回看。
+        if self.focused_mirror_term().is_none() {
             return false;
         }
         let Some((base, screen_top)) = self.hist_bounds else {
@@ -3188,9 +3275,15 @@ impl RemoteWs {
             return false;
         }
         self.hist_top = new_hist;
-        // 视图窗口变了（跟随↔回看 / 换窗口）：旧选区坐标作废。
+        // 视图窗口变了（跟随↔回看 / 换窗口）：旧选区坐标作废（单窗格 + 多窗格焦点窗格都清）。
         self.mirror_selection = None;
         self.mirror_selecting = false;
+        self.mirror_pane_selecting = None;
+        if let Some(sid) = self.mirror_active_pane {
+            if let Some(mp) = self.mirror_panes.iter_mut().find(|p| p.session_id == sid) {
+                mp.selection = None;
+            }
+        }
         true
     }
 
@@ -3243,6 +3336,42 @@ impl RemoteWs {
         })
     }
 
+    // ── part3d Phase 4 多窗格**焦点窗格**回看（复用单窗格 hist 机制，按 mirror_active_pane 驱动）──
+
+    /// 控制端：多窗格焦点窗格是否处于回看态（`hist_top` 有值；渲染据此用 `hist_term` 代替 live 窗格 term）。
+    #[must_use]
+    pub fn mirror_pane_in_hist(&self) -> bool {
+        !self.mirror_panes.is_empty() && self.hist_top.is_some()
+    }
+
+    /// 控制端：焦点窗格在回看态时，按 `(rows, cols)` 拉取缺失历史行 + 构建 `hist_term` scratch（与单窗格
+    /// `mirror_render` 回看分支同源；多窗格渲染段在画焦点窗格前调，之后 [`Self::mirror_hist_term`] 借出）。
+    /// 非回看态无操作。
+    pub fn prepare_focused_pane_hist(&mut self, rows: usize, cols: usize) {
+        // 规整回看锚点（同 mirror_render：触底回跟随 / 越下界夹到 base）。
+        if let (Some(top), Some((base, screen_top))) = (self.hist_top, self.hist_bounds) {
+            let fixed = if top >= screen_top {
+                None
+            } else if top < base {
+                Some(base)
+            } else {
+                Some(top)
+            };
+            self.hist_top = fixed;
+        }
+        let Some(top) = self.hist_top else {
+            return;
+        };
+        self.fetch_history_window(top, rows);
+        self.build_hist_term(top, rows, cols);
+    }
+
+    /// 控制端：当前回看 scratch 终端（`prepare_focused_pane_hist` 构建后借出，渲染焦点窗格回看用）。
+    #[must_use]
+    pub fn mirror_hist_term(&self) -> Option<&Terminal> {
+        self.hist_term.as_ref()
+    }
+
     /// 控制端：为回看窗口 `[top, top+rows)` 拉取缺失历史行（上下各约一屏预取，减少滚动
     /// 抖动时的请求次数）。已缓存 / 在途的行不重复请求。
     fn fetch_history_window(&mut self, top: u64, rows: usize) {
@@ -3277,7 +3406,8 @@ impl RemoteWs {
         }
     }
 
-    /// 控制端：请求历史行 `[top, top+count)`，标记在途、发 `HistoryReq`。
+    /// 控制端：请求历史行 `[top, top+count)`，标记在途。多窗格镜像（`mirror_panes` 非空）发
+    /// `HistoryReqForPane`（带焦点窗格 `mirror_active_pane`），单窗格镜像发旧 `HistoryReq`（焦点窗格）。
     fn request_history(&mut self, top: u64, count: u16) {
         if count == 0 {
             return;
@@ -3285,7 +3415,12 @@ impl RemoteWs {
         for a in top..top.saturating_add(u64::from(count)) {
             self.hist_inflight.insert(a);
         }
-        self.send_frame(&RemoteFrame::HistoryReq { top, count });
+        match (self.subscribed_tab, self.mirror_panes.is_empty(), self.mirror_active_pane) {
+            (Some(tab_id), false, Some(session_id)) => self.send_frame(
+                &RemoteFrame::HistoryReqForPane { tab_id, session_id, top, count },
+            ),
+            _ => self.send_frame(&RemoteFrame::HistoryReq { top, count }),
+        }
     }
 
     /// 控制端：把回看窗口 `[top, top+rows)` 的缓存行填进 `hist_term`（缺失行留空白），
@@ -3376,7 +3511,7 @@ impl RemoteWs {
     /// 转发按键时据此选 win32 编码 + 发 key-up，使被控端 win32 程序收到完整输入记录。
     #[must_use]
     pub fn mirror_win32_input(&self) -> bool {
-        self.mirror.as_ref().is_some_and(Terminal::win32_input)
+        self.focused_mirror_term().is_some_and(Terminal::win32_input)
     }
 
     /// 控制端（part4c）：当前镜像光标 `(row, col)`（跟随态 Some；回看态 None）。IME
@@ -3386,7 +3521,7 @@ impl RemoteWs {
         if self.hist_top.is_some() {
             return None;
         }
-        self.mirror.as_ref().map(|m| {
+        self.focused_mirror_term().map(|m| {
             let g = m.grid();
             // 加 display_offset 与渲染侧 cursor_view_row / 本地 IME 定位口径统一（镜像 grid
             // 当前恒 display_offset==0，显式加上以防将来非零时候选框纵向偏 display_offset 行）。
@@ -3444,6 +3579,124 @@ impl RemoteWs {
         (!text.is_empty()).then_some(text)
     }
 
+    // ── part3d Phase 4 多窗格 per-pane 选区 / 复制 / 焦点窗格状态 ───────────────────
+
+    /// 控制端：当前**焦点镜像窗格**的 term（多窗格取 `mirror_active_pane` 对应窗格、单窗格取 `mirror`）。
+    /// 供输入编码取目标窗格实时 win32 / bracketed-paste 模式、IME 光标定位。
+    fn focused_mirror_term(&self) -> Option<&Terminal> {
+        if self.mirror_panes.is_empty() {
+            self.mirror.as_ref()
+        } else {
+            let sid = self.mirror_active_pane?;
+            self.mirror_panes
+                .iter()
+                .find(|p| p.session_id == sid)
+                .map(|p| &p.term)
+        }
+    }
+
+    /// 控制端：多窗格在窗格 `sid` 的 `(row, col)` 起选（建空选区 + 进拖选态 + 清其它窗格选区，
+    /// 保「一时刻一个选区源」复制无歧义）。`row/col` 为该窗格内容矩形内行列（调用方按窗格像素换算）。
+    pub fn mirror_pane_sel_start(&mut self, sid: SessionId, row: usize, col: usize) {
+        for mp in self.mirror_panes.iter_mut() {
+            if mp.session_id == sid {
+                let line = mp.term.grid().view_top_abs_line() + row as u64;
+                let p = SelPoint { line, col };
+                mp.selection = Some(Selection { anchor: p, head: p });
+            } else {
+                mp.selection = None;
+            }
+        }
+        self.mirror_pane_selecting = Some(sid);
+    }
+
+    /// 控制端：拖动更新当前拖选窗格的选区终点。返回是否真移动（驱动重绘）。
+    pub fn mirror_pane_sel_update(&mut self, row: usize, col: usize) -> bool {
+        let Some(sid) = self.mirror_pane_selecting else {
+            return false;
+        };
+        if let Some(mp) = self.mirror_panes.iter_mut().find(|p| p.session_id == sid) {
+            let head = SelPoint {
+                line: mp.term.grid().view_top_abs_line() + row as u64,
+                col,
+            };
+            if let Some(sel) = mp.selection.as_mut() {
+                if sel.head != head {
+                    sel.head = head;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 控制端：是否正在多窗格拖选。
+    #[must_use]
+    pub fn mirror_pane_selecting(&self) -> bool {
+        self.mirror_pane_selecting.is_some()
+    }
+
+    /// 控制端：当前拖选窗格 session_id（main 据此把鼠标位置 clamp 到该窗格矩形换算 cell，
+    /// 拖出窗格收在边缘、不跳别格）。
+    #[must_use]
+    pub fn mirror_pane_selecting_sid(&self) -> Option<SessionId> {
+        self.mirror_pane_selecting
+    }
+
+    /// 控制端：结束多窗格拖选（仅点击未拖 = 空选区则清掉）。
+    pub fn mirror_pane_sel_end(&mut self) {
+        if let Some(sid) = self.mirror_pane_selecting.take() {
+            if let Some(mp) = self.mirror_panes.iter_mut().find(|p| p.session_id == sid) {
+                if mp.selection.is_some_and(|s| s.is_empty()) {
+                    mp.selection = None;
+                }
+            }
+        }
+    }
+
+    /// 控制端：焦点窗格当前是否有非空选区（Ctrl+C 裁决：复制 vs 中断转发）。
+    #[must_use]
+    pub fn has_mirror_pane_selection(&self) -> bool {
+        self.mirror_active_pane
+            .and_then(|sid| self.mirror_panes.iter().find(|p| p.session_id == sid))
+            .is_some_and(|mp| mp.selection.is_some_and(|s| !s.is_empty()))
+    }
+
+    /// 控制端：取**焦点窗格**选区文本（复制到本地剪贴板；空选区 / 空文本返回 `None`）。
+    #[must_use]
+    pub fn copy_mirror_pane_selection(&self) -> Option<String> {
+        let sid = self.mirror_active_pane?;
+        let mp = self.mirror_panes.iter().find(|p| p.session_id == sid)?;
+        let sel = mp.selection.filter(|s| !s.is_empty())?;
+        let text = mp.term.selection_text(&sel);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// 控制端：复制当前焦点镜像选区文本（多窗格焦点窗格优先，单窗格回退）。复制收口。
+    #[must_use]
+    pub fn copy_mirror_active(&self) -> Option<String> {
+        self.copy_mirror_pane_selection()
+            .or_else(|| self.copy_mirror_selection())
+    }
+
+    /// 控制端：焦点镜像当前是否有非空选区（Ctrl+C 裁决：复制 vs 中断转发）。多窗格 or 单窗格。
+    #[must_use]
+    pub fn has_mirror_active_selection(&self) -> bool {
+        self.has_mirror_pane_selection() || self.has_mirror_selection()
+    }
+
+    /// 控制端：清空焦点镜像选区（多窗格焦点窗格 + 单窗格都清；复制成功 / 切视图后调用）。
+    pub fn clear_mirror_active_selection(&mut self) {
+        self.mirror_selection = None;
+        self.mirror_selecting = false;
+        self.mirror_pane_selecting = None;
+        if let Some(sid) = self.mirror_active_pane {
+            if let Some(mp) = self.mirror_panes.iter_mut().find(|p| p.session_id == sid) {
+                mp.selection = None;
+            }
+        }
+    }
+
     /// 控制端：把文本作为「粘贴」转发给被控端 PTY——换行规整为 CR，按被控端 bracketed
     /// paste 模式（镜像跟踪自 VT 流）包裹，经 `RemoteFrame::Input` 发送。
     pub fn send_paste(&mut self, text: &str) {
@@ -3451,7 +3704,9 @@ impl RemoteWs {
             return;
         }
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-        let bracketed = self.mirror.as_ref().is_some_and(Terminal::bracketed_paste);
+        let bracketed = self
+            .focused_mirror_term()
+            .is_some_and(Terminal::bracketed_paste);
         let payload = if bracketed {
             let mut p = Vec::with_capacity(normalized.len() + 12);
             p.extend_from_slice(b"\x1b[200~");
@@ -3502,10 +3757,18 @@ impl RemoteWs {
                     let _ = mirror.take_responses();
                 }
             }
-            RemoteFrame::Input(bytes) => {
-                // 仅被控端会话期间接受（控制端不应收到 Input）。
+            RemoteFrame::Input(_bytes) => {
+                // part3d Phase 4：旧无 id `Input` 休眠（版本门已挡 v1 对端；本端只发带双 id 的
+                // InputWithId）。无 (tab,session) 无法安全路由，丢弃。
+            }
+            RemoteFrame::InputWithId {
+                tab_id,
+                session_id,
+                data,
+            } => {
+                // 仅被控端会话期间接受：入队，main 按 (tab_id, session_id) 查窗格 + per-pane 仲裁后写 PTY。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
-                    self.pending_input.push(bytes);
+                    self.pending_input.push((tab_id, session_id, data));
                 }
             }
             RemoteFrame::ViewportResize { rows, cols } => {
@@ -3516,9 +3779,20 @@ impl RemoteWs {
             }
             // part3d 历史按需分页：
             RemoteFrame::HistoryReq { top, count } => {
-                // 仅被控端应答：入待处理队列，main 从焦点窗格 term 序列化对应行后回。
+                // 仅被控端应答（单窗格镜像焦点窗格）：入队（目标 None），main 序列化后回 HistoryRows。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
-                    self.pending_history.push((top, count));
+                    self.pending_history.push((None, top, count));
+                }
+            }
+            RemoteFrame::HistoryReqForPane {
+                tab_id: _,
+                session_id,
+                top,
+                count,
+            } => {
+                // 仅被控端应答（多窗格指定窗格）：入队（目标 Some(sid)），main 序列化后回 HistoryRowsForPane。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_history.push((Some(session_id), top, count));
                 }
             }
             RemoteFrame::HistoryRows {
@@ -3529,6 +3803,28 @@ impl RemoteWs {
             } => {
                 // 仅控制端：刷新边界 + 把回带的行入缓存、销在途、提版本触发重建。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.hist_bounds = Some((base, screen_top));
+                    for (i, bytes) in lines.into_iter().enumerate() {
+                        let abs = top + i as u64;
+                        self.hist_inflight.remove(&abs);
+                        self.hist_cache.insert(abs, bytes);
+                    }
+                    self.hist_version = self.hist_version.wrapping_add(1);
+                    self.trim_history_cache();
+                }
+            }
+            RemoteFrame::HistoryRowsForPane {
+                session_id,
+                top,
+                base,
+                screen_top,
+                lines,
+            } => {
+                // 仅控制端 且 仍是当前焦点窗格的回看（切焦点窗格后到达的陈旧应答按 session_id 丢弃，
+                // 避免把别窗格绝对行喂进当前焦点窗格回看态串台）。绝对行号体系按该窗格独立。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller))
+                    && self.mirror_active_pane == Some(session_id)
+                {
                     self.hist_bounds = Some((base, screen_top));
                     for (i, bytes) in lines.into_iter().enumerate() {
                         let abs = top + i as u64;
@@ -3774,11 +4070,11 @@ impl RemoteWs {
             }
             RemoteFrame::SubscriptionStarted {
                 tab_id,
+                focused,
                 panes,
                 row_weights,
                 col_weights,
                 maximized,
-                .. // focused 忽略：控制端不跟随被控端焦点高亮（海风哥需求，留待 Phase 4 控制端自选）。
             } => {
                 // 仅控制端 且 与当前订阅目标一致（忽略换订阅在途的陈旧应答）。快照内联、先于任何
                 // OutputWithId（D3 保序）。**混合**：1 窗格走单 mirror（保回看/选区，1+2 已验收）；
@@ -3814,11 +4110,20 @@ impl RemoteWs {
                             .iter()
                             .map(|mp| mp.session_id)
                             .eq(panes.iter().map(|p| p.session_id));
+                        // 保留同 id 窗格的现有选区（纯尺寸/内容重发不丢选区）；新窗格选区为 None。
+                        let mut old_sel: std::collections::HashMap<SessionId, Selection> = self
+                            .mirror_panes
+                            .drain(..)
+                            .filter_map(|mp| mp.selection.map(|s| (mp.session_id, s)))
+                            .collect();
                         self.mirror_panes = panes
                             .iter()
                             .map(|p| MirrorPane {
                                 session_id: p.session_id,
                                 term: mk_term(p),
+                                selection: old_sel.remove(&p.session_id),
+                                hist_base: p.base,
+                                hist_screen_top: p.screen_top,
                             })
                             .collect();
                         // 比例布局：**结构变（增删窗格）或首帧** → 据被控端权重重建布局并复位同步基线
@@ -3833,6 +4138,22 @@ impl RemoteWs {
                             self.sub_layout_baseline = None; // 据新结构当前比例重新建立 SubLayout 同步。
                         } else if let Some(l) = self.mirror_layout.as_mut() {
                             l.maximized = maximized; // 比例保留，仅同步最大化结构。
+                        }
+                        // 控制端焦点窗格（Phase 4）：现存焦点仍在新窗格集里则保留（结构同的纯尺寸重发
+                        // 不夺焦点），否则初始化为被控端焦点窗格（panes[focused]，合理默认；之后控制端
+                        // 点击改、不回报被控端）。回看边界取**焦点窗格**的 (base, screen_top) 重建。
+                        let keep = self
+                            .mirror_active_pane
+                            .filter(|sid| panes.iter().any(|p| p.session_id == *sid));
+                        let active = keep.or_else(|| {
+                            panes
+                                .get(focused as usize)
+                                .or_else(|| panes.first())
+                                .map(|p| p.session_id)
+                        });
+                        self.mirror_active_pane = active;
+                        if let Some(ap) = active.and_then(|sid| panes.iter().find(|p| p.session_id == sid)) {
+                            self.hist_bounds = Some((ap.base, ap.screen_top));
                         }
                     }
                 }
@@ -5039,16 +5360,158 @@ mod tests {
     }
 
     #[test]
-    fn 只读阶段不转发输入() {
-        // part3d Phase 1–3 纯只读：send_input 为 no-op——不发输入、不动回看态（避免误改被控端
-        // 当前激活会话，海风哥两机实测确认）。Phase 4 恢复发送并按订阅窗格 (tab_id,session_id) 路由。
+    #[allow(clippy::field_reassign_with_default)]
+    fn part4_输入按焦点窗格路由转发() {
+        // Phase 4：未订阅→send_input 不发不动回看态（杜绝旧 part4a 落到被控端激活会话缺陷）；订阅后
+        // 按 (subscribed_tab, 焦点窗格 session_id) 发 InputWithId，且回看态转发即 snap 回跟随（看回显）。
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut ws = RemoteWs::default();
+        ws.cmd_tx = Some(tx);
         起会话(&mut ws, Role::Controller);
+        let take_input = |rx: &Receiver<RemoteC2S>| -> Option<(TabId, SessionId, Vec<u8>)> {
+            while let Ok(msg) = rx.try_recv() {
+                if let RemoteC2S::Relay(v) = msg {
+                    if let Ok(RemoteFrame::InputWithId {
+                        tab_id,
+                        session_id,
+                        data,
+                    }) = RemoteFrame::from_value(&v)
+                    {
+                        return Some((tab_id, session_id, data));
+                    }
+                }
+            }
+            None
+        };
+        // 未订阅：不发、回看态不变。
         relay(&mut ws, &RemoteFrame::HistoryBounds { base: 0, screen_top: 100 });
         ws.scroll_mirror(5);
         assert_eq!(ws.hist_top, Some(95), "已进回看态");
         ws.send_input(b"x");
-        assert_eq!(ws.hist_top, Some(95), "只读：send_input 为 no-op，回看态不变");
+        assert_eq!(ws.hist_top, Some(95), "未订阅：send_input no-op，回看态不变");
+        assert!(take_input(&rx).is_none(), "未订阅不发输入");
+        // 订阅单窗格会话：SubscriptionStarted 设 mirror_focus_sid（42）。
+        ws.subscribe_tab(7);
+        relay(
+            &mut ws,
+            &RemoteFrame::SubscriptionStarted {
+                tab_id: 7,
+                focused: 0,
+                panes: vec![PaneSnapshot {
+                    session_id: 42,
+                    rows: 24,
+                    cols: 80,
+                    snapshot: vec![],
+                    base: 0,
+                    screen_top: 24,
+                    custom_title: None,
+                }],
+                row_weights: vec![],
+                col_weights: vec![],
+                maximized: None,
+            },
+        );
+        ws.scroll_mirror(3); // 再进回看态
+        assert!(ws.hist_top.is_some(), "订阅后再进回看态");
+        ws.send_input(b"ls\r");
+        assert_eq!(ws.hist_top, None, "转发输入 snap 回跟随底部");
+        assert_eq!(
+            take_input(&rx),
+            Some((7, 42, b"ls\r".to_vec())),
+            "按 (tab=7, 焦点窗格=42) 路由发 InputWithId"
+        );
+    }
+
+    /// 构造一个 part3d PaneSnapshot（测试用，内容空、给定 id 与边界）。
+    fn pane_snap(session_id: SessionId, base: u64, screen_top: u64) -> PaneSnapshot {
+        PaneSnapshot {
+            session_id,
+            rows: 24,
+            cols: 80,
+            snapshot: vec![],
+            base,
+            screen_top,
+            custom_title: None,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn part4_多窗格焦点切换与输入路由() {
+        // 多窗格订阅 → 默认焦点 = 被控端 focused 窗格；点击切焦点 → 输入路由到新焦点窗格、
+        // 回看边界按新窗格快照复位（与被控端焦点解耦）。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ws = RemoteWs::default();
+        ws.cmd_tx = Some(tx);
+        起会话(&mut ws, Role::Controller);
+        let take_input = |rx: &Receiver<RemoteC2S>| -> Option<(TabId, SessionId, Vec<u8>)> {
+            while let Ok(msg) = rx.try_recv() {
+                if let RemoteC2S::Relay(v) = msg {
+                    if let Ok(RemoteFrame::InputWithId {
+                        tab_id,
+                        session_id,
+                        data,
+                    }) = RemoteFrame::from_value(&v)
+                    {
+                        return Some((tab_id, session_id, data));
+                    }
+                }
+            }
+            None
+        };
+        ws.subscribe_tab(5);
+        relay(
+            &mut ws,
+            &RemoteFrame::SubscriptionStarted {
+                tab_id: 5,
+                focused: 1, // 被控端焦点 = panes[1] = sid 20
+                panes: vec![pane_snap(10, 0, 30), pane_snap(20, 5, 40)],
+                row_weights: vec![0.5, 0.5],
+                col_weights: vec![vec![1.0], vec![1.0]],
+                maximized: None,
+            },
+        );
+        // 默认焦点采纳被控端 focused（sid 20）；输入路由到它。
+        assert_eq!(ws.mirror_active_pane, Some(20));
+        ws.send_input(b"a");
+        assert_eq!(take_input(&rx), Some((5, 20, b"a".to_vec())));
+        // 切焦点到 sid 10：输入改路由到 10，回看边界复位为该窗格快照 (0, 30)。
+        assert!(ws.set_mirror_active_pane(10));
+        assert_eq!(ws.mirror_active_pane, Some(10));
+        assert_eq!(ws.hist_bounds, Some((0, 30)));
+        ws.send_input(b"b");
+        assert_eq!(take_input(&rx), Some((5, 10, b"b".to_vec())));
+        // 不存在的窗格 id 切焦点被忽略。
+        assert!(!ws.set_mirror_active_pane(999));
+        assert_eq!(ws.mirror_active_pane, Some(10));
+    }
+
+    #[test]
+    fn part4_per_pane选区起选互斥() {
+        // 在某窗格起选 → 仅该窗格有选区、进拖选态；切到另一窗格起选 → 旧窗格选区清（一时刻一个源）。
+        let mut ws = RemoteWs::default();
+        起会话(&mut ws, Role::Controller);
+        ws.subscribe_tab(5);
+        relay(
+            &mut ws,
+            &RemoteFrame::SubscriptionStarted {
+                tab_id: 5,
+                focused: 0,
+                panes: vec![pane_snap(10, 0, 30), pane_snap(20, 0, 30)],
+                row_weights: vec![0.5, 0.5],
+                col_weights: vec![vec![1.0], vec![1.0]],
+                maximized: None,
+            },
+        );
+        ws.mirror_pane_sel_start(10, 0, 0);
+        assert!(ws.mirror_pane_selecting());
+        assert_eq!(ws.mirror_pane_selecting_sid(), Some(10));
+        assert!(ws.mirror_panes.iter().find(|p| p.session_id == 10).unwrap().selection.is_some());
+        // 切到窗格 20 起选 → 窗格 10 选区清。
+        ws.mirror_pane_sel_start(20, 0, 0);
+        assert!(ws.mirror_panes.iter().find(|p| p.session_id == 10).unwrap().selection.is_none());
+        assert!(ws.mirror_panes.iter().find(|p| p.session_id == 20).unwrap().selection.is_some());
+        assert_eq!(ws.mirror_pane_selecting_sid(), Some(20));
     }
 
     #[test]
@@ -5079,10 +5542,22 @@ mod tests {
         let mut ws = RemoteWs::default();
         起会话(&mut ws, Role::Controlled);
         relay(&mut ws, &RemoteFrame::HistoryReq { top: 5, count: 3 });
-        assert_eq!(ws.take_history_reqs(), vec![(5, 3)]);
+        // 单窗格 HistoryReq → 目标 None（焦点窗格）。
+        assert_eq!(ws.take_history_reqs(), vec![(None, 5, 3)]);
         // 取走后清空。
         assert!(ws.take_history_reqs().is_empty());
-        // 控制端角色不应入队历史请求（HistoryReq 仅被控端处理）。
+        // 多窗格 HistoryReqForPane → 目标 Some(sid)。
+        relay(
+            &mut ws,
+            &RemoteFrame::HistoryReqForPane {
+                tab_id: 1,
+                session_id: 9,
+                top: 20,
+                count: 4,
+            },
+        );
+        assert_eq!(ws.take_history_reqs(), vec![(Some(9), 20, 4)]);
+        // 控制端角色不应入队历史请求（HistoryReq* 仅被控端处理）。
         let mut cc = RemoteWs::default();
         起会话(&mut cc, Role::Controller);
         relay(&mut cc, &RemoteFrame::HistoryReq { top: 1, count: 1 });

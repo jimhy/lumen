@@ -139,6 +139,9 @@ pub struct MirrorMultiInput {
     pub layout: layout::PaneLayout,
     /// 最大化窗格下标（`Some` 时独占满 area）。
     pub maximized: Option<usize>,
+    /// M5.3 part3d Phase 4：**控制端自选焦点窗格**的渲染下标（输入/回看/复制/IME 目标）。shell 据此
+    /// 高亮该格标题栏（同本地 focused 视觉），与被控端焦点解耦（需求 e）。`None`=暂无焦点。
+    pub focused_idx: Option<usize>,
 }
 
 /// 一帧外壳 UI 的输入（main.rs 按帧构造的状态快照）。
@@ -1019,6 +1022,7 @@ pub fn show(
                         out.mirror_pane_rects.push(egui::Rect::NOTHING); // 最大化态隐藏格。
                         continue;
                     }
+                    let focused = multi.focused_idx == Some(i);
                     let title_h = PANE_TITLE_HEIGHT.min(rect.height() / 2.0);
                     let title_rect =
                         egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), title_h));
@@ -1027,13 +1031,19 @@ pub fn show(
                         rect.max,
                     )
                     .round_to_pixels(ppp);
-                    painter.rect_filled(title_rect, 0.0, pal.bg_dark);
+                    // 焦点窗格（Phase 4 控制端自选）：标题栏提亮一档（同本地 focused），作为输入/回看目标指示。
+                    let (bar_bg, bar_fg) = if focused {
+                        (pal.btn_bg, pal.fg)
+                    } else {
+                        (pal.bg_dark, pal.fg_dim)
+                    };
+                    painter.rect_filled(title_rect, 0.0, bar_bg);
                     painter.text(
                         egui::pos2(title_rect.min.x + 6.0, title_rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         &pane.title,
                         egui::FontId::proportional(12.0),
-                        pal.fg_dim,
+                        bar_fg,
                     );
                     if content_rect.width() >= 1.0 && content_rect.height() >= 1.0 {
                         painter.image(
@@ -1041,6 +1051,15 @@ pub fn show(
                             content_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
+                        );
+                    }
+                    // 焦点窗格 accent 边框（整格描边，Foreground 不被纹理盖；同本地焦点指示）。
+                    if focused {
+                        painter.rect_stroke(
+                            rect.round_to_pixels(ppp),
+                            0.0,
+                            egui::Stroke::new(1.5, pal.accent),
+                            egui::StrokeKind::Inside,
                         );
                     }
                     out.mirror_pane_rects.push(content_rect);
