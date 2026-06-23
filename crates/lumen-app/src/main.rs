@@ -1046,6 +1046,44 @@ impl AppState {
                 applied = true;
             }
         }
+        // 被控端：执行控制端发来的远程窗格操作（需求②：关闭/最大化切换/换位），按 (tab_id,session_id)
+        // 查窗格（非下标，D1）。布局/窗格集变化经 SubscriptionStarted 重发同步回控制端（两端一致）。
+        for (tab_id, sid, op) in self.remote_ws.take_pane_ops() {
+            use lumen_protocol::remote::PaneOpKind;
+            let Some(ti) = self.tabs.iter().position(|t| t.id == tab_id) else {
+                continue; // 目标会话已关。
+            };
+            let Some(pi) = self.tabs[ti].panes.iter().position(|p| p.id == sid) else {
+                continue; // 目标窗格已关。
+            };
+            match op {
+                PaneOpKind::Close => {
+                    // 远程关窗格；但若会关掉被控端**最后一个 tab 的最后一格**（致 app 退出），拒绝——
+                    // 控制端不应远程关停被控端进程。其余情况（关多格之一 / 关多 tab 之一）正常关。
+                    if self.tabs.len() == 1 && self.tabs[ti].panes.len() == 1 {
+                        log::warn!("远程关窗格被拒：这是被控端最后一个窗格，不远程关停 app");
+                    } else {
+                        let _ = self.close_pane(ti, pi); // 非最后 tab，不退出（返回 false）。
+                    }
+                }
+                PaneOpKind::ToggleMaximize => self.toggle_maximize_pane(ti, pi),
+                PaneOpKind::SwapWith { other } => {
+                    if let Some(pj) = self.tabs[ti].panes.iter().position(|p| p.id == other) {
+                        // 最大化期间禁换位（同本地 pane_swap 规则）。
+                        if pi != pj && self.tabs[ti].maximized.is_none() {
+                            self.tabs[ti].panes.swap(pi, pj);
+                            let tab = &mut self.tabs[ti];
+                            if tab.focused == pi {
+                                tab.focused = pj;
+                            } else if tab.focused == pj {
+                                tab.focused = pi;
+                            }
+                            self.persist_sessions(); // 窗格顺序即持久化顺序（同本地换位）。
+                        }
+                    }
+                }
+            }
+        }
         // 被控端：part3d 多会话镜像——推会话列表 + 按控制端订阅的会话推焦点窗格快照
         // （被控端自身焦点不动，需求 c/e）。
         let controlled = matches!(
@@ -3059,8 +3097,8 @@ impl AppState {
     /// Ctrl+Shift+Enter）。已处于最大化态时还原（无论 `pi` 是哪格
     /// ——可见的只有最大化格，按钮/快捷键都落在它身上）；普通态把
     /// `pi` 最大化并强制聚焦。布局权重不动：还原即回原比例。
-    fn toggle_maximize_pane(&mut self, pi: usize) {
-        let tab = &mut self.tabs[self.active_tab];
+    fn toggle_maximize_pane(&mut self, ti: usize, pi: usize) {
+        let tab = &mut self.tabs[ti];
         if pi >= tab.panes.len() {
             return; // 防御：结构刚变更的过渡帧
         }
@@ -5371,7 +5409,7 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                             ShellAction::ToggleMaximizePane => {
                                 let focused = state.tabs[state.active_tab].focused;
-                                state.toggle_maximize_pane(focused);
+                                state.toggle_maximize_pane(state.active_tab, focused);
                             }
                             ShellAction::ToggleSettings => {
                                 // 登录覆盖层打开时不响应（键盘归 egui）。
@@ -7485,7 +7523,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // —— 窗格最大化/还原（P14）：标题栏按钮（与
                 // Ctrl+Shift+Enter 同语义，toggle 内部含下标防御）。
                 if let Some(pi) = shell_out.pane_maximize {
-                    state.toggle_maximize_pane(pi);
+                    state.toggle_maximize_pane(state.active_tab, pi);
                 }
                 // —— 一键恢复默认布局（P15）：顶栏「▦」——全部比例
                 // 均分 + 最大化态先退出，复位后落盘。
@@ -7588,6 +7626,41 @@ impl ApplicationHandler<PtyWake> for App {
                         };
                         if changed {
                             state.window.request_redraw();
+                        }
+                    }
+                }
+
+                // —— 需求②：镜像窗格标题栏控件 → 远程操作被控端（PaneOp）。渲染下标 → session_id
+                // （mirror_panes 渲染序）；被控端执行后布局变化经 SubscriptionStarted 重发同步回来。
+                if state.is_mirror_active() {
+                    use lumen_protocol::remote::PaneOpKind;
+                    if let Some(tab_id) = state.remote_ws.subscribed_tab() {
+                        if let Some(idx) = shell_out.mirror_pane_close {
+                            if let Some(sid) =
+                                state.remote_ws.mirror_panes().get(idx).map(|p| p.session_id)
+                            {
+                                state.remote_ws.send_pane_op(tab_id, sid, PaneOpKind::Close);
+                            }
+                        }
+                        if let Some(idx) = shell_out.mirror_pane_maximize {
+                            if let Some(sid) =
+                                state.remote_ws.mirror_panes().get(idx).map(|p| p.session_id)
+                            {
+                                state
+                                    .remote_ws
+                                    .send_pane_op(tab_id, sid, PaneOpKind::ToggleMaximize);
+                            }
+                        }
+                        if let Some((src, dst)) = shell_out.mirror_pane_swap {
+                            let a = state.remote_ws.mirror_panes().get(src).map(|p| p.session_id);
+                            let b = state.remote_ws.mirror_panes().get(dst).map(|p| p.session_id);
+                            if let (Some(a), Some(b)) = (a, b) {
+                                state.remote_ws.send_pane_op(
+                                    tab_id,
+                                    a,
+                                    PaneOpKind::SwapWith { other: b },
+                                );
+                            }
                         }
                     }
                 }

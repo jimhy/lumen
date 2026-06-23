@@ -320,6 +320,12 @@ pub struct ShellOutput {
     pub mirror_divider_drag_ended: bool,
     /// M5.3 part3d Phase 3c：双击镜像分隔条 → 该方向恢复均分（作用于镜像布局）。
     pub mirror_divider_reset: Option<layout::DividerKind>,
+    /// M5.3 part3d Phase 4 需求②：点了镜像窗格 ✕（渲染下标）→ main 映射 session_id 发 PaneOp::Close。
+    pub mirror_pane_close: Option<usize>,
+    /// M5.3 part3d Phase 4 需求②：点了镜像窗格最大化按钮（渲染下标）→ main 发 PaneOp::ToggleMaximize。
+    pub mirror_pane_maximize: Option<usize>,
+    /// M5.3 part3d Phase 4 需求②：拖镜像窗格标题换位 `(源下标, 目标下标)` → main 发 PaneOp::SwapWith。
+    pub mirror_pane_swap: Option<(usize, usize)>,
     /// 左侧会话栏本帧实际宽度（逻辑点；P10）。main 在指针松开且与
     /// 已存值有差时写入 settings.json（拖动中不写盘）。
     pub sidebar_width: f32,
@@ -490,6 +496,9 @@ pub fn show(
         mirror_divider_drag: None,
         mirror_divider_drag_ended: false,
         mirror_divider_reset: None,
+        mirror_pane_close: None,
+        mirror_pane_maximize: None,
+        mirror_pane_swap: None,
         sidebar_width: app_settings.layout.sidebar_width,
         filetree_width: None,
         panel_resize_rects: Vec::new(),
@@ -1014,8 +1023,11 @@ pub fn show(
                     None => lay.pane_rects(area),
                 };
                 let ppp = ui.pixels_per_point();
-                // 各窗格标题栏（一致样式、不高亮焦点）+ 内容纹理。内容矩形回传 main（下标对齐
-                // multi.panes，隐藏/无效格回 NOTHING），main 据此把离屏按该格像素尺寸渲染（1:1 清晰）。
+                // 标题拖动换位（需求②，远程换位被控端）：拖动中 (源下标, 指针位置)、松手 (源下标, 落点)。
+                let mut title_drag: Option<(usize, egui::Pos2)> = None;
+                let mut title_drop: Option<(usize, egui::Pos2)> = None;
+                // 各窗格标题栏（焦点高亮 + ✕/最大化按钮 + 拖动换位）+ 内容纹理。内容矩形回传 main
+                // （下标对齐 multi.panes，隐藏/无效格回 NOTHING），main 据此把离屏按该格像素尺寸渲染。
                 for (i, pane) in multi.panes.iter().enumerate() {
                     let rect = rects.get(i).copied().unwrap_or(egui::Rect::NOTHING);
                     if !(rect.width() >= 1.0 && rect.height() >= 1.0) {
@@ -1045,6 +1057,109 @@ pub fn show(
                         egui::FontId::proportional(12.0),
                         bar_fg,
                     );
+                    // —— 标题栏控件（需求②，远程操作被控端）：仅多窗格（n>1）。✕ 关闭 + 最大化/还原；
+                    // 标题左侧（按钮区外）可拖动换位。命中区并入 divider_rects 让 raw 鼠标让位（不误起拖选）。
+                    if n > 1 {
+                        let cy = title_rect.center().y;
+                        // ✕ 关闭按钮（最右）。
+                        let close_rect = egui::Rect::from_center_size(
+                            egui::pos2(title_rect.max.x - 4.0 - PANE_CLOSE_SIZE / 2.0, cy),
+                            egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
+                        );
+                        let cresp = ui.interact(
+                            close_rect,
+                            ui.id().with(("mirror_pane_close", i)),
+                            egui::Sense::click(),
+                        );
+                        let cc = close_rect.center();
+                        if cresp.hovered() {
+                            painter.circle_filled(cc, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
+                        }
+                        let rr = 3.5;
+                        let cstroke =
+                            egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
+                        painter.line_segment(
+                            [egui::pos2(cc.x - rr, cc.y - rr), egui::pos2(cc.x + rr, cc.y + rr)],
+                            cstroke,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(cc.x - rr, cc.y + rr), egui::pos2(cc.x + rr, cc.y - rr)],
+                            cstroke,
+                        );
+                        if cresp.clicked() {
+                            out.mirror_pane_close = Some(i);
+                        }
+                        out.divider_rects.push(close_rect);
+                        // 最大化/还原按钮（✕ 左侧）。本窗格已最大化 → 画还原（双框错位），否则画 ▢。
+                        let max_rect = egui::Rect::from_center_size(
+                            egui::pos2(close_rect.min.x - 4.0 - PANE_CLOSE_SIZE / 2.0, cy),
+                            egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
+                        );
+                        let mresp = ui.interact(
+                            max_rect,
+                            ui.id().with(("mirror_pane_max", i)),
+                            egui::Sense::click(),
+                        );
+                        let mc = max_rect.center();
+                        if mresp.hovered() {
+                            painter.circle_filled(mc, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
+                        }
+                        let mstroke =
+                            egui::Stroke::new(1.2, if mresp.hovered() { pal.fg } else { bar_fg });
+                        let sq = 3.0;
+                        if multi.maximized == Some(i) {
+                            // 还原：双框错位。
+                            painter.rect_stroke(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(mc.x - sq, mc.y - sq + 1.5),
+                                    egui::vec2(sq * 2.0 - 1.5, sq * 2.0 - 1.5),
+                                ),
+                                0.0,
+                                mstroke,
+                                egui::StrokeKind::Middle,
+                            );
+                            painter.rect_stroke(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(mc.x - sq + 1.5, mc.y - sq),
+                                    egui::vec2(sq * 2.0 - 1.5, sq * 2.0 - 1.5),
+                                ),
+                                0.0,
+                                mstroke,
+                                egui::StrokeKind::Middle,
+                            );
+                        } else {
+                            painter.rect_stroke(
+                                egui::Rect::from_center_size(mc, egui::vec2(sq * 2.0, sq * 2.0)),
+                                0.0,
+                                mstroke,
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                        if mresp.clicked() {
+                            out.mirror_pane_maximize = Some(i);
+                        }
+                        out.divider_rects.push(max_rect);
+                        // 标题拖动换位：标题栏左段（按钮区之外）click_and_drag。
+                        let drag_rect = egui::Rect::from_min_max(
+                            title_rect.min,
+                            egui::pos2(max_rect.min.x - 2.0, title_rect.max.y),
+                        );
+                        let dresp = ui.interact(
+                            drag_rect,
+                            ui.id().with(("mirror_pane_title", i)),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if dresp.dragged() {
+                            if let Some(p) = dresp.interact_pointer_pos() {
+                                title_drag = Some((i, p));
+                            }
+                        }
+                        if dresp.drag_stopped() {
+                            if let Some(p) = dresp.interact_pointer_pos() {
+                                title_drop = Some((i, p));
+                            }
+                        }
+                    }
                     if content_rect.width() >= 1.0 && content_rect.height() >= 1.0 {
                         painter.image(
                             pane.tex,
@@ -1063,6 +1178,27 @@ pub fn show(
                         );
                     }
                     out.mirror_pane_rects.push(content_rect);
+                }
+                // 标题拖动换位（需求②）：拖动中高亮落点窗格；松手落在另一窗格 → mirror_pane_swap
+                // （main 映射 session_id 发 PaneOp::SwapWith，被控端真换位、两端一致）。落源/格外取消。
+                if let Some((src, pos)) = title_drag {
+                    if let Some(dst) = rects.iter().position(|r| r.contains(pos)) {
+                        if dst != src {
+                            painter.rect_stroke(
+                                rects[dst].round_to_pixels(ppp),
+                                0.0,
+                                egui::Stroke::new(2.0, pal.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
+                }
+                if let Some((src, pos)) = title_drop {
+                    if let Some(dst) = rects.iter().position(|r| r.contains(pos)) {
+                        if dst != src {
+                            out.mirror_pane_swap = Some((src, dst));
+                        }
+                    }
                 }
                 // 窗格分隔条：**可拖**——复刻本地分隔条交互（命中区加宽、拖动光标、双击复位），
                 // 但作用于镜像布局（产 mirror_divider_* 回 main → 改镜像比例 → SubViewport）。相邻格

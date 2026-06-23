@@ -29,9 +29,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneSnapshot, PaneViewport,
-    PutConflict, PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr,
-    RemoteS2C, Role, SessionId, TabId, TabState, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
+    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneOpKind, PaneSnapshot,
+    PaneViewport, PutConflict, PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame,
+    RemoteOpErr, RemoteS2C, Role, SessionId, TabId, TabState, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
     LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
@@ -361,6 +361,10 @@ pub struct RemoteWs {
     /// M5.3 part4 被控端待执行的远程输入 `(tab_id, session_id, 字节)`（控制端 [`RemoteFrame::InputWithId`]
     /// 转发来）：main 每帧取走、按双 id 查目标窗格、经 **per-pane**「本地输入优先」仲裁后写入该窗格 PTY。
     pending_input: Vec<(TabId, SessionId, Vec<u8>)>,
+    /// M5.3 part3d Phase 4 需求②：被控端待执行的远程窗格操作 `(tab_id, session_id, op)`（控制端
+    /// [`RemoteFrame::PaneOp`] 发来）：main 取走后按双 id 查窗格执行关闭/最大化/换位，布局变化经
+    /// `SubscriptionStarted` 重发同步回控制端。
+    pending_pane_ops: Vec<(TabId, SessionId, PaneOpKind)>,
     /// M5.3 被控端待应用的远程视口尺寸（控制端请求；SSH 式跟随）：main 取走后
     /// 把焦点窗格 resize 到此 (rows, cols)。仅保留最新值。
     pending_viewport: Option<(u16, u16)>,
@@ -3247,6 +3251,24 @@ impl RemoteWs {
         std::mem::take(&mut self.pending_input)
     }
 
+    /// 控制端：对订阅窗格发远程操作（[`RemoteFrame::PaneOp`]：关闭/最大化/换位）。被控端执行后布局变化
+    /// 经 `SubscriptionStarted` 重发同步。仅控制中可发。
+    pub fn send_pane_op(&self, tab_id: TabId, session_id: SessionId, op: PaneOpKind) {
+        if !self.is_controlling() {
+            return;
+        }
+        self.send_frame(&RemoteFrame::PaneOp {
+            tab_id,
+            session_id,
+            op,
+        });
+    }
+
+    /// 被控端：取走待执行的远程窗格操作（main 按双 id 查窗格执行关闭/最大化/换位）。
+    pub fn take_pane_ops(&mut self) -> Vec<(TabId, SessionId, PaneOpKind)> {
+        std::mem::take(&mut self.pending_pane_ops)
+    }
+
     /// 控制端：滚轮回看镜像历史（part3d 按需拉取）。`lines > 0` 向上看更旧、`< 0` 向下；
     /// 按**绝对行**锚定窗口——被控端实时输出推进时回看内容不被推走（标准终端回滚行为）。
     /// 滚回底部即恢复「跟随实时」。返回是否改变了视图（驱动重绘）。
@@ -3790,6 +3812,16 @@ impl RemoteWs {
                 // 仅被控端会话期间接受：入队，main 按 (tab_id, session_id) 查窗格 + per-pane 仲裁后写 PTY。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
                     self.pending_input.push((tab_id, session_id, data));
+                }
+            }
+            RemoteFrame::PaneOp {
+                tab_id,
+                session_id,
+                op,
+            } => {
+                // 仅被控端会话期间接受：入队，main 按 (tab_id, session_id) 查窗格执行关闭/最大化/换位。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_pane_ops.push((tab_id, session_id, op));
                 }
             }
             RemoteFrame::ViewportResize { rows, cols } => {
@@ -5506,6 +5538,38 @@ mod tests {
         // 不存在的窗格 id 切焦点被忽略。
         assert!(!ws.set_mirror_active_pane(999));
         assert_eq!(ws.mirror_active_pane, Some(10));
+    }
+
+    #[test]
+    fn part4_paneop_仅被控端入队() {
+        use lumen_protocol::remote::PaneOpKind;
+        // 被控端收 PaneOp → 入队（按 tab/session/op）；控制端角色不入队。
+        let mut ctl = RemoteWs::default();
+        起会话(&mut ctl, Role::Controller);
+        relay(
+            &mut ctl,
+            &RemoteFrame::PaneOp {
+                tab_id: 1,
+                session_id: 2,
+                op: PaneOpKind::Close,
+            },
+        );
+        assert!(ctl.take_pane_ops().is_empty(), "控制端不入队 PaneOp");
+        let mut sub = RemoteWs::default();
+        起会话(&mut sub, Role::Controlled);
+        relay(
+            &mut sub,
+            &RemoteFrame::PaneOp {
+                tab_id: 1,
+                session_id: 2,
+                op: PaneOpKind::SwapWith { other: 9 },
+            },
+        );
+        assert_eq!(
+            sub.take_pane_ops(),
+            vec![(1, 2, PaneOpKind::SwapWith { other: 9 })]
+        );
+        assert!(sub.take_pane_ops().is_empty(), "取走后清空");
     }
 
     #[test]

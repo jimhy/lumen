@@ -568,6 +568,32 @@ pub enum RemoteFrame {
         /// 每排内各列宽度权重（外层 = 排数，内层 = 该排列数）。复刻 `PaneLayout::col_weights`。
         col_weights: Vec<Vec<f32>>,
     },
+    /// 控制端 → 被控端（part3d Phase 4 需求②）：对订阅会话的某窗格做**远程操作**（关闭 / 最大化切换 /
+    /// 与另一窗格换位）。被控端在该 tab 上执行后，布局/窗格集变化经 [`SubscriptionStarted`](RemoteFrame::SubscriptionStarted)
+    /// 重发同步回控制端（两端一致）。**fire-and-forget**：无独立结果帧，以后续 `SubscriptionStarted`/
+    /// `TabClosed` 为确认。按 `(tab_id, session_id)` 路由（非下标，D1）。
+    PaneOp {
+        /// 目标会话 id。
+        tab_id: TabId,
+        /// 目标窗格 id（路由键）。
+        session_id: SessionId,
+        /// 操作。
+        op: PaneOpKind,
+    },
+}
+
+/// part3d Phase 4 [`RemoteFrame::PaneOp`] 的操作种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneOpKind {
+    /// 关闭该窗格（被控端关其 shell/PTY；若是该 tab 最后一格则关整个 tab）。
+    Close,
+    /// 切换该窗格最大化 / 还原（被控端 `toggle_maximize`）。
+    ToggleMaximize,
+    /// 与窗格 `other` 换位（被控端交换两窗格在 `panes` 中的下标 = 渲染序）。
+    SwapWith {
+        /// 换位目标窗格 id。
+        other: SessionId,
+    },
 }
 
 /// part3c-2 Option B 目录条目（被控端 `read_dir_worker` 产物，控制端只展示 + 原样回传）。
@@ -958,6 +984,21 @@ mod tests {
                 base: 1000,
                 screen_top: 1400,
                 lines: vec![vec![b'a'], vec![]],
+            },
+            RemoteFrame::PaneOp {
+                tab_id: 3,
+                session_id: 7,
+                op: PaneOpKind::Close,
+            },
+            RemoteFrame::PaneOp {
+                tab_id: 3,
+                session_id: 7,
+                op: PaneOpKind::ToggleMaximize,
+            },
+            RemoteFrame::PaneOp {
+                tab_id: 3,
+                session_id: 7,
+                op: PaneOpKind::SwapWith { other: 9 },
             },
         ] {
             let v = frame.to_value().expect("to_value");
