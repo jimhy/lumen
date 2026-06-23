@@ -59,7 +59,11 @@ const HISTORY_CACHE_CAP: usize = 8000;
 pub const HISTORY_CHUNK_MAX: u16 = 1024;
 
 /// 读超时：无消息时 `read` 返回，循环转去处理出站/保活/停止（兼顾响应与不空转）。
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// WS 读超时。**也是出站延迟上限**：`run_connection` 单线程循环「排空出站命令 → 阻塞读最长本超时」，
+/// 读阻塞期间无法发出站，故键入的输入帧最多延迟本超时才发出（两端各一次，往返双倍）。100ms 时打字
+/// 严重卡顿（海风哥实测）；降到 5ms：发送延迟 ≤5ms（低于 8ms 合帧预算），空闲时仍睡在 read 系统调用、
+/// CPU 可忽略。要彻底零延迟需读写分线程（tungstenite 单 socket 不便拆，5ms 轮询是务实解）。
+const READ_TIMEOUT: Duration = Duration::from_millis(5);
 /// 应用层 Ping 周期（保活 + 刷新服务端 `last_seen`）。
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
