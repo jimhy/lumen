@@ -15,6 +15,8 @@ mod virtual_files;
 mod remote;
 mod remote_mirror;
 mod remote_ws;
+// M6 P2P 直连（QUIC 打洞 + 中继回退）：tokio 隔离后台线程 + STUN 端点发现 + QUIC/证书就位。
+mod p2p;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
 mod completion;

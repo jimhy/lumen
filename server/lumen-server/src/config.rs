@@ -18,6 +18,10 @@ pub struct Config {
     pub token_ttl_secs: i64,
     /// 设备在线判定阈值（秒）：`last_seen` 在此窗口内视为在线（M5.1 近似，M5.2 换心跳）。
     pub online_window_secs: i64,
+    /// M6 P2P STUN 反射端 UDP 监听地址（如 `0.0.0.0:8788`）。客户端经此探公网映射端点做 QUIC
+    /// 打洞（自建反射替代被墙的公共 STUN，国内可达 + 自主可控，见 docs/M6 设计 §7）。与中继 WS
+    /// （TCP `bind_addr`）解耦的独立端点。
+    pub stun_bind_addr: String,
 }
 
 impl Config {
@@ -43,6 +47,8 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            stun_bind_addr: env::var("LUMEN_STUN_BIND_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:8788".to_string()),
         }
     }
 

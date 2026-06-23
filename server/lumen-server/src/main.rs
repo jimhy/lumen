@@ -12,6 +12,8 @@ mod error;
 mod handlers;
 mod hub;
 mod state;
+// M6 P2P：极简 STUN 反射端（独立 UDP，客户端探公网映射端点做 QUIC 打洞）。
+mod stun;
 mod ws;
 
 use std::sync::Arc;
@@ -47,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库就绪，建表完成");
 
     let bind_addr = config.bind_addr.clone();
+    let stun_bind = config.stun_bind_addr.clone();
     let hub = Arc::new(Hub::new());
     let state = AppState {
         pool,
@@ -59,6 +62,13 @@ async fn main() -> anyhow::Result<()> {
         loop {
             ticker.tick().await;
             hub.gc();
+        }
+    });
+    // M6 P2P STUN 反射端（独立 UDP，与中继 WS 解耦）：客户端探公网映射端点做 QUIC 打洞。
+    // 绑定失败仅告警、不拖垮主服务（中继仍可用，P2P 退化为不可加速）。
+    tokio::spawn(async move {
+        if let Err(e) = stun::serve(&stun_bind).await {
+            tracing::warn!("STUN 反射端退出（P2P 打洞将不可用，中继不受影响）: {e}");
         }
     });
     let app = build_router(state);
