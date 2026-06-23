@@ -580,6 +580,18 @@ pub enum RemoteFrame {
         /// 操作。
         op: PaneOpKind,
     },
+    /// **双向**（控制端↔被控端，M6 P2P 直连）：P2P 打洞信令——交换公网端点候选 / 自签证书指纹，协商
+    /// 建立 QUIC 直连或宣告回退中继。走现有 [`RemoteC2S::Relay`] 通路盲转，**服务器零改动**（前向兼容
+    /// 铁律）。信令通道本身已过 JWT + 配对鉴权，可作直连证书指纹的信任锚（防 MITM）。
+    ///
+    /// `payload` 为该阶段数据的 **JSON 字符串**（候选端点 / SPKI 指纹 / nonce 等）。**内层结构 Phase 2
+    /// 定**——Phase 0 只立信令信封，避免过早冻结候选/指纹格式（见 `docs/M6-P2P直连-QUIC打洞-设计-2026-06-23.md`）。
+    P2pSignal {
+        /// 信令阶段。
+        kind: P2pSignalKind,
+        /// 阶段数据（JSON 字符串；内层结构 Phase 2 定）。
+        payload: String,
+    },
 }
 
 /// part3d Phase 4 [`RemoteFrame::PaneOp`] 的操作种类。
@@ -597,6 +609,23 @@ pub enum PaneOpKind {
         /// 换位目标窗格 id。
         other: SessionId,
     },
+}
+
+/// M6 [`RemoteFrame::P2pSignal`] 的打洞信令阶段（QUIC 打洞 + 中继回退握手机）。
+///
+/// 流程：`Offer`(发起方公布候选+指纹+nonce) → `Answer`(应答方公布候选+指纹) → 双方同时打洞 + QUIC
+/// 握手 → `Ready`(某候选握手成功，确认直连) | `Fallback`(超时/失败，宣告继续全中继)。中继 WS 全程
+/// 在线，P2P 仅作叠加加速层（见 `docs/M6-P2P直连-QUIC打洞-设计-2026-06-23.md` §4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum P2pSignalKind {
+    /// 发起方 → 应答方：公布本端候选端点（LAN + STUN 反射的公网映射）+ 自签证书 SPKI 指纹 + nonce。
+    Offer,
+    /// 应答方 → 发起方：回带本端候选端点 + 自签证书 SPKI 指纹。
+    Answer,
+    /// 任一端：某条候选 QUIC(TLS1.3) 握手成功且指纹校验通过，确认选定该直连。
+    Ready,
+    /// 任一端：打洞超时 / 全部候选失败（对称 NAT 等），宣告继续全中继（对端停止打洞尝试）。
+    Fallback,
 }
 
 /// part3c-2 Option B 目录条目（被控端 `read_dir_worker` 产物，控制端只展示 + 原样回传）。
@@ -1011,6 +1040,30 @@ mod tests {
         ] {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn m6_p2p信令帧经value往返() {
+        // M6 Phase 0：P2pSignal 四阶段经 Relay 盲转往返（服务端零改动、前向兼容）。
+        // payload 内层结构 Phase 2 才定，此处用占位 JSON 字符串验证信封序列化。
+        for kind in [
+            P2pSignalKind::Offer,
+            P2pSignalKind::Answer,
+            P2pSignalKind::Ready,
+            P2pSignalKind::Fallback,
+        ] {
+            let frame = RemoteFrame::P2pSignal {
+                kind,
+                payload: r#"{"candidates":["192.168.1.85:51820"],"fp":"sha256:deadbeef"}"#.into(),
+            };
+            // 模拟服务端盲转：RemoteFrame → Value → 包进 Relay → 原样取出 → 还原。
+            let value = frame.to_value().expect("to_value");
+            let RemoteC2S::Relay(relayed) = RemoteC2S::Relay(value) else {
+                unreachable!()
+            };
+            let back = RemoteFrame::from_value(&relayed).expect("from_value");
             assert_eq!(back, frame);
         }
     }

@@ -4342,6 +4342,10 @@ impl RemoteWs {
                 }
             }
             RemoteFrame::Echo(_) => {}
+            // M6 P2P 直连信令（Phase 0 协议地基已立信封；Phase 2 起在此分发给 P2P 线程的
+            // 打洞状态机——交换候选/指纹、协商建立 QUIC 直连或回退中继）。Phase 0 暂不处理，
+            // 由穷尽匹配占位（见 docs/M6-P2P直连-QUIC打洞-设计-2026-06-23.md §4）。
+            RemoteFrame::P2pSignal { .. } => {}
         }
     }
 
