@@ -1533,6 +1533,7 @@ impl RemoteWs {
         self.last_sub_viewport = None; // 换订阅：强制为新会话重发目标尺寸。
         self.reset_sub_layout_baseline(); // 换订阅：据新会话当前比例重建 SubLayout 双向同步。
         self.reset_history();
+        self.clear_remote_filetree(); // 修③：换订阅清旧树，等被控端按新订阅会话 cwd 推 RootChanged。
         self.send_frame(&RemoteFrame::SubscribeSession { tab_id });
     }
 
@@ -3264,9 +3265,24 @@ impl RemoteWs {
         });
     }
 
-    /// 被控端：取走待执行的远程窗格操作（main 按双 id 查窗格执行关闭/最大化/换位）。
+    /// 被控端：取走待执行的远程窗格操作（main 按双 id 查窗格执行新建/关闭/最大化/换位）。
     pub fn take_pane_ops(&mut self) -> Vec<(TabId, SessionId, PaneOpKind)> {
         std::mem::take(&mut self.pending_pane_ops)
+    }
+
+    /// 控制端：对**当前焦点镜像窗格**发 PaneOp（远程视图下快捷键/按钮路由远程操作焦点窗格——
+    /// 关闭/最大化等）。无订阅 / 无焦点窗格则忽略。
+    pub fn send_focused_pane_op(&self, op: PaneOpKind) {
+        if let (Some(tab_id), Some(sid)) = (self.subscribed_tab, self.mirror_active_pane) {
+            self.send_pane_op(tab_id, sid, op);
+        }
+    }
+
+    /// 控制端：远程视图下「新建窗格」→ 在订阅会话加一格（`PaneOpKind::New` 忽略 session_id，填 0）。
+    pub fn send_new_remote_pane(&self) {
+        if let Some(tab_id) = self.subscribed_tab {
+            self.send_pane_op(tab_id, 0, PaneOpKind::New);
+        }
     }
 
     /// 控制端：滚轮回看镜像历史（part3d 按需拉取）。`lines > 0` 向上看更旧、`< 0` 向下；

@@ -585,6 +585,9 @@ pub enum RemoteFrame {
 /// part3d Phase 4 [`RemoteFrame::PaneOp`] 的操作种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneOpKind {
+    /// 在该会话**新建一个窗格**（远程 split；`session_id` 字段被忽略——目标是 `tab_id` 整个会话）。
+    /// 被控端在该 tab 加一格（不抢被控端自身焦点，需求 c/e），满窗格数上限则忽略（fire-and-forget）。
+    New,
     /// 关闭该窗格（被控端关其 shell/PTY；若是该 tab 最后一格则关整个 tab）。
     Close,
     /// 切换该窗格最大化 / 还原（被控端 `toggle_maximize`）。
@@ -984,6 +987,11 @@ mod tests {
                 base: 1000,
                 screen_top: 1400,
                 lines: vec![vec![b'a'], vec![]],
+            },
+            RemoteFrame::PaneOp {
+                tab_id: 3,
+                session_id: 7,
+                op: PaneOpKind::New,
             },
             RemoteFrame::PaneOp {
                 tab_id: 3,

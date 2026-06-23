@@ -1046,17 +1046,23 @@ impl AppState {
                 applied = true;
             }
         }
-        // 被控端：执行控制端发来的远程窗格操作（需求②：关闭/最大化切换/换位），按 (tab_id,session_id)
+        // 被控端：执行控制端发来的远程窗格操作（需求②①：新建/关闭/最大化切换/换位），按 (tab_id,session_id)
         // 查窗格（非下标，D1）。布局/窗格集变化经 SubscriptionStarted 重发同步回控制端（两端一致）。
         for (tab_id, sid, op) in self.remote_ws.take_pane_ops() {
             use lumen_protocol::remote::PaneOpKind;
             let Some(ti) = self.tabs.iter().position(|t| t.id == tab_id) else {
                 continue; // 目标会话已关。
             };
+            // New 无窗格目标（在整个 tab 加格），先于按 session_id 查窗格处理（修①远程新建窗格）。
+            if matches!(op, PaneOpKind::New) {
+                self.new_remote_pane_in(ti);
+                continue;
+            }
             let Some(pi) = self.tabs[ti].panes.iter().position(|p| p.id == sid) else {
                 continue; // 目标窗格已关。
             };
             match op {
+                PaneOpKind::New => unreachable!("New 已在上方处理"),
                 PaneOpKind::Close => {
                     // 远程关窗格；但若会关掉被控端**最后一个 tab 的最后一格**（致 app 退出），拒绝——
                     // 控制端不应远程关停被控端进程。其余情况（关多格之一 / 关多 tab 之一）正常关。
@@ -1303,9 +1309,15 @@ impl AppState {
                     }
                 }
             }
-            // part3c-2 Option B：远程文件树跟随**被控端自身焦点窗格** cwd（需求 1 既有行为，
-            // 与订阅会话解耦——保持已验收语义）。cwd 未知（首个提示符前）不推，控制端维持「等待 cwd」。
-            if let Some(cwd) = self.tabs[self.active_tab].cwd_path() {
+            // part3d 修③：远程文件树跟**控制端订阅的会话** cwd（不再跟被控端自身焦点 tab——两端焦点不同
+            // tab 时树对不上控制端正在看的会话）。未订阅时回退被控端焦点 tab（至少有树）。cwd 未知不推。
+            if let Some(cwd) = self
+                .remote_ws
+                .sub_target()
+                .and_then(|sid| self.tabs.iter().find(|t| t.id == sid))
+                .or_else(|| self.tabs.get(self.active_tab))
+                .and_then(|t| t.cwd_path())
+            {
                 self.remote_ws.send_root_changed(cwd);
             }
             // part3c-2 Option B 文件服务：控制端按需 ListDir → 被控端后台读盘 → 回包发回。
@@ -3093,6 +3105,50 @@ impl AppState {
         }
     }
 
+    /// 被控端：远程新建窗格到 tab `ti`（控制端 `PaneOp::New`，修①）。尺寸取该 tab 焦点窗格当前网格
+    /// （后续 SubViewport / 布局同步会按控制端镜像精确 resize）；满 `MAX_PANES` 则忽略（fire-and-forget，
+    /// 无 toast——控制端不该弹被控端的提示）。**不抢被控端自身焦点**（需求 c/e）：新格加在末尾、`focused`
+    /// 不动。窗格集变化经 `SubscriptionStarted` 重发同步回控制端。
+    fn new_remote_pane_in(&mut self, ti: usize) {
+        if self.tabs[ti].panes.len() >= MAX_PANES {
+            log::warn!("远程新建窗格忽略：tab id={} 已达 MAX_PANES", self.tabs[ti].id);
+            return;
+        }
+        let (rows, cols) = {
+            let g = self.tabs[ti].focused_pane().term.grid();
+            (g.rows(), g.cols())
+        };
+        let cwd = self.tabs[ti]
+            .focused_pane()
+            .term
+            .cwd()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| self.tabs[ti].focused_pane().initial_cwd.clone())
+            .filter(|p| p.is_dir());
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        match Session::spawn(
+            id,
+            rows,
+            cols,
+            SCROLLBACK,
+            self.wake_pending.clone(),
+            self.proxy.clone(),
+            cwd.as_deref(),
+            self.settings.proxy.effective_url(),
+        ) {
+            Ok(s) => {
+                let tab = &mut self.tabs[ti];
+                tab.maximized = None; // 加格前退最大化（新格要可见）。
+                tab.panes.push(s); // 末尾追加；不改 focused（被控端焦点不动）。
+                tab.layout = PaneLayout::uniform(tab.panes.len());
+                self.persist_sessions();
+                self.window.request_redraw();
+            }
+            Err(e) => error!("远程新建窗格失败（tab {ti}）: {e:#}"),
+        }
+    }
+
     /// 最大化/还原激活 tab 的窗格 `pi`（P14：标题栏按钮 /
     /// Ctrl+Shift+Enter）。已处于最大化态时还原（无论 `pi` 是哪格
     /// ——可见的只有最大化格，按钮/快捷键都落在它身上）；普通态把
@@ -4870,7 +4926,14 @@ impl ApplicationHandler<PtyWake> for App {
                 state.remote_ws.session.as_ref().map(|s| s.role),
                 Some(lumen_protocol::remote::Role::Controlled)
             ) {
-                if let Some(cwd) = state.tabs[state.active_tab].cwd_path() {
+                // 修③：跟控制端订阅的会话 cwd（回退被控端焦点 tab）。
+                if let Some(cwd) = state
+                    .remote_ws
+                    .sub_target()
+                    .and_then(|sid| state.tabs.iter().find(|t| t.id == sid))
+                    .or_else(|| state.tabs.get(state.active_tab))
+                    .and_then(|t| t.cwd_path())
+                {
                     state.remote_ws.send_root_changed(cwd);
                 }
             }
@@ -5399,17 +5462,32 @@ impl ApplicationHandler<PtyWake> for App {
                         use keymap::ShellAction;
                         match shell_action {
                             ShellAction::NewPane => {
-                                state.new_pane();
+                                // 远程视图：新建窗格到订阅会话（远程 split），否则本地新建。
+                                if state.is_mirror_active() {
+                                    state.remote_ws.send_new_remote_pane();
+                                } else {
+                                    state.new_pane();
+                                }
                             }
                             ShellAction::ClosePane => {
-                                if state.close_pane(ti, pi) {
+                                if state.is_mirror_active() {
+                                    state.remote_ws.send_focused_pane_op(
+                                        lumen_protocol::remote::PaneOpKind::Close,
+                                    );
+                                } else if state.close_pane(ti, pi) {
                                     info!("最后一个会话已关闭，退出应用");
                                     event_loop.exit();
                                 }
                             }
                             ShellAction::ToggleMaximizePane => {
-                                let focused = state.tabs[state.active_tab].focused;
-                                state.toggle_maximize_pane(state.active_tab, focused);
+                                if state.is_mirror_active() {
+                                    state.remote_ws.send_focused_pane_op(
+                                        lumen_protocol::remote::PaneOpKind::ToggleMaximize,
+                                    );
+                                } else {
+                                    let focused = state.tabs[state.active_tab].focused;
+                                    state.toggle_maximize_pane(state.active_tab, focused);
+                                }
                             }
                             ShellAction::ToggleSettings => {
                                 // 登录覆盖层打开时不响应（键盘归 egui）。
@@ -5427,15 +5505,23 @@ impl ApplicationHandler<PtyWake> for App {
                             ShellAction::NewTab => {
                                 // 设置页打开时不响应（避免在覆盖层背后偷偷增删）。
                                 if !state.shell_state.settings.open {
-                                    state.new_tab();
+                                    if state.is_mirror_active() {
+                                        state.remote_ws.new_remote_tab(); // 远程新建被控端会话。
+                                    } else {
+                                        state.new_tab();
+                                    }
                                 }
                             }
                             ShellAction::CloseTab => {
-                                if !state.shell_state.settings.open
-                                    && state.close_tab(state.active_tab)
-                                {
-                                    info!("最后一个会话已关闭，退出应用");
-                                    event_loop.exit();
+                                if !state.shell_state.settings.open {
+                                    if state.is_mirror_active() {
+                                        if let Some(t) = state.remote_ws.subscribed_tab() {
+                                            state.remote_ws.close_remote_tab(t); // 远程关订阅会话。
+                                        }
+                                    } else if state.close_tab(state.active_tab) {
+                                        info!("最后一个会话已关闭，退出应用");
+                                        event_loop.exit();
+                                    }
                                 }
                             }
                             ShellAction::ToggleFiletree => {
@@ -7508,7 +7594,12 @@ impl ApplicationHandler<PtyWake> for App {
                 // （语义同 Ctrl+Shift+D / Ctrl+Shift+W）。结构变更由下方
                 // layout_pane_ids 对照检测，本帧跳过矩形应用与终端渲染。
                 if shell_out.new_pane {
-                    state.new_pane();
+                    // 远程视图：新建窗格到订阅会话（远程 split，修①），否则本地新建。
+                    if state.is_mirror_active() {
+                        state.remote_ws.send_new_remote_pane();
+                    } else {
+                        state.new_pane();
+                    }
                 }
                 if let Some(pi) = shell_out.pane_close {
                     let ti = state.active_tab;

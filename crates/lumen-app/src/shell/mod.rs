@@ -1393,7 +1393,9 @@ pub fn show(
                 // 均画线（不赌字体覆盖）；命中矩形进 pane_close_rects 让 raw
                 // 鼠标路由让位（点击不聚焦/不建选区）。
                 let mut title_end = title_rect.max.x - 8.0;
-                if input.panes.len() > 1 {
+                // 多窗格镜像覆盖时抑制本地窗格 ✕/最大化交互：本地窗格在镜像下方、其 ui.interact 后注册
+                // 会遮挡镜像窗格的同位按钮（海风哥②④）。镜像窗格自带 ✕/最大化/拖动（remote_mirror_multi 块）。
+                if input.panes.len() > 1 && input.remote_mirror_multi.is_none() {
                     // ✕ 关闭按钮（标题栏右端）。
                     let close_rect = egui::Rect::from_center_size(
                         egui::pos2(
@@ -1573,11 +1575,14 @@ pub fn show(
                         .truncate()
                         .selectable(false),
                     );
-                    let tresp = ui.interact(
-                        title_hit,
-                        ui.id().with(("pane_title", i)),
-                        egui::Sense::click_and_drag(),
-                    );
+                    // 镜像覆盖时本地标题栏改 hover sense（不捕获点击/拖动）→ 让镜像窗格标题交互
+                    // 拿到事件（海风哥②④：本地标题拖动遮挡镜像换位）。
+                    let title_sense = if input.remote_mirror_multi.is_some() {
+                        egui::Sense::hover()
+                    } else {
+                        egui::Sense::click_and_drag()
+                    };
+                    let tresp = ui.interact(title_hit, ui.id().with(("pane_title", i)), title_sense);
                     if tresp.clicked() {
                         out.pane_clicked = Some(i);
                         out.term_clicked = true;
@@ -1629,11 +1634,14 @@ pub fn show(
                         egui::Image::new(egui::load::SizedTexture::new(tex, content_rect.size())),
                     );
                 }
-                let resp = ui.interact(
-                    content_rect,
-                    ui.id().with(("pane", i)),
-                    egui::Sense::click(),
-                );
+                // 镜像覆盖时本地内容点击改 hover sense（镜像内容点击聚焦由 main 的 raw 鼠标
+                // mirror_pane_cell_at_mouse 处理，本地 egui 点击不应抢、不应误切本地焦点）。
+                let content_sense = if input.remote_mirror_multi.is_some() {
+                    egui::Sense::hover()
+                } else {
+                    egui::Sense::click()
+                };
+                let resp = ui.interact(content_rect, ui.id().with(("pane", i)), content_sense);
                 if resp.clicked() {
                     out.pane_clicked = Some(i);
                     out.term_clicked = true;
