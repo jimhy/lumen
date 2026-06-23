@@ -6048,7 +6048,15 @@ impl ApplicationHandler<PtyWake> for App {
                 // 指针可能正悬在滚动条轨道（Foreground 层）上，此时
                 // pane_under_mouse 因命中 egui 层返回 None——但用户意图仍是
                 // 滚终端，故补一判：在轨道上也放行，避免右缘整列成滚轮死区。
-                if state.pane_under_mouse().is_none() && !state.mouse_on_scrollbar_track() {
+                // 命中判定：镜像态查**镜像窗格**矩形（mirror_pane_at_mouse，海风哥反馈③：旧逻辑用
+                // pane_under_mouse 只认本地窗格、镜像态恒 None → 滚轮被吃、scroll_mirror 没被调）；
+                // 本地态查 pane_under_mouse。轨道上也放行（右缘不成死区）。
+                let over_term = if state.is_mirror_active() {
+                    state.mirror_pane_at_mouse().is_some()
+                } else {
+                    state.pane_under_mouse().is_some()
+                };
+                if !over_term && !state.mouse_on_scrollbar_track() {
                     return;
                 }
                 let lines = match delta {
@@ -6058,8 +6066,12 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 };
                 if lines != 0 {
-                    // M5.3 镜像：控制中（远程视图）滚轮滚镜像历史，否则滚本地焦点窗格。
+                    // M5.3 镜像：控制中（远程视图）滚轮滚镜像历史，否则滚本地焦点窗格。镜像态滚轮
+                    // **作用于鼠标所在窗格**（自动聚焦 + 滚，符直觉；回看绑焦点窗格、切焦点会复位回看态）。
                     if state.is_mirror_active() {
+                        if let Some((sid, ..)) = state.mirror_pane_at_mouse() {
+                            state.remote_ws.set_mirror_active_pane(sid);
+                        }
                         state.remote_ws.scroll_mirror(lines);
                     } else {
                         state

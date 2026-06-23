@@ -4111,15 +4111,16 @@ impl RemoteWs {
                         let _ = term.take_responses(); // 镜像无 PTY，排空应答。
                         term
                     };
-                    if panes.len() <= 1 {
+                    // **统一**：1+ 窗格一律走 per-pane 路径（1:1 清晰 + per-pane 回看/选区/焦点），
+                    // 消除单窗格「离屏按被控端网格像素 → shell 拉伸铺满 → 缩放锯齿」特例（海风哥反馈①）。
+                    // 单 mirror 仅 0 窗格（空 tab）兜底——清空，不显示。
+                    if panes.is_empty() {
+                        self.mirror = None;
+                        self.mirror_focus_sid = None;
                         self.mirror_panes.clear();
                         self.mirror_layout = None;
-                        if let Some(p) = panes.first() {
-                            self.mirror = Some(mk_term(p));
-                            self.mirror_focus_sid = Some(p.session_id); // 仅认焦点窗格那一路增量。
-                            self.reset_history(); // 清旧回看态（会清 hist_bounds）。
-                            self.hist_bounds = Some((p.base, p.screen_top)); // 再设新边界。
-                        }
+                        self.mirror_active_pane = None;
+                        self.reset_history();
                     } else {
                         // 多窗格：清单 mirror + 回看态，建 per-pane 镜像 + 布局。
                         self.mirror = None;
