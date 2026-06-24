@@ -1439,11 +1439,15 @@ impl RemoteWs {
     }
 
     /// 切换（直连↔中继）后控制端补发一次订阅，触发被控端重发整屏快照重建镜像——消除切换瞬间可能的
-    /// VT 错位/丢失（被控端 `sub_dirty` 即使重订同一会话也强制重发 `SubscriptionStarted`）。被控端
-    /// `subscribed_tab` 恒为 `None`，此处自然 no-op。
+    /// VT 错位/丢失（被控端 `sub_dirty` 即使重订同一会话也强制重发 `SubscriptionStarted`）。
+    ///
+    /// **不走 `subscribe_tab`**（那会 `clear_remote_filetree` 清空文件树→闪「等待 shell 上报路径」）：
+    /// 同会话 cwd 未变，被控端重推的 RootChanged 经 `set_root` 去重为 no-op，文件树保持不动。镜像由
+    /// 被控端重发的 `SubscriptionStarted` 重建。被控端 `subscribed_tab` 恒为 `None`，此处自然 no-op。
     fn resubscribe_after_switch(&mut self) {
         if let Some(tab) = self.subscribed_tab {
-            self.subscribe_tab(tab);
+            self.reset_history(); // 换源/重建：回看绝对行号体系复位（同 subscribe_tab）。
+            self.send_frame(&RemoteFrame::SubscribeSession { tab_id: tab });
         }
     }
 
@@ -4215,6 +4219,11 @@ impl RemoteWs {
                     }
                     self.sub_target = Some(tab_id);
                     self.sub_dirty = true;
+                    // 复位 RootChanged 去重基线：控制端订阅（含**重订同一会话**，如 Phase 3 切换后
+                    // resubscribe_after_switch / 重点同一 tab）时会清空其文件树（根置 None →「等待 shell
+                    // 上报路径」），被控端必须重推 RootChanged。否则同 cwd 被 remote_root_sent 去重跳过，
+                    // 控制端文件树永久卡在等待、要切到别的 tab（cwd 变）才刷新（海风哥实测踩坑）。
+                    self.remote_root_sent = None;
                 }
             }
             RemoteFrame::SubscriptionStarted {
