@@ -1,22 +1,20 @@
-//! M6 P2P 直连 · Phase 1：tokio 隔离骨架 + STUN 端点发现 + QUIC/证书就位。
+//! M6 P2P 直连：QUIC 打洞 + mTLS 握手 + 数据面直连（含中继回退）。
 //!
 //! 设计见 `docs/M6-P2P直连-QUIC打洞-设计-2026-06-23.md`。本模块是「QUIC 打洞 + 中继回退」的
-//! **客户端传输地基**，与主线程的同步 tungstenite（`remote_ws.rs`）范式**隔离**：一条 P2P 后台
+//! **客户端传输引擎**，与主线程的同步 tungstenite（`remote_ws.rs`）范式**隔离**：一条 P2P 后台
 //! 线程内起 **current-thread tokio runtime** 驱动 quinn / STUN（tokio 关在线程内，主线程零感知）。
 //!
 //! # 线程模型（与 `remote_ws.rs` 对称：后台线程 + channel）
-//! - 主线程 → P2P 线程：`P2pCmd`（tokio unbounded channel，`send` 同步、主线程非 async 可调）。
-//! - P2P 线程 → 主线程：`P2pEvent`（std mpsc，主线程每帧 [`P2pEngine::poll`] 非阻塞排空）。
-//! - `ready: Arc<AtomicBool>`：直连数据面就绪标志（Phase 3 握手成功置位，主线程 `send_frame` 选路读）。
-//!   Phase 1 恒 false。
+//! - 主线程 → P2P 线程：`P2pCmd`（对端信令）/ `data_tx`（出站数据帧），均 tokio unbounded、主线程同步调。
+//! - P2P 线程 → 主线程：`P2pEvent`（std mpsc，每帧 [`P2pEngine::poll`] 排空）；收到帧/事件后 [`Waker`]
+//!   nudge 唤醒主线程重绘。
+//! - `data_ready: Arc<AtomicBool>`：数据面就绪标志（流建立时置位，主线程 `send_frame` 选路读）。
 //!
-//! # Phase 1 范围（骨架空跑，**未接** `remote_ws`——Phase 2/3 接）
-//! ① tokio 隔离线程 + quinn client `Endpoint` 在 runtime 内创建（验证「tokio 隔离 + quinn 可活」）；
-//! ② STUN binding 客户端（RFC 5389）探公网映射端点；③ 本地 LAN 候选枚举；④ rcgen 自签证书生成
-//! （Phase 2 握手 + 指纹信任锚就位）。打洞 / 候选交换 / 握手 / 数据面切换是 Phase 2–3。
-//!
-//! 因 Phase 1 尚未接入 `main`/`remote_ws`，本模块整体 `#![allow(dead_code)]`；Phase 2 接线后逐项移除。
-#![allow(dead_code)]
+//! # 流程（Phase 0–3 已落地）
+//! ① STUN 端点发现（RFC 5389）+ 本地 LAN 候选；② 经信令通道交换候选 + 自签证书（`SignalPayload`）；
+//! ③ role 定向打洞（Controller connect / Controlled accept，收敛同一连接）+ mTLS pinned 双向认证；
+//! ④ 单条双向 QUIC stream 承载**输出方向**数据面（length-prefix JSON，复用 `RemoteFrame::to_value`），
+//! 链路断自动回退中继。输入方向恒走中继（防切换乱序，见 `remote_ws::send_frame`）。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,10 +75,6 @@ const P2P_KEEPALIVE: Duration = Duration::from_secs(4);
 /// 直连 QUIC 最大空闲超时（超过即判链路丢失，触发回退中继）。
 const P2P_MAX_IDLE: Duration = Duration::from_secs(30);
 
-/// 开发期默认 STUN 服务器（公共）。**生产切自建 server UDP 反射**（国内可达性 + 自主可控，
-/// 见设计 §7）。host:port 形式，运行期 DNS 解析（`tokio::net::lookup_host`）。
-pub const DEFAULT_STUN: &str = "stun.l.google.com:19302";
-
 /// STUN 单次探测超时（无应答即视作该服务器不可达，回退/换源）。
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -130,10 +124,8 @@ pub struct P2pEngine {
     data_tx: UnboundedSender<serde_json::Value>,
     /// P2P 线程 → 主线程事件端。
     evt_rx: Receiver<P2pEvent>,
-    /// QUIC 连接已建立标志（打洞成功置位；信息性，数据面是否就绪看 `data_ready`）。
-    connected: Arc<AtomicBool>,
-    /// **数据面就绪标志**（收到对端 Ready 置 true / 链路断置 false）。主线程 `send_frame` 据此选路：
-    /// true 走 QUIC、false 走中继。与 `connected` 解耦实现两端对齐的切换屏障。
+    /// **数据面就绪标志**（数据面流真正建立置 true / 链路断置 false）。主线程 `send_frame` 据此选路：
+    /// true 走 QUIC、false 走中继（两端对齐的切换屏障）。
     data_ready: Arc<AtomicBool>,
     /// 停机标志（与 `Stop` 命令双保险）。
     stop: Arc<AtomicBool>,
@@ -158,11 +150,9 @@ impl P2pEngine {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let connected = Arc::new(AtomicBool::new(false));
         let data_ready = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let conn_thread = Arc::clone(&connected);
         let data_thread = Arc::clone(&data_ready);
         let waker = match (ctx, proxy, pending) {
             (Some(ctx), Some(proxy), Some(pending)) => Some(Waker {
@@ -182,7 +172,6 @@ impl P2pEngine {
                     data_rx,
                     &evt_tx,
                     &stop_thread,
-                    &conn_thread,
                     &data_thread,
                     waker,
                 )
@@ -192,7 +181,6 @@ impl P2pEngine {
             cmd_tx,
             data_tx,
             evt_rx,
-            connected,
             data_ready,
             stop,
             handle,
@@ -222,19 +210,6 @@ impl P2pEngine {
             out.push(ev);
         }
         out
-    }
-
-    /// 直连是否已建立（Phase 3 起主线程数据面选路读此）。
-    pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
-    }
-
-    /// 优雅停机并 join 后台线程。
-    pub fn stop(&mut self) {
-        self.signal_stop();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 
     /// 置停机标志 + 投 `Stop`（唤醒阻塞在 `recv` 的线程）。
@@ -300,7 +275,6 @@ fn run(
     data_rx: UnboundedReceiver<serde_json::Value>,
     evt_tx: &Sender<P2pEvent>,
     stop: &AtomicBool,
-    connected: &AtomicBool,
     data_ready: &Arc<AtomicBool>,
     waker: Option<Waker>,
 ) {
@@ -383,7 +357,6 @@ fn run(
                 },
                 Some(conn) = res_rx.recv() => {
                     log::info!("P2P 直连已通 → {}", conn.remote_address());
-                    connected.store(true, Ordering::SeqCst);
                     emit(evt_tx, &waker, P2pEvent::Connected);
                     // 通告对端「我直连已通」（仅诊断；data_ready 由本端 run_data_plane 在流建立时置位）。
                     emit(
@@ -555,29 +528,6 @@ fn local_lan_addr() -> Option<IpAddr> {
     let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     sock.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
     sock.local_addr().ok().map(|a| a.ip())
-}
-
-/// 经 STUN 探本端公网映射端点（RFC 5389 Binding）：绑随机端口 UDP → 发 Binding Request →
-/// 收 Binding Success Response → 解析 XOR-MAPPED-ADDRESS。超时 / 失败返回 `None`。
-async fn discover_public_addr(stun_host: &str, timeout: Duration) -> Option<SocketAddr> {
-    // 解析 STUN 服务器（取首个 IPv4）。
-    let target = tokio::net::lookup_host(stun_host)
-        .await
-        .ok()?
-        .find(SocketAddr::is_ipv4)?;
-    let sock = tokio::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-        .await
-        .ok()?;
-    sock.connect(target).await.ok()?;
-    let txn = new_txn_id();
-    let req = build_binding_request(&txn);
-    sock.send(&req).await.ok()?;
-    let mut buf = [0u8; 512];
-    let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-    parse_xor_mapped_addr(&buf[..n], &txn)
 }
 
 /// STUN transaction id 发号器（进程级单调，混入时间——非密码学随机，端点发现足够区分应答）。
@@ -1105,8 +1055,8 @@ mod tests {
     #[test]
     fn 引擎启停_不panic() {
         // 空 STUN → 不联网；仅验证起线程 + 停机不 panic（无对端信令故不会握手）。无唤醒句柄（测试态）。
-        let mut eng = P2pEngine::start(Role::Controller, String::new(), None, None, None);
-        assert!(!eng.is_connected(), "未握手前不应已连接");
+        let eng = P2pEngine::start(Role::Controller, String::new(), None, None, None);
+        assert!(!eng.is_data_ready(), "未握手前数据面不应就绪");
         eng.peer_signal(
             P2pSignalKind::Fallback,
             SignalPayload {
@@ -1115,7 +1065,7 @@ mod tests {
                 nonce: 1,
             },
         );
-        eng.stop();
+        drop(eng); // Drop 触发非阻塞停机（signal_stop + 弃 handle）。
     }
 
     /// 测试用 mock STUN 反射：构造 Binding Success Response，XOR-MAPPED-ADDRESS = `src`。
@@ -1147,10 +1097,10 @@ mod tests {
         Some(resp)
     }
 
-    /// 端到端：客户端 `discover_public_addr` 打本地 mock 反射，走完「构造请求→发→收→XOR 解析」
-    /// 全链路，探到本机回环源端点（Phase 1 验收点「探公网端点」的离线可重复验证）。
+    /// 端到端：生产用的 `stun_query` 打本地 mock 反射，走完「构造请求→发→收→XOR 解析」全链路，
+    /// 探到本机回环源端点（Phase 1 验收点「探公网端点」的离线可重复验证；直接覆盖生产 STUN 路径）。
     #[tokio::test]
-    async fn discover_对本地mock反射_探到端点() {
+    async fn stun_query_对本地mock反射_探到端点() {
         let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind mock 反射");
@@ -1163,7 +1113,10 @@ mod tests {
                 }
             }
         });
-        let got = discover_public_addr(&server_addr.to_string(), STUN_TIMEOUT).await;
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind client");
+        let got = stun_query(&client, &server_addr.to_string(), STUN_TIMEOUT).await;
         let _ = task.await;
         let addr = got.expect("应探到端点");
         assert!(addr.ip().is_loopback(), "源地址应为本机回环");
