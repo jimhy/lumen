@@ -1112,6 +1112,52 @@ fn build_list_dir_recursive_reply(req_id: u64, path: String, show_hidden: bool) 
     reply
 }
 
+/// 控制端「双击打开远程文件」临时夹（`temp/lumen_remote_open`）的总字节上限：单会话内反复打开
+/// 远程文件会不断在此堆副本（`fetch_end` 后不删，留给外部程序占用），仅靠会话结束整夹清。超此
+/// 上限即 LRU 淘汰最旧的。500 MiB（roadmap §3.1.3 默认；后续可经设置项调，暂用常量）。
+const REMOTE_OPEN_DIR_CAP: u64 = 500 * 1024 * 1024;
+
+/// 对控制端远程打开临时夹做容量淘汰（每次 `fetch_end` 打开新文件后调）。见 [`enforce_dir_byte_cap`]。
+fn enforce_remote_open_cap(cap: u64) {
+    enforce_dir_byte_cap(&std::env::temp_dir().join("lumen_remote_open"), cap);
+}
+
+/// 对 `dir` 做按 mtime 近似的 LRU 字节上限淘汰：累计文件字节超 `cap` 时从**最旧**（mtime 最小）
+/// 起删，直到 ≤ `cap`。**best-effort**：删不掉的（Windows 上正被打开它的程序占用——通常正是最新、
+/// 最该留的）静默跳过，留到会话结束整夹清兜底。纯维护，无错误传播。抽出固定夹外以便单测。
+fn enforce_dir_byte_cap(dir: &std::path::Path, cap: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return; // 夹不存在 / 不可读：无可淘汰。
+    };
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in rd.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let size = meta.len();
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        total = total.saturating_add(size);
+        files.push((entry.path(), size, mtime));
+    }
+    if total <= cap {
+        return;
+    }
+    files.sort_by_key(|(_, _, mtime)| *mtime); // 最旧在前。
+    for (path, size, _) in files {
+        if total <= cap {
+            break;
+        }
+        // 删不掉（占用）则 total 不减，继续尝试更旧的其它文件。
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
 /// 被控端 Fetch 源后台线程：打开文件 → 发 `FileBegin` → 受许可（ACK 窗口）逐块读发
 /// `FileChunk` → `FileEnd`。出错发 `FileErr`。帧经 `cmd_tx` 直投 WS 出站（不经主线程，
 /// 避免每块一次主线程往返）；许可通道关闭（会话结束 / 主线程清 `inflight_fetch_src`）即中止。
@@ -2418,6 +2464,8 @@ impl RemoteWs {
                         crate::shell::filetree::open_with_default(&d);
                     }
                 }
+                // 新副本已落地：LRU 淘汰临时夹超额旧文件（刚打开的最新，正常不会被淘汰）。
+                enforce_remote_open_cap(REMOTE_OPEN_DIR_CAP);
             }
             FetchKind::Download => {
                 let dest = job.dest.take();
@@ -4947,6 +4995,44 @@ mod tests {
             }
             _ => panic!("应为 ListDir"),
         }
+    }
+
+    #[test]
+    fn enforce_dir_byte_cap_超额删最旧_未超不动() {
+        let dir = std::env::temp_dir().join(format!("lumen_open_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试夹");
+        let count = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .map(|rd| rd.flatten().filter(|e| e.path().is_file()).count())
+                .unwrap_or(0)
+        };
+        let total_bytes = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                        .sum::<u64>()
+                })
+                .unwrap_or(0)
+        };
+        // 3 个各 100 字节 = 300 总。写入顺序即 mtime 近似顺序（最旧 f0）。
+        for i in 0..3u8 {
+            std::fs::write(dir.join(format!("f{i}.bin")), vec![0u8; 100]).expect("写文件");
+        }
+        // 上限充裕：不动。
+        enforce_dir_byte_cap(&dir, 1000);
+        assert_eq!(count(&dir), 3, "未超上限不应删");
+        // 上限 250：300>250 → 删到 ≤250（删 1 个 → 200）。
+        enforce_dir_byte_cap(&dir, 250);
+        assert!(total_bytes(&dir) <= 250, "应淘汰到 ≤ 上限");
+        assert_eq!(count(&dir), 2, "300→250 上限应恰删最旧 1 个");
+        // 上限 0：全删（best-effort，无占用故应清空）。
+        enforce_dir_byte_cap(&dir, 0);
+        assert_eq!(count(&dir), 0, "上限 0 应清空");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
