@@ -20,6 +20,8 @@ pub static STRINGS: Strings = Strings {
     topbar_new_pane_tip: "新增窗格 (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "最多 {} 个窗格",
     topbar_not_logged_in: "未登录",
+    topbar_session_expired: "登录态已过期，请重新登录",
+    menu_session_expired: "登录过期，点此重新登录",
     menu_settings: "设置",
     menu_keyboard_shortcuts: "键盘快捷键",
     menu_documentation: "文档",

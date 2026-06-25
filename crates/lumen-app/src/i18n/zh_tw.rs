@@ -26,6 +26,8 @@ pub static STRINGS: Strings = Strings {
     topbar_new_pane_tip: "新增窗格 (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "最多 {} 個窗格",
     topbar_not_logged_in: "未登入",
+    topbar_session_expired: "登入狀態已過期，請重新登入",
+    menu_session_expired: "登入過期，點此重新登入",
     menu_settings: "設定",
     menu_keyboard_shortcuts: "鍵盤快捷鍵",
     menu_documentation: "文件",

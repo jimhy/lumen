@@ -20,6 +20,8 @@ pub static STRINGS: Strings = Strings {
     topbar_new_pane_tip: "New pane (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "Maximum {} panes",
     topbar_not_logged_in: "Not logged in",
+    topbar_session_expired: "Session expired — please log in again",
+    menu_session_expired: "Session expired — log in again",
     menu_settings: "Settings",
     menu_keyboard_shortcuts: "Keyboard shortcuts",
     menu_documentation: "Documentation",

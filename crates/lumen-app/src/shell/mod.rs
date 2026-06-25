@@ -161,6 +161,8 @@ pub struct ShellInput<'a> {
     /// 头像菜单更新项：Some(版本号) = 有就绪更新（显示「更新到 vX」），
     /// None = 无更新（显示「检查更新」）。main 据 update_ready/available 构造。
     pub update_version: Option<String>,
+    /// 登录态已过期需重登（token 过期）：头像红感叹号 + 菜单红字。main 据 profile.token_expires_at 判。
+    pub token_expired: bool,
     /// 焦点窗格的 cwd（文件树跟随；OSC 9;9 上报）。
     pub cwd: Option<&'a std::path::Path>,
     /// 焦点窗格 shell 空闲（文件树 cd 注入闸门）。
@@ -613,6 +615,7 @@ pub fn show(
             filetree_visible: st.filetree.visible,
             update_version: input.update_version.clone(),
             current_view: app_settings.layout.view_mode,
+            need_relogin: input.token_expired,
         },
     );
     if tb.new_pane {

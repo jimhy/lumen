@@ -118,6 +118,9 @@ pub struct ViewState {
     pub update_version: Option<String>,
     /// 当前视图（M5.2）：false = 本地，true = 远程。
     pub current_view: bool,
+    /// 登录态已过期需重新登录（token 过期）：头像叠红色感叹号角标 + 菜单出红字「登录过期」。
+    /// main 据 `profile.token_expires_at` 判定（自动续期之外的兜底，如关闭 >7 天再开）。
+    pub need_relogin: bool,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
@@ -287,12 +290,14 @@ pub fn show(
 
                 // ── 头像（紧贴窗控左侧，加右内边距 10px）──────────────────
                 ui.add_space(10.0);
-                let resp = avatar_button(ui, profile, pal, view.update_version.is_some());
+                let resp =
+                    avatar_button(ui, profile, pal, view.update_version.is_some(), view.need_relogin);
                 let update_version = view.update_version.as_deref();
+                let need_relogin = view.need_relogin;
                 let _ = egui::Popup::menu(&resp)
                     .align(egui::RectAlign::BOTTOM_END)
                     .width(MENU_WIDTH)
-                    .show(|ui| menu_ui(ui, profile, pal, update_version, &mut out));
+                    .show(|ui| menu_ui(ui, profile, pal, update_version, need_relogin, &mut out));
                 ui.add_space(6.0);
 
                 // 「＋」新增窗格（F5）：满 MAX_PANES 时禁用 + 悬停提示。
@@ -574,12 +579,13 @@ fn draw_view_tab(ui: &mut egui::Ui, text: &str, active: bool, pal: &Palette) -> 
 }
 
 /// 圆形头像按钮：已登录 = 强调色圆底 + 首字母；未登录 = 占位人形。
-/// `has_update` 为真时右上角叠一个小红圆点（有可用更新提示）。
+/// `need_relogin` 为真时右上角叠红色感叹号角标（登录过期，最优先）；否则 `has_update` 为真时叠小红点。
 fn avatar_button(
     ui: &mut egui::Ui,
     profile: Option<&Profile>,
     pal: &Palette,
     has_update: bool,
+    need_relogin: bool,
 ) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE), egui::Sense::click());
@@ -614,19 +620,36 @@ fn avatar_button(
         ui.painter()
             .circle_stroke(center, radius, egui::Stroke::new(1.5, pal.fg_dim));
     }
-    // 有可用更新：右上角小红圆点。先垫一圈顶栏底色再填红，确保在 accent
-    // 头像底 / 顶栏底上都清晰可辨。
-    if has_update {
-        let dot = egui::pos2(center.x + radius * 0.66, center.y - radius * 0.66);
+    // 右上角角标：登录过期（红圆 + 白「!」，最优先）> 有更新（小红点）。先垫一圈顶栏底色，
+    // 确保在 accent 头像底 / 顶栏底上都清晰可辨。
+    let red = egui::Color32::from_rgb(0xE5, 0x48, 0x4D);
+    let badge = egui::pos2(center.x + radius * 0.66, center.y - radius * 0.66);
+    if need_relogin {
+        let r = 5.0;
+        ui.painter().circle_filled(badge, r + 1.2, pal.bg_dark);
+        ui.painter().circle_filled(badge, r, red);
+        ui.painter().text(
+            badge,
+            egui::Align2::CENTER_CENTER,
+            "!",
+            egui::FontId::proportional(8.5),
+            egui::Color32::WHITE,
+        );
+    } else if has_update {
         let dot_r = 3.5;
-        ui.painter().circle_filled(dot, dot_r + 1.2, pal.bg_dark);
-        ui.painter()
-            .circle_filled(dot, dot_r, egui::Color32::from_rgb(0xE5, 0x48, 0x4D));
+        ui.painter().circle_filled(badge, dot_r + 1.2, pal.bg_dark);
+        ui.painter().circle_filled(badge, dot_r, red);
     }
-    resp.on_hover_text(profile.map_or_else(
-        || i18n::strings().topbar_not_logged_in.to_owned(),
-        |p| p.email.clone(),
-    ))
+    // 悬停提示：过期时提示重新登录。
+    let hover = if need_relogin {
+        i18n::strings().topbar_session_expired.to_owned()
+    } else {
+        profile.map_or_else(
+            || i18n::strings().topbar_not_logged_in.to_owned(),
+            |p| p.email.clone(),
+        )
+    };
+    resp.on_hover_text(hover)
 }
 
 /// 头像下拉菜单（对齐 Warp 分组样式）：
@@ -637,6 +660,7 @@ fn menu_ui(
     profile: Option<&Profile>,
     pal: &Palette,
     update_version: Option<&str>,
+    need_relogin: bool,
     out: &mut TopbarOutput,
 ) {
     let s = i18n::strings();
@@ -690,7 +714,16 @@ fn menu_ui(
         ui.close();
     }
     ui.separator();
-    // 账号组：登录 / 退出登录。
+    // 账号组：登录过期 → 红字「登录过期」（点此重登）置顶；再「登录 / 退出登录」。
+    if need_relogin
+        && profile.is_some()
+        && ui
+            .button(egui::RichText::new(s.menu_session_expired).color(pal.error))
+            .clicked()
+    {
+        out.open_login = true;
+        ui.close();
+    }
     if profile.is_some() {
         if ui.button(s.menu_log_out).clicked() {
             out.log_out = true;
@@ -735,6 +768,7 @@ mod topbar_layout_tests {
                     filetree_visible: true,
                     update_version: None,
                     current_view: false,
+                    need_relogin: false,
                 },
             );
             got = Some(tb.maximize_btn_rect.unwrap_or(egui::Rect::NOTHING));
@@ -775,6 +809,7 @@ mod topbar_layout_tests {
                     filetree_visible: true,
                     update_version: None,
                     current_view: false,
+                    need_relogin: false,
                 },
             );
         });
@@ -827,6 +862,7 @@ mod topbar_layout_tests {
                     filetree_visible: false,
                     update_version: None,
                     current_view: false,
+                    need_relogin: false,
                 },
             );
         });

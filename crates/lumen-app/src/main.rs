@@ -6730,6 +6730,16 @@ impl ApplicationHandler<PtyWake> for App {
                         .is_some()
                         .then(|| state.update_available.as_ref().map(|u| u.version.to_string()))
                         .flatten(),
+                    // 登录态过期判定（自动续期之外的兜底）：已登录 + 有到期时间 + 当前已过期。
+                    token_expired: {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                        state
+                            .profile
+                            .as_ref()
+                            .is_some_and(|p| p.token_expires_at > 0 && now >= p.token_expires_at)
+                    },
                     cwd: active_cwd.as_deref(),
                     shell_idle,
                     os_dark: state.os_dark,

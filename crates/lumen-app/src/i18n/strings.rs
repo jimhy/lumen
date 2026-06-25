@@ -49,6 +49,10 @@ pub struct Strings {
     pub topbar_max_panes_fmt: &'static str,
     /// 头像 tooltip（未登录态）"未登录"
     pub topbar_not_logged_in: &'static str,
+    /// 头像 tooltip（登录态过期）"登录态已过期，请重新登录"
+    pub topbar_session_expired: &'static str,
+    /// 头像菜单红字项（登录态过期，点此重登）"登录过期，点此重新登录"
+    pub menu_session_expired: &'static str,
     /// 头像菜单 Settings
     pub menu_settings: &'static str,
     /// 头像菜单 Keyboard shortcuts
