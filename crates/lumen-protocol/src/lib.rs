@@ -38,6 +38,8 @@ pub mod routes {
     pub const REGISTER: &str = "/api/v1/auth/register";
     /// 登录 `POST`（成功即登记/更新本设备）。
     pub const LOGIN: &str = "/api/v1/auth/login";
+    /// 续期 token `POST`（需 Bearer 现有**有效** token，换发新 token；M5 自动续期，免 7 天到期掉线）。
+    pub const REFRESH: &str = "/api/v1/auth/refresh";
     /// 设备列表 `GET`（需 Bearer token）。
     pub const DEVICES: &str = "/api/v1/devices";
     /// 偏好设置同步：`GET` 拉取 / `PUT` 推送。
@@ -133,6 +135,16 @@ pub struct AuthResponse {
     pub user: UserInfo,
     /// 本设备 id（首次登录由服务端分配，客户端需持久化）。
     pub device_id: String,
+}
+
+/// token 续期响应（`POST /auth/refresh`）：用现有有效 token 换发新 token，避免 7 天到期掉线。
+/// 仅含新 token 与到期时间——账户/设备信息客户端已有，无需重复回传。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResponse {
+    /// 新 Bearer token（JWT，客户端持久化覆盖旧 token）。
+    pub token: String,
+    /// 新 token 过期 Unix 秒。
+    pub expires_at: i64,
 }
 
 /// 设备列表项。
@@ -266,6 +278,18 @@ mod tests {
         let json = serde_json::to_string(&e).expect("序列化");
         assert!(!json.contains("cwd"));
         assert!(!json.contains("exit_code"));
+    }
+
+    #[test]
+    fn 续期响应往返() {
+        let resp = RefreshResponse {
+            token: "new-jwt".into(),
+            expires_at: 1_782_999_999,
+        };
+        let json = serde_json::to_string(&resp).expect("序列化");
+        let back: RefreshResponse = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.token, "new-jwt");
+        assert_eq!(back.expires_at, 1_782_999_999);
     }
 
     #[test]

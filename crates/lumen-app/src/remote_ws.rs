@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1333,7 +1333,8 @@ pub struct MirrorFrame<'a> {
 }
 
 impl RemoteWs {
-    /// 登录后启动后台 WS 线程（已在跑则先停旧的）。`token` 为账户 JWT。
+    /// 登录后启动后台 WS 线程（已在跑则先停旧的）。`token` 为**共享**账户 JWT 句柄——心跳 worker
+    /// 自动续期时写回同一句柄，WS 每次（重）连读其当前值，确保续期后重连用新 token（免 7 天到期 401）。
     ///
     /// `proxy` + `wake_pending`：后台收到消息时除 `ctx.request_repaint()` 外，再发
     /// `PtyWake` user event 唤醒 winit 事件循环——**否则窗口失焦时 `request_repaint`
@@ -1341,7 +1342,7 @@ impl RemoteWs {
     /// 输出同款唤醒机制，共用 `wake_pending` 去重防事件风暴）。
     pub fn start(
         &mut self,
-        token: String,
+        token: Arc<RwLock<String>>,
         ctx: egui::Context,
         proxy: EventLoopProxy<PtyWake>,
         wake_pending: Arc<AtomicBool>,
@@ -4855,9 +4856,10 @@ fn nudge(ctx: &egui::Context, proxy: &EventLoopProxy<PtyWake>, wake_pending: &Ar
     }
 }
 
-/// 后台线程主体：连接 → 跑读写循环 → 断线退避重连，直到 `stop`。
+/// 后台线程主体：连接 → 跑读写循环 → 断线退避重连，直到 `stop`。每次（重）连读共享 token 的
+/// **当前值**——心跳 worker 自动续期后写回同一句柄，重连即用新 token（免 7 天到期后 WS 401 连不上）。
 fn worker(
-    token: &str,
+    token: &Arc<RwLock<String>>,
     cmd_rx: &Receiver<RemoteC2S>,
     evt_tx: &Sender<WsEvent>,
     stop: &Arc<AtomicBool>,
@@ -4866,7 +4868,8 @@ fn worker(
     wake_pending: &Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        match connect_ws(token) {
+        let tok = token.read().map(|g| g.clone()).unwrap_or_default();
+        match connect_ws(&tok) {
             Ok(mut socket) => {
                 let _ = evt_tx.send(WsEvent::Connected);
                 nudge(ctx, proxy, wake_pending);

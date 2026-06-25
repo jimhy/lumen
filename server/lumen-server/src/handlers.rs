@@ -5,8 +5,8 @@ use axum::Json;
 use deadpool_postgres::Client;
 use lumen_protocol::{
     AuthResponse, DeviceInfo, DeviceListResponse, DeviceRecord, HistoryEntry, HistoryPullResponse,
-    HistoryPushRequest, LoginRequest, RegisterRequest, RenameDeviceRequest, SettingsSync, UserInfo,
-    PROTOCOL_VERSION,
+    HistoryPushRequest, LoginRequest, RefreshResponse, RegisterRequest, RenameDeviceRequest,
+    SettingsSync, UserInfo, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 
@@ -125,6 +125,23 @@ pub async fn login(
         },
         device_id,
     }))
+}
+
+/// `POST /auth/refresh`：用现有**有效** token（经 [`AuthUser`] 提取器校验通过）换发新 token，
+/// 客户端在快到期时调用，避免 7 天到期后对 WS / `/devices` / `/heartbeat` 全面 401 掉线。
+/// 无需查库 / 密码——`AuthUser` 已从旧 token 解出 `user_id`/`device_id`；旧 token 已过期则提取器
+/// 直接 401（续期失败，需重新登录）。在线状态由心跳维持，此处不重复刷 `last_seen`。
+pub async fn refresh(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> AppResult<Json<RefreshResponse>> {
+    let (token, expires_at) = auth::issue_token(
+        &state.config.jwt_secret,
+        &user.user_id,
+        &user.device_id,
+        state.config.token_ttl_secs,
+    )?;
+    Ok(Json(RefreshResponse { token, expires_at }))
 }
 
 /// 登记/更新设备：带有效 `device_id` 且属于本账户则更新 `last_seen`，

@@ -85,6 +85,7 @@ fn build_router(state: AppState) -> Router {
         .route(r::HEALTH, get(handlers::health))
         .route(r::REGISTER, post(handlers::register))
         .route(r::LOGIN, post(handlers::login))
+        .route(r::REFRESH, post(handlers::refresh))
         .route(r::DEVICES, get(handlers::list_devices))
         .route(
             "/api/v1/devices/{id}",

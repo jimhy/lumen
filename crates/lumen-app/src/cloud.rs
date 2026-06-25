@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use lumen_protocol::{
     routes, ApiError, AuthResponse, DeviceListResponse, HistoryEntry, HistoryPullResponse,
-    HistoryPushRequest, LoginRequest, RegisterRequest, RenameDeviceRequest, SettingsSync, UserInfo,
+    HistoryPushRequest, LoginRequest, RefreshResponse, RegisterRequest, RenameDeviceRequest,
+    SettingsSync, UserInfo,
 };
 
 /// 本地开发默认服务端地址（可由环境变量 `LUMEN_SERVER_URL` 覆盖）。
@@ -224,6 +225,13 @@ impl CloudClient {
     pub fn put_settings(&self, token: &str, s: &SettingsSync) -> Result<SettingsSync, CloudError> {
         let body = Self::encode(s)?;
         let txt = self.send("PUT", routes::SYNC_SETTINGS, Some(token), Some(&body))?;
+        Self::decode(&txt)
+    }
+
+    /// 用现有**有效** token 续期，返回新 token + 到期时间。客户端在 token 快到期时调用，免 7 天
+    /// 到期后全面 401 掉线。旧 token 已过期则服务端 401（续期失败，需重新登录）。
+    pub fn refresh_token(&self, token: &str) -> Result<RefreshResponse, CloudError> {
+        let txt = self.send("POST", routes::REFRESH, Some(token), None)?;
         Self::decode(&txt)
     }
 

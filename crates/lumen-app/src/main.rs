@@ -56,7 +56,7 @@ mod update;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -616,6 +616,9 @@ struct AppState {
 
     // —— egui 外壳 ——
     egui_ctx: egui::Context,
+    /// 账户 JWT 的**共享可变句柄**（登录后建；心跳 worker 自动续期写回、设备心跳 + 远程控制 WS 共读
+    /// 同一份，确保续期后处处用新 token，免 7 天到期后全面 401 掉线）。未登录 / 登出为 None。
+    auth_token: Option<Arc<RwLock<String>>>,
     /// M5.2 远程设备状态（心跳 + 设备列表）。
     remote: remote::RemoteState,
     /// M5.3 远程控制 WS 引擎（配对 / 会话 / 数据面中继；part2a 引擎，UI part2b）。
@@ -4356,6 +4359,7 @@ impl App {
             update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
             update_proxy: Arc::new(std::sync::Mutex::new(init_proxy)),
             egui_ctx,
+            auth_token: None,
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
             mirror_src: None,
@@ -6568,15 +6572,27 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     None
                 };
+                // 共享 token 句柄（登录后懒建）：心跳 worker 自动续期时写回，WS + REST 共读同一份，
+                // 确保续期后处处用新 token（治本：免 7 天到期后全面 401）。必须单一实例供两者共享。
+                if state.auth_token.is_none() {
+                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
+                        state.auth_token = Some(std::sync::Arc::new(std::sync::RwLock::new(tok)));
+                    }
+                }
                 // M5.2：已登录但远程线程未起（启动时已登录 / 刚登录）→ 启动；
                 // 每帧收取后台心跳/设备列表回包。M5.3：远程控制 WS 同生命周期。
                 if !state.remote.is_running() {
-                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
+                    if let Some(auth) = state.auth_token.clone() {
+                        let exp = state
+                            .profile
+                            .as_ref()
+                            .map_or(0, |p| p.token_expires_at);
                         let ctx = state.egui_ctx.clone();
                         // 传 proxy + wake_pending：设备列表后台线程拉到新数据后须唤醒空闲 winit 循环
                         // （否则停在远程视图时在线状态不自动刷新，要切 tab 才更新）。
                         state.remote.start(
-                            tok,
+                            auth,
+                            exp,
                             ctx,
                             state.proxy.clone(),
                             state.wake_pending.clone(),
@@ -6584,9 +6600,9 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 if !state.remote_ws.is_running() {
-                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
+                    if let Some(auth) = state.auth_token.clone() {
                         state.remote_ws.start(
-                            tok,
+                            auth,
                             state.egui_ctx.clone(),
                             state.proxy.clone(),
                             state.wake_pending.clone(),
@@ -6594,6 +6610,16 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 let _ = state.remote.poll();
+                // 自动续期落地：心跳 worker 已把新 token 写回共享句柄；这里持久化到 profile，
+                // 使重启后也用新 token（否则重启读旧 token、又可能过期）。
+                if let Some((tok, exp)) = state.remote.take_refreshed_token() {
+                    if let Some(p) = state.profile.as_mut() {
+                        p.token = Some(tok);
+                        p.token_expires_at = exp;
+                        p.save();
+                        log::info!("token 已自动续期并落盘（到期 {exp}）");
+                    }
+                }
                 // 远程 WS 的 poll / 被控端输入应用 / 整屏快照转发已移到 user_event
                 // （App::pump_remote），失焦也能及时处理（否则配对/输入/镜像会卡到
                 // 焦点回来）；此处只读镜像态供渲染。
@@ -8099,12 +8125,15 @@ impl ApplicationHandler<PtyWake> for App {
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();
                     state.profile = Some(p);
+                    // 新登录态：清共享 token 句柄，下帧据新 token 重建（供心跳续期 + WS 共读）。
+                    state.auth_token = None;
                 }
                 if shell_out.logged_out {
                     // 登出：删 profile.json，三处 UI 即时回未登录态。
                     profile::Profile::delete();
                     info!("已登出（profile.json 已删除）");
                     state.profile = None;
+                    state.auth_token = None; // 清共享 token 句柄
                     // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
                     state.remote.stop();
                     // M5.3：停止远程控制 WS 引擎，清远程会话/配对态。
