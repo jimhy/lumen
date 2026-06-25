@@ -376,6 +376,10 @@ pub struct RemoteWs {
     inflight_put_meta: HashMap<u64, PutMeta>,
     /// 控制端：进行中的片5 上传编排（本地 → 被控端递归传输）；同一时刻一个。
     upload: Option<UploadWalk>,
+    /// 控制端：菜单触发的远程单次文件操作（新建文件夹/文件、删除）在途映射：req_id → **操作完成后
+    /// 要刷新的远程目录**（新建项的父目录 / 删除项的父目录）。回 `MkDir/MkFile/DeleteResult` 时据此
+    /// 刷新该目录让变更立即反映。区别于上传遍历的 `inflight_mkdir`（那是 UploadWalk 内部）。
+    inflight_remote_fsop: HashMap<u64, String>,
     /// M5.3 part4 被控端待执行的远程输入 `(tab_id, session_id, 字节)`（控制端 [`RemoteFrame::InputWithId`]
     /// 转发来）：main 每帧取走、按双 id 查目标窗格、经 **per-pane**「本地输入优先」仲裁后写入该窗格 PTY。
     pending_input: Vec<(TabId, SessionId, Vec<u8>)>,
@@ -1003,6 +1007,16 @@ fn last_path_segment(path: &str) -> String {
         .find(|seg| !seg.is_empty())
         .unwrap_or(path)
         .to_owned()
+}
+
+/// 取不透明远程路径的父目录（剥末段，兼容 `/` 与 `\`）。无父（盘符根 / 单段）则回原串（刷新自身）。
+/// 删除完成后用它刷新被删项所在目录。
+fn parent_remote_dir(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(i) if i > 0 => trimmed[..i].to_owned(),
+        _ => trimmed.to_owned(),
+    }
 }
 
 /// 把任意名字清洗成安全文件名（非 `[A-Za-z0-9._-]` 一律换 `_`；空则 `file`）。临时文件命名
@@ -2030,6 +2044,53 @@ impl RemoteWs {
         if let Some(id) = id {
             self.remote_refresh_dir(id);
         }
+    }
+
+    /// 控制端：远程菜单「新建文件夹」——在被控端 `dir` 下建 `name`（复用 MkDir 协议）。登记
+    /// `inflight_remote_fsop` 以便结果回来刷新 `dir`。需控制中 + 名非空。
+    pub fn remote_make_dir(&mut self, dir: String, name: String) {
+        if !self.is_controlling() || name.trim().is_empty() {
+            return;
+        }
+        let req_id = self.next_req_id();
+        self.inflight_remote_fsop.insert(req_id, dir.clone());
+        self.send_frame(&RemoteFrame::MkDir { req_id, dir, name });
+    }
+
+    /// 控制端：远程菜单「新建文件」——在被控端 `dir` 下建空文件 `name`（MkFile 协议）。
+    pub fn remote_make_file(&mut self, dir: String, name: String) {
+        if !self.is_controlling() || name.trim().is_empty() {
+            return;
+        }
+        let req_id = self.next_req_id();
+        self.inflight_remote_fsop.insert(req_id, dir.clone());
+        self.send_frame(&RemoteFrame::MkFile { req_id, dir, name });
+    }
+
+    /// 控制端：远程菜单「删除」——删被控端 `path`（`is_dir` 递归）。完成后刷新其**父目录**。
+    pub fn remote_delete(&mut self, path: String, is_dir: bool) {
+        if !self.is_controlling() || path.trim().is_empty() {
+            return;
+        }
+        let req_id = self.next_req_id();
+        self.inflight_remote_fsop.insert(req_id, parent_remote_dir(&path));
+        self.send_frame(&RemoteFrame::Delete {
+            req_id,
+            path,
+            is_dir,
+        });
+    }
+
+    /// 控制端：单次远程文件操作（新建文件夹/文件、删除）完成——刷新登记的目录（变更立即反映）；
+    /// 出错记日志（刷新后界面即反映真实结果：新项未出现 / 被删项仍在）。
+    fn finish_remote_fsop(&mut self, req_id: u64, err: Option<FsErr>) {
+        let Some(dir) = self.inflight_remote_fsop.remove(&req_id) else {
+            return;
+        };
+        if let Some(e) = err {
+            log::warn!("远程文件操作失败 req={req_id}: {e:?}");
+        }
+        self.refresh_remote_path(&dir);
     }
 
     /// 控制端：用户点目录行的「刷新」图标 → 作废该目录缓存、保持展开、重发 ListDir 拉最新内容
@@ -3118,6 +3179,65 @@ impl RemoteWs {
                 err: None,
             });
         }
+    }
+
+    /// 被控端：处理 `MkFile`——在 `dir` 下建**空文件** `name`。同 `handle_mkdir` 经 `put_resolve_target`
+    /// 校验名/子树；用 `create_new`（已存在则失败、**不覆盖**，区别于 MkDir 幂等）。成功回路径。
+    fn handle_mkfile(&mut self, req_id: u64, dir: String, name: String) {
+        let target = match Self::put_resolve_target(&dir, &name) {
+            Ok(t) => t,
+            Err(err) => {
+                self.send_frame(&RemoteFrame::MkFileResult {
+                    req_id,
+                    path: String::new(),
+                    err: Some(err),
+                });
+                return;
+            }
+        };
+        let err = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_f) => None, // 句柄即时 drop，留下空文件
+            Err(e) => {
+                log::warn!("MkFile 失败 {}: {e}", target.display());
+                Some(io_err_to_fs(&e))
+            }
+        };
+        if let Some(err) = err {
+            self.send_frame(&RemoteFrame::MkFileResult {
+                req_id,
+                path: String::new(),
+                err: Some(err),
+            });
+        } else {
+            self.send_frame(&RemoteFrame::MkFileResult {
+                req_id,
+                path: target.display().to_string(),
+                err: None,
+            });
+        }
+    }
+
+    /// 被控端：处理 `Delete`——把 `path` **移入回收站**（`trash` crate，文件/目录通用、可恢复，与
+    /// 本地树删除同语义；`is_dir` 仅协议保留，trash 不需要）。`path` 是先前 ListDir 枚举出的被控端
+    /// 真实绝对路径（控制端为已配对鉴权方、本就可在被控端跑任意命令，删任意路径在威胁模型内、与终端
+    /// 删除等价，故不额外沙箱；仅防空路径）。结果回 `DeleteResult`。
+    fn handle_delete(&mut self, req_id: u64, path: String, _is_dir: bool) {
+        let err = if path.trim().is_empty() {
+            Some(FsErr::Io)
+        } else {
+            match trash::delete(&path) {
+                Ok(()) => None,
+                Err(e) => {
+                    log::warn!("Delete(回收站) 失败 {path}: {e}");
+                    Some(FsErr::Io)
+                }
+            }
+        };
+        self.send_frame(&RemoteFrame::DeleteResult { req_id, err });
     }
 
     // ── part3c-2 片5 控制端上传编排（本地 → 被控端递归传输）────────────────────
@@ -4447,9 +4567,42 @@ impl RemoteWs {
                 }
             }
             RemoteFrame::MkDirResult { req_id, path, err } => {
-                // 仅控制端：用返回的被控端目录路径递归上传其子项。
+                // 仅控制端：菜单「新建文件夹」的 MkDir（在 inflight_remote_fsop）→ 刷新目录；
+                // 否则是上传遍历的 MkDir → 用返回路径递归上传其子项。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
-                    self.upload_mkdir_result(req_id, path, err);
+                    if self.inflight_remote_fsop.contains_key(&req_id) {
+                        self.finish_remote_fsop(req_id, err);
+                    } else {
+                        self.upload_mkdir_result(req_id, path, err);
+                    }
+                }
+            }
+            RemoteFrame::MkFile { req_id, dir, name } => {
+                // 仅被控端：建空文件 + 子树断言。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_mkfile(req_id, dir, name);
+                }
+            }
+            RemoteFrame::MkFileResult { req_id, err, .. } => {
+                // 仅控制端：菜单「新建文件」完成 → 刷新目录。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.finish_remote_fsop(req_id, err);
+                }
+            }
+            RemoteFrame::Delete {
+                req_id,
+                path,
+                is_dir,
+            } => {
+                // 仅被控端：删文件 / 递归删目录。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_delete(req_id, path, is_dir);
+                }
+            }
+            RemoteFrame::DeleteResult { req_id, err } => {
+                // 仅控制端：删除完成 → 刷新父目录（被删项消失）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.finish_remote_fsop(req_id, err);
                 }
             }
             // ── part3d 多会话 × 多窗格镜像（Phase 1 MVP：列表 + 订阅，单 mirror 只读）──────

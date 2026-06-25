@@ -392,6 +392,10 @@ pub struct ShellOutput {
     pub copy_text: Option<String>,
     /// 文件树：对话框（新建/删除确认）本帧关闭（main 把焦点交还终端）。
     pub filetree_dialog_closed: bool,
+    /// 远程文件树：新建确认 (远程目录, 名字, 是否目录) → main 调 `remote_ws.remote_make_dir/file`。
+    pub remote_create: Option<(String, String, bool)>,
+    /// 远程文件树：删除确认 (远程 path, 是否目录) → main 调 `remote_ws.remote_delete`。
+    pub remote_delete: Option<(String, bool)>,
     /// 设置页本帧被打开（main 把终端焦点交给 egui）。
     pub settings_opened: bool,
     /// 设置页本帧被关闭（main 把焦点交还终端，IME 复位链路照旧）。
@@ -529,6 +533,8 @@ pub fn show(
         insert_path: None,
         copy_text: None,
         filetree_dialog_closed: false,
+        remote_create: None,
+        remote_delete: None,
         settings_opened: false,
         settings_closed: false,
         settings_font_changed: false,
@@ -838,7 +844,7 @@ pub fn show(
         let controlling = input.remote_session.is_some_and(|sess| {
             matches!(sess.role, lumen_protocol::remote::Role::Controller)
         });
-        let rout = filetree::show_remote(
+        let mut rout = filetree::show_remote(
             root,
             input.remote_filetree,
             st.filetree.visible && !is_remote_unconnected,
@@ -847,6 +853,18 @@ pub fn show(
             can_paste,
             controlling,
         );
+        // 远程菜单的「新建文件夹/文件」「删除」请求 → 开远程对话框（本帧即渲染收集结果）。
+        if let Some(dir) = rout.new_dir_req.take() {
+            st.filetree.open_remote_create(dir, true);
+        }
+        if let Some(dir) = rout.new_file_req.take() {
+            st.filetree.open_remote_create(dir, false);
+        }
+        if let Some((path, name, is_dir)) = rout.delete_req.take() {
+            st.filetree.open_remote_delete(path, name, is_dir);
+        }
+        // 渲染远程新建/删除对话框（提交写回 rout.remote_create/remote_delete）。
+        filetree::remote_dialog_ui(root.ctx(), &mut st.filetree, pal, &mut rout);
         out.filetree_width = rout.panel_width;
         out.remote_dir_clicks = rout.dir_clicks;
         out.remote_toggle_hidden = rout.toggle_hidden;
@@ -859,6 +877,13 @@ pub fn show(
             .copy_files
             .map(|(path, name, is_dir, size)| (ClipSide::Remote, path, name, is_dir, size));
         out.file_paste = rout.paste_into.map(|dir| (ClipSide::Remote, dir));
+        // 远程菜单：复制路径文本 → 系统剪贴板（复用本地 copy_text 路径）；新建/删除确认 → main 发协议。
+        out.copy_text = rout.copy_text;
+        out.remote_create = rout.remote_create;
+        out.remote_delete = rout.remote_delete;
+        if rout.dialog_closed {
+            out.filetree_dialog_closed = true;
+        }
         (rout.panel_width, rout.panel_rect, None) // 远程树无拖放
     } else {
         // 本地树可粘贴 = 系统剪贴板有文件（资源管理器/Lumen 本地复制 → 本机复制到此目录）

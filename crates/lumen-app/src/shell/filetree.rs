@@ -255,6 +255,8 @@ pub struct FileTreeState {
     restore_open: HashSet<PathBuf>,
     /// 进行中的对话框（新建输入/删除确认）。
     dialog: Option<Dialog>,
+    /// 进行中的**远程**文件树对话框（新建/删除；提交走协议发送，见 `remote_dialog_ui`）。
+    remote_dialog: Option<RemoteDialog>,
     /// 后台文件操作（新建/删除）的回包通道。
     op_tx: mpsc::Sender<OpReply>,
     op_rx: mpsc::Receiver<OpReply>,
@@ -300,6 +302,7 @@ impl Default for FileTreeState {
             hint_until: None,
             restore_open: HashSet::new(),
             dialog: None,
+            remote_dialog: None,
             op_tx,
             op_rx,
             ops_pending: 0,
@@ -319,9 +322,25 @@ impl Default for FileTreeState {
 
 impl FileTreeState {
     /// 是否有对话框（新建输入/删除确认）打开。main 据此把键盘/IME
-    /// 焦点交给 egui（与重命名编辑同款仲裁）。
+    /// 焦点交给 egui（与重命名编辑同款仲裁）。**含远程对话框**（远程视图下的新建/删除）。
     pub fn dialog_open(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.remote_dialog.is_some()
+    }
+
+    /// 打开远程「新建文件/文件夹」对话框（shell 在远程菜单请求时调）。
+    pub(crate) fn open_remote_create(&mut self, dir: String, is_dir: bool) {
+        self.remote_dialog = Some(RemoteDialog::Create {
+            dir,
+            is_dir,
+            name: String::new(),
+            focus: true,
+            error: None,
+        });
+    }
+
+    /// 打开远程「删除确认」对话框（shell 在远程菜单请求时调）。
+    pub(crate) fn open_remote_delete(&mut self, path: String, name: String, is_dir: bool) {
+        self.remote_dialog = Some(RemoteDialog::ConfirmDelete { path, name, is_dir });
     }
 
     /// 搜索输入框是否展开。其 `egui::TextEdit` 聚焦时能接收 IME 合成，
@@ -1978,6 +1997,39 @@ pub struct RemoteFileTreeOutput {
     pub refresh_dir: Option<usize>,
     /// 本帧单击选中的节点 id（main 设 ft.selected → 渲染高亮 + Ctrl+C 复制源）。
     pub select: Option<usize>,
+    /// 菜单「新建文件夹」请求：在此远程目录下新建（shell 据此开远程新建对话框）。
+    pub new_dir_req: Option<String>,
+    /// 菜单「新建文件」请求：在此远程目录下新建。
+    pub new_file_req: Option<String>,
+    /// 菜单「删除」请求：(path, name, is_dir)（shell 据此开删除确认对话框）。
+    pub delete_req: Option<(String, String, bool)>,
+    /// 要写入系统剪贴板的文本（复制绝对/相对路径；相对路径已在树侧按 root 算好）。
+    pub copy_text: Option<String>,
+    /// 远程新建对话框**确认**：(dir, name, is_dir) → main 调 remote_make_dir/file。
+    pub remote_create: Option<(String, String, bool)>,
+    /// 远程删除确认：(path, is_dir) → main 调 remote_delete。
+    pub remote_delete: Option<(String, bool)>,
+    /// 远程对话框本帧关闭（main 把键盘焦点交还）。
+    pub dialog_closed: bool,
+}
+
+/// 远程文件树的新建 / 删除对话框（与本地 [`Dialog`] 同构，但路径为不透明远程 String、提交走协议
+/// 发送而非本地 fs；独立一套避免改动精密的本地 `dialog_ui`）。存于 [`FileTreeState::remote_dialog`]。
+enum RemoteDialog {
+    /// 新建文件/文件夹：在远程 `dir` 下输入名字。
+    Create {
+        dir: String,
+        is_dir: bool,
+        name: String,
+        focus: bool,
+        error: Option<String>,
+    },
+    /// 删除确认：远程 `path`（`name` 仅展示）。
+    ConfirmDelete {
+        path: String,
+        name: String,
+        is_dir: bool,
+    },
 }
 
 /// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树（只读渲染）。
@@ -2028,6 +2080,16 @@ enum RemoteMenuAction {
     Copy(String, String, bool, u64),
     /// 粘贴到此远程目录（上传目标）：dir path。
     Paste(String),
+    /// 进入文件夹（= 翻转展开，与点击目录同效）：dir 节点 id。
+    Enter(usize),
+    /// 新建文件夹：在此远程目录下（开对话框）。
+    NewDir(String),
+    /// 新建文件：在此远程目录下（开对话框）。
+    NewFile(String),
+    /// 删除：(path, name, is_dir)（开确认对话框）。
+    Delete(String, String, bool),
+    /// 复制路径文本到系统剪贴板（绝对/相对已在树侧算好）。
+    CopyText(String),
 }
 
 /// 远程树面板内容：根名工具条 + 「显示隐藏项」勾选 + 可见行（按 depth 缩进，三角由
@@ -2043,6 +2105,8 @@ fn remote_panel_ui(
     use crate::remote_ws::RemoteRowKind;
     let s = crate::i18n::strings();
     let root_label = ft.and_then(crate::remote_ws::RemoteFileTree::root_label);
+    // owned 根路径：供下方行菜单算「复制相对路径」（避免在闭包里持 ft 借用）。
+    let root_owned = root_label.map(str::to_owned);
     // 占位文案：未控制设备 → 「未连接设备」（#5a）；控制中但 cwd 未到 → 「等待 shell 上报路径」。
     let placeholder = if controlling {
         s.filetree_waiting_cwd
@@ -2071,7 +2135,7 @@ fn remote_panel_ui(
                     .sense(egui::Sense::click()),
             )
             .on_hover_text(root_label.unwrap_or(""));
-        // 根目录右键：粘贴到树根（上传到被控端 cwd）。仅在树已就绪（root_label 有值）+ 可粘贴时。
+        // 根目录右键（树已就绪时）：粘贴（上传到 cwd）+ 新建文件夹/文件 + 复制绝对路径。
         if let Some(root) = root_label {
             let root = root.to_string();
             egui::Popup::context_menu(&root_resp).show(|ui| {
@@ -2083,6 +2147,20 @@ fn remote_panel_ui(
                     }
                 } else {
                     ui.add_enabled(false, egui::Button::new(s.remote_menu_paste));
+                }
+                ui.separator();
+                if ui.button(s.filetree_menu_new_file).clicked() {
+                    *menu.borrow_mut() = Some(RemoteMenuAction::NewFile(root.clone()));
+                    ui.close();
+                }
+                if ui.button(s.filetree_menu_new_dir).clicked() {
+                    *menu.borrow_mut() = Some(RemoteMenuAction::NewDir(root.clone()));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button(s.filetree_menu_copy_abs).clicked() {
+                    *menu.borrow_mut() = Some(RemoteMenuAction::CopyText(root.clone()));
+                    ui.close();
                 }
             });
         }
@@ -2195,9 +2273,15 @@ fn remote_panel_ui(
                                         out.refresh_dir = Some(row.id);
                                     }
                                 }
-                                // 右键菜单挂同一显式 id 句柄（路由必中本行）。
+                                // 右键菜单挂同一显式 id 句柄（路由必中本行）。与本地目录菜单对齐
+                                // （除「在资源管理器打开」——被控端无文管）。
                                 egui::Popup::context_menu(&row_resp).show(|ui| {
                                     ui.set_min_width(150.0);
+                                    if ui.button(s.filetree_menu_enter_dir).clicked() {
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::Enter(row.id));
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                     if ui.button(s.remote_menu_copy).clicked() {
                                         *menu.borrow_mut() = Some(RemoteMenuAction::Copy(
                                             row.path.clone(),
@@ -2210,6 +2294,38 @@ fn remote_panel_ui(
                                     if can_paste && ui.button(s.remote_menu_paste).clicked() {
                                         *menu.borrow_mut() =
                                             Some(RemoteMenuAction::Paste(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(s.filetree_menu_new_file).clicked() {
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::NewFile(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(s.filetree_menu_new_dir).clicked() {
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::NewDir(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(s.filetree_menu_copy_abs).clicked() {
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::CopyText(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(s.filetree_menu_copy_rel).clicked() {
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::CopyText(
+                                            rel_remote_path(&row.path, root_owned.as_deref()),
+                                        ));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(s.filetree_menu_delete).clicked() {
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::Delete(
+                                            row.path.clone(),
+                                            row.name.clone(),
+                                            true,
+                                        ));
                                         ui.close();
                                     }
                                 });
@@ -2233,7 +2349,7 @@ fn remote_panel_ui(
                                 if row_resp.clicked() {
                                     out.select = Some(row.id); // 单击选中（高亮 + Ctrl+C 下载源）
                                 }
-                                // 右键：复制（下载源 → 文件剪贴板 Remote 侧）。
+                                // 右键菜单：与本地文件菜单对齐（除「在资源管理器打开」）。
                                 egui::Popup::context_menu(&row_resp).show(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.remote_menu_copy).clicked() {
@@ -2242,6 +2358,43 @@ fn remote_panel_ui(
                                             row.name.clone(),
                                             false,
                                             row.size,
+                                        ));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    // 新建目标 = 文件所在目录（剥末段；无分隔符回退自身）。
+                                    let parent = row
+                                        .path
+                                        .rsplit_once(['/', '\\'])
+                                        .map_or_else(|| row.path.clone(), |(p, _)| p.to_string());
+                                    if ui.button(s.filetree_menu_new_file).clicked() {
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::NewFile(parent.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(s.filetree_menu_new_dir).clicked() {
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::NewDir(parent.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(s.filetree_menu_copy_abs).clicked() {
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::CopyText(row.path.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(s.filetree_menu_copy_rel).clicked() {
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::CopyText(
+                                            rel_remote_path(&row.path, root_owned.as_deref()),
+                                        ));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(s.filetree_menu_delete).clicked() {
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::Delete(
+                                            row.path.clone(),
+                                            row.name.clone(),
+                                            false,
                                         ));
                                         ui.close();
                                     }
@@ -2274,7 +2427,177 @@ fn remote_panel_ui(
             out.copy_files = Some((path, name, is_dir, size));
         }
         Some(RemoteMenuAction::Paste(dir)) => out.paste_into = Some(dir),
+        Some(RemoteMenuAction::Enter(id)) => out.dir_clicks.push(id),
+        Some(RemoteMenuAction::NewDir(dir)) => out.new_dir_req = Some(dir),
+        Some(RemoteMenuAction::NewFile(dir)) => out.new_file_req = Some(dir),
+        Some(RemoteMenuAction::Delete(path, name, is_dir)) => {
+            out.delete_req = Some((path, name, is_dir));
+        }
+        Some(RemoteMenuAction::CopyText(t)) => out.copy_text = Some(t),
         None => {}
+    }
+}
+
+/// 取远程不透明路径相对树根的相对路径（菜单「复制相对路径」用）。`root` 前缀剥掉 + 去首分隔符；
+/// 不在 `root` 下（异常）则回原绝对路径兜底。
+fn rel_remote_path(path: &str, root: Option<&str>) -> String {
+    root.and_then(|r| path.strip_prefix(r))
+        .map(|s| s.trim_start_matches(['/', '\\']).to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_owned())
+}
+
+/// 远程文件树新建/删除对话框渲染（远程视图时由 shell 在 `show_remote` 后调用）。与本地 [`dialog_ui`]
+/// 同构 Modal，但目标为不透明远程 String、提交经 [`RemoteFileTreeOutput`] 的 `remote_create`/
+/// `remote_delete` 回 main 走协议发送（删除走被控端回收站，文案同本地）。
+pub(crate) fn remote_dialog_ui(
+    ctx: &egui::Context,
+    st: &mut FileTreeState,
+    pal: &theme::Palette,
+    out: &mut RemoteFileTreeOutput,
+) {
+    let Some(mut dialog) = st.remote_dialog.take() else {
+        return;
+    };
+    let s = crate::i18n::strings();
+    let mut close = false;
+    let frame = egui::Frame::new()
+        .fill(pal.bg_panel)
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(16));
+    match &mut dialog {
+        RemoteDialog::Create {
+            dir,
+            is_dir,
+            name,
+            focus,
+            error,
+        } => {
+            let title = if *is_dir {
+                s.filetree_create_dir_title
+            } else {
+                s.filetree_create_file_title
+            };
+            let mut confirmed = false;
+            let modal = egui::Modal::new(egui::Id::new("lumen_remote_create"))
+                .backdrop_color(egui::Color32::from_black_alpha(120))
+                .frame(frame)
+                .show(ctx, |ui| {
+                    ui.set_width(280.0);
+                    ui.label(egui::RichText::new(title).size(14.0).strong().color(pal.fg));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(crate::i18n::fmt1(
+                                s.filetree_create_location_fmt,
+                                dir.as_str(),
+                            ))
+                            .size(10.5)
+                            .color(pal.fg_dim),
+                        )
+                        .truncate(),
+                    );
+                    ui.add_space(8.0);
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text(s.filetree_create_name_hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if *focus {
+                        edit.request_focus();
+                        *focus = false;
+                    }
+                    let submitted =
+                        edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if let Some(err) = error {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(err.as_str()).size(11.0).color(pal.error));
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let create_btn = egui::Button::new(
+                            egui::RichText::new(s.filetree_create_btn).color(pal.accent_fg),
+                        )
+                        .fill(pal.accent);
+                        if ui.add(create_btn).clicked() || submitted {
+                            confirmed = true;
+                        }
+                        if ui.button(s.filetree_cancel_btn).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if confirmed {
+                let trimmed = name.trim().to_owned();
+                match validate_entry_name(&trimmed) {
+                    Err(msg) => {
+                        *error = Some(msg.to_owned());
+                        *focus = true;
+                    }
+                    Ok(()) => {
+                        out.remote_create = Some((dir.clone(), trimmed, *is_dir));
+                        close = true;
+                    }
+                }
+            }
+            if modal.should_close() {
+                close = true;
+            }
+        }
+        RemoteDialog::ConfirmDelete { path, name, is_dir } => {
+            let mut confirmed = false;
+            let modal = egui::Modal::new(egui::Id::new("lumen_remote_delete"))
+                .backdrop_color(egui::Color32::from_black_alpha(120))
+                .frame(frame)
+                .show(ctx, |ui| {
+                    ui.set_width(280.0);
+                    ui.label(
+                        egui::RichText::new(s.filetree_delete_title)
+                            .size(14.0)
+                            .strong()
+                            .color(pal.fg),
+                    );
+                    ui.add_space(8.0);
+                    let what = if *is_dir {
+                        s.filetree_delete_what_dir
+                    } else {
+                        s.filetree_delete_what_file
+                    };
+                    ui.label(
+                        egui::RichText::new(crate::i18n::fmt2(
+                            s.filetree_delete_confirm_fmt,
+                            what,
+                            name,
+                        ))
+                        .size(12.0)
+                        .color(pal.fg),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let del_btn = egui::Button::new(
+                            egui::RichText::new(s.filetree_delete_trash_btn).color(pal.accent_fg),
+                        )
+                        .fill(pal.error);
+                        if ui.add(del_btn).clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button(s.filetree_cancel_btn).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if confirmed {
+                out.remote_delete = Some((path.clone(), *is_dir));
+                close = true;
+            }
+            if modal.should_close() {
+                close = true;
+            }
+        }
+    }
+    if close {
+        out.dialog_closed = true;
+    } else {
+        st.remote_dialog = Some(dialog);
     }
 }
 

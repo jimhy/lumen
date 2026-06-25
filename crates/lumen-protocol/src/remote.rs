@@ -411,6 +411,41 @@ pub enum RemoteFrame {
         /// 失败原因。
         err: Option<FsErr>,
     },
+    /// 控制端 → 被控端：在 `dir` 下新建**空文件** `name`（远程菜单「新建文件」；被控端校验名 + 子树
+    /// 断言，`create_new` 已存在则失败、不覆盖）。
+    MkFile {
+        /// 关联请求号。
+        req_id: u64,
+        /// 父目录（不透明）。
+        dir: String,
+        /// 新文件名（被控端校验）。
+        name: String,
+    },
+    /// 被控端 → 控制端：[`MkFile`](RemoteFrame::MkFile) 结果。
+    MkFileResult {
+        /// 关联请求号。
+        req_id: u64,
+        /// 新建文件被控端完整路径（`err=Some` 时空串）。
+        path: String,
+        /// 失败原因。
+        err: Option<FsErr>,
+    },
+    /// 控制端 → 被控端：删除 `path`（远程菜单「删除」）。`is_dir` 决定递归删目录 / 删单文件。
+    Delete {
+        /// 关联请求号。
+        req_id: u64,
+        /// 被删项被控端完整路径（不透明，先前 ListDir 枚举所得）。
+        path: String,
+        /// 是否目录（true 递归删，false 删文件）。
+        is_dir: bool,
+    },
+    /// 被控端 → 控制端：[`Delete`](RemoteFrame::Delete) 结果（成功 `err=None`）。
+    DeleteResult {
+        /// 关联请求号。
+        req_id: u64,
+        /// 失败原因。
+        err: Option<FsErr>,
+    },
     // ── part3d 多会话 × 多窗格镜像 ───────────────────────────────────────────────
     //    控制端镜像被控端「所有会话(tab) + 每会话多窗格(pane)」：会话列表/状态帧（被控端推、
     //    随增删实时更新）+ 订阅切换（控制端选看某会话，被控端焦点不动）+ `(TabId,SessionId)`
@@ -1199,6 +1234,29 @@ mod tests {
                 req_id: 11,
                 path: String::new(),
                 err: Some(FsErr::PermissionDenied),
+            },
+            RemoteFrame::MkFile {
+                req_id: 12,
+                dir: "C:\\dst".into(),
+                name: "new.txt".into(),
+            },
+            RemoteFrame::MkFileResult {
+                req_id: 12,
+                path: "C:\\dst\\new.txt".into(),
+                err: None,
+            },
+            RemoteFrame::Delete {
+                req_id: 13,
+                path: "C:\\dst\\old.txt".into(),
+                is_dir: false,
+            },
+            RemoteFrame::DeleteResult {
+                req_id: 13,
+                err: None,
+            },
+            RemoteFrame::DeleteResult {
+                req_id: 14,
+                err: Some(FsErr::NotFound),
             },
         ];
         for frame in frames {

@@ -8304,6 +8304,20 @@ impl ApplicationHandler<PtyWake> for App {
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();
                 }
+                // 远程菜单：新建文件夹/文件确认 → 发协议给被控端（结果回来刷新目录）。
+                if let Some((dir, name, is_dir)) = shell_out.remote_create {
+                    if is_dir {
+                        state.remote_ws.remote_make_dir(dir, name);
+                    } else {
+                        state.remote_ws.remote_make_file(dir, name);
+                    }
+                    state.window.request_redraw();
+                }
+                // 远程菜单：删除确认 → 发协议（被控端移入回收站，结果回来刷新父目录）。
+                if let Some((path, is_dir)) = shell_out.remote_delete {
+                    state.remote_ws.remote_delete(path, is_dir);
+                    state.window.request_redraw();
+                }
 
                 // —— 窗格矩形（物理像素）变化 → 逐窗格重建离屏 + resize ——
                 // 对各边按 epaint 同款语义取整后求宽高：分数 DPI（如
