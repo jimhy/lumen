@@ -16,25 +16,22 @@ use lumen_protocol::{
     SettingsSync, UserInfo,
 };
 
-/// 本地开发默认服务端地址（可由环境变量 `LUMEN_SERVER_URL` 覆盖）。
-pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
-
-/// 进程内的服务端基址（懒初始化：环境变量 > 持久化文件 > 默认）。
+/// 进程内的服务端基址（懒初始化：环境变量 > 持久化(设置页) > **空**）。
+/// **发布版不预设任何默认服务端地址**（含 localhost）——未配置时为空串，用户须在
+/// 设置页填服务端地址；开发时用环境变量 `LUMEN_SERVER_URL` 指向本地服务端。
 static SERVER_URL: RwLock<Option<String>> = RwLock::new(None);
 
-/// 取服务端基址（已规整：去尾 `/`、缺协议补 `http://`）。
+/// 取服务端基址（已规整：去尾 `/`、缺协议补 `http://`；**未配置返回空串**）。
 ///
-/// 首次读取时按「`LUMEN_SERVER_URL` 环境变量 > 持久化文件 > 默认」初始化；
-/// 之后由 [`set_server_url`]（登录界面输入）覆盖。供 `login_ui` / `remote` 共用。
+/// 首次读取时按「`LUMEN_SERVER_URL` 环境变量 > 持久化(设置页) > 空」初始化；
+/// 之后由 [`set_server_url`]（设置页输入）覆盖。供 `login_ui` / `remote` 共用。
+/// 返回空 = 未配置服务端，调用方应提示用户先在设置里填地址。
 pub fn server_url() -> String {
     if let Some(u) = SERVER_URL.read().ok().and_then(|g| g.clone()) {
         return u;
     }
-    let initial = std::env::var("LUMEN_SERVER_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string());
-    let normalized = normalize_url(&initial);
+    let raw = std::env::var("LUMEN_SERVER_URL").ok().unwrap_or_default();
+    let normalized = normalize_url(&raw);
     if let Ok(mut g) = SERVER_URL.write() {
         *g = Some(normalized.clone());
     }
@@ -49,11 +46,12 @@ pub fn set_server_url(url: &str) {
     }
 }
 
-/// 规整地址：去首尾空白与尾 `/`；用户只填 `IP:端口` 时自动补 `http://`；空则回默认。
+/// 规整地址：去首尾空白与尾 `/`；用户只填 `IP:端口` 时自动补 `http://`；**空则返回
+/// 空串**（不再回退任何默认地址——发布版不预设服务端）。
 fn normalize_url(raw: &str) -> String {
     let s = raw.trim().trim_end_matches('/');
     if s.is_empty() {
-        DEFAULT_SERVER_URL.to_string()
+        String::new()
     } else if s.starts_with("http://") || s.starts_with("https://") {
         s.to_string()
     } else {
@@ -312,8 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn server_url_去尾斜杠() {
-        // 默认值不带尾斜杠。
+    fn normalize_url_规整与无默认() {
+        assert_eq!(normalize_url("1.2.3.4:8787/"), "http://1.2.3.4:8787");
+        assert_eq!(normalize_url("https://x.com/"), "https://x.com");
+        assert_eq!(normalize_url("http://a.b:8787"), "http://a.b:8787");
+        // 空 / 纯空白 → 空串（发布版不预设默认服务端地址）。
+        assert_eq!(normalize_url(""), "");
+        assert_eq!(normalize_url("   "), "");
+        // server_url 规整后绝不带尾斜杠。
         assert!(!server_url().ends_with('/'));
     }
 }

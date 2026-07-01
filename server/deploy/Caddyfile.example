@@ -1,0 +1,11 @@
+# Caddy 反代：对外 HTTPS（自动 Let's Encrypt 证书）→ 内网 lumen-server 明文 HTTP。
+#
+# - 客户端设置里「服务端地址」填 https://你的域名 （REST + WebSocket 走同一入口）。
+# - WebSocket（远程控制中继 /ws）由 Caddy 自动处理 Upgrade，无需额外配置。
+# - P2P 的 UDP 8788 **不走 Caddy**：防火墙单独放行 8788/udp（公网直达打洞）。
+#
+# 用法：把 example 去掉、改成你的域名，放到 /etc/caddy/Caddyfile，systemctl reload caddy。
+
+your-domain.example.com {
+    reverse_proxy 127.0.0.1:8787
+}

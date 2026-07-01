@@ -1,0 +1,26 @@
+[Unit]
+Description=Lumen Server (远程控制中继 + STUN 打洞 + 云同步)
+Documentation=https://github.com/jimhy/lumen
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lumen
+Group=lumen
+# 二进制与工作目录（按实际部署路径改）
+WorkingDirectory=/opt/lumen-server
+ExecStart=/opt/lumen-server/lumen-server
+# 环境变量（LUMEN_*）从此文件读——见 lumen-server.env.example
+EnvironmentFile=/etc/lumen-server/lumen-server.env
+Restart=on-failure
+RestartSec=3s
+
+# —— 安全加固 ——
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

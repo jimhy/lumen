@@ -92,15 +92,23 @@ cargo run -p lumen-server
 
 ## 4. 生产部署（Linux）
 
+**完整分步指引 + 现成配置文件见 [`../deploy/README.md`](../deploy/README.md)**
+（附 systemd 单元 `lumen-server.service`、env 模板 `lumen-server.env.example`、
+Caddy 反代 `Caddyfile.example`）。速览：
+
 ```bash
-# 在 Linux 上只编 server（不触及 Windows-only 客户端 crate）
-cargo build -p lumen-server --release
+# 在 Linux 上只编 server（不触及 Windows-only 客户端 crate）；server 不依赖 quinn。
+cargo build -p lumen-server --release   # → target/release/lumen-server
 ```
 
-- 单二进制 + systemd；`LUMEN_*` 环境变量配置。
+- 单二进制 + systemd；`LUMEN_*` 环境变量配置（见 `deploy/lumen-server.env.example`）。
+- **端口**：`8787/tcp`（WebSocket 中继 + REST，经 Caddy 反代）+ **`8788/udp`（P2P 打洞
+  STUN，必须公网直接可达、不走反代）**。
+- **建表自动**：启动时幂等 `CREATE TABLE IF NOT EXISTS`，无需手动 SQL。
 - TLS：前置 **Caddy** 反代终止 TLS（Let's Encrypt 自动续期），server 内网明文 HTTP。
 - 数据库：生产 Postgres（同主机/内网），`LUMEN_DATABASE_URL` 指向之。
-- `LUMEN_JWT_SECRET` 必须改为强随机值。
+- `LUMEN_JWT_SECRET` 必须改为强随机值（`openssl rand -hex 32`）。
+- **客户端不预设默认服务端地址**：用户在设置里填 `https://你的域名`（或 `LUMEN_SERVER_URL` env）。
 
 ---
 
