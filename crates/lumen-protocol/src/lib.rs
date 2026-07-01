@@ -83,6 +83,13 @@ pub struct DeviceInfo {
     /// 已有设备 id（首次登录为 `None`，由服务端分配并回传，客户端持久化后续带上）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    /// **稳定硬件标识**（Windows 取 `MachineGuid`）：对「更新 app / 删本地文件 / 换数据
+    /// 目录 / 服务端 DB 重置」全都不变，只在重装系统时才变。服务端据 `(user_id, hw_id)`
+    /// 幂等认领同一物理机的唯一设备行，杜绝「带空/异 device_id 就分裂出幽灵设备」。
+    /// `Option` + `skip_serializing_if`：老服务端忽略该字段、老客户端不发该字段，双向兼容；
+    /// 取不到（受限机器/非 Windows）为 `None`，服务端退化回按 `device_id` 处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_id: Option<String>,
     /// 设备显示名（默认取机器名，用户可改）。
     pub name: String,
     /// 操作系统标识（如 `windows`）。
@@ -257,14 +264,38 @@ mod tests {
         // 首次登录 device_id = None，不应出现在 JSON 里。
         let info = DeviceInfo {
             device_id: None,
+            hw_id: None,
             name: "PC".into(),
             os: "windows".into(),
             app_version: "0.1.9".into(),
         };
         let json = serde_json::to_string(&info).expect("序列化");
         assert!(!json.contains("device_id"), "None 的 device_id 不应序列化");
+        assert!(!json.contains("hw_id"), "None 的 hw_id 不应序列化");
         let back: DeviceInfo = serde_json::from_str(&json).expect("反序列化");
         assert_eq!(back, info);
+    }
+
+    #[test]
+    fn 设备信息带hw_id往返() {
+        // hw_id 非空：应出现在 JSON 里且往返一致；老服务端遇未知/缺字段也能解析。
+        let info = DeviceInfo {
+            device_id: Some("d1".into()),
+            hw_id: Some("MACHINE-GUID-1234".into()),
+            name: "PC".into(),
+            os: "windows".into(),
+            app_version: "0.1.9".into(),
+        };
+        let json = serde_json::to_string(&info).expect("序列化");
+        assert!(json.contains("hw_id"), "非空 hw_id 应序列化");
+        let back: DeviceInfo = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back, info);
+        // 老客户端（无 hw_id 字段）的 JSON：hw_id 缺省为 None，向后兼容。
+        let legacy: DeviceInfo =
+            serde_json::from_str(r#"{"name":"PC","os":"windows","app_version":"0.1.9"}"#)
+                .expect("老 JSON 应可解析");
+        assert_eq!(legacy.hw_id, None);
+        assert_eq!(legacy.device_id, None);
     }
 
     #[test]

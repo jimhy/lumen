@@ -144,23 +144,81 @@ pub async fn refresh(
     Ok(Json(RefreshResponse { token, expires_at }))
 }
 
-/// 登记/更新设备：带有效 `device_id` 且属于本账户则更新 `last_seen`，
-/// 否则新建一台并返回其 id（容错客户端持有陈旧 id 的情况）。
+/// 登记/更新设备，返回该设备在服务端的稳定 id。
+///
+/// **幂等认领（修「幽灵设备」核心）**：优先按客户端上报的稳定硬件标识
+/// `(user_id, hw_id)` 认领同一物理机的唯一行——无论这次带的 `device_id` 是旧的、空的
+/// 还是丢了，只要 `hw_id` 命中就复用同一行、**绝不新建**，从根上杜绝「同机分裂出幽灵行」。
+/// 无 `hw_id`（老客户端 / 取不到）时退化回原「按 `device_id` 更新，否则新建」的行为，兼容老端。
 async fn upsert_device(
     client: &Client,
     user_id: &str,
     device: &DeviceInfo,
 ) -> AppResult<String> {
     let now = auth::now_secs();
-    if let Some(did) = device.device_id.as_ref().filter(|s| !s.is_empty()) {
+    let hw_id = device.hw_id.as_deref().filter(|s| !s.is_empty());
+    let did = device.device_id.as_deref().filter(|s| !s.is_empty());
+
+    // —— 1) 有稳定硬件标识：按 (user_id, hw_id) 幂等认领 ——
+    if let Some(hw) = hw_id {
+        // 1a) 已登记过这台机器 → 复用其行（顺带刷新 os/版本/last_seen）。
+        if let Some(row) = client
+            .query_opt(
+                "SELECT id FROM devices WHERE user_id=$1 AND hw_id=$2 ORDER BY created_at ASC LIMIT 1",
+                &[&user_id, &hw],
+            )
+            .await?
+        {
+            let id: String = row.get(0);
+            client
+                .execute(
+                    "UPDATE devices SET last_seen=$1, os=$2, app_version=$3 WHERE id=$4",
+                    &[&now, &device.os, &device.app_version, &id],
+                )
+                .await?;
+            return Ok(id);
+        }
+        // 1b) 尚无本机 hw 行，但客户端带着一条「属于本账户、hw_id 仍为 NULL」的旧行
+        //     （滚动升级：老客户端建的行）→ 采纳并回填 hw_id，复用老行、id 不变，
+        //     滚动升级期零新增幽灵。先 1a 再 1b 的顺序可避开与既有 hw 行的唯一冲突。
+        if let Some(d) = did {
+            let affected = client
+                .execute(
+                    "UPDATE devices SET hw_id=$1, last_seen=$2, os=$3, app_version=$4 \
+                     WHERE id=$5 AND user_id=$6 AND hw_id IS NULL",
+                    &[&hw, &now, &device.os, &device.app_version, &d, &user_id],
+                )
+                .await?;
+            if affected == 1 {
+                return Ok(d.to_string());
+            }
+        }
+        // 1c) 全新机器 → 插入带 hw_id 的新行；并发登录以部分唯一索引兜底
+        //     （撞索引则改为认领已存在的那行），最终该机恰好一行。
+        let id = new_id();
+        let row = client
+            .query_opt(
+                "INSERT INTO devices (id,user_id,name,os,app_version,last_seen,created_at,hw_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$6,$7) \
+                 ON CONFLICT (user_id, hw_id) WHERE hw_id IS NOT NULL \
+                 DO UPDATE SET last_seen=EXCLUDED.last_seen, os=EXCLUDED.os, app_version=EXCLUDED.app_version \
+                 RETURNING id",
+                &[&id, &user_id, &device.name, &device.os, &device.app_version, &now, &hw],
+            )
+            .await?;
+        return Ok(row.map_or(id, |r| r.get(0)));
+    }
+
+    // —— 2) 无 hw_id（老客户端 / 取不到）：保持原行为——按 device_id 更新，否则新建 ——
+    if let Some(d) = did {
         let affected = client
             .execute(
                 "UPDATE devices SET last_seen=$1, os=$2, app_version=$3 WHERE id=$4 AND user_id=$5",
-                &[&now, &device.os, &device.app_version, did, &user_id],
+                &[&now, &device.os, &device.app_version, &d, &user_id],
             )
             .await?;
         if affected == 1 {
-            return Ok(did.clone());
+            return Ok(d.to_string());
         }
     }
     let id = new_id();
@@ -394,4 +452,141 @@ pub async fn push_history(
         inserted += n;
     }
     Ok(Json(serde_json::json!({ "inserted": inserted })))
+}
+
+#[cfg(test)]
+mod tests {
+    //! `upsert_device` 幂等认领的 DB 集成测试（修「幽灵设备」核心回归）。
+    //!
+    //! 需要可达的 Postgres，故默认 `#[ignore]`——CI 无库时不阻塞；本地对接开发库跑：
+    //! `cargo test -p lumen-server -- --ignored`（可用 `LUMEN_TEST_DATABASE_URL` 指定库）。
+    //! 每个测试用 uuid 临时账户、结束即 `DELETE`（`ON DELETE CASCADE` 顺带清设备），不污染既有数据。
+
+    use super::*;
+    use deadpool_postgres::Pool;
+    use lumen_protocol::DeviceInfo;
+
+    fn test_db_url() -> String {
+        std::env::var("LUMEN_TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://lumen_user:lumen_password@127.0.0.1:5544/lumen?sslmode=disable".to_string()
+        })
+    }
+
+    /// 进程内只建一次表：并行测试各自并发跑 DDL（`ALTER TABLE`/`CREATE INDEX` 取
+    /// AccessExclusiveLock）会互相死锁，故用 `OnceCell` 串行化、只跑一次。
+    async fn ensure_schema(pool: &Pool) {
+        static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        SCHEMA
+            .get_or_init(|| async {
+                crate::db::init_schema(pool).await.expect("建表");
+            })
+            .await;
+    }
+
+    /// 建池 + 幂等建表（含 hw_id 列/索引）+ 一个临时账户，返回 `(pool, user_id)`。
+    async fn setup() -> (Pool, String) {
+        let pool = crate::db::create_pool(&test_db_url()).expect("建连接池");
+        ensure_schema(&pool).await;
+        let client = pool.get().await.expect("取连接");
+        let uid = new_id();
+        client
+            .execute(
+                "INSERT INTO users (id,email,display_name,password_hash,created_at) VALUES ($1,$2,$3,$4,$5)",
+                &[&uid, &format!("{uid}@test.local"), &"t", &"x", &auth::now_secs()],
+            )
+            .await
+            .expect("建临时用户");
+        (pool, uid)
+    }
+
+    async fn teardown(pool: &Pool, uid: &str) {
+        if let Ok(c) = pool.get().await {
+            let _ = c.execute("DELETE FROM users WHERE id=$1", &[&uid]).await;
+        }
+    }
+
+    fn dev(device_id: Option<&str>, hw_id: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            device_id: device_id.map(str::to_string),
+            hw_id: hw_id.map(str::to_string),
+            name: "PC".into(),
+            os: "windows".into(),
+            app_version: "1.0.0".into(),
+        }
+    }
+
+    async fn device_count(pool: &Pool, uid: &str) -> i64 {
+        let c = pool.get().await.expect("取连接");
+        c.query_one("SELECT COUNT(*) FROM devices WHERE user_id=$1", &[&uid])
+            .await
+            .expect("count")
+            .get(0)
+    }
+
+    #[tokio::test]
+    #[ignore = "需要可达的 Postgres"]
+    async fn hw幂等_同机重登复用同一行不产幽灵() {
+        let (pool, uid) = setup().await;
+        let c = pool.get().await.expect("连接");
+        // 首次：带 hw、无 device_id → 新建。
+        let id1 = upsert_device(&c, &uid, &dev(None, Some("HW-1"))).await.expect("首登");
+        // 重登：带 hw、device_id 为空（模拟本地文件丢失）→ 复用同一行，绝不新建。
+        let id2 = upsert_device(&c, &uid, &dev(None, Some("HW-1"))).await.expect("重登-空id");
+        // 重登：带 hw、带一个陈旧/错误 device_id → 仍复用同一行。
+        let id3 = upsert_device(&c, &uid, &dev(Some("STALE-XYZ"), Some("HW-1"))).await.expect("重登-异id");
+        assert_eq!(id1, id2, "空 device_id 应按 hw 复用");
+        assert_eq!(id1, id3, "异 device_id 应按 hw 复用");
+        assert_eq!(device_count(&pool, &uid).await, 1, "同机恰好一行，无幽灵");
+        teardown(&pool, &uid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要可达的 Postgres"]
+    async fn hw采纳老did行_滚动升级零幽灵() {
+        let (pool, uid) = setup().await;
+        let c = pool.get().await.expect("连接");
+        // 老客户端建的行：无 hw（legacy 分支）。
+        let old = upsert_device(&c, &uid, &dev(None, None)).await.expect("老登");
+        assert_eq!(device_count(&pool, &uid).await, 1);
+        // 升级后带 hw + 老 did 回来 → 采纳老行、回填 hw、id 不变，不新建。
+        let adopted = upsert_device(&c, &uid, &dev(Some(&old), Some("HW-2"))).await.expect("升级登");
+        assert_eq!(adopted, old, "应复用并回填老行");
+        assert_eq!(device_count(&pool, &uid).await, 1, "滚动升级不新增行");
+        // 之后即便 did 丢了，靠 hw 仍复用同一行。
+        let again = upsert_device(&c, &uid, &dev(None, Some("HW-2"))).await.expect("再登");
+        assert_eq!(again, old);
+        assert_eq!(device_count(&pool, &uid).await, 1);
+        teardown(&pool, &uid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要可达的 Postgres"]
+    async fn 老客户端无hw_保持旧行为() {
+        let (pool, uid) = setup().await;
+        let c = pool.get().await.expect("连接");
+        let id1 = upsert_device(&c, &uid, &dev(None, None)).await.expect("首登");
+        // 带回该 did → 复用。
+        let id2 = upsert_device(&c, &uid, &dev(Some(&id1), None)).await.expect("重登");
+        assert_eq!(id1, id2);
+        // 带一个查不到的 did → 无 hw 无从幂等，退化回老行为「新建」。
+        let id3 = upsert_device(&c, &uid, &dev(Some("NOPE"), None)).await.expect("异id");
+        assert_ne!(id3, id1);
+        assert_eq!(device_count(&pool, &uid).await, 2);
+        teardown(&pool, &uid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要可达的 Postgres"]
+    async fn 跨账户同hw互不合并() {
+        let (pool, uid_a) = setup().await;
+        let (_pool_b, uid_b) = setup().await;
+        let c = pool.get().await.expect("连接");
+        let a = upsert_device(&c, &uid_a, &dev(None, Some("SHARED-HW"))).await.expect("A 登");
+        let b = upsert_device(&c, &uid_b, &dev(None, Some("SHARED-HW"))).await.expect("B 登");
+        assert_ne!(a, b, "同 hw 不同账户应各自一行，按 (user_id,hw_id) 隔离");
+        assert_eq!(device_count(&pool, &uid_a).await, 1);
+        assert_eq!(device_count(&pool, &uid_b).await, 1);
+        teardown(&pool, &uid_a).await;
+        teardown(&pool, &uid_b).await;
+    }
 }

@@ -1677,8 +1677,11 @@ impl AppState {
                                 None => log::warn!("剪贴板不可用，复制跳过"),
                             }
                         }
-                    } else if self.tabs[ti].panes[pi].copy_selection(&mut self.clipboard) {
+                    } else if let Some(text) =
+                        self.tabs[ti].panes[pi].copy_selection(&mut self.clipboard)
+                    {
                         self.tabs[ti].panes[pi].selection = None;
+                        self.show_copied_toast(&text);
                         self.window.request_redraw();
                     }
                 }
@@ -2520,6 +2523,21 @@ impl AppState {
             MouseButton::Right => Some(MouseReportBtn::Right),
             _ => None,
         }
+    }
+
+    /// 终端选区复制成功后弹 toast「已复制：<预览>」，给用户明确反馈（老实现终端选区
+    /// 复制成功/失败都无任何提示，是「不知道到底复制没复制成」的体验盲区）。
+    fn show_copied_toast(&mut self, text: &str) {
+        let mut preview: String = text.chars().take(40).collect();
+        if text.chars().count() > 40 {
+            preview.push('…');
+        }
+        // 多行选区把换行显示为空格，避免 toast 里断行。
+        let preview = preview.replace('\n', " ");
+        self.shell_state.toast.push(
+            shell::toast::ToastKind::Info,
+            i18n::fmt1(i18n::strings().toast_copied_fmt, preview),
+        );
     }
 
     /// 鼠标按键上报：把按下/释放编码成鼠标事件写入对应窗格 PTY 并请求重绘，
@@ -4856,6 +4874,13 @@ impl App {
             Some(p) => info!("登录态加载：{} <{}>", p.display_name, p.email),
             None => info!("登录态：未登录"),
         }
+        // 启动对账：device_id 独立文件若缺失而 profile 尚有镜像值，回写修复——把双源背离消灭在
+        // 「下次重登带空 id → 服务端造幽灵」爆发之前（修「幽灵设备」的廉价治本兜底）。
+        cloud::reconcile_device_id(
+            user_profile
+                .as_ref()
+                .and_then(|p| p.device_id.as_deref()),
+        );
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
@@ -6920,6 +6945,24 @@ impl ApplicationHandler<PtyWake> for App {
                     // 拖选结束：停掉边缘 auto-scroll。
                     state.autoscroll_drag = 0;
                     state.autoscroll_at = None;
+                    // copy-on-select（**仅鼠标上报态**=全屏 TUI，如 Claude/vim/less）：Shift+拖选一
+                    // 松手即自动复制到剪贴板。这些程序里鼠标被上报吃掉、选取全靠 Shift 逃生，自动复制
+                    // 免去「选完还得再按 Ctrl+C / 右键」的困扰（也彻底绕开右键被吃、Ctrl+C 触发时机等
+                    // 坑）。普通 shell（未上报）**不**自动复制，避免只想选来看看却误清了剪贴板。不清
+                    // 选区：保留高亮，Ctrl+C / 右键仍可再复制。
+                    {
+                        let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                        let reporting = state.tabs[ti].panes[pi].term.mouse_protocol().is_on();
+                        let non_empty =
+                            state.tabs[ti].panes[pi].selection.is_some_and(|s| !s.is_empty());
+                        if reporting && non_empty {
+                            if let Some(text) =
+                                state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard)
+                            {
+                                state.show_copied_toast(&text);
+                            }
+                        }
+                    }
                     if state.focused_pane().selection.is_some_and(|s| s.is_empty()) {
                         // F10：**Ctrl+单击**落在可点击链接上 → 用系统默认
                         // 程序/浏览器打开（对齐 VSCode 终端 Ctrl+Click 惯例）。
@@ -6995,24 +7038,29 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
 
-                    // 鼠标上报开启（且非 Shift）：右键按下交给程序，不走本地复制/
-                    // 粘贴（程序可能用右键弹自己的菜单）。!is_mirror_active() 守卫同
-                    // 左键 Pressed：镜像态恒不触发本地上报、不穿透写本地 PTY。
+                    // 右键（终端区，Windows Terminal 惯例）。字段级下标：clipboard 需同时可变借用。
+                    let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                    // **有非空选区 → 右键优先本地复制**，哪怕鼠标上报开启（修 Claude 等全屏 TUI
+                    // 里右键被上报吃掉、下面的复制那条路根本走不到——正是「Claude 里选中却复制不了」
+                    // 的直接成因）。复制成功清选区 + 弹「已复制」toast。
+                    if state.tabs[ti].panes[pi].selection.is_some_and(|s| !s.is_empty()) {
+                        if let Some(text) =
+                            state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard)
+                        {
+                            state.tabs[ti].panes[pi].selection = None;
+                            state.show_copied_toast(&text);
+                        }
+                        state.window.request_redraw();
+                        return;
+                    }
+                    // 无选区 + 鼠标上报开启（非镜像）→ 右键交给程序（其自有右键菜单）。
                     if !state.is_mirror_active()
                         && state.report_mouse_button(MouseButton::Right, true)
                     {
                         return;
                     }
-
-                    // 右键（终端区）：有选区则复制，否则粘贴（Windows Terminal 惯例）。
-                    // 字段级下标：clipboard 需要同时可变借用。
-                    let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
-                    if state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard) {
-                        state.tabs[ti].panes[pi].selection = None;
-                        state.window.request_redraw();
-                    } else {
-                        state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
-                    }
+                    // 无选区 → 粘贴（Windows Terminal 惯例）。
+                    state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
                 }
                 (MouseButton::Right, ElementState::Released) if !state.is_mirror_active() => {
                     // 镜像态不走本地上报（远程右键在 Pressed 已处理并 return；
@@ -7758,15 +7806,18 @@ impl ApplicationHandler<PtyWake> for App {
                         .is_some()
                         .then(|| state.update_available.as_ref().map(|u| u.version.to_string()))
                         .flatten(),
-                    // 登录态过期判定（自动续期之外的兜底）：已登录 + 有到期时间 + 当前已过期。
+                    // 登录态过期判定（自动续期之外的兜底）：本地时钟判过期，或服务端实际拒绝
+                    // （list_devices 401 / 列表里已无本机 did）。后者修「token 被服务端失效但
+                    // 本地 exp 未到 → 不提示、静默显绿却隐身、用户只能手动两台都重登」的痛点。
                     token_expired: {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map_or(0i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-                        state
+                        let local_expired = state
                             .profile
                             .as_ref()
-                            .is_some_and(|p| p.token_expires_at > 0 && now >= p.token_expires_at)
+                            .is_some_and(|p| p.token_expires_at > 0 && now >= p.token_expires_at);
+                        local_expired || (state.profile.is_some() && state.remote.needs_relogin())
                     },
                     cwd: active_cwd.as_deref(),
                     shell_idle,
@@ -9199,6 +9250,11 @@ impl ApplicationHandler<PtyWake> for App {
                     state.profile = Some(p);
                     // 新登录态：清共享 token 句柄，下帧据新 token 重建（供心跳续期 + WS 共读）。
                     state.auth_token = None;
+                    // 关键：停掉仍握着旧 token 句柄的后台线程，下帧据新 token 重启——否则
+                    // 「已登录时点重新登录」（token 被服务端失效的自愈场景）后，心跳/WS 仍用
+                    // 旧死 token 死循环，重登白做、needs_relogin 永不清除。
+                    state.remote.stop();
+                    state.remote_ws.stop();
                 }
                 if shell_out.logged_out {
                     // 登出：删 profile.json，三处 UI 即时回未登录态。

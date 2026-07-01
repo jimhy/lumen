@@ -349,7 +349,11 @@ fn start_auth(ctx: &egui::Context, st: &mut LoginUiState) {
 fn do_auth(mode: AuthMode, email: &str, password: &str) -> AuthResult {
     let client = CloudClient::new(cloud::server_url());
     let device = DeviceInfo {
-        device_id: cloud::load_device_id(),
+        // 独立文件缺失时回退 profile.json 里的镜像 device_id（消除「文件丢失但 profile 尚存
+        // did」这一最常见的幽灵触发链）。
+        device_id: cloud::load_device_id().or_else(|| Profile::load().and_then(|p| p.device_id)),
+        // 稳定硬件标识：即便上面两处 device_id 都取不到，服务端也能据此认领同一物理机、不新建。
+        hw_id: cloud::hardware_id(),
         name: cloud::device_name(),
         os: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -372,7 +376,11 @@ fn do_auth(mode: AuthMode, email: &str, password: &str) -> AuthResult {
 
     match client.login(&req) {
         Ok(resp) => {
-            cloud::save_device_id(&resp.device_id);
+            if let Err(e) = cloud::save_device_id(&resp.device_id) {
+                // 写盘失败不阻断本次登录（内存态已生效），但记警告——下次重登会回退 profile
+                // 镜像 + hw_id 兜底，不会因此造出幽灵。
+                log::warn!("持久化 device_id 失败: {e}");
+            }
             Ok(Profile::from_auth(resp))
         }
         Err(CloudError::Api { code, .. }) if code == "user_not_found" => Err(AuthErr::UserNotFound),

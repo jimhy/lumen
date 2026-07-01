@@ -45,6 +45,15 @@ pub async fn init_schema(pool: &Pool) -> anyhow::Result<()> {
                 created_at  BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS devices_user_idx ON devices(user_id);
+            -- 修「幽灵设备」：新增稳定硬件标识列 hw_id（客户端 Windows MachineGuid）。
+            -- 对同一物理机跨「更新 app / 删本地文件 / 换数据目录 / 服务端 DB 重置」保持不变，
+            -- 让服务端能幂等认领同一台机器、不再因客户端带空/异 device_id 而分裂出新行。
+            -- 沿用本项目「启动时幂等 DDL、不用迁移工具」约定：老库自动补列、历史行 hw_id=NULL。
+            ALTER TABLE devices ADD COLUMN IF NOT EXISTS hw_id TEXT;
+            -- 部分唯一索引：仅对 hw_id 非 NULL 的行强制「同账户同机唯一」（历史 NULL 行不受约束、
+            -- 可并存），是 upsert 幂等认领的落点，从结构上杜绝同机重复行。
+            CREATE UNIQUE INDEX IF NOT EXISTS devices_user_hw_idx
+                ON devices (user_id, hw_id) WHERE hw_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS settings_sync (
                 user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 version    BIGINT NOT NULL,

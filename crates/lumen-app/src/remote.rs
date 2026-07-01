@@ -66,8 +66,13 @@ enum Event {
     /// 设备列表刷新成功。
     Devices(Vec<DeviceRecord>),
     /// 拉取失败。`network=true` 表示网络层连不上（红「连接错误」）；`false` 表示
-    /// 服务器有响应但业务错误（如 401，服务器仍可达，不算连接错误）。
-    Error { message: String, network: bool },
+    /// 服务器有响应但业务错误（如 401，服务器仍可达，不算连接错误）。`auth=true` 表示
+    /// 服务端 401 拒绝（token 密钥轮换 / 吊销 / 过期）——据此引导重新登录。
+    Error {
+        message: String,
+        network: bool,
+        auth: bool,
+    },
     /// token 已自动续期：主线程据此落 profile（持久化新 token + 到期时间）。
     TokenRefreshed { token: String, expires_at: i64 },
 }
@@ -79,6 +84,10 @@ pub struct RemoteState {
     pub devices: Vec<DeviceRecord>,
     /// 最近一次拉取错误（展示用）。
     pub last_error: Option<String>,
+    /// 是否需要重新登录：服务端 401 拒 token，或设备列表里已无本机（`is_self` 缺失＝
+    /// did 成孤儿 / 被删 / 服务端 DB 重置）。驱动头像「登录过期，点此重新登录」提示，
+    /// 修「显绿却隐身、用户无从下手只能手动两台都重登」。
+    auth_rejected: bool,
     /// 与服务器的连接态（状态栏指示；仅登录后有意义，由心跳结果驱动）。
     conn: ServerConn,
     /// 当前选中的设备 id（高亮用；M5.3 连接用）。
@@ -138,6 +147,7 @@ impl RemoteState {
         self.refresh = None;
         self.devices.clear();
         self.last_error = None;
+        self.auth_rejected = false;
         self.conn = ServerConn::Connecting;
         self.active_device_id = None;
     }
@@ -145,6 +155,12 @@ impl RemoteState {
     /// 是否已在运行（登录态）。
     pub fn is_running(&self) -> bool {
         self.stop.is_some()
+    }
+
+    /// 是否需要重新登录（token 被服务端拒 / 本机设备行已不在服务端）。
+    /// main 据此把头像标红并弹「登录过期，点此重新登录」，点击即开登录框。
+    pub fn needs_relogin(&self) -> bool {
+        self.auth_rejected
     }
 
     /// 与服务器的连接态（状态栏指示用；仅在 [`Self::is_running`] 为真时有意义）。
@@ -166,13 +182,22 @@ impl RemoteState {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     Event::Devices(d) => {
+                        // 列表里没有本机（is_self）＝服务端已无此设备（did 成孤儿 / 被删 /
+                        // DB 重置）→ 需重新登录重新登记；空列表同理（连自己都没有）。
+                        self.auth_rejected = !d.iter().any(|r| r.is_self);
                         self.devices = d;
                         self.last_error = None;
                         self.conn = ServerConn::Connected;
                         updated = true;
                     }
-                    Event::Error { message, network } => {
+                    Event::Error { message, network, auth } => {
                         self.last_error = Some(message);
+                        if auth {
+                            // token 被服务端 401 拒（密钥轮换 / 吊销 / 过期）→ 引导重登；
+                            // 陈旧设备列表已无意义，清掉免得误以为还能连。
+                            self.auth_rejected = true;
+                            self.devices.clear();
+                        }
                         // 网络层失败=连不上→红。其余（HTTP 有响应但非正常 list_devices：
                         // 401 token 失效/被吊销、5xx、captive portal / 非 Lumen 服务器致解析
                         // 失败）→未确认连上真服务器，退回 Connecting（黄「未连接」），绝不误报绿。
@@ -293,9 +318,12 @@ fn worker(
                 }
                 Err(e) => {
                     let network = matches!(e, CloudError::Network(_));
+                    // 服务端 401：token 被拒（密钥轮换 / 吊销 / 过期）——报给主线程引导重登。
+                    let auth = matches!(&e, CloudError::Api { status: 401, .. });
                     let _ = tx.send(Event::Error {
                         message: e.user_message(),
                         network,
+                        auth,
                     });
                 }
             }

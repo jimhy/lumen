@@ -118,6 +118,10 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     # GetCurrentThreadId（OLE 线程把自身 id 报回 UI 线程供 PostThreadMessageW）。
     "Win32_System_Threading",
+    # 稳定设备标识（cloud::hardware_id）：RegGetValueW 读 HKLM\SOFTWARE\Microsoft\
+    # Cryptography\MachineGuid，作为跨「更新/删文件/换目录/DB 重置」不变的同机标识，
+    # 供服务端幂等认领设备、根治「幽灵设备」。
+    "Win32_System_Registry",
 ] }
 # COM server：`#[implement]` 宏展开引用 windows_core crate，须显式依赖使其在 crate root 可见
 # （与 windows 0.61 同版）。

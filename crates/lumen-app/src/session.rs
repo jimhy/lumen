@@ -387,22 +387,25 @@ impl Session {
         true
     }
 
-    /// 复制选区文本到剪贴板，返回是否真的复制了内容。
-    pub fn copy_selection(&mut self, clipboard: &mut Option<arboard::Clipboard>) -> bool {
-        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
-            return false;
-        };
+    /// 复制选区文本到剪贴板。成功返回**复制的文本**（供 UI 弹「已复制」预览）；无选区 /
+    /// 空文本 / 剪贴板不可用 / 写失败均返回 `None`（各失因落日志，便于排查——老实现这些
+    /// 分支全静默，是「复制不了却查不出哪步落空」的盲区）。
+    pub fn copy_selection(&mut self, clipboard: &mut Option<arboard::Clipboard>) -> Option<String> {
+        let sel = self.selection.filter(|s| !s.is_empty())?;
         let text = self.term.selection_text(&sel);
         if text.is_empty() {
-            return false;
+            log::debug!("复制跳过：选区非空但取到的文本为空");
+            return None;
         }
-        match clipboard.as_mut().map(|c| c.set_text(text)) {
-            Some(Ok(())) => true,
-            other => {
-                if let Some(Err(e)) = other {
-                    error!("写剪贴板失败: {e}");
-                }
-                false
+        let Some(cb) = clipboard.as_mut() else {
+            log::warn!("复制失败：剪贴板不可用（arboard 初始化失败）");
+            return None;
+        };
+        match cb.set_text(text.clone()) {
+            Ok(()) => Some(text),
+            Err(e) => {
+                error!("写剪贴板失败: {e}");
+                None
             }
         }
     }

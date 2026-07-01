@@ -262,8 +262,13 @@ fn device_id_path() -> Option<PathBuf> {
 
 /// 读取持久化的设备 id（首次登录前为 None）。
 pub fn load_device_id() -> Option<String> {
-    let p = device_id_path()?;
-    let s = std::fs::read_to_string(p).ok()?;
+    load_device_id_from(&device_id_path()?)
+}
+
+/// 从指定路径读设备 id（拆出来供单测注入临时路径，不碰真实数据目录）。
+/// 空 / 纯空白（老实现「半写成空」的残留）视作 `None`。
+fn load_device_id_from(path: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
     let s = s.trim_start_matches('\u{feff}').trim();
     if s.is_empty() {
         None
@@ -273,16 +278,108 @@ pub fn load_device_id() -> Option<String> {
 }
 
 /// 保存设备 id（登录成功后调用；**登出不删**，保持设备稳定）。
-pub fn save_device_id(id: &str) {
-    let Some(p) = device_id_path() else {
-        return;
+///
+/// **原子写**（同目录临时文件 + rename，与 [`crate::profile`] 同款）：老实现用 `fs::write`
+/// 截断写又静默吞错，一旦半写成空 / 写失败而 profile.json 仍有值，就会长期潜伏、直到某次
+/// 重登带空 device_id、被服务端当新机造出「幽灵设备」。改原子写并把错误上抛由调用方处置。
+/// 数据目录不可用时视为「本次运行不持久化」，返回 `Ok`。
+pub fn save_device_id(id: &str) -> std::io::Result<()> {
+    match device_id_path() {
+        Some(p) => save_device_id_to(&p, id),
+        None => Ok(()), // 数据目录不可用：本次运行不持久化（与 profile 同语义）。
+    }
+}
+
+/// 原子写设备 id 到指定路径（同目录临时文件 + rename），拆出来供单测注入临时路径。
+fn save_device_id_to(path: &std::path::Path, id: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, id.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// 启动对账：把 `device_id` 独立文件与 profile.json 里的镜像值收敛到一致。
+///
+/// 独立文件与 `profile.device_id` 是同一个 id 的两处副本，但重登只读独立文件、运行期又
+/// 从不再读它——一旦独立文件缺失 / 为空而 profile 仍有 id（历史写失败 / 外部清理 / 曾在别的
+/// 数据目录写过），下次重登就会带空 id 造出幽灵。启动时若独立文件读不到而 profile 有值，
+/// 用 profile 的值回写修复，把背离消灭在爆发之前。返回是否发生了修复（供日志）。
+pub fn reconcile_device_id(profile_device_id: Option<&str>) -> bool {
+    if load_device_id().is_some() {
+        return false; // 独立文件已有值：无需修复。
+    }
+    let Some(pid) = profile_device_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false; // profile 也没有：首次登录前的正常状态。
     };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    match save_device_id(pid) {
+        Ok(()) => {
+            log::info!("已用 profile.device_id 回写修复缺失的 device_id 文件");
+            true
+        }
+        Err(e) => {
+            log::warn!("回写 device_id 文件失败: {e}");
+            false
+        }
     }
-    if let Err(e) = std::fs::write(&p, id) {
-        log::warn!("写设备 id 失败: {e}");
+}
+
+/// **稳定硬件标识**：Windows 读注册表 `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`。
+///
+/// 该值对「更新 app / 删本地文件 / 换数据目录 / 服务端 DB 重置」全都不变，只在重装系统时
+/// 才变，是理想的「同一物理机」稳定标识。服务端据 `(user_id, hw_id)` 幂等认领设备，从根上
+/// 杜绝「客户端带空 / 异 device_id 就分裂出幽灵设备」。读不到（受限机器 / 非 Windows）返回
+/// `None`，服务端退化回按 `device_id` 处理（无回归）。结果进程内缓存（该值恒定）。
+pub fn hardware_id() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(read_machine_guid).clone()
+}
+
+/// 读 `MachineGuid`（Windows 实现）。
+#[cfg(windows)]
+fn read_machine_guid() -> Option<String> {
+    use windows::core::w;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+    };
+    // MachineGuid 是 36 字符 GUID 串，128 个 u16 足够容纳（含结尾 NUL）。
+    let mut buf = [0u16; 128];
+    let mut cb = u32::try_from(std::mem::size_of_val(&buf)).unwrap_or(0);
+    // SAFETY: buf/cb 均为本地栈缓冲，指针在调用期间有效；RegGetValueW 至多写 cb 字节到 buf
+    // 并把实际字节数回写 cb。子键 / 值名为静态宽字符串常量。RRF_SUBKEY_WOW6464KEY 强制 64 位
+    // 视图（本应用 x64，避免 WOW64 重定向）。
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Cryptography"),
+            w!("MachineGuid"),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut cb),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
     }
+    // cb 为字节数（含结尾 NUL）→ 元素数；去尾部 NUL 后按 UTF-16 解码。
+    let elems = (usize::try_from(cb).unwrap_or(0) / 2).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..elems]);
+    let s = s.trim_end_matches('\u{0}').trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// 非 Windows（开发 / 测试）：无 `MachineGuid`，返回 `None`（服务端退化按 `device_id`）。
+#[cfg(not(windows))]
+fn read_machine_guid() -> Option<String> {
+    None
 }
 
 /// 本机设备显示名（Windows 取 `COMPUTERNAME`，兜底 `Lumen-PC`）。
@@ -296,6 +393,58 @@ pub fn device_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每个测试独立临时目录，避免并行互踩，且绝不碰真实数据目录。
+    fn temp_devid_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lumen_devid_test_{}_{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("device_id")
+    }
+
+    #[test]
+    fn 设备id原子写往返() {
+        let p = temp_devid_path("roundtrip");
+        let _ = std::fs::remove_file(&p);
+        // 缺失 → None。
+        assert_eq!(load_device_id_from(&p), None);
+        // 写入 → 读回一致；rename 后不应残留 .tmp。
+        save_device_id_to(&p, "dev-123").expect("写盘");
+        assert_eq!(load_device_id_from(&p), Some("dev-123".to_string()));
+        assert!(!p.with_extension("tmp").exists(), "原子写后不应残留 tmp");
+        // 覆盖写生效。
+        save_device_id_to(&p, "dev-456").expect("覆盖");
+        assert_eq!(load_device_id_from(&p), Some("dev-456".to_string()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn 空白设备id视作缺失() {
+        // 老实现「半写成空/纯空白」的残留必须被当成 None——否则重登会带空 id 造幽灵。
+        let p = temp_devid_path("blank");
+        save_device_id_to(&p, "   \r\n").expect("写空白");
+        assert_eq!(load_device_id_from(&p), None);
+        // BOM 前缀也应被剥离后判空/取值。
+        std::fs::write(&p, "\u{feff}dev-bom").expect("写 BOM");
+        assert_eq!(load_device_id_from(&p), Some("dev-bom".to_string()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn 硬件标识幂等() {
+        // 值因机而异不可硬断言具体值，但同进程多次调用必一致（进程内缓存 + 机器恒定）。
+        assert_eq!(hardware_id(), hardware_id());
+        // Windows 上 MachineGuid 恒存在：必须真的读到一个合法 GUID（36 字符、含连字符），
+        // 否则说明注册表读取失效、hw_id 会退化、治本落空——此断言守住这条底线。
+        #[cfg(windows)]
+        {
+            let hw = hardware_id().expect("Windows 应能读到 MachineGuid");
+            assert_eq!(hw.len(), 36, "MachineGuid 应为 36 字符 GUID：{hw}");
+            assert_eq!(hw.matches('-').count(), 4, "GUID 应含 4 个连字符：{hw}");
+        }
+    }
 
     #[test]
     fn 错误码映射() {
