@@ -17,7 +17,12 @@ F*ClaudeWorkspacesLumen*
 
 # 敏感：证书/私钥，绝不入库（公开仓库）。
 /证书/
-# 文档媒体素材（截图等），本地保留、不随源码入库。
-/docs/media/
+# 文档媒体素材（截图等），默认本地保留、不随源码入库；README 引用的三张
+# 展示截图白名单入库。目录规则必须写 /* 而非以 / 结尾：整目录被 ignore 时
+# git 不进入该目录，! 例外不生效。
+/docs/media/*
+!/docs/media/lumen-overview.png
+!/docs/media/lumen-workflow.png
+!/docs/media/lumen-splits.png
 # Docker 交叉编译 Linux 版服务端的产物目录（本地临时）。
 /target-linux/

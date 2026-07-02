@@ -2,6 +2,10 @@
 name = "lumen-server"
 version.workspace = true
 edition.workspace = true
+# 服务端依赖树的真实 MSRV（time 0.3.49 要求 1.88）：不继承 workspace 的 1.92——
+# 那是纯客户端依赖（egui/ecolor）决定的，继承会把云 Linux 上 1.88~1.91 工具链的
+# `cargo build -p lumen-server` 无谓硬拦（部署指南允许用发行版自带 Rust）。
+rust-version = "1.88"
 license.workspace = true
 repository.workspace = true
 description = "Lumen 云服务端：账户、设备、设置/历史同步（M5.1），及后续远程控制中继"

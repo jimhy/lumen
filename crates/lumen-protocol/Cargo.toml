@@ -2,6 +2,9 @@
 name = "lumen-protocol"
 version.workspace = true
 edition.workspace = true
+# 与 lumen-server 树同步（服务端部署路径的 MSRV 上限，理由见其 Cargo.toml）；
+# 本 crate 自身依赖仅需更低版本，取服务端树上限便于统一维护。
+rust-version = "1.88"
 license.workspace = true
 repository.workspace = true
 description = "Lumen 远程控制协议：客户端与 lumen-server 共享的线缆类型（零平台依赖）"

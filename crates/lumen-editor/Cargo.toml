@@ -3,6 +3,7 @@ name = "lumen-editor"
 description = "Lumen 输入编辑器纯状态机：零 winit/wgpu/pty 依赖，apply() 是唯一可变入口，同一 Action 序列产生确定性终态（M4 远程一致性地基）"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

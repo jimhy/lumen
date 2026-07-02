@@ -3,6 +3,7 @@ name = "lumen-renderer"
 description = "Lumen 的 wgpu + glyphon 渲染层"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [features]

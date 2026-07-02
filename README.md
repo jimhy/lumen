@@ -1,120 +1,152 @@
-# Lumen
-
-**A modern, GPU-accelerated terminal** — written in Rust, Windows-first, in the spirit of Warp.
-
-**English** · [简体中文](README.zh-CN.md)
-
 <p align="center">
-  <img src="docs/demo.gif" alt="Lumen demo: syntax-highlighted commands, live output, up to 6 split panes (3 top / 3 bottom)" width="880">
+  <img src="icons/lumen-icon-128.png" alt="Lumen logo" width="96">
 </p>
 
-Lumen brings GPU-smooth rendering, command blocks, a modern input editor, multi-pane
-splits, built-in themes, and a multilingual UI together in a native Windows terminal —
-the goal is to make *typing commands* feel as fluid as working in a modern code editor.
+<h1 align="center">Lumen</h1>
 
-> Status: the terminal core, the app shell, and the modern input editor are all in
-> place and being actively polished.
+<p align="center">
+  <strong>A Windows-first, GPU-accelerated terminal for people who want command-line work to feel fast, visual, and controllable across devices.</strong>
+</p>
 
----
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="https://github.com/jimhy/lumen/releases">Download</a> ·
+  <a href="#build-from-source">Build from source</a> ·
+  <a href="server/deploy/README.md">Self-host remote server</a>
+</p>
 
-## ✨ Features
+<p align="center">
+  <img alt="Windows 10 1809+" src="https://img.shields.io/badge/Windows-10%201809%2B-0078D4?logo=windows">
+  <img alt="Rust 1.92+" src="https://img.shields.io/badge/Rust-1.92%2B-f74c00?logo=rust">
+  <img alt="License Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
+  <img alt="GPU rendering" src="https://img.shields.io/badge/rendering-wgpu%20%2B%20glyphon-7c3aed">
+</p>
 
-### Terminal core
-- **PowerShell over ConPTY**: prefers `pwsh`, falls back to `powershell`.
-- **Full VT100/ANSI parsing**: SGR 16/256/true color, cursor control, erase, scroll
-  regions, alternate screen (vim/less and other full-screen apps), bracketed paste,
-  DEC 2026 synchronized updates.
-- **GPU rendering**: wgpu + glyphon text + a custom rectangle pipeline (background
-  cells / cursor / underline); no redraws when idle, with frame coalescing and rate
-  limiting — it never busy-spins the CPU.
-- **10k-line scrollback**: mouse wheel, `Shift+PgUp/PgDn`.
-- **CJK IME input**: inline preedit, candidate window that follows the cursor.
-- **Command Blocks**: command boundaries captured via shell-integration OSC 133; a
-  left-edge status bar marks running (blue) / success (green) / failure (red); click a
-  block to select its output.
+<p align="center">
+  <img src="docs/demo.gif" alt="Lumen screen recording: file tree, PowerShell, command output, and multi-pane splits" width="920">
+</p>
 
-### Modern input editor
-- **Multi-line command editing**: a dedicated footer input area; `Shift+Enter` for newlines.
-- **PowerShell syntax highlighting**: commands / keywords / parameters / variables /
-  numbers / strings / comments / operators each get their own color, matched to the
-  active theme.
-- **Continuation detection**: while quotes / pipes are unclosed, Enter inserts a newline
-  instead of submitting.
-- **Command history**: `↑/↓` navigation, draft recovery; PSReadLine history is imported
-  on first launch.
-- **Fuzzy history search**: `Ctrl+R` opens a search panel (subsequence matching +
-  frequency/recency weighting, match highlighting, exit-code badges); Enter fills the
-  input area without executing.
-- **Tab completion**: local file-path completion + background `pwsh` sidecar command
-  completion.
-- **Ghost text**: the best matching history entry is shown inline in gray; press `→`/`End` to accept.
-- **Exit-code badge**: ✓/✗ and elapsed time shown when a command finishes.
-- **Classic passthrough mode**: `Ctrl+Shift+E` switches back to traditional
-  byte-by-byte passthrough (via PSReadLine).
+Lumen combines a native Windows terminal, an editor-style command input, command blocks,
+file browsing, themes, and self-hosted remote control in one Rust app. It is built for
+developers who spend the day in PowerShell, switch between projects often, and want a
+terminal that helps them see what happened instead of forcing them to scroll through a
+wall of text.
 
-### UI & appearance
-- **Custom title bar**: borderless window with the title bar fused into the top bar
-  (Warp/VSCode style); drag, double-click to maximize, Win11 Snap Layouts.
-- **11 built-in themes**: Lumen Dark/Light, Tokyo Night (dark/light), Dracula, Nord,
-  Gruvbox, Solarized (dark/light), Catppuccin, One Dark; a theme gallery preview in
-  settings, plus **Sync with OS** to follow the system light/dark mode automatically.
-- **Internationalization (i18n)**: Simplified Chinese / Traditional Chinese / English,
-  switchable instantly in settings and persisted.
-- **Terminal background image**: pick a local image with opacity / dimming sliders
-  (keeping text readable).
-- **File tree**: right-click to create files/folders, delete to the Recycle Bin, enter a
-  folder (cd), copy its absolute/relative path, reveal in File Explorer; drag a file onto
-  the terminal to insert its path; recursive search at the top.
-- **Clickable links**: URLs / file paths (including `:line:col`) / OSC 8 hyperlinks in the
-  terminal show an underline and tooltip on hover; `Ctrl+Click` to open (URL → browser,
-  file → default program).
-- **System notifications**: auto-dismissing toasts in the bottom-right corner, with
-  severity levels (info / warning / error).
+> Current status: the local terminal, modern input editor, file tree, multi-pane layout,
+> auto-update, account/server plumbing, remote device control, remote file operations,
+> and QUIC-assisted P2P data path are implemented and actively polished.
 
-### Multi-pane splits
-- Up to **6 panes** per session, with fixed even layouts (1 full / 2 side-by-side / … /
-  6 as 3-top-3-bottom).
-- Pane ratios are **drag-adjustable** (dividers change the cursor on hover, double-click
-  restores the even split).
-- Each pane has its own title bar (showing cwd, close / maximize buttons); **drag a
-  title bar to swap pane positions**.
-- **Maximize/restore** a pane; click a pane to focus it — keyboard / IME / file tree all
-  follow the focused pane.
+## Why Lumen
 
-### Sessions & window
-- **Session persistence**: the session list and each pane's cwd / ratio / maximized state
-  are restored on restart (screen contents are not restored; shells are relaunched).
-- **Single instance**: the release build is single-instance (a second instance brings the
-  existing window to the front and then exits); the debug build, or `--multi-instance` /
-  `LUMEN_MULTI_INSTANCE=1`, allows multiple instances.
-- **Maximized on launch by default**; sidebar / file-tree column widths are
-  drag-adjustable and persisted.
-- **Auto-update**: checks the latest GitHub Release on launch, prompts when a new version
-  is available, and downloads + installs + restarts in one click (toggle / manual check
-  under Settings → About → Updates).
+| You want to... | Use this | Why it helps |
+|---|---|---|
+| Write longer commands without fear | Multi-line footer input, PowerShell highlighting, continuation detection | Treat commands more like code: edit first, run when ready. |
+| Find and reuse commands quickly | `Ctrl+R` fuzzy history, `↑/↓` history, ghost text, `Tab` completion | Less retyping, fewer context switches, faster repeat work. |
+| Understand output at a glance | Command blocks, exit-code badges, elapsed time, block selection | Each command becomes a readable unit you can jump to, copy, and debug. |
+| Work in several folders at once | Up to 6 panes, draggable ratios, pane maximize, title-bar swapping | Keep build, logs, server, and scratch commands visible together. |
+| Browse files without leaving the terminal | `Ctrl+B` file tree, right-click actions, drag file to insert path | Move through a project, create files, copy paths, and `cd` faster. |
+| Control your own machines | Self-host `lumen-server`, sign in on devices, pair with a 9-digit code | Mirror/control a remote Lumen instance and move files between machines. |
+| Make the terminal fit your setup | 11 built-in themes, OS light/dark sync, background images, Chinese/English UI | A comfortable terminal is one you keep open all day. |
 
----
+## Screenshots
 
-## 📦 Build & run
+| Local workspace | Command workflow | Six-pane split |
+|---|---|---|
+| <img src="docs/media/lumen-overview.png" alt="Lumen local terminal with file tree" width="300"> | <img src="docs/media/lumen-workflow.png" alt="Lumen command output and split panes" width="300"> | <img src="docs/media/lumen-splits.png" alt="Lumen six-pane terminal layout" width="300"> |
 
-Requires **Rust 1.85+** and **Windows 10 1809+** (ConPTY).
+## Quick Start
+
+### Install
+
+Download the latest Windows build from
+[GitHub Releases](https://github.com/jimhy/lumen/releases), then run `lumen.exe`.
+
+Requirements:
+
+- Windows 10 1809+ for ConPTY.
+- PowerShell: Lumen prefers `pwsh` and falls back to Windows PowerShell.
+
+### First 3 Minutes
+
+| Action | Shortcut or place |
+|---|---|
+| Open a new session | `Ctrl+T` |
+| Add a pane | `Ctrl+Shift+D` |
+| Toggle the file tree | `Ctrl+B` |
+| Open settings | `Ctrl+,` |
+| Search command history | `Ctrl+R` |
+| Add a newline before running | `Shift+Enter` |
+| Accept ghost text | `→` or `End` |
+| Open a URL or file path from output | `Ctrl+Click` |
+
+## Feature Highlights
+
+### Editor-Style Command Input
+
+Lumen gives commands their own input area instead of forcing you to edit at the prompt.
+You get multi-line editing, syntax highlighting, smart continuation handling, history
+search, command/file completion, ghost text, draft recovery, Unicode grapheme-aware
+cursor movement, and a one-key fallback to classic passthrough mode.
+
+### Command Blocks
+
+Shell integration captures command boundaries through OSC 133. Finished commands show
+success/failure state and elapsed time, and block navigation lets you jump through output
+without hunting for prompts manually.
+
+### GPU Terminal Core
+
+The renderer uses `wgpu` + `glyphon`, with a custom rectangle pipeline for cell
+backgrounds, cursors, and underlines. The terminal core handles ANSI/VT sequences,
+alternate screen apps such as `vim`/`less`, bracketed paste, synchronized updates,
+10k-line scrollback, CJK IME preedit, true color, and clickable links.
+
+### Project-Aware UI
+
+The app shell includes sessions, panes, a file tree, custom title bar, snap layout
+support, persisted layout widths, system toasts, and built-in themes including Lumen,
+Tokyo Night, Dracula, Nord, Gruvbox, Solarized, Catppuccin, and One Dark.
+
+### Self-Hosted Remote Control
+
+Run `lumen-server` on your own machine or VPS, enter its address in Lumen settings, then
+sign in on two devices. The remote tab shows online devices; double-click to connect,
+enter the 9-digit pairing code shown on the controlled device, and start working.
+
+Remote sessions support terminal mirroring/control, remote tabs and panes, a remote file
+tree, file upload/download, folder copy via virtual file clipboard, relay fallback, and a
+QUIC P2P data path when direct connectivity is available.
+
+Start here:
+
+- [Server overview](server/lumen-server/README.md)
+- [Production deployment guide](server/deploy/README.md)
+
+## Build From Source
 
 ```powershell
-# Dev run (recommended — fast compile, with console logging)
-cargo run
+# Clone and enter the repo first, then:
+cargo run -p lumen-app
 
 # Release build
-cargo build --release
-# Output: target\release\lumen.exe
+cargo build -p lumen-app --release
+.\target\release\lumen.exe
 ```
 
-The optional `input-editor` feature (the modern input editor) is on by default;
-`--no-default-features` removes it entirely, falling back to a traditional byte-stream
-terminal.
+The modern input editor is enabled by default through the `input-editor` feature.
+To build a classic byte-stream terminal:
 
----
+```powershell
+cargo run -p lumen-app --no-default-features
+```
 
-## ⌨️ Keyboard shortcuts
+To run the self-hosted server locally:
+
+```powershell
+cargo run -p lumen-server
+```
+
+## Keyboard Shortcuts
 
 | Shortcut | Action |
 |---|---|
@@ -124,55 +156,61 @@ terminal.
 | `Ctrl+B` | Toggle file tree |
 | `Ctrl+,` | Open / close settings |
 | `Ctrl+↑` / `Ctrl+↓` | Jump between command blocks |
-| `Ctrl+C` | Copy selection / selected block output; send interrupt when nothing is selected |
+| `Ctrl+C` | Copy selection or selected block output; interrupt when nothing is selected |
 | `Ctrl+V` / `Shift+Insert` | Paste |
 | `Shift+PgUp` / `Shift+PgDn` | Scroll up / down |
-| `Esc` | Close settings / overlay |
-| **Splits** | |
+| `Esc` | Close settings or overlay |
 | `Ctrl+Shift+D` | Add pane |
 | `Ctrl+Shift+W` | Close pane |
 | `Ctrl+Shift+Enter` | Maximize / restore pane |
-| **Input editor** | |
-| `↑` / `↓` | Command history navigation |
 | `Ctrl+R` | Fuzzy history search |
-| `Tab` | Completion (file path / command) |
-| `Shift+Enter` | Multi-line newline |
+| `Tab` | Completion |
+| `Shift+Enter` | Insert newline |
 | `Ctrl+Shift+E` | Toggle classic passthrough mode |
-| `Ctrl+Click` | Open a link / file in the terminal |
+| `Ctrl+Click` | Open terminal link or file path |
 
----
+## Architecture
 
-## 🏗️ Architecture
-
-```
+```text
 crates/
-├── lumen-pty/       # PTY abstraction (portable-pty / ConPTY)
-├── lumen-term/      # VT parsing + Grid + Block model (pure data, no graphics)
-├── lumen-editor/    # Input-editor state machine (multi-line / cursor / undo / highlighting, pure logic)
-├── lumen-renderer/  # wgpu + glyphon rendering
-└── lumen-app/       # winit main program + egui shell (top bar / sidebar / file tree / settings / splits)
+├── lumen-pty/       # PTY abstraction: Windows ConPTY / portable-pty
+├── lumen-term/      # VT parser, grid, scrollback, command blocks
+├── lumen-editor/    # Pure command-editor state machine
+├── lumen-renderer/  # wgpu + glyphon renderer
+├── lumen-protocol/  # Remote-control protocol shared by client/server
+└── lumen-app/       # winit + egui app shell, sessions, panes, settings, remote UI
+
+server/
+└── lumen-server/    # Axum server: auth, devices, sync, WebSocket relay, STUN helper
 ```
 
-Data flow: PTY bytes → the `lumen-term` state machine → `Grid` → `lumen-renderer` to the
-screen; keyboard / mouse / IME → `lumen-app` routing → (in editor mode) `lumen-editor` →
-submitted back to the PTY.
+Data flow: PTY bytes -> `lumen-term` -> grid/block model -> `lumen-renderer`.
+Keyboard, mouse, IME, file tree, and remote events are routed through `lumen-app`; editor
+mode uses `lumen-editor` before sending finalized bytes back to the PTY.
 
-See [docs/架构设计.md](docs/架构设计.md) and
-[docs/输入编辑器设计.md](docs/输入编辑器设计.md) for details (in Chinese).
+Deep dives:
 
----
+- [Architecture design](docs/架构设计.md)
+- [Input editor design](docs/输入编辑器设计.md)
+- [Remote control design](docs/M5远程控制设计.md)
+- [P2P direct connection design](docs/M6-P2P直连-QUIC打洞-设计-2026-06-23.md)
 
-## 🗺️ Roadmap
+## Roadmap
 
-- **Terminal core** ✅ ConPTY / VT parsing / GPU rendering / Blocks
-- **App shell** ✅ Custom title bar / splits / theme library / i18n / file tree / background image
-- **Modern input editor** ✅ Multi-line editing / syntax highlighting / history search / completion / clickable links
-- **Auto-update** ✅ GitHub Release auto-update
-- **AI integration** 🔭 Natural-language-to-command, error explanation (planned)
-- **Cloud sync / remote** 🔭 Per-user data sync across devices after sign-in, plus a state & control protocol (planned)
+- Local terminal core: ConPTY, ANSI/VT, GPU rendering, blocks
+- App shell: custom title bar, panes, file tree, settings, themes, i18n
+- Modern editor: multi-line input, highlighting, history, completion, links
+- Updates: GitHub Release auto-update and proxy support
+- Remote: accounts, devices, pairing, terminal control, file transfer, relay/P2P path
+- Next: AI-assisted command generation and error explanation
+- Next: broader sync polish and cross-device workflow refinements
 
----
+## Contributing
 
-## 📄 License
+Try Lumen on your own workflow, open issues with real terminal scenarios, share short
+screen recordings, or help test remote control across different NAT/network setups.
+Small, reproducible reports are especially valuable.
+
+## License
 
 [Apache-2.0](LICENSE) © jimhy

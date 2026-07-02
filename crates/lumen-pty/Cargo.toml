@@ -3,6 +3,7 @@ name = "lumen-pty"
 description = "Lumen 的 PTY 抽象层（Windows ConPTY / unix pty）"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

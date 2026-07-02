@@ -3,6 +3,7 @@ name = "lumen-app"
 description = "Lumen 主程序：winit 事件循环，组装 PTY/终端状态机/渲染器"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
