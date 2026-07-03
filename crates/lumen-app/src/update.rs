@@ -161,7 +161,8 @@ pub struct ParsedRelease {
     pub download_url: Option<String>,
 }
 
-/// GitHub latest Release API URL。
+/// GitHub latest Release API URL。仅 Windows 更新检查用（见 [`check_for_update`]）。
+#[cfg(windows)]
 fn latest_release_url(repo: &str) -> String {
     format!("https://api.github.com/repos/{repo}/releases/latest")
 }
@@ -180,6 +181,8 @@ fn with_proxy(builder: ureq::AgentBuilder, proxy: Option<&str>) -> ureq::AgentBu
 
 /// 请求并解析 GitHub 的 latest Release。失败（网络/HTTP 非 2xx/解析）返回
 /// `Err`。在后台线程内调用（阻塞）。`proxy` 为生效的网络代理（None=直连）。
+/// 仅 Windows 更新检查用（非 Windows [`check_for_update`] 直接返回 UpToDate）。
+#[cfg(windows)]
 fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> {
     let url = latest_release_url(repo);
     let agent = with_proxy(
@@ -223,20 +226,33 @@ pub enum CheckResult {
 /// 查更新：请求 GitHub latest Release，与当前版本比较裁决。
 /// 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。
 /// 在后台线程内调用（阻塞）。
+///
+/// 非 Windows：自动更新分发的是 Windows Inno Setup `.exe` 安装包（见
+/// [`launch_installer`]），Linux/macOS 无从应用（走源码构建 / 平台包管理器）。
+/// 故一律返回 [`CheckResult::UpToDate`]，从源头掐断「弹更新提示 → 下载 .exe →
+/// 拉起安装器失败」的坏链路，整条更新 UI 流程在非 Windows 上永不触发。
 pub fn check_for_update(proxy: Option<&str>) -> CheckResult {
-    let current = current_version();
-    match fetch_release(GITHUB_REPO, proxy) {
-        Ok(info) if info.version > current => {
-            log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
-            CheckResult::Newer(info)
-        }
-        Ok(info) => {
-            log::debug!("F3：已是最新版 {current}（GitHub 上 {}）", info.version);
-            CheckResult::UpToDate
-        }
-        Err(e) => {
-            log::debug!("F3：{e}");
-            CheckResult::Failed
+    #[cfg(not(windows))]
+    {
+        let _ = proxy;
+        CheckResult::UpToDate
+    }
+    #[cfg(windows)]
+    {
+        let current = current_version();
+        match fetch_release(GITHUB_REPO, proxy) {
+            Ok(info) if info.version > current => {
+                log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
+                CheckResult::Newer(info)
+            }
+            Ok(info) => {
+                log::debug!("F3：已是最新版 {current}（GitHub 上 {}）", info.version);
+                CheckResult::UpToDate
+            }
+            Err(e) => {
+                log::debug!("F3：{e}");
+                CheckResult::Failed
+            }
         }
     }
 }
@@ -408,6 +424,8 @@ mod tests {
         assert!(should_auto_check(Some(1_000_000), 5_000_000, 3_600_000));
     }
 
+    // latest_release_url 仅 Windows 编译（非 Windows 更新检查直接返回 UpToDate）。
+    #[cfg(windows)]
     #[test]
     fn latest_release_url_格式() {
         assert_eq!(
