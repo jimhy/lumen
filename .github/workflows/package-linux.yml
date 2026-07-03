@@ -41,7 +41,10 @@ jobs:
             pkg-config fonts-dejavu-core
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # 不用 rust-cache：其缓存键按 runner.os（笼统 Linux）不区分 22.04/24.04，
+      # 会把 24.04(glibc 2.39) 编译的 release 产物 + cargo-deb 二进制恢复到 22.04
+      # 复用，导致产出物反而要求 GLIBC_2.39（cargo-deb 直接跑不起来）。冷编译
+      # 保证整条链都在 22.04(glibc 2.35) 上产出，兼容老发行版。
 
       - name: 构建 release 二进制
         run: cargo build --release -p lumen-app
