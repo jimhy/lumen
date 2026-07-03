@@ -53,6 +53,13 @@ quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 
+# Linux 上 rfd 必须显式选一个后端（gtk3 / xdg-portal），否则其 build.rs 直接
+# panic（workspace 层 default-features=false 关掉了默认 gtk3，Windows/macOS 用
+# 系统原生对话框无需后端 feature，唯 Linux 强制要求）。选 gtk3：同步 FileDialog
+# API 与现有用法一致，构建/运行需系统 libgtk-3（CI 已装 libgtk-3-dev）。
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { workspace = true, features = ["gtk3"] }
+
 # 单实例检测（F8）仅 Windows 路径需要 Win32 同步原语。
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
