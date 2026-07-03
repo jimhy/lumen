@@ -10,6 +10,18 @@ license.workspace = true
 name = "lumen"
 path = "src/main.rs"
 
+# ── Linux .deb 打包（cargo-deb，见 .github/workflows/package-linux.yml）─────────
+# cargo-deb 自动探测链接期共享库依赖（gtk/xcb/xkbcommon/wayland 等，$auto）；
+# wgpu 运行时 dlopen 加载 Vulkan/GL（非链接期依赖，$auto 检测不到），显式补上。
+# 不指定 assets：默认把 [[bin]] lumen 打到 /usr/bin/lumen。
+[package.metadata.deb]
+maintainer = "Lumen contributors <noreply@users.noreply.github.com>"
+copyright = "2026 jimhy — Apache-2.0"
+extended-description = "Lumen: GPU-accelerated terminal — cross-platform (Linux/macOS) build."
+section = "utils"
+priority = "optional"
+depends = "$auto, libvulkan1, libgl1, libegl1"
+
 [features]
 ## 输入编辑器 footer 渲染（M4.1 批C/D1）——设计稿 §7.1。
 ## 默认开启；剔除时所有 footer 渲染/占高逻辑被完全移除，
