@@ -2657,6 +2657,18 @@ impl AppState {
         {
             return false;
         }
+        // 上报开且焦点窗格已有本地选区高亮时，普通左键（非 Shift——已在上面逃生）按下
+        // → 清选区并消费该次按下（点击取消选择）。高亮靠 Shift 逃生选出、copy-on-select
+        // 后刻意保留（供再复制），但上报态普通单击会被程序吞掉、清不掉高亮——这里拦下，
+        // 对齐终端「有选区时点击先取消选择」惯例（海风哥反馈：Shift 选完不复制则高亮永久
+        // 赖着，普通左键应能取消）。held 不置位、不上报给程序。
+        if button == MouseButton::Left
+            && self.focused_pane().selection.is_some_and(|s| !s.is_empty())
+        {
+            self.focused_pane_mut().selection = None;
+            self.window.request_redraw();
+            return true;
+        }
         let enc = self.tabs[self.active_tab].panes[pane_idx]
             .term
             .mouse_encoding();
@@ -3060,6 +3072,20 @@ impl AppState {
             && self.mirror_link_at_mouse().is_some()
         {
             return false;
+        }
+        // 镜像焦点窗格已有本地选区高亮、且这次点的就是焦点窗格时，普通左键（非 Shift）
+        // 按下 → 清选区并消费该次按下（点击取消选择）。镜像选区靠 Shift 逃生选出、
+        // copy-on-select 后保留，普通单击本会被转发吞掉、清不掉——对齐本地
+        // report_mouse_button 的「有选区时点击先取消」。`mirror_target_sid()==Some(sid)`
+        // 守卫：只清被点焦点窗格自身的选区，点别的窗格不误清焦点窗格高亮、也不吞该点击
+        // （与本地臂「focused_pane 一致、点哪清哪」对齐）。held 不置位、不转发被控端。
+        if button == MouseButton::Left
+            && self.remote_ws.mirror_target_sid() == Some(sid)
+            && self.remote_ws.has_mirror_active_selection()
+        {
+            self.remote_ws.clear_mirror_active_selection();
+            self.window.request_redraw();
+            return true;
         }
         let ev = MouseEvent {
             kind: MouseEventKind::Press(btn),
@@ -7244,25 +7270,8 @@ impl ApplicationHandler<PtyWake> for App {
                             return;
                         }
                     }
-                    // 镜像 copy-on-select（**仅焦点镜像窗格开鼠标上报时**=全屏 TUI 如 Claude）：
-                    // 上报态下普通拖被转发、选区只能靠 Shift 逃生拖出，松手即自动复制到本地剪贴板，
-                    // 免去「选完还得右键 / Ctrl+C」（对齐本地 copy-on-select）。**不清选区**：保留
-                    // 高亮，右键 / Ctrl+C 仍可再复制。普通 shell（未上报）不自动复制，避免只想选来
-                    // 看看却误清剪贴板。置于 report 转发 return 之后，故仅本地镜像选区收尾这条路生
-                    // 效（被转发的普通释放已在上面早退）；先复制、再由下面 mirror_*_sel_end 收尾
-                    // （非空不清）。
-                    if state.is_mirror_active()
-                        && state.remote_ws.mirror_active_reporting()
-                        && state.remote_ws.has_mirror_active_selection()
-                    {
-                        if let Some(text) = state.remote_ws.copy_mirror_active() {
-                            match state.clipboard.as_mut().map(|c| c.set_text(text.clone())) {
-                                Some(Ok(())) => state.show_copied_toast(&text),
-                                Some(Err(e)) => error!("写剪贴板失败: {e}"),
-                                None => log::warn!("剪贴板不可用，复制跳过"),
-                            }
-                        }
-                    }
+                    // 镜像 Shift+拖选松手**不自动复制**（海风哥 2026-07 要求去掉 copy-on-select）：
+                    // 只选中、保留高亮，复制交给 Ctrl+C / 右键。
                     // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
                     if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
                         state.remote_ws.mirror_pane_sel_end();
@@ -7293,24 +7302,8 @@ impl ApplicationHandler<PtyWake> for App {
                     // 拖选结束：停掉边缘 auto-scroll。
                     state.autoscroll_drag = 0;
                     state.autoscroll_at = None;
-                    // copy-on-select（**仅鼠标上报态**=全屏 TUI，如 Claude/vim/less）：Shift+拖选一
-                    // 松手即自动复制到剪贴板。这些程序里鼠标被上报吃掉、选取全靠 Shift 逃生，自动复制
-                    // 免去「选完还得再按 Ctrl+C / 右键」的困扰（也彻底绕开右键被吃、Ctrl+C 触发时机等
-                    // 坑）。普通 shell（未上报）**不**自动复制，避免只想选来看看却误清了剪贴板。不清
-                    // 选区：保留高亮，Ctrl+C / 右键仍可再复制。
-                    {
-                        let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
-                        let reporting = state.tabs[ti].panes[pi].term.mouse_protocol().is_on();
-                        let non_empty =
-                            state.tabs[ti].panes[pi].selection.is_some_and(|s| !s.is_empty());
-                        if reporting && non_empty {
-                            if let Some(text) =
-                                state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard)
-                            {
-                                state.show_copied_toast(&text);
-                            }
-                        }
-                    }
+                    // Shift+拖选松手**不自动复制**（海风哥 2026-07 要求去掉 copy-on-select）：
+                    // 只选中、保留高亮，复制交给 Ctrl+C / 右键。普通单击(空选区)才清块/开链接。
                     if state.focused_pane().selection.is_some_and(|s| s.is_empty()) {
                         // F10：**Ctrl+单击**落在可点击链接上 → 用系统默认
                         // 程序/浏览器打开（对齐 VSCode 终端 Ctrl+Click 惯例）。
