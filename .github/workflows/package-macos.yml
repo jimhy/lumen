@@ -11,6 +11,8 @@
 name: package-macos
 
 on:
+  push:
+    branches: [feat/cross-platform-native-parity]
   workflow_dispatch:
 
 env:
