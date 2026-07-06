@@ -41,6 +41,15 @@ arboard = "3"
 percent-encoding = "2"
 x11-clipboard = "0.9"
 wl-clipboard-rs = "0.9"
+# 会话前台进程图标（proc_icon.rs）Linux：按可执行名查 freedesktop 图标主题
+# （仅 Linux target）。macOS 走 objc2 NSWorkspace（见下 objc2 系）。
+freedesktop-icons = "0.4"
+# macOS 原生（仅 macos target）：文件剪贴板（NSPasteboard 的文件 URL）+ 进程图标
+# （NSWorkspace/NSImage）。版本对齐 arboard/winit 已解析的 objc2 0.6 系，不引新版本。
+# 具体 feature 在 lumen-app 按用到的类开启。
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2"

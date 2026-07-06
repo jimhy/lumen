@@ -311,7 +311,81 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// 从 `/proc/<pid>/stat` 内容解析父进程 PID（PPid）。stat 第 4 字段是 ppid，但第 2
+/// 字段 comm 用括号包裹且可能含空格/括号（如 `(Web Content)`）——故从**最后一个** `)`
+/// 之后再按空白切分：其后依次是 state、ppid。解析失败返回 `None`。全平台编译（Linux 用 +
+/// 三平台单测）。
+#[cfg(any(target_os = "linux", test))]
+fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
+    let after = stat.rsplit_once(')')?.1;
+    let mut it = after.split_whitespace();
+    let _state = it.next()?;
+    it.next()?.parse().ok()
+}
+
+// ── Linux：/proc 找前台子进程 + freedesktop 图标主题 ───────────────────────────
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::parse_ppid_from_stat;
+
+    pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
+        let pid = foreground_pid(shell_pid).unwrap_or(shell_pid);
+        exe_path(pid)
+    }
+
+    /// 扫 `/proc` 找 `shell_pid` 的直接子进程（前台程序）；多个取 PID 最大者（近似最近
+    /// 创建）。无子进程返回 `None`（停在提示符 → 回落 shell 自身）。
+    fn foreground_pid(shell_pid: u32) -> Option<u32> {
+        let mut best: Option<u32> = None;
+        for entry in fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue; // 非数字目录（/proc/self、/proc/cpuinfo 等）跳过
+            };
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue; // 进程可能刚退出
+            };
+            if parse_ppid_from_stat(&stat) == Some(shell_pid) {
+                best = Some(best.map_or(pid, |b| b.max(pid)));
+            }
+        }
+        best
+    }
+
+    /// `readlink /proc/<pid>/exe` 得可执行绝对路径。权限不足 / 进程已退出返回 `None`。
+    fn exe_path(pid: u32) -> Option<PathBuf> {
+        fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+
+    pub fn load_icon_rgba(exe: &Path) -> Option<super::IconRgba> {
+        // 可执行名（去扩展名）近似图标名：GUI 程序（firefox/code…）多能命中 freedesktop
+        // 图标主题；shell（bash/zsh/pwsh）通常无同名图标 → None → 上层回退自绘字形。
+        let name = exe.file_stem()?.to_str()?;
+        let icon = freedesktop_icons::lookup(name)
+            .with_size(48)
+            .with_cache()
+            .find()?;
+        // 仅解 PNG（image 已是依赖）；SVG 等矢量图暂不支持（需额外渲染器）→ None。
+        if !icon
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        {
+            return None;
+        }
+        let img = image::open(&icon).ok()?.to_rgba8();
+        Some(super::IconRgba {
+            width: img.width(),
+            height: img.height(),
+            rgba: img.into_raw(),
+        })
+    }
+}
+
+// ── 其余非 Windows（macOS / BSD）：暂空实现（macOS 的 NSWorkspace 图标后续补）─────
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     use std::path::{Path, PathBuf};
 
@@ -321,5 +395,30 @@ mod imp {
 
     pub fn load_icon_rgba(_exe: &Path) -> Option<super::IconRgba> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ppid_from_stat;
+
+    #[test]
+    fn ppid解析_常规() {
+        let stat = "1234 (bash) S 1000 1234 1234 34816 1234 4194304 123 0 0 0 1 2";
+        assert_eq!(parse_ppid_from_stat(stat), Some(1000));
+    }
+
+    #[test]
+    fn ppid解析_comm含空格和右括号() {
+        // 进程名含空格与右括号（真实存在，如 Firefox 的 "(Web Content)"）：须按最后一个
+        // ')' 切分才不被 comm 里的括号误导。
+        let stat = "42 (weird )( name) R 7 42 42 0 -1";
+        assert_eq!(parse_ppid_from_stat(stat), Some(7));
+    }
+
+    #[test]
+    fn ppid解析_残缺返回none() {
+        assert_eq!(parse_ppid_from_stat("无括号的垃圾串"), None);
+        assert_eq!(parse_ppid_from_stat("123 (x) S"), None); // 缺 ppid 字段
     }
 }
