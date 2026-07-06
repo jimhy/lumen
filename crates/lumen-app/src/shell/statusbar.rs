@@ -124,6 +124,10 @@ pub fn show(
             let (txt, color) = match link {
                 crate::remote_ws::P2pLink::Direct => (s.statusbar_link_direct, pal.accent),
                 crate::remote_ws::P2pLink::Relay => (s.statusbar_link_relay, pal.fg_dim),
+                // 断线宽限重挂中：黄色警示——画面冻结是在自动恢复而非死机。
+                crate::remote_ws::P2pLink::Reconnecting => {
+                    (s.statusbar_link_reconnecting, pal.warn)
+                }
             };
             ui.add(
                 egui::Label::new(

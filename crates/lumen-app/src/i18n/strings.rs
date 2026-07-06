@@ -461,10 +461,16 @@ pub struct Strings {
     pub remote_toast_p2p_direct: &'static str,
     /// toast：M6 P2P 已回退到中继（直连断开）
     pub remote_toast_p2p_relay: &'static str,
+    /// toast：断线宽限重挂中（连接中断，会话保留，自动重连）
+    pub remote_toast_reconnecting: &'static str,
+    /// toast：断线宽限重挂成功（会话已自动恢复）
+    pub remote_toast_restored: &'static str,
     /// 状态栏链路指示：P2P 直连（短标签）
     pub statusbar_link_direct: &'static str,
     /// 状态栏链路指示：中继转发（短标签）
     pub statusbar_link_relay: &'static str,
+    /// 状态栏链路指示：断线重挂中（短标签，黄）
+    pub statusbar_link_reconnecting: &'static str,
     /// 状态栏服务器连接指示：已连接（绿）
     pub statusbar_server_connected: &'static str,
     /// 状态栏服务器连接指示：未连接（黄，已配置地址但尚未连上/未登录）

@@ -75,6 +75,14 @@ const DIR_SERVICE_QUEUE_CAP: usize = 64;
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+/// 断线自动重挂（会话宽限恢复）：放弃前的总窗口。窗口内 WS 重连 / 对端重新上线后凭
+/// 服务端持久化的配对信任（`device_pairs`，免码直连）自动重建会话；超窗才真正拆会话。
+/// 120s ≈ 覆盖系统睡眠边缘、Wi-Fi 省电抖动、路由器重启等常见瞬断场景。
+const REATTACH_WINDOW: Duration = Duration::from_secs(120);
+/// 断线自动重挂：两次 `RequestControl` 重试的最小间隔（对端未上线时服务端回
+/// `ControlDenied{Offline}`，按此节流重试，等它回来）。实际节拍受主循环事件驱动影响
+/// （最小化时退化为约设备列表轮询周期一试），只慢不快，无风暴风险。
+const REATTACH_RETRY: Duration = Duration::from_secs(3);
 /// part3c-2 控制端在途 Fetch 的停滞超时：超过这么久没收到新块即判传输中断、清临时文件
 /// （正常传输每收一块刷新计时；仅防对端静默卡死，非总时长上限）。
 const FETCH_STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,10 +118,26 @@ pub struct IncomingControl {
 /// 活跃会话态（控制中 / 被控中）。
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
+    /// 对端设备 id（断线自动重挂时作 `RequestControl` 目标）。
+    pub peer_device_id: String,
     /// 对端设备显示名。
     pub peer_name: String,
     /// 本端角色（[`Role::Controller`] = 控制中；[`Role::Controlled`] = 被控中）。
     pub role: Role,
+}
+
+/// 断线自动重挂态（仅控制端）：WS 瞬断 / 对端掉线后**不拆会话**，凭服务端持久化的
+/// 配对信任免码自动重建（`RequestControl` 直连 → `SessionStarted` → 重订阅重建镜像）。
+/// 期间会话/镜像/订阅意图全部保留（画面冻结 + 状态栏「重连中」），[`REATTACH_WINDOW`]
+/// 内恢复则用户无感；超窗或遭非 Offline 拒绝才走真正的拆会话。
+#[derive(Debug)]
+struct Reattach {
+    /// 目标（被控端）设备 id（取自 [`ActiveSession::peer_device_id`]）。
+    target: String,
+    /// 进入重挂态时刻（超 [`REATTACH_WINDOW`] 放弃）。
+    since: Instant,
+    /// 上次发 `RequestControl` 的时刻（`None`=尚未试过，WS 一连上立即首试）。
+    last_try: Option<Instant>,
 }
 
 /// part3d Phase 3 尺寸同步：订阅会话各窗格的目标尺寸列表 `(session_id, rows, cols)`。
@@ -228,6 +252,10 @@ pub enum Notice {
     P2pDirect,
     /// M6 Phase 3：数据面已回退到中继转发（直连断开 / idle 超时）。
     P2pRelay,
+    /// 断线宽限重挂：连接中断，会话保留、正在自动重连（画面冻结提示）。
+    SessionReconnecting,
+    /// 断线宽限重挂：会话已自动恢复（免码重建 + 镜像重订阅完成）。
+    SessionRestored,
 }
 
 /// 后台线程 → 主线程事件。
@@ -399,6 +427,11 @@ pub struct RemoteWs {
     /// 任一端：数据面是否已处于直连态（去重 `DataPlaneUp`/`Down` 事件，避免重复 toast / 重订阅风暴）。
     /// 控制端据此重订阅重建镜像、被控端据此把输出切到 QUIC；两端各自维护。
     p2p_data_active: bool,
+    /// 控制端断线自动重挂态（见 [`Reattach`]）；`None`=无待重挂会话。
+    reattach: Option<Reattach>,
+    /// WS 链路当前是否在线（[`WsEvent::Connected`]/[`WsEvent::Disconnected`] 翻转）。
+    /// 重挂重试仅在在线时发出（离线发了也只是白排队）。
+    ws_up: bool,
     /// UI → 后台 出站命令发送端。
     cmd_tx: Option<Sender<RemoteC2S>>,
     /// 后台 → UI 事件接收端。
@@ -887,6 +920,8 @@ pub enum P2pLink {
     Direct,
     /// 数据面走中继转发（无直连 / 直连断后回退）。
     Relay,
+    /// 断线自动重挂中（WS 瞬断 / 对端掉线，会话保留、画面冻结，正在自动重建）。
+    Reconnecting,
 }
 
 /// 控制端状态栏文件传输进度聚合（每帧由 [`RemoteWs::transfer_status`] 算；空闲返回 `None`）。
@@ -1417,6 +1452,8 @@ impl RemoteWs {
         self.pairing = None;
         self.incoming = None;
         self.session = None;
+        self.reattach = None;
+        self.ws_up = false;
         self.mirror = None;
         self.pending_input.clear();
         self.pending_viewport = None;
@@ -1652,7 +1689,9 @@ impl RemoteWs {
         for ev in p2p_events {
             self.apply_p2p_event(ev);
         }
-        changed || p2p_changed
+        // 断线宽限重挂：退避重试 / 超窗放弃（事件驱动节拍，见 tick_reattach 文档）。
+        let reattach_changed = self.tick_reattach();
+        changed || p2p_changed || reattach_changed
     }
 
     /// 处理一条 P2P 引擎事件：发信令（转 `send_frame`→中继盲转）/ 连接建立 / 数据面切换 / 入站数据帧。
@@ -1729,10 +1768,11 @@ impl RemoteWs {
         self.incoming = None;
     }
 
-    /// 任一端：结束当前活跃会话。
+    /// 任一端：结束当前活跃会话。重挂等待中调用 = 用户主动放弃自动恢复，一并清重挂态。
     pub fn end_session(&mut self) {
         self.send(RemoteC2S::EndSession);
         self.session = None;
+        self.reattach = None;
         self.mirror = None;
         self.pending_input.clear();
         self.pending_viewport = None;
@@ -1757,7 +1797,8 @@ impl RemoteWs {
     /// （键盘路径忽略返回值即可；文件树「进入文件夹」cd 注入据此判定能否送达、
     /// 否则给用户提示而非静默无效）。
     pub fn send_input(&mut self, bytes: &[u8]) -> bool {
-        if !self.is_controlling() || bytes.is_empty() {
+        // 断线重挂中丢弃输入：画面冻结不接受操作，也不积压到重连后爆发。
+        if !self.is_controlling() || self.reattach.is_some() || bytes.is_empty() {
             return false;
         }
         let Some(tab_id) = self.subscribed_tab else {
@@ -1785,7 +1826,8 @@ impl RemoteWs {
     /// 被控端幻影按住」）。其余语义同 [`Self::send_input`]（仅控制态 + 已订阅 tab
     /// 时发出，回看态 snap 回底部）。返回是否真正发出。
     pub fn send_input_to(&mut self, session_id: SessionId, bytes: &[u8]) -> bool {
-        if !self.is_controlling() || bytes.is_empty() {
+        // 断线重挂中丢弃输入（同 send_input）。
+        if !self.is_controlling() || self.reattach.is_some() || bytes.is_empty() {
             return false;
         }
         let Some(tab_id) = self.subscribed_tab else {
@@ -2695,6 +2737,11 @@ impl RemoteWs {
     /// 会话返回 `None`（状态栏不显示链路指示）。两端各自维护，控被两端均可显示。
     #[must_use]
     pub fn p2p_link_state(&self) -> Option<P2pLink> {
+        // 断线重挂中：P2P 引擎已随断线拆除，但会话保留——显示「重连中」（黄），
+        // 让用户知道画面冻结是在自动恢复而非死机。
+        if self.reattach.is_some() {
+            return Some(P2pLink::Reconnecting);
+        }
         self.p2p.as_ref()?;
         Some(if self.p2p_data_active {
             P2pLink::Direct
@@ -2702,6 +2749,9 @@ impl RemoteWs {
             P2pLink::Relay
         })
     }
+
+    // 「重挂进行中」对 UI 的暴露走 p2p_link_state() 的 Reconnecting 三态（状态栏黄标），
+    // 不另设布尔查询（避免死码）；内部判定直接看 self.reattach。
 
     /// 控制端：清理停滞（超 [`FETCH_STALL_TIMEOUT`] 没收到新块）的在途 Fetch。
     pub fn sweep_fetch_stalls(&mut self) {
@@ -5017,25 +5067,94 @@ impl RemoteWs {
     /// 处理一条后台事件。
     fn apply(&mut self, ev: WsEvent) {
         match ev {
-            // 连接建立：presence 上线（后台线程已处理重连，主线程无需记状态）。
-            WsEvent::Connected => {}
+            // 连接建立：presence 上线（后台线程已处理重连）。有待重挂会话则立即首试
+            //（`last_try` 为 `None` 时 [`Self::tick_reattach`] 不等退避）。
+            WsEvent::Connected => {
+                self.ws_up = true;
+                self.tick_reattach();
+            }
             WsEvent::Disconnected => {
-                // 断线即丢弃进行中的配对/会话态（服务端侧亦已拆除）。
+                self.ws_up = false;
+                // 配对流程态直接丢弃（服务端侧已拆，配对需人工重走）。
                 self.pairing = None;
                 self.incoming = None;
-                self.mirror = None;
-                self.pending_input.clear();
-                self.pending_viewport = None;
-                self.pending_history.clear();
-                self.reset_history();
-                self.reset_multi_session();
-                self.clear_remote_filetree();
-                if self.session.take().is_some() {
-                    self.notices.push(Notice::SessionEnded(EndReason::PeerDisconnected));
+                // 控制端有活跃会话：进入宽限重挂而非拆除——保留会话/镜像/订阅意图
+                //（画面冻结 + 状态栏「重连中」），WS 重连后凭服务端持久化的配对信任
+                // 免码自动重建（海风哥 2026-07-06 拍板：瞬断不再要求手动重连）。
+                if self.begin_reattach() {
+                    return;
                 }
+                self.teardown_session_state(EndReason::PeerDisconnected);
             }
             WsEvent::Server(msg) => self.apply_server(*msg),
         }
+    }
+
+    /// 若当前是**控制端**活跃会话，进入（或保持）断线重挂态并返回 `true`；否则 `false`。
+    /// 已在重挂中再次触发时保持原 `since`（放弃窗口从首断算起），不重复通知。
+    /// 被控端不重挂：本地 PTY 会话不受网络影响，被控横幅随会话拆除，控制端重挂成功后
+    /// 会随新 `SessionStarted` 自动回来。
+    fn begin_reattach(&mut self) -> bool {
+        if self.reattach.is_some() {
+            return true;
+        }
+        let Some(sess) = &self.session else {
+            return false;
+        };
+        if sess.role != Role::Controller {
+            return false;
+        }
+        // 服务端侧会话已拆：P2P 引擎失去信令与对端，一并拆除（重挂成功随新会话重建）。
+        self.p2p = None;
+        self.p2p_data_active = false;
+        self.reattach = Some(Reattach {
+            target: sess.peer_device_id.clone(),
+            since: Instant::now(),
+            last_try: None,
+        });
+        self.notices.push(Notice::SessionReconnecting);
+        true
+    }
+
+    /// 拆除会话相关全部本地态（断线不可重挂 / 对端结束 / 重挂放弃共用），有活跃会话时
+    /// 按 `reason` 发 [`Notice::SessionEnded`]。不清配对流程态（`pairing`/`incoming`）——
+    /// 调用方按语境自定（断线清，对端结束保留）。
+    fn teardown_session_state(&mut self, reason: EndReason) {
+        self.reattach = None;
+        self.mirror = None;
+        self.pending_input.clear();
+        self.pending_viewport = None;
+        self.pending_history.clear();
+        self.reset_history();
+        self.reset_multi_session();
+        self.clear_remote_filetree();
+        if self.session.take().is_some() {
+            self.notices.push(Notice::SessionEnded(reason));
+        }
+    }
+
+    /// 驱动断线重挂：超 [`REATTACH_WINDOW`] 放弃拆会话；WS 在线且到退避点则发一次
+    /// `RequestControl`（服务端查 `device_pairs` 信任免码直连，成功走 `SessionStarted`
+    /// 重挂臂）。由 [`Self::poll`] 每帧与 [`WsEvent::Connected`] 驱动——`ControlFlow::Wait`
+    /// 下最小化时退化为约设备列表轮询周期一试，只慢不快。返回是否有动作（重绘用）。
+    fn tick_reattach(&mut self) -> bool {
+        let Some(ra) = &self.reattach else {
+            return false;
+        };
+        if ra.since.elapsed() >= REATTACH_WINDOW {
+            // 超窗放弃：对端一直没回来（关机/网络长断），拆会话并按对端掉线通知。
+            self.teardown_session_state(EndReason::PeerDisconnected);
+            return true;
+        }
+        if !self.ws_up || ra.last_try.is_some_and(|t| t.elapsed() < REATTACH_RETRY) {
+            return false;
+        }
+        let target = ra.target.clone();
+        if let Some(ra) = &mut self.reattach {
+            ra.last_try = Some(Instant::now());
+        }
+        self.send(RemoteC2S::RequestControl { target });
+        true
     }
 
     /// 处理一条服务端协议消息，推进配对/会话状态机。
@@ -5098,6 +5217,17 @@ impl RemoteWs {
                 }
             }
             RemoteS2C::ControlDenied { reason, .. } => {
+                // 重挂重试被拒：Offline=对端还没重连回来，静默留在重挂态等下轮退避重试
+                //（不 toast，避免每 3s 刷屏）；其它原因（信任撤销/被他人控制/跨账户等）
+                // 说明无法自动恢复——放弃重挂拆会话，并把拒因如实提示。
+                if self.reattach.is_some() {
+                    if matches!(reason, DenyReason::Offline) {
+                        return;
+                    }
+                    self.notices.push(Notice::ControlDenied(reason));
+                    self.teardown_session_state(EndReason::PeerDisconnected);
+                    return;
+                }
                 self.pairing = None;
                 self.notices.push(Notice::ControlDenied(reason));
             }
@@ -5106,17 +5236,30 @@ impl RemoteWs {
                 self.notices.push(Notice::PairingCancelled(reason));
             }
             RemoteS2C::SessionStarted {
-                peer_name, role, ..
+                peer_device_id,
+                peer_name,
+                role,
             } => {
                 self.pairing = None;
                 self.incoming = None;
+                // 断线重挂成功到达的 SessionStarted：走恢复语义（重订阅 + 「已恢复」toast）。
+                // 须校验对端一致：重挂等待期间用户手动连了**另一台**设备时，新会话按
+                // 全新会话走（旧重挂意图作废；重订阅旧 tab 打到新设备上会串会话）。
+                let was_reattach = self
+                    .reattach
+                    .take()
+                    .is_some_and(|ra| ra.target == peer_device_id);
                 let peer = peer_name.clone();
                 // 控制端：起一个无 PTY 的镜像 Terminal（被控端会随即发 Resize+快照）。
                 self.reset_history();
                 self.clear_remote_filetree();
                 self.mirror = (role == Role::Controller)
                     .then(|| Terminal::new(MIRROR_INIT_ROWS, MIRROR_INIT_COLS, MIRROR_SCROLLBACK));
-                self.session = Some(ActiveSession { peer_name, role });
+                self.session = Some(ActiveSession {
+                    peer_device_id,
+                    peer_name,
+                    role,
+                });
                 // M6：会话建立 → 启动 P2P 打洞引擎（控制端发 Offer，被控端等 Offer 回 Answer）。
                 // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。传入主线程唤醒句柄——
                 // P2P 收到数据帧后须 nudge 主线程重绘（漏传则按需重绘 UI 回显延迟数秒）。
@@ -5127,18 +5270,24 @@ impl RemoteWs {
                     self.proxy.clone(),
                     self.wake_pending.clone(),
                 ));
-                self.notices.push(Notice::SessionStarted { role, peer });
+                if was_reattach {
+                    // 重挂成功：重订阅断线前的 tab（subscribed_tab 在重挂期间特意保留），
+                    // 被控端强制重发 SubscriptionStarted → 快照重建镜像，与直连↔中继切换
+                    // 同一套恢复机制。toast 用「已自动恢复」而非「已开始控制」。
+                    self.resubscribe_after_switch();
+                    self.notices.push(Notice::SessionRestored);
+                } else {
+                    self.notices.push(Notice::SessionStarted { role, peer });
+                }
             }
             RemoteS2C::SessionEnded { reason } => {
-                self.session = None;
-                self.mirror = None;
-                self.pending_input.clear();
-                self.pending_viewport = None;
-                self.pending_history.clear();
-                self.reset_history();
-                self.reset_multi_session();
-                self.clear_remote_filetree();
-                self.notices.push(Notice::SessionEnded(reason));
+                // 对端异常掉线且本端为控制端：进入宽限重挂（对端重连回来即自动重建），
+                // 而非立即拆。对端主动结束（PeerLeft）/被新连接顶替（Replaced）等明确
+                // 意图的结束不重试。
+                if matches!(reason, EndReason::PeerDisconnected) && self.begin_reattach() {
+                    return;
+                }
+                self.teardown_session_state(reason);
             }
             // 数据面：part3a 镜像字节流 / part4 远程输入，按角色路由。
             RemoteS2C::Relay(value) => self.apply_relay(&value),
@@ -5496,6 +5645,190 @@ mod tests {
         // drop ws → P2pEngine Drop 停后台线程。
     }
 
+    // —— 断线宽限重挂（会话自动恢复，海风哥 2026-07-06 拍板）——
+
+    /// 控制中会话 + 注入出站通道，断线进入重挂态。返回 (ws, 出站接收端)。
+    fn reattaching_ws() -> (RemoteWs, std::sync::mpsc::Receiver<RemoteC2S>) {
+        let mut ws = controlling_ws();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        ws.apply(WsEvent::Disconnected);
+        (ws, rx)
+    }
+
+    #[test]
+    fn 断线_控制端进入重挂_会话保留() {
+        let (mut ws, _rx) = reattaching_ws();
+        assert!(ws.reattach.is_some(), "断线后应进入重挂态");
+        assert!(ws.session.is_some(), "会话态应保留（画面冻结显示）");
+        assert!(ws.p2p.is_none(), "P2P 引擎应随断线拆除");
+        assert_eq!(ws.p2p_link_state(), Some(P2pLink::Reconnecting));
+        assert!(
+            matches!(ws.take_notices()[..], [Notice::SessionReconnecting]),
+            "应有「重连中」通知"
+        );
+    }
+
+    #[test]
+    fn 断线_被控端不重挂_直接拆除() {
+        let mut ws = RemoteWs {
+            session: Some(ActiveSession {
+                peer_device_id: "dev-ctl".into(),
+                peer_name: "ctl".into(),
+                role: Role::Controlled,
+            }),
+            ..RemoteWs::default()
+        };
+        ws.apply(WsEvent::Disconnected);
+        assert!(ws.reattach.is_none(), "被控端不重挂（重挂由控制端负责）");
+        assert!(ws.session.is_none(), "被控端断线应拆会话");
+        assert!(matches!(
+            ws.take_notices()[..],
+            [Notice::SessionEnded(EndReason::PeerDisconnected)]
+        ));
+    }
+
+    #[test]
+    fn 重连后自动免码重发请求() {
+        let (mut ws, rx) = reattaching_ws();
+        ws.apply(WsEvent::Connected);
+        let sent = rx.try_recv().expect("重连后应立即发 RequestControl");
+        assert!(
+            matches!(sent, RemoteC2S::RequestControl { ref target } if target == "dev-peer"),
+            "目标应为断线前对端设备，实际 {sent:?}"
+        );
+    }
+
+    #[test]
+    fn 重挂中收到会话建立_恢复并重订阅() {
+        let (mut ws, rx) = reattaching_ws();
+        ws.subscribed_tab = Some(7);
+        ws.take_notices(); // 清「重连中」通知，聚焦断言恢复语义。
+        ws.apply_server(RemoteS2C::SessionStarted {
+            peer_device_id: "dev-peer".into(),
+            peer_name: "peer".into(),
+            role: Role::Controller,
+        });
+        assert!(ws.reattach.is_none(), "SessionStarted 应清重挂态");
+        assert!(
+            matches!(ws.take_notices()[..], [Notice::SessionRestored]),
+            "toast 应为「已自动恢复」而非「已开始控制」"
+        );
+        // 应自动重订阅断线前的 tab（经 Relay 帧 SubscribeSession{7} 触发被控端快照重建）。
+        let mut resub = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let RemoteC2S::Relay(v) = msg {
+                if matches!(
+                    RemoteFrame::from_value(&v),
+                    Ok(RemoteFrame::SubscribeSession { tab_id: 7 })
+                ) {
+                    resub = true;
+                }
+            }
+        }
+        assert!(resub, "应重发 SubscribeSession 重建镜像");
+    }
+
+    #[test]
+    fn 重挂中手动连接他机_按新会话走不误判恢复() {
+        let (mut ws, rx) = reattaching_ws();
+        ws.subscribed_tab = Some(7);
+        ws.take_notices();
+        // 重挂等待期间用户手动连接了另一台设备（≠ 重挂目标 dev-peer）。
+        ws.apply_server(RemoteS2C::SessionStarted {
+            peer_device_id: "dev-other".into(),
+            peer_name: "other".into(),
+            role: Role::Controller,
+        });
+        assert!(ws.reattach.is_none(), "旧重挂意图应作废");
+        assert!(
+            matches!(ws.take_notices()[..], [Notice::SessionStarted { .. }]),
+            "应按全新会话通知，而非「已恢复」"
+        );
+        // 不得把旧 tab 的 SubscribeSession 发给新设备（会串会话）。
+        while let Ok(msg) = rx.try_recv() {
+            if let RemoteC2S::Relay(v) = msg {
+                assert!(
+                    !matches!(
+                        RemoteFrame::from_value(&v),
+                        Ok(RemoteFrame::SubscribeSession { .. })
+                    ),
+                    "不应向新设备重订阅旧 tab"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 重挂中被拒_离线继续等_其它原因放弃() {
+        let (mut ws, _rx) = reattaching_ws();
+        ws.take_notices();
+        ws.apply_server(RemoteS2C::ControlDenied {
+            target_device_id: "dev-peer".into(),
+            reason: DenyReason::Offline,
+        });
+        assert!(ws.reattach.is_some(), "Offline=对端还没回来，应继续等");
+        assert!(ws.take_notices().is_empty(), "Offline 重试不应刷 toast");
+        ws.apply_server(RemoteS2C::ControlDenied {
+            target_device_id: "dev-peer".into(),
+            reason: DenyReason::AlreadyControlled,
+        });
+        assert!(ws.reattach.is_none(), "非 Offline 拒因应放弃重挂");
+        assert!(ws.session.is_none(), "放弃后应拆会话");
+    }
+
+    #[test]
+    fn 重挂超窗_放弃拆会话() {
+        let (mut ws, _rx) = reattaching_ws();
+        ws.take_notices();
+        // 构造「已过窗」的进入时刻。单调钟起点过近（刚开机的 CI）时无法构造，跳过——
+        // 该分支逻辑简单且其余运行会覆盖。
+        let Some(past) = Instant::now().checked_sub(REATTACH_WINDOW + Duration::from_secs(1))
+        else {
+            return;
+        };
+        if let Some(ra) = &mut ws.reattach {
+            ra.since = past;
+        }
+        assert!(ws.tick_reattach(), "超窗应触发拆除动作");
+        assert!(ws.reattach.is_none());
+        assert!(ws.session.is_none(), "超窗应放弃并拆会话");
+        assert!(matches!(
+            ws.take_notices()[..],
+            [Notice::SessionEnded(EndReason::PeerDisconnected)]
+        ));
+    }
+
+    #[test]
+    fn 对端掉线_控制端进入重挂_主动结束不重挂() {
+        // 对端异常掉线（PeerDisconnected）：进入重挂等它回来。
+        let mut ws = controlling_ws();
+        ws.apply_server(RemoteS2C::SessionEnded {
+            reason: EndReason::PeerDisconnected,
+        });
+        assert!(ws.reattach.is_some(), "对端掉线应进重挂");
+        assert!(ws.session.is_some(), "会话态应保留");
+        // 对端主动结束（PeerLeft）：明确意图，不重挂。
+        let mut ws2 = controlling_ws();
+        ws2.apply_server(RemoteS2C::SessionEnded {
+            reason: EndReason::PeerLeft,
+        });
+        assert!(ws2.reattach.is_none());
+        assert!(ws2.session.is_none());
+    }
+
+    #[test]
+    fn 重挂中输入被丢弃() {
+        let (mut ws, rx) = reattaching_ws();
+        ws.subscribed_tab = Some(1);
+        ws.mirror_focus_sid = Some(2);
+        assert!(!ws.send_input(b"ls\n"), "重挂中输入应被丢弃（不积压不发送）");
+        assert!(rx.try_recv().is_err(), "不应有出站帧");
+        // 对照：清掉重挂态后同样输入应正常发出（证明上面确为重挂守卫所拦）。
+        ws.reattach = None;
+        assert!(ws.send_input(b"ls\n"), "无重挂时同样输入应发出");
+    }
+
     #[test]
     fn build_list_dir_recursive_reply_缺失路径回err() {
         let missing = std::env::temp_dir().join("lumen_dirsvc_nonexistent_xyz_42");
@@ -5665,6 +5998,7 @@ mod tests {
         // start_download 守卫 is_controlling：测试需置控制中会话。
         let mut ws = RemoteWs {
             session: Some(ActiveSession {
+                peer_device_id: "dev-peer".into(),
                 peer_name: "peer".into(),
                 role: Role::Controller,
             }),
@@ -5705,6 +6039,7 @@ mod tests {
     fn 下载_不覆盖时跳过已存在() {
         let mut ws = RemoteWs {
             session: Some(ActiveSession {
+                peer_device_id: "dev-peer".into(),
                 peer_name: "peer".into(),
                 role: Role::Controller,
             }),
@@ -5855,6 +6190,7 @@ mod tests {
     fn controlling_ws() -> RemoteWs {
         RemoteWs {
             session: Some(ActiveSession {
+                peer_device_id: "dev-peer".into(),
                 peer_name: "peer".into(),
                 role: Role::Controller,
             }),
