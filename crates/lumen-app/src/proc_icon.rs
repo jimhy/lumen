@@ -390,7 +390,8 @@ mod imp {
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSImageRep, NSWorkspace};
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSWorkspace};
     use objc2_foundation::NSString;
 
     // libproc（macOS libSystem 内，默认链接）：查子进程 / 取进程可执行路径。
@@ -446,10 +447,8 @@ mod imp {
             let image = ws.iconForFile(&path);
             image.TIFFRepresentation()?
         };
-        // TIFF → NSBitmapImageRep（imageRepWithData 对 TIFF 返回位图 rep，downcast 取具体类型）。
-        let rep = unsafe { NSImageRep::imageRepWithData(&tiff) }?
-            .downcast::<NSBitmapImageRep>()
-            .ok()?;
+        // TIFF → NSBitmapImageRep（alloc + initWithData；对 TIFF 数据构造位图 rep）。
+        let rep = unsafe { NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &tiff) }?;
         bitmap_to_rgba(&rep)
     }
 
