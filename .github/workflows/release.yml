@@ -1,20 +1,26 @@
 # Lumen 发版流水（F3 热更分发用，需求池 F3）。
 #
 # 触发：push 形如 `v0.2.0` 的 tag。
-# 产物：dist\Lumen-Setup-<version>.exe（Inno Setup 安装包），作为资产传到
-#       同名 GitHub Release——客户端 update.rs 查 `jimhy/lumen` 的 latest
-#       Release、下载本 .exe 完成自替换更新。
+# 产物（挂到同名 GitHub Release）：
+#   - Windows：dist\Lumen-Setup-<version>.exe（Inno Setup 安装包）——客户端
+#     update.rs 查 `jimhy/lumen` 的 latest Release、下载本 .exe 完成自替换更新。
+#   - Linux：Lumen-<version>-linux-x86_64.tar.gz（任意发行版通用）+ *.deb
+#     （Debian/Ubuntu）。**实验性**：CI 绿只证明编译打包成功，GPU/渲染运行时
+#     需真机验证；Linux 不走自更新（update.rs 在非 Windows 直接 UpToDate），
+#     仅供手动下载安装。
+#   - macOS：暂未纳入（打包脚本待补，后续单独接入）。
 #
-# 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。本工作流是
-# scripts\release.ps1 的 CI 等价物：同一条 改版本号 → release 构建 →
-# Inno 打包 → 发 Release 链路，差别仅在「谁来跑」。
+# 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。Windows 部分是
+# scripts\release.ps1 的 CI 等价物：改版本号 → release 构建 → Inno 打包 → 发
+# Release；Linux 部分复用 package-linux.yml 的打包逻辑。
 #
 # 一次性发版流程：
 #   1) 本地把 Cargo.toml 版本号 bump 到目标版本、提交。
 #   2) git tag v<版本> && git push origin v<版本>
-#   3) 本工作流自动构建打包并创建 GitHub Release。
-# （CI 会按 tag 再校正一次 Cargo.toml 版本号，纵使忘了 bump 也能保证
-#  exe 内嵌的 CARGO_PKG_VERSION 与 tag 一致，否则客户端版本比较会失灵。）
+#   3) 本工作流自动构建打包：Windows 先建 Release 并附 exe，Linux 随后把
+#      tarball / .deb 追加到同一 Release。
+# （CI 会按 tag 再校正一次 Cargo.toml 版本号，纵使忘了 bump 也能保证二进制
+#  内嵌的 CARGO_PKG_VERSION 与 tag 一致，否则客户端版本比较会失灵。）
 
 name: release
 
@@ -118,3 +124,102 @@ jobs:
           name: Lumen ${{ github.ref_name }}
           body_path: ${{ steps.notes.outputs.path }}
           files: dist/Lumen-Setup-${{ steps.ver.outputs.version }}.exe
+
+  # ── Linux：通用 tarball + .deb，追加到 Windows 已建好的同名 Release ──────────
+  # needs: release —— 等 Windows job 把 Release 建好再追加资产（避免并发建 Release
+  # 竞争），且本 job 失败不影响已发布的 Windows 包（Linux 是增量资产）。打包逻辑
+  # 与 package-linux.yml 一致；ubuntu-22.04：glibc 2.35 + 无 t64 包名，兼容面最广。
+  linux:
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖（X11 / Wayland / GTK / xkb / 等宽字体）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            pkg-config fonts-dejavu-core
+
+      - uses: dtolnay/rust-toolchain@stable
+      # 独立缓存 key，与 ci.yml 的笼统 Linux 缓存隔离（避免 24.04 glibc 2.39
+      # 产物污染 22.04，见 package-linux.yml 注释）。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-2204
+
+      # tag 去 v 前缀作版本号，并校正根 Cargo.toml 行首 version（与 Windows job
+      # 同款语义，保证二进制内嵌 CARGO_PKG_VERSION == tag）。
+      - name: 推导版本号并校正 Cargo.toml
+        id: ver
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag '$GITHUB_REF_NAME' 不是 v<major>.<minor>.<patch> 形态" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # 只改行首 version（workspace.package），内联依赖 version 不误伤。
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml
+          echo "版本号 → $version"
+
+      - name: 构建 release 二进制
+        run: cargo build --release -p lumen-app
+
+      # 保底产物：通用 tarball（几乎不会失败）。命名带版本号，与 Windows 对齐。
+      - name: 打通用 tarball
+        run: |
+          mkdir -p dist
+          cp target/release/lumen dist/lumen
+          cp README.md dist/ 2>/dev/null || true
+          cat > dist/运行说明.txt <<'EOF'
+          Lumen —— Linux 通用构建
+
+          运行需系统安装以下运行库（按发行版选一条）：
+            Debian/Ubuntu:
+              sudo apt install libgtk-3-0 libxcb1 libxcb-render0 libxcb-shape0 \
+                libxcb-xfixes0 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 \
+                libvulkan1 libgl1 libegl1 fonts-dejavu-core
+            Fedora:
+              sudo dnf install gtk3 libxcb libxkbcommon libxkbcommon-x11 wayland-libs-client \
+                vulkan-loader mesa-libGL mesa-libEGL dejavu-sans-mono-fonts
+            Arch:
+              sudo pacman -S gtk3 libxcb libxkbcommon libxkbcommon-x11 wayland \
+                vulkan-icd-loader mesa ttf-dejavu
+
+          然后：  chmod +x lumen && ./lumen
+          配置/会话/历史落在 ~/.local/share/Lumen/（release）。
+          EOF
+          tar -czf "Lumen-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz" -C dist .
+          ls -la "Lumen-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz"
+
+      # Debian/Ubuntu 安装包（best-effort：cargo-deb 若失败不阻塞，仍发 tarball）。
+      - name: 安装 cargo-deb
+        run: cargo install cargo-deb --locked
+        continue-on-error: true
+
+      - name: 打 .deb（默认输出 target/debian/*.deb）
+        id: deb
+        run: cargo deb -p lumen-app --no-build
+        continue-on-error: true
+
+      # 把 Linux 产物追加到 Windows 已建好的同名 Release（--clobber：重发同 tag
+      # 时覆盖旧资产）。tarball 必传（保底），.deb 存在才传。
+      - name: 上传 Linux 产物到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tarball="Lumen-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz"
+          gh release upload "$GITHUB_REF_NAME" "$tarball" --clobber
+          echo "已上传 tarball：$tarball"
+          deb=$(ls target/debian/*.deb 2>/dev/null | head -n1 || true)
+          if [ -n "$deb" ]; then
+            gh release upload "$GITHUB_REF_NAME" "$deb" --clobber
+            echo "已上传 .deb：$deb"
+          else
+            echo "::warning::未生成 .deb（cargo-deb 失败？），本次仅发布 tarball"
+          fi
