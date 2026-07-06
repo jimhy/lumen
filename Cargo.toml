@@ -33,6 +33,14 @@ lumen-protocol = { path = "crates/lumen-protocol" }
 
 anyhow = "1"
 arboard = "3"
+# Linux 文件剪贴板（clipboard_files.rs 的 Linux 实现）：与文件管理器互通的
+# text/uri-list。arboard 只管纯文本，故 X11/Wayland 各引专用 crate（仅 Linux
+# target 编译）：X11 用 x11-clipboard（进程内常驻 selection owner 持续 serve），
+# Wayland 用 wl-clipboard-rs。percent-encoding 做 file:// URI 路径转义（纯逻辑，
+# 已是传递依赖，全平台编译供单测）。
+percent-encoding = "2"
+x11-clipboard = "0.9"
+wl-clipboard-rs = "0.9"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2"
