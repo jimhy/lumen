@@ -61,6 +61,9 @@ fn parse_leading_u32(s: &str) -> Option<u32> {
 }
 
 /// 当前运行版本（编译期 `CARGO_PKG_VERSION`）。
+/// 仅 Windows 更新检查用（非 Windows [`check_for_update`] 直接返回 UpToDate，
+/// 无需比对版本），故 windows-only，避免非 Windows 上「函数从未使用」告警。
+#[cfg(windows)]
 pub fn current_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version {
         major: 0,
@@ -120,6 +123,10 @@ pub fn should_auto_check(last: Option<u64>, now: u64, min_interval_ms: u64) -> b
 /// GitHub Release 结构含 `tag_name` / `body` / `assets[]`（每项有 `name` +
 /// `browser_download_url`）。无 `.exe` 资产时回退取第一个资产；完全无资产
 /// 或无 tag 返回 None。
+/// 仅 Windows 更新检查（[`fetch_release`]）+ 单测用；非 Windows 非测试构建
+/// 用不到（[`check_for_update`] 直接返回 UpToDate），故 `any(windows, test)`
+/// 门控，避免 Linux/macOS release 构建「函数从未使用」告警。
+#[cfg(any(windows, test))]
 pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let tag = v.get("tag_name")?.as_str()?.to_owned();
@@ -153,6 +160,8 @@ pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
 }
 
 /// [`parse_release_json`] 的中间结果（下载地址可能缺失）。
+/// 与 [`parse_release_json`] 同门控（仅 Windows + 测试）。
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRelease {
     pub version: Version,
@@ -213,6 +222,11 @@ fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> 
 }
 
 /// 更新检查结果。
+///
+/// 非 Windows 上 [`check_for_update`] 只构造 `UpToDate`，`Newer`/`Failed` 仅
+/// 在 `main.rs` 被模式匹配、从不构造 → 「variant never constructed」告警；但
+/// 两变体又必须保留（否则 main.rs 的 match 编译不过），故非 Windows 抑制该告警。
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     /// 有新版本。
