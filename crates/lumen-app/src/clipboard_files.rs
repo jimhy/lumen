@@ -373,33 +373,55 @@ mod macos {
     }
 
     /// 读剪贴板里的文件（NSURL → 本地路径），仅取文件 URL（排除 http 等）。无 / 失败返回空列表。
+    /// 用 autoreleasepool 包住：本函数（经 has_files）可能被 UI 高频调用，及时释放
+    /// readObjectsForClasses 产生的 NSArray/NSURL 等 autoreleased 对象，避免累积涨内存。
     pub fn paste_files() -> Vec<PathBuf> {
-        let Some(pb) = pasteboard() else {
-            return Vec::new();
-        };
-        let class_array = NSArray::from_slice(&[NSURL::class()]);
-        // 不传 fileURLsOnly 选项（省去 NSDictionary 类型匹配），改用 isFileURL 过滤。
-        let objects = unsafe { pb.readObjectsForClasses_options(&class_array, None) };
-        objects
-            .map(|array| {
-                array
-                    .iter()
-                    .filter_map(|obj| {
-                        let url = obj.downcast::<NSURL>().ok()?;
-                        if unsafe { url.isFileURL() } {
-                            unsafe { url.path() }.map(|p| PathBuf::from(p.to_string()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        objc2::rc::autoreleasepool(|_| {
+            let Some(pb) = pasteboard() else {
+                return Vec::new();
+            };
+            let class_array = NSArray::from_slice(&[NSURL::class()]);
+            // 不传 fileURLsOnly 选项（省去 NSDictionary 类型匹配），改用 isFileURL 过滤。
+            let objects = unsafe { pb.readObjectsForClasses_options(&class_array, None) };
+            objects
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|obj| {
+                            let url = obj.downcast::<NSURL>().ok()?;
+                            if unsafe { url.isFileURL() } {
+                                unsafe { url.path() }.map(|p| PathBuf::from(p.to_string()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
     }
 
-    /// 剪贴板是否有文件。复用 `paste_files`（NSPasteboard 读取是本地快调用，非跨进程往返）。
+    /// 剪贴板是否有文件。文件树 UI 每帧调用（TUI 忙时更是 ~30fps 连续渲染）→ 300ms
+    /// 缓存，避免每帧读 NSPasteboard（频繁读累积 objc 临时对象 + 占 CPU）。
     pub fn has_files() -> bool {
-        !paste_files().is_empty()
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+        fn cache() -> &'static Mutex<Option<(Instant, bool)>> {
+            static C: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
+            C.get_or_init(|| Mutex::new(None))
+        }
+        if let Ok(g) = cache().lock() {
+            if let Some((t, v)) = *g {
+                if t.elapsed() < Duration::from_millis(300) {
+                    return v;
+                }
+            }
+        }
+        let v = !paste_files().is_empty();
+        if let Ok(mut g) = cache().lock() {
+            *g = Some((Instant::now(), v));
+        }
+        v
     }
 }
 

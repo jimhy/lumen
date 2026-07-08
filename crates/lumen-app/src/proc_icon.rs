@@ -439,17 +439,20 @@ mod imp {
     }
 
     pub fn load_icon_rgba(exe: &Path) -> Option<super::IconRgba> {
-        let path = NSString::from_str(exe.to_str()?);
-        // NSWorkspace 对任意存在文件都返回图标（无专属图标则给通用可执行图标）。
-        // SAFETY: 均为标准 AppKit 只读调用；NSWorkspace/NSImage 线程安全，本函数在 UI 线程调用。
-        let tiff = unsafe {
-            let ws = NSWorkspace::sharedWorkspace();
-            let image = ws.iconForFile(&path);
-            image.TIFFRepresentation()?
-        };
-        // TIFF → NSBitmapImageRep（alloc + initWithData；对 TIFF 数据构造位图 rep）。
-        let rep = unsafe { NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &tiff) }?;
-        bitmap_to_rgba(&rep)
+        // autoreleasepool 包住：及时释放 TIFF NSData（较大）等 autoreleased 对象。
+        objc2::rc::autoreleasepool(|_| {
+            let path = NSString::from_str(exe.to_str()?);
+            // NSWorkspace 对任意存在文件都返回图标（无专属图标则给通用可执行图标）。
+            // SAFETY: 均为标准 AppKit 只读调用；NSWorkspace/NSImage 线程安全，本函数在 UI 线程调用。
+            let tiff = unsafe {
+                let ws = NSWorkspace::sharedWorkspace();
+                let image = ws.iconForFile(&path);
+                image.TIFFRepresentation()?
+            };
+            // TIFF → NSBitmapImageRep（alloc + initWithData；对 TIFF 数据构造位图 rep）。
+            let rep = unsafe { NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &tiff) }?;
+            bitmap_to_rgba(&rep)
+        })
     }
 
     /// NSBitmapImageRep → top-down RGBA8。仅处理常见 32bpp / 4 通道 / 非平面；其余返回
