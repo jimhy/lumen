@@ -38,6 +38,9 @@ mod keymap;
 /// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
 mod links;
 mod mode;
+/// unix：从系统读 shell 进程实时 cwd（bash/zsh 无 OSC 9;9 cwd 上报时文件树的兜底）。
+#[cfg(unix)]
+mod os_cwd;
 /// 应用数据目录解析（单一真源）：按构建类型隔离 debug/release 的持久化数据。
 mod paths;
 /// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
@@ -5113,15 +5116,23 @@ impl App {
                 .with_window_icon(window_icon)
                 .with_taskbar_icon(taskbar_icon)
         };
-        #[cfg(not(target_os = "windows"))]
+        // macOS：保留原生装饰（红黄绿交通灯）。自绘 × 在 mac 上点击命中不可靠（真机
+        // 实测关不掉），且原生窗口管理更符合 mac 习惯；topbar 在 mac 上不再画自绘窗控
+        // 按钮（避免与交通灯双套）。不强制最大化、不无边框——排除「无边框+maximized」
+        // 在 Metal 上的 surface 尺寸/渲染怪象（残影排查）。
+        #[cfg(target_os = "macos")]
+        let attrs = Window::default_attributes()
+            .with_title("Lumen")
+            .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
+            .with_visible(false)
+            .with_window_icon(window_icon);
+        // Linux/其它 unix：无边框 + 自绘顶栏作唯一标题栏（消除双标题栏，已真机验证）。
+        // 移动走顶栏 drag_window、缩放走 resize_edge_dir + drag_resize_window（winit 跨平台）。
+        #[cfg(all(unix, not(target_os = "macos")))]
         let attrs = Window::default_attributes()
             .with_title("Lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
             .with_maximized(true)
-            // 无边框：自绘顶栏作为唯一标题栏（与 Windows 一致），消除
-            // 「系统标题栏 + 自绘顶栏」双栏 + 双套窗控按钮。移动走顶栏
-            // drag_window、缩放走 resize_edge_dir + drag_resize_window（均 winit
-            // 跨平台）。若某些 compositor 不认，WM 的 Alt+拖动仍可移动窗口。
             .with_decorations(false)
             // 隐藏创建，init 末尾铺底色帧后再显示（消白闪，见 init 收尾）。
             .with_visible(false)
@@ -7922,11 +7933,23 @@ impl ApplicationHandler<PtyWake> for App {
                 let was_pane_renaming = state.shell_state.pane_renaming.is_some();
                 // 文件树输入：焦点窗格的 cwd（OSC 9;9 上报）与空闲态
                 // （cd 注入闸门，见 Terminal::shell_waiting_input）。
-                let active_cwd = tab
+                // 焦点窗格 cwd：先取 OSC 9;9 上报值（Windows shell 集成）。
+                let osc_cwd = tab
                     .focused_pane()
                     .term
                     .cwd()
                     .map(std::path::Path::to_path_buf);
+                // unix：OSC 9;9 未上报（bash/zsh 无集成）→ 读 shell 进程实时 cwd 兜底
+                // （cd 后由 filetree::sync_root 变化检测触发重载）。
+                #[cfg(unix)]
+                let active_cwd = osc_cwd.or_else(|| {
+                    tab.focused_pane()
+                        .pty
+                        .shell_pid()
+                        .and_then(os_cwd::shell_cwd)
+                });
+                #[cfg(not(unix))]
+                let active_cwd = osc_cwd;
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 // 背景图参数（P13）：仅当纹理已加载且 settings 启用时传入。
                 // 同时检查 enabled：用户本帧拨动开关关闭后，bg_texture 清空在

@@ -180,13 +180,26 @@ impl Renderer {
         } else {
             wgpu::PresentMode::AutoVsync
         };
+        // 不透明窗口：优先 Opaque。某些后端（尤其 macOS/Metal）alpha_modes[0] 可能是
+        // PreMultiplied/PostMultiplied/Inherit，一旦窗口内容含非 1.0 alpha（文本抗锯齿边缘/
+        // 光标/纹理边），合成器按透明混合 → 桌面从半透明区透出（灰块）、光标移动留拖尾
+        // （Windows/DX12 的 alpha_modes[0]=Opaque 恰好规避了）。显式选 Opaque 让合成忽略
+        // alpha 通道；无 Opaque 时回退首个（不改变原行为）。
+        let alpha_mode = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::Opaque)
+        {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: width.max(1),
             height: height.max(1),
             present_mode,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
