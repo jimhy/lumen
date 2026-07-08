@@ -38,6 +38,9 @@ mod keymap;
 /// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
 mod links;
 mod mode;
+/// unix：从系统读 shell 进程实时 cwd（bash/zsh 无 OSC 9;9 cwd 上报时文件树的兜底）。
+#[cfg(unix)]
+mod os_cwd;
 /// 应用数据目录解析（单一真源）：按构建类型隔离 debug/release 的持久化数据。
 mod paths;
 /// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
@@ -7927,11 +7930,23 @@ impl ApplicationHandler<PtyWake> for App {
                 let was_pane_renaming = state.shell_state.pane_renaming.is_some();
                 // 文件树输入：焦点窗格的 cwd（OSC 9;9 上报）与空闲态
                 // （cd 注入闸门，见 Terminal::shell_waiting_input）。
-                let active_cwd = tab
+                // 焦点窗格 cwd：先取 OSC 9;9 上报值（Windows shell 集成）。
+                let osc_cwd = tab
                     .focused_pane()
                     .term
                     .cwd()
                     .map(std::path::Path::to_path_buf);
+                // unix：OSC 9;9 未上报（bash/zsh 无集成）→ 读 shell 进程实时 cwd 兜底
+                // （cd 后由 filetree::sync_root 变化检测触发重载）。
+                #[cfg(unix)]
+                let active_cwd = osc_cwd.or_else(|| {
+                    tab.focused_pane()
+                        .pty
+                        .shell_pid()
+                        .and_then(os_cwd::shell_cwd)
+                });
+                #[cfg(not(unix))]
+                let active_cwd = osc_cwd;
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 // 背景图参数（P13）：仅当纹理已加载且 settings 启用时传入。
                 // 同时检查 enabled：用户本帧拨动开关关闭后，bg_texture 清空在
