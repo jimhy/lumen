@@ -1,8 +1,13 @@
-//! 顶栏（M3.5 / M3.8 / 问题1 修复 / R8）：
-//! - 左端（LTR）：①侧栏 ②文件树 ③还原窗格 三按钮（紧贴左缘，组前留 10px）
-//! - 右端（RTL）：关闭 / 最大化还原 / 最小化 / 头像 / 「＋」
+//! 顶栏（M3.5 / M3.8 / 问题1 修复 / R8 / F12 批1）：
+//! - 左端（LTR）：本地/远程视图 tab（M5.2）
+//! - 右端（RTL）：关闭 / 最大化还原 / 最小化 / 头像
 //! - 中间剩余空白：拖动区（drag / 双击 / 右键语义不变）
 //! - 标题文字已删除（R8 海风哥点名去掉路径标题）
+//!
+//! F12 批1 变更：原左端①侧栏 ②文件树 ③还原窗格三按钮与右端「＋」
+//! 新增窗格按钮迁往标题栏之下的应用工具栏（见 [`super::toolbar`]，
+//! 图标绘制函数一并迁走）；顶栏只留拖动区 + 头像 + 窗控三按钮，
+//! 拖动/双击/右键/Snap Layouts 热区语义不变。
 //!
 //! 问题1 修复（RTL 布局 cursor().min bug）：
 //! - 原实现用 `allocate_rect(Rect::from_min_size(cursor().min, …))` 手工构造矩形，
@@ -10,16 +15,6 @@
 //!   按钮全部叠画在面板左端、顶栏内容消失。
 //! - 修复：一律用 `allocate_exact_size(vec2(W, H), Sense::click())` 让布局引擎
 //!   自动放置（RTL 下靠右排、左移 cursor），painter 按返回 rect 画图。
-//!
-//! R8 图标精绘（统一 codicon 族系几何）：
-//! - ①侧栏：圆角外框 18×14 + 左 1/3 竖分隔线；可见态左舱填充。
-//! - ②文件树：竖干 + 三横枝树形（无外框，横枝长 9/6.5/4 层次分明）。
-//! - ③还原窗格：圆角外框 16×14 + 内部十字分隔（田字）。
-//!
-//! 统一规格：线宽 1.2，热区 28×26，组左缘距 10，组内间距 4。
-//!
-//! R8.2 变更：图标视觉盒从 ~16×12 扩到 ~18×14；按钮间距 2→4；
-//! 树形横枝长度差拉大为 9/6.5/4（高 DPI 下层次可辨）。
 //!
 //! M3.8 变更：
 //! - 窗口无边框后，窗控三按钮并入顶栏右端（Warp/VSCode 形态）。
@@ -32,11 +27,10 @@
 //! （灰字不可点）/ Settings / Keyboard shortcuts / Documentation
 //! （灰显占位）/ 分隔线 / Log out；未登录：Log in / Settings /
 //! Keyboard shortcuts。UI 只产出动作（[`TopbarOutput`]），登录/登出
-//! 与设置页打开/增窗格/窗口操作由上层执行。
+//! 与设置页打开/窗口操作由上层执行。
 
 use crate::i18n;
 use crate::profile::Profile;
-use crate::session::MAX_PANES;
 
 use super::theme::Palette;
 
@@ -45,12 +39,11 @@ use super::theme::Palette;
 pub const HEIGHT: f32 = 34.0;
 /// 窗控按钮热区宽度（逻辑像素，参考 Win11 约 46 × 34）。
 const WC_BTN_W: f32 = 46.0;
-/// 视图切换按钮热区宽度 × 高度（逻辑像素，R8：28×26）。
-const VIEW_BTN_W: f32 = 28.0;
+/// 视图 tab 热区高度（逻辑像素，R8：26）。
 const VIEW_BTN_H: f32 = 26.0;
-/// 左端按钮组前缘内边距。
+/// 左端内容前缘内边距。
 const LEFT_GROUP_MARGIN: f32 = 10.0;
-/// 按钮组内间距（R8.2：2→4，增强分组感）。
+/// 左端内容间距（R8.2：2→4，增强分组感）。
 const VIEW_BTN_GAP: f32 = 4.0;
 /// 头像直径。
 const AVATAR_SIZE: f32 = 24.0;
@@ -78,10 +71,6 @@ pub struct TopbarOutput {
     pub open_feedback: bool,
     /// 点击了 Log out。
     pub log_out: bool,
-    /// 点击了「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
-    pub new_pane: bool,
-    /// 点击了③还原窗格大小按钮（原「▦」功能，问题7迁入）。
-    pub reset_layout: bool,
     // ── M3.8 窗口控制信号 ──────────────────────────────────────────────
     /// 拖动了顶栏空白区——main 调 window.drag_window()。
     pub drag_title_bar: bool,
@@ -97,11 +86,7 @@ pub struct TopbarOutput {
     /// 子类化用）：main 换算为屏幕物理像素后写入 snap_layouts 原子。
     /// 按钮不可见（极端情况）时为 None，main 跳过本帧更新。
     pub maximize_btn_rect: Option<egui::Rect>,
-    // ── 三视图切换信号 ───────────────────────────────────────────────
-    /// 切换会话栏显示/隐藏（点击①按钮）。None = 未点击，Some(v) = 新可见值。
-    pub toggle_sidebar: Option<bool>,
-    /// 切换文件树显示/隐藏（点击②按钮，与 Ctrl+B 同状态源）。None = 未点击，Some(v) = 新可见值。
-    pub toggle_filetree: Option<bool>,
+    // ── 视图切换信号 ─────────────────────────────────────────────────
     /// 切换本地/远程视图（点击顶栏「本地/远程」tab，M5.2）。
     /// None = 未点击，Some(false) = 本地，Some(true) = 远程。
     pub toggle_view_mode: Option<bool>,
@@ -109,10 +94,6 @@ pub struct TopbarOutput {
 
 /// 顶栏额外状态（打包传入 [`show`]，避免参数列表超过 clippy 7 参数限制）。
 pub struct ViewState {
-    /// 会话栏（①）当前是否可见。
-    pub sidebar_visible: bool,
-    /// 文件树（②）当前是否可见（与 Ctrl+B 同状态源）。
-    pub filetree_visible: bool,
     /// 头像菜单更新项：Some(版本号) = 有就绪更新（显示「更新到 vX」强调项），
     /// None = 无更新（显示「检查更新」）。
     pub update_version: Option<String>,
@@ -123,17 +104,16 @@ pub struct ViewState {
     pub need_relogin: bool,
 }
 
-/// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
+/// 绘制顶栏（全宽窄条；须先于工具栏/侧栏加入面板布局才能横贯整窗
+/// 且居于最顶）。
 ///
 /// # 参数
 /// - `title`：激活会话标题（R8 已不显示，仅保留参数兼容，未来可用于 OS 窗口标题）。
-/// - `pane_count`：激活 tab 当前窗格数（「＋」按钮满额禁用判定）。
 /// - `is_maximized`：窗口当前是否最大化（切换最大化/还原图标）。
-/// - `view`：三视图切换按钮的当前可见态（①会话栏 / ②文件树）。
+/// - `view`：头像菜单/视图 tab 的当前状态。
 pub fn show(
     root: &mut egui::Ui,
     title: &str,
-    pane_count: usize,
     profile: Option<&Profile>,
     pal: &Palette,
     is_maximized: bool,
@@ -151,9 +131,9 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(0, 0)),
         )
         .show_inside(root, |ui| {
-            // 布局策略（R8）：
-            //   右端：RTL 布局分配窗控/头像/「＋」各按钮。
-            //   左端：在余下空间内用 LTR 子布局放三视图按钮组。
+            // 布局策略（R8 / F12 批1 后）：
+            //   右端：RTL 布局分配窗控三按钮 + 头像。
+            //   左端：在余下空间内用 LTR 子布局放本地/远程视图 tab。
             //   中间：剩余矩形作为拖动区（drag/双击/右键语义不变）。
             //
             // 关键：一律用 allocate_exact_size(vec2(W, H), Sense::click()) 让布局
@@ -295,8 +275,13 @@ pub fn show(
 
                 // ── 头像（紧贴窗控左侧，加右内边距 10px）──────────────────
                 ui.add_space(10.0);
-                let resp =
-                    avatar_button(ui, profile, pal, view.update_version.is_some(), view.need_relogin);
+                let resp = avatar_button(
+                    ui,
+                    profile,
+                    pal,
+                    view.update_version.is_some(),
+                    view.need_relogin,
+                );
                 let update_version = view.update_version.as_deref();
                 let need_relogin = view.need_relogin;
                 let _ = egui::Popup::menu(&resp)
@@ -305,28 +290,15 @@ pub fn show(
                     .show(|ui| menu_ui(ui, profile, pal, update_version, need_relogin, &mut out));
                 ui.add_space(6.0);
 
-                // 「＋」新增窗格（F5）：满 MAX_PANES 时禁用 + 悬停提示。
-                let plus =
-                    egui::Button::new(egui::RichText::new("＋").size(15.0).color(pal.fg_dim))
-                        .min_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE));
-                let presp = ui
-                    .add_enabled(pane_count < MAX_PANES, plus)
-                    .on_hover_text(s.topbar_new_pane_tip)
-                    .on_disabled_hover_text(i18n::fmt1(s.topbar_max_panes_fmt, MAX_PANES));
-                if presp.clicked() {
-                    out.new_pane = true;
-                }
-                ui.add_space(6.0);
-
-                // ── 左端三视图按钮组（R8：移到最左；LTR 子布局占满余下左端空间）
-                // 中间剩余空白区作为拖动区。
-                // RTL 布局在此处 cursor 已经是右端按钮左侧；用 available_rect_before_wrap
-                // 取整个余下区域，然后在里面画两层：
-                //   1. LTR 子 ui 在左端按钮组
+                // ── 左端本地/远程 tab（M5.2；F12 批1 后左端仅剩它们，
+                // 原三视图按钮组已迁往应用工具栏）。中间剩余空白区作为
+                // 拖动区。RTL 布局在此处 cursor 已经是右端按钮左侧；用
+                // available_rect_before_wrap 取整个余下区域，然后在里面画两层：
+                //   1. LTR 子 ui 在左端放视图 tab
                 //   2. interact 覆盖整个余下矩形作为拖动区
                 let remaining = ui.available_rect_before_wrap();
 
-                // 拖动区（双击/右键/拖动感知）——覆盖余下整个空白，含三视图按钮之间区域
+                // 拖动区（双击/右键/拖动感知）——覆盖余下整个空白，含视图 tab 之间区域
                 let drag_resp = ui.interact(
                     remaining,
                     ui.id().with("topbar_drag"),
@@ -344,78 +316,21 @@ pub fn show(
                     }
                 }
 
-                // LTR 子布局：在余下区域左端放三视图按钮组
+                // LTR 子布局：在余下区域左端放本地/远程视图 tab
                 let mut left_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(remaining)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 left_ui.add_space(LEFT_GROUP_MARGIN);
-
-                // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
-                {
-                    let (sb_rect, sb_resp) = left_ui.allocate_exact_size(
-                        egui::vec2(VIEW_BTN_W, VIEW_BTN_H),
-                        egui::Sense::click(),
-                    );
-                    draw_icon_sidebar(&left_ui, sb_rect, view.sidebar_visible, pal);
-                    let tip1 = if view.sidebar_visible {
-                        s.topbar_sidebar_hide_tip
-                    } else {
-                        s.topbar_sidebar_show_tip
-                    };
-                    if sb_resp.on_hover_text(tip1).clicked() {
-                        out.toggle_sidebar = Some(!view.sidebar_visible);
-                    }
-                }
-
-                left_ui.add_space(VIEW_BTN_GAP);
-
-                // ② 显示/隐藏文件树（codicon list-tree 风格）
-                {
-                    let (ft_rect, ft_resp) = left_ui.allocate_exact_size(
-                        egui::vec2(VIEW_BTN_W, VIEW_BTN_H),
-                        egui::Sense::click(),
-                    );
-                    draw_icon_filetree(&left_ui, ft_rect, view.filetree_visible, pal);
-                    let tip2 = if view.filetree_visible {
-                        s.topbar_filetree_hide_tip
-                    } else {
-                        s.topbar_filetree_show_tip
-                    };
-                    if ft_resp.on_hover_text(tip2).clicked() {
-                        out.toggle_filetree = Some(!view.filetree_visible);
-                    }
-                }
-
-                left_ui.add_space(VIEW_BTN_GAP);
-
-                // ③ 还原窗格大小（grid 图标，田字格风格）
-                {
-                    let enabled = pane_count > 1;
-                    let (reset_rect, reset_resp) = left_ui.allocate_exact_size(
-                        egui::vec2(VIEW_BTN_W, VIEW_BTN_H),
-                        egui::Sense::click(),
-                    );
-                    draw_icon_grid(&left_ui, reset_rect, enabled, pal);
-                    let tip3 = if pane_count > 1 {
-                        s.topbar_reset_layout_tip
-                    } else {
-                        s.topbar_reset_layout_disabled_tip
-                    };
-                    if reset_resp.on_hover_text(tip3).clicked() && pane_count > 1 {
-                        out.reset_layout = true;
-                    }
-                }
-
-                // ── 本地/远程 tab（M5.2）：与三视图图标拉开间距 ──
-                left_ui.add_space(VIEW_BTN_GAP * 3.0);
-                if draw_view_tab(&mut left_ui, s.topbar_tab_local, !view.current_view, pal).clicked()
+                if draw_view_tab(&mut left_ui, s.topbar_tab_local, !view.current_view, pal)
+                    .clicked()
                 {
                     out.toggle_view_mode = Some(false);
                 }
                 left_ui.add_space(VIEW_BTN_GAP);
-                if draw_view_tab(&mut left_ui, s.topbar_tab_remote, view.current_view, pal).clicked()
+                if draw_view_tab(&mut left_ui, s.topbar_tab_remote, view.current_view, pal)
+                    .clicked()
                 {
                     out.toggle_view_mode = Some(true);
                 }
@@ -424,137 +339,8 @@ pub fn show(
     out
 }
 
-// ── 图标绘制子函数（R8.2 精绘，统一规格）──────────────────────────────────
-// 视觉盒 18×14 逻辑 px 居中于 28×26 热区（R8.2：从 16×12 扩大）；线宽 1.2；
-// 颜色常态 fg_dim，hover fg；hover 圆角底 bg_highlight（圆角 4）。
-
-/// ① 侧栏切换图标（codicon layout-sidebar-left 风格）：
-/// 圆角外框 18×14（圆角 2.5）+ 距左 1/3 处竖分隔线；
-/// 侧栏可见态左舱填充（fg_dim 40% 透明度），隐藏态仅线框。
-fn draw_icon_sidebar(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palette) {
-    let painter = ui.painter();
-    // 悬停底色
-    if ui.rect_contains_pointer(rect) {
-        painter.rect_filled(rect, 4.0, pal.bg_highlight);
-    }
-    let fg = if visible { pal.fg } else { pal.fg_dim };
-    let stroke = egui::Stroke::new(1.2, fg);
-    let c = rect.center();
-    // 外框 18×14，圆角 2.5，像素对齐（R8.2：从 15×12 扩大）
-    let bw = 18.0_f32;
-    let bh = 14.0_f32;
-    let ox = (c.x - bw / 2.0 + 0.5).floor() - 0.5; // round to 0.5
-    let oy = (c.y - bh / 2.0 + 0.5).floor() - 0.5;
-    let frame = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(bw, bh));
-    painter.rect_stroke(frame, 2.5, stroke, egui::StrokeKind::Middle);
-    // 左 1/3 竖分隔线（距左缘约 bw/3）
-    let div_x = (ox + bw / 3.0 + 0.5).floor() - 0.5;
-    painter.line_segment(
-        [
-            egui::pos2(div_x, oy + 1.0),
-            egui::pos2(div_x, oy + bh - 1.0),
-        ],
-        stroke,
-    );
-    // 可见态：左舱填充（fg_dim 40% 透明度的 rect）
-    if visible {
-        let fill_color = egui::Color32::from_rgba_unmultiplied(
-            pal.fg_dim.r(),
-            pal.fg_dim.g(),
-            pal.fg_dim.b(),
-            (pal.fg_dim.a() as f32 * 0.4) as u8,
-        );
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(ox + 1.5, oy + 1.5),
-                egui::pos2(div_x - 0.5, oy + bh - 1.5),
-            ),
-            1.5,
-            fill_color,
-        );
-    }
-}
-
-/// ② 文件树切换图标（codicon list-tree 风格）：
-/// 无外框；左侧竖干线（高 14）+ 向右三条横枝（y 均分，长度 9/6.5/4）。
-/// 层次差拉大（9/6.5/4）使高 DPI 下层次可辨；可见态 fg，隐藏态 fg_dim。
-fn draw_icon_filetree(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palette) {
-    let painter = ui.painter();
-    if ui.rect_contains_pointer(rect) {
-        painter.rect_filled(rect, 4.0, pal.bg_highlight);
-    }
-    let fg = if visible { pal.fg } else { pal.fg_dim };
-    let stroke = egui::Stroke::new(1.2, fg);
-    let c = rect.center();
-    // R8.2：树形高度随视觉盒扩大到 14，竖干偏左 8px
-    let tree_h = 14.0_f32;
-    let trunk_x = (c.x - 8.0 + 0.5).floor() - 0.5; // 竖干 x，像素对齐
-    let top_y = (c.y - tree_h / 2.0 + 0.5).floor() - 0.5;
-    let bot_y = top_y + tree_h;
-    // 竖干
-    painter.line_segment(
-        [egui::pos2(trunk_x, top_y), egui::pos2(trunk_x, bot_y)],
-        stroke,
-    );
-    // 三条横枝（y 均分于 top+2/top+7/top+12；R8.2 长度差拉大 9/6.5/4）
-    let branches: [(f32, f32); 3] = [(top_y + 2.0, 9.0), (top_y + 7.0, 6.5), (top_y + 12.0, 4.0)];
-    for (by, branch_len) in branches {
-        let by = (by + 0.5).floor() - 0.5;
-        painter.line_segment(
-            [
-                egui::pos2(trunk_x, by),
-                egui::pos2(trunk_x + branch_len, by),
-            ],
-            stroke,
-        );
-    }
-}
-
-/// ③ 还原窗格图标（田字格风格）：
-/// 圆角外框 16×14（圆角 2.5）+ 内部横竖中线十字分隔（2×2 田字）。
-/// 不画四个分离小方块（避免显碎）。R8.2：从 14×12 扩大。
-fn draw_icon_grid(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette) {
-    let painter = ui.painter();
-    let hovered = ui.rect_contains_pointer(rect);
-    if hovered && enabled {
-        painter.rect_filled(rect, 4.0, pal.bg_highlight);
-    }
-    let fg = if !enabled {
-        pal.fg_dim.gamma_multiply(0.4)
-    } else if hovered {
-        pal.fg
-    } else {
-        pal.fg_dim
-    };
-    let stroke = egui::Stroke::new(1.2, fg);
-    let c = rect.center();
-    // R8.2：从 14×12 扩大到 16×14，比例对齐侧栏/树形框
-    let bw = 16.0_f32;
-    let bh = 14.0_f32;
-    let ox = (c.x - bw / 2.0 + 0.5).floor() - 0.5;
-    let oy = (c.y - bh / 2.0 + 0.5).floor() - 0.5;
-    let frame = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(bw, bh));
-    // 圆角外框
-    painter.rect_stroke(frame, 2.5, stroke, egui::StrokeKind::Middle);
-    // 内部横中线
-    let mid_y = (oy + bh / 2.0 + 0.5).floor() - 0.5;
-    painter.line_segment(
-        [
-            egui::pos2(ox + 1.5, mid_y),
-            egui::pos2(ox + bw - 1.5, mid_y),
-        ],
-        stroke,
-    );
-    // 内部竖中线
-    let mid_x = (ox + bw / 2.0 + 0.5).floor() - 0.5;
-    painter.line_segment(
-        [
-            egui::pos2(mid_x, oy + 1.5),
-            egui::pos2(mid_x, oy + bh - 1.5),
-        ],
-        stroke,
-    );
-}
+// 注：原 R8.2 三个图标绘制函数（①侧栏 ②文件树 ③田字复位）已随
+// 按钮迁往 [`super::toolbar`]（F12 批1），此处不再保留副本。
 
 /// 本地/远程 tab 按钮（M5.2）：文字 pill。active = accent 字 + bg_highlight 底；
 /// hover = fg 字 + 半透底；常态 = fg_dim 字。返回点击 Response。
@@ -745,6 +531,29 @@ mod topbar_layout_tests {
     use super::*;
     use crate::shell::theme;
 
+    fn test_palette() -> Palette {
+        let info = lumen_renderer::themes::find_or_default("lumen-dark");
+        theme::shell_palette(info)
+    }
+
+    fn test_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1200.0, 700.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn test_view() -> ViewState {
+        ViewState {
+            update_version: None,
+            current_view: false,
+            need_relogin: false,
+        }
+    }
+
     /// RTL 布局哨兵（fb2610a 修复回归防线）：无头 egui 跑一帧顶栏布局，
     /// 断言窗控按钮分配在面板右端——cursor().min 类手工矩形 bug 重现时此测试失败。
     /// macOS 用原生装饰、不画自绘窗控（见 show 内 cfg），故本测试不适用。
@@ -752,32 +561,10 @@ mod topbar_layout_tests {
     #[test]
     fn 顶栏_最大化按钮分配在右端() {
         let ctx = egui::Context::default();
-        let info = lumen_renderer::themes::find_or_default("lumen-dark");
-        let pal = theme::shell_palette(info);
+        let pal = test_palette();
         let mut got: Option<egui::Rect> = None;
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1200.0, 700.0),
-            )),
-            ..Default::default()
-        };
-        let _ = ctx.run_ui(input, |ui| {
-            let tb = show(
-                ui,
-                "诊断标题",
-                1,
-                None,
-                &pal,
-                false,
-                ViewState {
-                    sidebar_visible: true,
-                    filetree_visible: true,
-                    update_version: None,
-                    current_view: false,
-                    need_relogin: false,
-                },
-            );
+        let _ = ctx.run_ui(test_input(), |ui| {
+            let tb = show(ui, "诊断标题", None, &pal, false, test_view());
             got = Some(tb.maximize_btn_rect.unwrap_or(egui::Rect::NOTHING));
         });
         let r = got.expect("应跑过一帧");
@@ -796,39 +583,10 @@ mod topbar_layout_tests {
     #[test]
     fn 顶栏_右端绘制图元存在() {
         let ctx = egui::Context::default();
-        let info = lumen_renderer::themes::find_or_default("lumen-dark");
-        let pal = theme::shell_palette(info);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1200.0, 700.0),
-            )),
-            ..Default::default()
-        };
-        let full = ctx.run_ui(input, |ui| {
-            let _ = show(
-                ui,
-                "诊断标题",
-                1,
-                None,
-                &pal,
-                false,
-                ViewState {
-                    sidebar_visible: true,
-                    filetree_visible: true,
-                    update_version: None,
-                    current_view: false,
-                    need_relogin: false,
-                },
-            );
+        let pal = test_palette();
+        let full = ctx.run_ui(test_input(), |ui| {
+            let _ = show(ui, "诊断标题", None, &pal, false, test_view());
         });
-        fn count_right_segments(shapes: &[egui::epaint::ClippedShape]) -> usize {
-            let mut n = 0;
-            for cs in shapes {
-                n += walk(&cs.shape);
-            }
-            n
-        }
         fn walk(s: &egui::epaint::Shape) -> usize {
             use egui::epaint::Shape;
             match s {
@@ -839,62 +597,33 @@ mod topbar_layout_tests {
                 _ => 0,
             }
         }
-        let segs = count_right_segments(&full.shapes);
+        let segs: usize = full.shapes.iter().map(|cs| walk(&cs.shape)).sum();
         // 窗控三按钮至少 4 条线段（✕ 两条 + — 一条 + □ 矩形另算）
         assert!(segs >= 3, "右端线段图元过少：{segs} 条——按钮没画");
     }
 
-    /// R8 新增：左端三视图按钮组哨兵——egui 跑一帧，左端区域（x<200）
-    /// 应存在线段图元（三视图图标的竖干/框线/横枝）。
+    /// F12 批1 后左端哨兵：三视图按钮已迁工具栏，顶栏左端只剩
+    /// 本地/远程 tab——一帧的绘制图元里左端区域（x<250）应存在
+    /// 至少 2 个文字图元（「本地」「远程」）。
     #[test]
-    fn 顶栏_左端视图按钮图元存在() {
+    fn 顶栏_左端本地远程tab图元存在() {
         let ctx = egui::Context::default();
-        let info = lumen_renderer::themes::find_or_default("lumen-dark");
-        let pal = theme::shell_palette(info);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1200.0, 700.0),
-            )),
-            ..Default::default()
-        };
-        let full = ctx.run_ui(input, |ui| {
-            let _ = show(
-                ui,
-                "标题",
-                1,
-                None,
-                &pal,
-                false,
-                ViewState {
-                    sidebar_visible: true,
-                    filetree_visible: false,
-                    update_version: None,
-                    current_view: false,
-                    need_relogin: false,
-                },
-            );
+        let pal = test_palette();
+        let full = ctx.run_ui(test_input(), |ui| {
+            let _ = show(ui, "标题", None, &pal, false, test_view());
         });
-        fn count_left_segments(shapes: &[egui::epaint::ClippedShape]) -> usize {
-            let mut n = 0;
-            for cs in shapes {
-                n += walk_left(&cs.shape);
-            }
-            n
-        }
-        fn walk_left(s: &egui::epaint::Shape) -> usize {
+        fn walk_text(s: &egui::epaint::Shape) -> usize {
             use egui::epaint::Shape;
             match s {
-                Shape::LineSegment { points, .. } => {
-                    // 左端按钮组：x < 200（三按钮组约在 10..130 范围内）
-                    usize::from(points[0].x < 200.0 || points[1].x < 200.0)
-                }
-                Shape::Vec(v) => v.iter().map(walk_left).sum(),
+                Shape::Text(t) => usize::from(t.pos.x < 250.0),
+                Shape::Vec(v) => v.iter().map(walk_text).sum(),
                 _ => 0,
             }
         }
-        let segs = count_left_segments(&full.shapes);
-        // 三视图图标含多条线段（①侧栏分隔线 + ②树形竖干+横枝 + ③田字中线）
-        assert!(segs >= 4, "左端线段图元过少：{segs} 条——视图按钮没画到左端");
+        let texts: usize = full.shapes.iter().map(|cs| walk_text(&cs.shape)).sum();
+        assert!(
+            texts >= 2,
+            "左端文字图元过少：{texts} 个——本地/远程 tab 没画到左端"
+        );
     }
 }

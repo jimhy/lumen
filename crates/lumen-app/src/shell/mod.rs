@@ -1,5 +1,5 @@
-//! 应用外壳 UI（egui）：顶栏 + 侧栏 + 文件树 + 终端工作区布局 +
-//! 设置/登录覆盖层。
+//! 应用外壳 UI（egui）：顶栏 + 应用工具栏 + 侧栏 + 文件树 + 终端
+//! 工作区布局 + 设置/登录覆盖层。
 //!
 //! M3.2 起侧栏是真功能的会话 tab 列表：条目（标题 + 未读点 + 激活
 //! 高亮）点击切换、右键菜单重命名/关闭、底部新建。M3.3 增加中间一栏
@@ -18,6 +18,7 @@ pub mod settings_ui;
 pub mod statusbar;
 pub mod theme;
 pub mod toast;
+pub mod toolbar;
 pub mod topbar;
 
 /// 窗格标题栏里关闭按钮的边长（逻辑像素，F5 批2 引入、F7① 迁入
@@ -282,15 +283,17 @@ pub struct ShellOutput {
     /// 原子，子类过程据此在 WM_NCHITTEST 时返回 HTMAXBUTTON。
     /// None 表示本帧按钮不可见，main 跳过更新（保留上一帧的矩形）。
     pub maximize_btn_rect: Option<egui::Rect>,
-    /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
+    /// 工具栏④「＋」（F12 批1 自顶栏迁入）：焦点 tab 内新增窗格
+    /// （同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
-    /// 顶栏③还原窗格大小（P15 / 问题7）：当前 tab 全部窗格比例恢复均分
-    /// （最大化态先退出）；复位后 main 落盘。
+    /// 工具栏③还原窗格大小（P15 / 问题7，F12 批1 自顶栏迁入）：当前
+    /// tab 全部窗格比例恢复均分（最大化态先退出）；复位后 main 落盘。
     pub layout_reset: bool,
-    /// 顶栏①切换会话栏显示/隐藏（问题7）：Some(v) = 新可见值，None = 未操作。
-    /// main 更新 settings.layout.sidebar_visible 并落盘。
+    /// 工具栏①切换会话栏显示/隐藏（问题7，F12 批1 自顶栏迁入）：
+    /// Some(v) = 新可见值，None = 未操作。main 更新
+    /// settings.layout.sidebar_visible 并落盘。
     pub toggle_sidebar: Option<bool>,
-    /// 顶栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
+    /// 工具栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
     pub toggle_filetree: Option<bool>,
     /// 本地/远程视图切换（M5.2）：main 写 settings.layout.view_mode + 存盘。
     pub toggle_view_mode: Option<bool>,
@@ -473,9 +476,9 @@ pub fn show(
 ) -> ShellOutput {
     // 远程视图但未连上任何设备：隐藏会话栏 / 文件树栏，命令行区中央显示「未连接任何设备」占位。
     let is_remote_unconnected = input.remote_view_active
-        && !input.remote_session.is_some_and(|sess| {
-            matches!(sess.role, lumen_protocol::remote::Role::Controller)
-        });
+        && !input
+            .remote_session
+            .is_some_and(|sess| matches!(sess.role, lumen_protocol::remote::Role::Controller));
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
         pane_rects: Vec::new(),
@@ -612,21 +615,15 @@ pub fn show(
     let tb = topbar::show(
         root,
         active_title,
-        input.panes.len(),
         input.profile,
         pal,
         is_maximized,
         topbar::ViewState {
-            sidebar_visible: app_settings.layout.sidebar_visible,
-            filetree_visible: st.filetree.visible,
             update_version: input.update_version.clone(),
             current_view: app_settings.layout.view_mode,
             need_relogin: input.token_expired,
         },
     );
-    if tb.new_pane {
-        out.new_pane = true;
-    }
     // 头像菜单更新组 / 资源组动作转发。
     if tb.check_update {
         out.update_check_now = true;
@@ -642,18 +639,6 @@ pub fn show(
     }
     if tb.open_feedback {
         out.open_feedback = true;
-    }
-    if tb.reset_layout {
-        out.layout_reset = true;
-    }
-    // 问题7：三视图切换信号转发
-    if tb.toggle_sidebar.is_some() {
-        out.toggle_sidebar = tb.toggle_sidebar;
-    }
-    if let Some(v) = tb.toggle_filetree {
-        // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
-        st.filetree.visible = v;
-        out.toggle_filetree = Some(v);
     }
     // M5.2：本地/远程 tab 切换 → 转发给 main（写 settings.layout.view_mode + 存盘）。
     if let Some(v) = tb.toggle_view_mode {
@@ -693,6 +678,36 @@ pub fn show(
     // M3.8 批2：最大化按钮逻辑矩形（Snap Layouts 热区，main 换算为屏幕坐标）。
     if tb.maximize_btn_rect.is_some() {
         out.maximize_btn_rect = tb.maximize_btn_rect;
+    }
+
+    // —— 应用工具栏（F12 批1）：紧贴标题栏下方的全宽横条，承载自
+    // 标题栏迁入的 ①侧栏开关 ②文件树开关 ③窗格复位 ④「＋」新增窗格。
+    // 须在 topbar 之后、侧栏/文件树面板之前声明——egui 顶部面板按声明
+    // 顺序自上而下堆叠，工作区高度随之自然下移（终端离屏纹理走既有
+    // 「矩形变化 → 重建 + resize」链路，无需特判）。
+    let tbar = toolbar::show(
+        root,
+        input.panes.len(),
+        pal,
+        toolbar::ViewState {
+            sidebar_visible: app_settings.layout.sidebar_visible,
+            filetree_visible: st.filetree.visible,
+        },
+    );
+    if tbar.new_pane {
+        out.new_pane = true;
+    }
+    if tbar.reset_layout {
+        out.layout_reset = true;
+    }
+    // 问题7：视图开关信号转发（原顶栏路径原样迁入）
+    if tbar.toggle_sidebar.is_some() {
+        out.toggle_sidebar = tbar.toggle_sidebar;
+    }
+    if let Some(v) = tbar.toggle_filetree {
+        // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
+        st.filetree.visible = v;
+        out.toggle_filetree = Some(v);
     }
 
     // 左侧会话栏（问题7：sidebar_visible 控制是否渲染）。
@@ -850,9 +865,9 @@ pub fn show(
         //（本地复制的文件→上传到被控端；本地复制现走系统剪贴板 CF_HDROP，与资源管理器互通）。
         let can_paste = crate::clipboard_files::has_files();
         // 是否正在控制设备（占位文案区分「未连接设备」/「等待 cwd」）。
-        let controlling = input.remote_session.is_some_and(|sess| {
-            matches!(sess.role, lumen_protocol::remote::Role::Controller)
-        });
+        let controlling = input
+            .remote_session
+            .is_some_and(|sess| matches!(sess.role, lumen_protocol::remote::Role::Controller));
         let mut rout = filetree::show_remote(
             root,
             input.remote_filetree,
@@ -918,9 +933,10 @@ pub fn show(
         out.filetree_dialog_closed = ft.dialog_closed;
         // 复制本地项 → 剪贴板 Local 侧（上传源，片5）；粘贴到本地目录 → Local 目标（下载）。
         out.file_copy = ft.file_copy.map(|(path, is_dir)| {
-            let name = path
-                .file_name()
-                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
             // 本地复制走系统剪贴板 CF_HDROP，不需要 size（恒 0）。
             (ClipSide::Local, path.display().to_string(), name, is_dir, 0)
         });
@@ -1129,11 +1145,17 @@ pub fn show(
                         let cstroke =
                             egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
                         painter.line_segment(
-                            [egui::pos2(cc.x - rr, cc.y - rr), egui::pos2(cc.x + rr, cc.y + rr)],
+                            [
+                                egui::pos2(cc.x - rr, cc.y - rr),
+                                egui::pos2(cc.x + rr, cc.y + rr),
+                            ],
                             cstroke,
                         );
                         painter.line_segment(
-                            [egui::pos2(cc.x - rr, cc.y + rr), egui::pos2(cc.x + rr, cc.y - rr)],
+                            [
+                                egui::pos2(cc.x - rr, cc.y + rr),
+                                egui::pos2(cc.x + rr, cc.y - rr),
+                            ],
                             cstroke,
                         );
                         if cresp.clicked() {
@@ -1263,8 +1285,10 @@ pub fn show(
                             div.rect
                                 .expand2(egui::vec2((hit_w - div.rect.width()).max(0.0) / 2.0, 0.0))
                         } else {
-                            div.rect
-                                .expand2(egui::vec2(0.0, (hit_w - div.rect.height()).max(0.0) / 2.0))
+                            div.rect.expand2(egui::vec2(
+                                0.0,
+                                (hit_w - div.rect.height()).max(0.0) / 2.0,
+                            ))
                         };
                         let resp = ui.interact(
                             hit,
@@ -1579,8 +1603,10 @@ pub fn show(
                 // 标题 Label（点击聚焦 / 双击进重命名 / 右键菜单重命名 /
                 // 拖动换位）。镜像侧栏标签重命名机制（见 sidebar_ui），
                 // 窗格用下标 i 定位（侧栏用会话 id）。
-                let is_pane_renaming =
-                    st.pane_renaming.as_ref().is_some_and(|(id, _)| *id == pane.id);
+                let is_pane_renaming = st
+                    .pane_renaming
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == pane.id);
                 if is_pane_renaming {
                     // 行内编辑框替代标题：Enter 提交、Esc 或点击别处取消
                     // （三种情况 TextEdit 都失焦）。缓冲取自 st.pane_renaming
@@ -1619,11 +1645,9 @@ pub fn show(
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
                     title_ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&pane.title).size(12.0).color(bar_fg),
-                        )
-                        .truncate()
-                        .selectable(false),
+                        egui::Label::new(egui::RichText::new(&pane.title).size(12.0).color(bar_fg))
+                            .truncate()
+                            .selectable(false),
                     );
                     // 镜像覆盖时本地标题栏改 hover sense（不捕获点击/拖动）→ 让镜像窗格标题交互
                     // 拿到事件（海风哥②④：本地标题拖动遮挡镜像换位）。
@@ -1632,7 +1656,8 @@ pub fn show(
                     } else {
                         egui::Sense::click_and_drag()
                     };
-                    let tresp = ui.interact(title_hit, ui.id().with(("pane_title", i)), title_sense);
+                    let tresp =
+                        ui.interact(title_hit, ui.id().with(("pane_title", i)), title_sense);
                     if tresp.clicked() {
                         out.pane_clicked = Some(i);
                         out.term_clicked = true;
@@ -2013,9 +2038,12 @@ fn overwrite_modal(
         .show(ctx, |ui| {
             ui.set_width(300.0);
             ui.label(
-                egui::RichText::new(crate::i18n::fmt1(s.remote_overwrite_prompt_fmt, conflict_count))
-                    .size(13.0)
-                    .color(pal.fg),
+                egui::RichText::new(crate::i18n::fmt1(
+                    s.remote_overwrite_prompt_fmt,
+                    conflict_count,
+                ))
+                .size(13.0)
+                .color(pal.fg),
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -2195,7 +2223,8 @@ fn sidebar_ui(
                 // 否则回退自绘终端字形。
                 let icon_center = egui::pos2(rect.left() + ICON_COL / 2.0, rect.center().y);
                 if let Some(tex) = entry.icon {
-                    let img_rect = egui::Rect::from_center_size(icon_center, egui::vec2(20.0, 20.0));
+                    let img_rect =
+                        egui::Rect::from_center_size(icon_center, egui::vec2(20.0, 20.0));
                     ui.painter().image(
                         tex,
                         img_rect,
@@ -2488,7 +2517,7 @@ fn draw_busy_spinner(ui: &egui::Ui, center: egui::Pos2, half: f32, color: egui::
     let t = ui.input(|i| i.time) as f32;
     let side = 2.0 * half; // 单边长
     let perim = 4.0 * side; // 周长
-    // 沿正方形边框把「行进距离 d」映射到坐标（上边→右边→下边→左边）。
+                            // 沿正方形边框把「行进距离 d」映射到坐标（上边→右边→下边→左边）。
     let point_at = |d: f32| -> egui::Pos2 {
         let d = d.rem_euclid(perim);
         let (l, top, r, bot) = (
@@ -2541,15 +2570,24 @@ fn draw_session_icon(ui: &egui::Ui, center: egui::Pos2, active: bool, pal: &them
     let px = ox + 4.5;
     let py = oy + 4.0;
     let chev = 3.0_f32;
-    painter.line_segment([egui::pos2(px, py), egui::pos2(px + chev, py + chev)], stroke);
     painter.line_segment(
-        [egui::pos2(px + chev, py + chev), egui::pos2(px, py + 2.0 * chev)],
+        [egui::pos2(px, py), egui::pos2(px + chev, py + chev)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(px + chev, py + chev),
+            egui::pos2(px, py + 2.0 * chev),
+        ],
         stroke,
     );
     // 下划线光标（提示符右侧短横，贴底）。
     let uy = oy + bh - 4.0;
     painter.line_segment(
-        [egui::pos2(px + chev + 2.0, uy), egui::pos2(ox + bw - 4.0, uy)],
+        [
+            egui::pos2(px + chev + 2.0, uy),
+            egui::pos2(ox + bw - 4.0, uy),
+        ],
         stroke,
     );
 }

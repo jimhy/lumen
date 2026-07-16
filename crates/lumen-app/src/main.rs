@@ -16,7 +16,6 @@ mod remote;
 mod remote_mirror;
 mod remote_ws;
 // M6 P2P 直连（QUIC 打洞 + 中继回退）：tokio 隔离后台线程 + STUN 端点发现 + QUIC/证书就位。
-mod p2p;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
 mod completion;
@@ -41,6 +40,7 @@ mod mode;
 /// unix：从系统读 shell 进程实时 cwd（bash/zsh 无 OSC 9;9 cwd 上报时文件树的兜底）。
 #[cfg(unix)]
 mod os_cwd;
+mod p2p;
 /// 应用数据目录解析（单一真源）：按构建类型隔离 debug/release 的持久化数据。
 mod paths;
 /// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
@@ -176,7 +176,9 @@ fn main() -> Result<()> {
     // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
     // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；
     // 若日志里没有这行，就是拷了旧 exe，本次测试无效。
-    log::info!("[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16");
+    log::info!(
+        "[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16"
+    );
     // F8 单实例限制（事件循环创建前检测）：release 默认单开——已有
     // 实例在跑时通知其前台化、本实例静默退出；debug 构建与
     // --multi-instance / LUMEN_MULTI_INSTANCE=1 放行多开。
@@ -1179,7 +1181,8 @@ impl AppState {
                     );
                 } else if let Some(new_id) = self.new_tab_unfocused() {
                     self.persist_sessions(); // 不夺焦变体不落盘，结构性变更须显式落盘。
-                    self.remote_ws.send_new_tab_result(req_id, Some(new_id), None);
+                    self.remote_ws
+                        .send_new_tab_result(req_id, Some(new_id), None);
                 } else {
                     self.remote_ws.send_new_tab_result(
                         req_id,
@@ -1220,8 +1223,7 @@ impl AppState {
                 if let Some(ti) = self.tabs.iter().position(|t| t.id == vp_tab) {
                     if ti != self.active_tab {
                         for (sid, rows, cols) in sizes {
-                            if let Some(pane) =
-                                self.tabs[ti].panes.iter_mut().find(|p| p.id == sid)
+                            if let Some(pane) = self.tabs[ti].panes.iter_mut().find(|p| p.id == sid)
                             {
                                 let (r, c) = (usize::from(rows).max(1), usize::from(cols).max(1));
                                 let g = pane.term.grid();
@@ -1372,7 +1374,8 @@ impl AppState {
                         for (target, top, count) in reqs {
                             let count = usize::from(count.min(remote_ws::HISTORY_CHUNK_MAX));
                             let term = match target {
-                                Some(sid) => match self.tabs[ti].panes.iter().find(|p| p.id == sid) {
+                                Some(sid) => match self.tabs[ti].panes.iter().find(|p| p.id == sid)
+                                {
                                     Some(p) => &p.term,
                                     None => continue, // 目标窗格已关，丢弃该请求。
                                 },
@@ -1384,9 +1387,9 @@ impl AppState {
                                 Some(sid) => self
                                     .remote_ws
                                     .send_history_rows_for_pane(sid, top, base, screen_top, lines),
-                                None => {
-                                    self.remote_ws.send_history_rows(top, base, screen_top, lines)
-                                }
+                                None => self
+                                    .remote_ws
+                                    .send_history_rows(top, base, screen_top, lines),
                             }
                         }
                     }
@@ -1442,7 +1445,6 @@ impl AppState {
             self.window.request_redraw();
         }
     }
-
 
     /// 控制端镜像视图是否生效（控制中 且 处于「远程」视图）：决定键盘是否转发给
     /// 被控端而非本地执行（bug3：切回「本地」视图则本地输入、不转发、不画镜像）。
@@ -2186,8 +2188,8 @@ impl AppState {
                 (footer_x, footer_y)
             } else {
                 let g = s.term.grid();
-                let view_row = (g.display_offset() + s.cursor_displayed.0)
-                    .min(g.rows().saturating_sub(1));
+                let view_row =
+                    (g.display_offset() + s.cursor_displayed.0).min(g.rows().saturating_sub(1));
                 let (cx, cy) = self.renderer.cell_origin(view_row, s.cursor_displayed.1);
                 (px + cx, py + cy)
             }
@@ -2234,9 +2236,7 @@ impl AppState {
         let focus_sid = self.focused_pane().id;
         // 焦点窗格 footer 高度（物理像素）；非 input-editor 构建无 footer。
         #[cfg(feature = "input-editor")]
-        let footer_h_px = self
-            .focused_footer_rect_px()
-            .map_or(0.0, |(_, _, _, h)| h);
+        let footer_h_px = self.focused_footer_rect_px().map_or(0.0, |(_, _, _, h)| h);
         #[cfg(not(feature = "input-editor"))]
         let footer_h_px = 0.0_f32;
 
@@ -2318,10 +2318,8 @@ impl AppState {
             let movable = (th - thumb_h).max(0.0);
             let offset = g.display_offset().min(sb);
             let thumb_top = ty + (1.0 - offset as f32 / sb as f32) * movable;
-            let thumb = egui::Rect::from_min_size(
-                egui::pos2(tx, thumb_top),
-                egui::vec2(WIDTH, thumb_h),
-            );
+            let thumb =
+                egui::Rect::from_min_size(egui::pos2(tx, thumb_top), egui::vec2(WIDTH, thumb_h));
             out.push(ScrollbarGeom {
                 sid: *sid,
                 track,
@@ -2342,10 +2340,7 @@ impl AppState {
         if ppp <= 0.0 {
             return false;
         }
-        let pos = egui::pos2(
-            self.mouse_pos.0 as f32 / ppp,
-            self.mouse_pos.1 as f32 / ppp,
-        );
+        let pos = egui::pos2(self.mouse_pos.0 as f32 / ppp, self.mouse_pos.1 as f32 / ppp);
         self.scrollbar_overlays()
             .iter()
             .any(|g| g.track.contains(pos))
@@ -2396,7 +2391,10 @@ impl AppState {
     /// padding），故与窗格同款 `cell_at_with_footer`（footer=0）换算。
     fn mirror_cell_at_mouse(&self) -> Option<(usize, usize)> {
         let (rx, ry, rw, rh) = self.mirror_rect_px?;
-        let (lx, ly) = (self.mouse_pos.0 - f64::from(rx), self.mouse_pos.1 - f64::from(ry));
+        let (lx, ly) = (
+            self.mouse_pos.0 - f64::from(rx),
+            self.mouse_pos.1 - f64::from(ry),
+        );
         if lx < 0.0 || ly < 0.0 || lx >= f64::from(rw) || ly >= f64::from(rh) {
             return None;
         }
@@ -2415,7 +2413,10 @@ impl AppState {
     /// 在最后一个区内格）。非控制中返回 None。
     fn mirror_cell_clamped(&self) -> Option<(usize, usize)> {
         let (rx, ry, rw, rh) = self.mirror_rect_px?;
-        let (lx, ly) = (self.mouse_pos.0 - f64::from(rx), self.mouse_pos.1 - f64::from(ry));
+        let (lx, ly) = (
+            self.mouse_pos.0 - f64::from(rx),
+            self.mouse_pos.1 - f64::from(ry),
+        );
         Some(self.renderer.cell_at_with_footer(
             lx,
             ly,
@@ -2444,7 +2445,10 @@ impl AppState {
     /// 按该窗格离屏尺寸换算，用于点选焦点 + per-pane 拖选）；不在任何窗格返回 None。
     fn mirror_pane_cell_at_mouse(&self) -> Option<(session::SessionId, usize, usize)> {
         let (sid, x, y, w, h) = self.mirror_pane_at_mouse()?;
-        let (lx, ly) = (self.mouse_pos.0 - f64::from(x), self.mouse_pos.1 - f64::from(y));
+        let (lx, ly) = (
+            self.mouse_pos.0 - f64::from(x),
+            self.mouse_pos.1 - f64::from(y),
+        );
         let (row, col) = self.renderer.cell_at_with_footer(
             lx,
             ly,
@@ -2463,7 +2467,10 @@ impl AppState {
             .iter()
             .copied()
             .find(|(s, ..)| *s == sid)?;
-        let (lx, ly) = (self.mouse_pos.0 - f64::from(x), self.mouse_pos.1 - f64::from(y));
+        let (lx, ly) = (
+            self.mouse_pos.0 - f64::from(x),
+            self.mouse_pos.1 - f64::from(y),
+        );
         Some(self.renderer.cell_at_with_footer(
             lx,
             ly,
@@ -2624,7 +2631,8 @@ impl AppState {
                 mods: self.mouse_mods(),
             };
             if let Some(bytes) = encode_mouse(proto, enc, ev) {
-                if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&bytes) {
+                if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&bytes)
+                {
                     log::error!("鼠标上报写 PTY 失败: {e:#}");
                 }
                 self.window.request_redraw();
@@ -2781,9 +2789,10 @@ impl AppState {
         // 被控端、清状态，避免被控端程序残留「幻影按住」。`mirror_report_sid` 有值
         // 即当前按住是镜像转发的（与本地互斥）。
         if let Some(sid) = self.mirror_report_sid {
-            if let (Some((row, col)), Some((proto, enc))) =
-                (self.mirror_pane_cell_clamped(sid), self.mirror_pane_proto_enc(sid))
-            {
+            if let (Some((row, col)), Some((proto, enc))) = (
+                self.mirror_pane_cell_clamped(sid),
+                self.mirror_pane_proto_enc(sid),
+            ) {
                 if proto.is_on() {
                     let mods = self.mouse_mods();
                     let held = self.mouse_report_held;
@@ -2900,7 +2909,16 @@ impl AppState {
         let mods = self.mouse_mods();
         let mut buf = Vec::new();
         for _ in 0..notches.max(1) {
-            if let Some(b) = encode_mouse(proto, enc, MouseEvent { kind, col, row, mods }) {
+            if let Some(b) = encode_mouse(
+                proto,
+                enc,
+                MouseEvent {
+                    kind,
+                    col,
+                    row,
+                    mods,
+                },
+            ) {
                 buf.extend_from_slice(&b);
             }
         }
@@ -3014,9 +3032,10 @@ impl AppState {
             // 钉在按下时的镜像窗格、坐标按其矩形夹紧（鼠标可能已拖到别处 / 窗外），
             // 保证发起窗格收到配对的 Release、被控端按钮不卡死；用 send_input_to 钉 sid。
             if let Some(sid) = self.mirror_report_sid {
-                if let (Some((row, col)), Some((proto, enc))) =
-                    (self.mirror_pane_cell_clamped(sid), self.mirror_pane_proto_enc(sid))
-                {
+                if let (Some((row, col)), Some((proto, enc))) = (
+                    self.mirror_pane_cell_clamped(sid),
+                    self.mirror_pane_proto_enc(sid),
+                ) {
                     if proto.is_on() {
                         let ev = MouseEvent {
                             kind: MouseEventKind::Release(btn),
@@ -3339,15 +3358,17 @@ impl AppState {
     /// `hover_probe_cell` 字段——手型光标、提示浮层、渲染下划线全复用本地那套，
     /// 无需新增。
     fn update_mirror_link_hover(&mut self) {
-        let probe = self.mirror_pane_cell_at_mouse().and_then(|(sid, row, col)| {
-            let abs = self
-                .remote_ws
-                .mirror_panes()
-                .iter()
-                .find(|p| p.session_id == sid)
-                .map(|mp| mp.term.grid().view_top_abs_line() + row as u64)?;
-            Some((sid, abs, col))
-        });
+        let probe = self
+            .mirror_pane_cell_at_mouse()
+            .and_then(|(sid, row, col)| {
+                let abs = self
+                    .remote_ws
+                    .mirror_panes()
+                    .iter()
+                    .find(|p| p.session_id == sid)
+                    .map(|mp| mp.term.grid().view_top_abs_line() + row as u64)?;
+                Some((sid, abs, col))
+            });
         if probe == self.hover_probe_cell {
             return;
         }
@@ -3439,10 +3460,11 @@ impl AppState {
         let dest = update::installer_dest(&info.tag);
         self.update_downloading = true;
         std::thread::spawn(move || {
-            let msg = match update::download_installer(&url, &dest, net_proxy.as_deref(), |_d, _t| {}) {
-                Ok(()) => update::UpdateMsg::DownloadDone(dest),
-                Err(e) => update::UpdateMsg::DownloadFailed(e),
-            };
+            let msg =
+                match update::download_installer(&url, &dest, net_proxy.as_deref(), |_d, _t| {}) {
+                    Ok(()) => update::UpdateMsg::DownloadDone(dest),
+                    Err(e) => update::UpdateMsg::DownloadFailed(e),
+                };
             let _ = tx.send(msg);
             let _ = proxy.send_event(PtyWake);
         });
@@ -3689,10 +3711,8 @@ impl AppState {
         // Compose 态分流：进编辑器；其余态直写 PTY。
         #[cfg(feature = "input-editor")]
         {
-            let mode = mode::effective_mode(
-                &self.tabs[ti].panes[pi_focused].term,
-                self.force_fallback,
-            );
+            let mode =
+                mode::effective_mode(&self.tabs[ti].panes[pi_focused].term, self.force_fallback);
             if mode == mode::InputMode::Compose {
                 // path_insert_text_str 与 path_insert_text 同一引号规则；
                 // 控制字符路径返回 None，静默跳过（纵深防御）。
@@ -3981,7 +4001,9 @@ impl AppState {
         let scale = self.egui_ctx.pixels_per_point();
         let inner = self.window.inner_size();
         let sidebar_px = (self.settings.layout.sidebar_width * scale).round();
-        let topbar_px = (shell::topbar::HEIGHT * scale).round();
+        // 顶部双栏合计占高：标题栏 + 应用工具栏（F12 批1 工具栏入栏后
+        // 工作区 y 起点下移，估算须同步扣除）。
+        let topbar_px = ((shell::topbar::HEIGHT + shell::toolbar::HEIGHT) * scale).round();
         let ft_width = self
             .shell_state
             .filetree
@@ -4068,7 +4090,10 @@ impl AppState {
     /// 不动。窗格集变化经 `SubscriptionStarted` 重发同步回控制端。
     fn new_remote_pane_in(&mut self, ti: usize) {
         if self.tabs[ti].panes.len() >= MAX_PANES {
-            log::warn!("远程新建窗格忽略：tab id={} 已达 MAX_PANES", self.tabs[ti].id);
+            log::warn!(
+                "远程新建窗格忽略：tab id={} 已达 MAX_PANES",
+                self.tabs[ti].id
+            );
             return;
         }
         let (rows, cols) = {
@@ -4226,8 +4251,7 @@ impl AppState {
         let title = self.tabs[self.active_tab].display_title();
         // [BUILD-MARKER r4]（composer-IME 取证临时）：标题栏带版本标记，海风哥
         // 一眼确认跑的是不是带修复的新版，不用翻日志。坐实后连同诊断一并移除。
-        self.window
-            .set_title(&format!("Lumen [ime-r4] — {title}"));
+        self.window.set_title(&format!("Lumen [ime-r4] — {title}"));
     }
 
     /// F7② 节流轮询各 tab 焦点窗格的前台运行程序 exe（进程快照较重，
@@ -4355,8 +4379,7 @@ impl AppState {
             for (id, exe) in probed {
                 self.session_icon_exe.insert(id, exe);
             }
-            let live: std::collections::HashSet<TabId> =
-                self.tabs.iter().map(|t| t.id).collect();
+            let live: std::collections::HashSet<TabId> = self.tabs.iter().map(|t| t.id).collect();
             self.session_icon_exe.retain(|k, _| live.contains(k));
         }
         // 抽新出现 exe 的图标位图（top-down RGBA8 上线）；已缓存的跳过（廉价）。
@@ -4600,7 +4623,7 @@ impl AppState {
             let ok = clipboard_files::copy_files(&[path]);
             self.remote_ws.clear_file_clipboard();
             self.remote_ws.cancel_clip_dir(); // 作废可能在途的远程目录枚举（M1）
-            // 片6：清掉系统剪贴板可能残留的我方远程虚拟文件（本地复制改走 CF_HDROP）。
+                                              // 片6：清掉系统剪贴板可能残留的我方远程虚拟文件（本地复制改走 CF_HDROP）。
             if let Some(svc) = self.clipboard_svc.as_ref() {
                 svc.clear();
             }
@@ -4872,7 +4895,14 @@ fn local_copy_item(
             let child_src = entry.path();
             let child_dest = dest.join(entry.file_name());
             let child_is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            local_copy_item(&child_dest, &child_src, child_is_dir, overwrite, depth + 1, stats);
+            local_copy_item(
+                &child_dest,
+                &child_src,
+                child_is_dir,
+                overwrite,
+                depth + 1,
+                stats,
+            );
         }
     } else {
         if !overwrite && dest.exists() {
@@ -5215,11 +5245,7 @@ impl App {
         }
         // 启动对账：device_id 独立文件若缺失而 profile 尚有镜像值，回写修复——把双源背离消灭在
         // 「下次重登带空 id → 服务端造幽灵」爆发之前（修「幽灵设备」的廉价治本兜底）。
-        cloud::reconcile_device_id(
-            user_profile
-                .as_ref()
-                .and_then(|p| p.device_id.as_deref()),
-        );
+        cloud::reconcile_device_id(user_profile.as_ref().and_then(|p| p.device_id.as_deref()));
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
@@ -5239,11 +5265,12 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
 
-        // 终端区初值：窗口减去侧栏宽度与顶栏高度（首帧 egui 布局后
-        // 按实际窗格矩形校正，文件树栏宽度即在首帧补扣）。窗格离屏
-        // 纹理在首帧 RedrawRequested 懒创建（布局前不知道各窗格尺寸）。
+        // 终端区初值：窗口减去侧栏宽度与顶部双栏（标题栏 + 应用工具栏，
+        // F12 批1）合计高度（首帧 egui 布局后按实际窗格矩形校正，文件树
+        // 栏宽度即在首帧补扣）。窗格离屏纹理在首帧 RedrawRequested 懒创建
+        // （布局前不知道各窗格尺寸）。
         let sidebar_px = (app_settings.layout.sidebar_width * scale).round();
-        let topbar_px = (shell::topbar::HEIGHT * scale).round();
+        let topbar_px = ((shell::topbar::HEIGHT + shell::toolbar::HEIGHT) * scale).round();
         let term_w = ((size.width as f32 - sidebar_px).max(1.0)) as u32;
         let term_h = ((size.height as f32 - topbar_px).max(1.0)) as u32;
 
@@ -5727,8 +5754,10 @@ impl ApplicationHandler<PtyWake> for App {
 
         // 本机复制粘贴（local→local）完成回包 → toast。后台 fs 递归复制完会 send PtyWake 唤醒到此
         // user_event；try_recv 非阻塞，无在途/未完成则空过。先取值再清字段，规避 rx 借用与赋值冲突。
-        if let Some((done, skipped, errors)) =
-            state.local_copy_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+        if let Some((done, skipped, errors)) = state
+            .local_copy_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
         {
             state.local_copy_rx = None;
             let kind = if errors > 0 {
@@ -5833,7 +5862,9 @@ impl ApplicationHandler<PtyWake> for App {
                                 // 控制端按 session_id 路由到对应镜像。后台窗格受 BG_DRAIN_CAP 节流（D7）。
                                 if state.tabs[ti].id == sub_id {
                                     let session_id = state.tabs[ti].panes[pi].id;
-                                    state.remote_ws.send_output_with_id(sub_id, session_id, &bytes);
+                                    state
+                                        .remote_ws
+                                        .send_output_with_id(sub_id, session_id, &bytes);
                                 }
                             }
                         }
@@ -6673,7 +6704,8 @@ impl ApplicationHandler<PtyWake> for App {
                                 if !state.shell_state.settings.open {
                                     if state.is_mirror_active() {
                                         if let Some(t) = state.remote_ws.subscribed_tab() {
-                                            state.remote_ws.close_remote_tab(t); // 远程关订阅会话。
+                                            state.remote_ws.close_remote_tab(t);
+                                            // 远程关订阅会话。
                                         }
                                     } else if state.close_tab(state.active_tab) {
                                         info!("最后一个会话已关闭，退出应用");
@@ -6719,7 +6751,8 @@ impl ApplicationHandler<PtyWake> for App {
                             if state.is_mirror_active() {
                                 state.remote_ws.send_input(&bytes);
                                 state.last_key_at = Some(Instant::now());
-                            } else if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
+                            } else if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes)
+                            {
                                 error!("写入 PTY 失败（win32 key-up）: {e:#}");
                             }
                         }
@@ -7226,7 +7259,13 @@ impl ApplicationHandler<PtyWake> for App {
                     // 坐标系串台高亮错范围）。否则退化为新建。普通左键 = 新建空选区并记锚点。
                     let reporting = state.focused_pane().term.mouse_protocol().is_on();
                     let prev = state.last_left_click.filter(|&(id, a)| {
-                        id == pane_id && state.focused_pane().term.grid().line_by_abs(a.line).is_some()
+                        id == pane_id
+                            && state
+                                .focused_pane()
+                                .term
+                                .grid()
+                                .line_by_abs(a.line)
+                                .is_some()
                     });
                     let shift_extend = !reporting && state.modifiers.shift_key() && prev.is_some();
                     let anchor = if shift_extend {
@@ -7413,7 +7452,10 @@ impl ApplicationHandler<PtyWake> for App {
                     // **有非空选区 → 右键优先本地复制**，哪怕鼠标上报开启（修 Claude 等全屏 TUI
                     // 里右键被上报吃掉、下面的复制那条路根本走不到——正是「Claude 里选中却复制不了」
                     // 的直接成因）。复制成功清选区 + 弹「已复制」toast。
-                    if state.tabs[ti].panes[pi].selection.is_some_and(|s| !s.is_empty()) {
+                    if state.tabs[ti].panes[pi]
+                        .selection
+                        .is_some_and(|s| !s.is_empty())
+                    {
                         if let Some(text) =
                             state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard)
                         {
@@ -7636,7 +7678,12 @@ impl ApplicationHandler<PtyWake> for App {
                                     if let Some(b) = encode_mouse(
                                         proto,
                                         enc,
-                                        MouseEvent { kind, col, row, mods },
+                                        MouseEvent {
+                                            kind,
+                                            col,
+                                            row,
+                                            mods,
+                                        },
                                     ) {
                                         buf.extend_from_slice(&b);
                                     }
@@ -8052,10 +8099,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // 每帧收取后台心跳/设备列表回包。M5.3：远程控制 WS 同生命周期。
                 if !state.remote.is_running() {
                     if let Some(auth) = state.auth_token.clone() {
-                        let exp = state
-                            .profile
-                            .as_ref()
-                            .map_or(0, |p| p.token_expires_at);
+                        let exp = state.profile.as_ref().map_or(0, |p| p.token_expires_at);
                         let ctx = state.egui_ctx.clone();
                         // 传 proxy + wake_pending：设备列表后台线程拉到新数据后须唤醒空闲 winit 循环
                         // （否则停在远程视图时在线状态不自动刷新，要切 tab 才更新）。
@@ -8146,13 +8190,21 @@ impl ApplicationHandler<PtyWake> for App {
                         .iter()
                         .enumerate()
                         .filter_map(|(i, mp)| {
-                            state.mirror_pane_textures.get(i).map(|&tex| shell::MirrorPaneView {
-                                tex,
-                                title: mirror_pane_title(&mp.term, i),
-                            })
+                            state
+                                .mirror_pane_textures
+                                .get(i)
+                                .map(|&tex| shell::MirrorPaneView {
+                                    tex,
+                                    title: mirror_pane_title(&mp.term, i),
+                                })
                         })
                         .collect();
-                    Some(shell::MirrorMultiInput { panes, layout, maximized, focused_idx })
+                    Some(shell::MirrorMultiInput {
+                        panes,
+                        layout,
+                        maximized,
+                        focused_idx,
+                    })
                 } else {
                     // 退出多窗格：释放全部 per-pane 纹理 + 离屏（延后注销）。
                     while let Some(tex) = state.mirror_pane_textures.pop() {
@@ -8197,7 +8249,12 @@ impl ApplicationHandler<PtyWake> for App {
                     update_version: state
                         .update_ready
                         .is_some()
-                        .then(|| state.update_available.as_ref().map(|u| u.version.to_string()))
+                        .then(|| {
+                            state
+                                .update_available
+                                .as_ref()
+                                .map(|u| u.version.to_string())
+                        })
                         .flatten(),
                     // 登录态过期判定（自动续期之外的兜底）：本地时钟判过期，或服务端实际拒绝
                     // （list_devices 401 / 列表里已无本机 did）。后者修「token 被服务端失效但
@@ -8325,13 +8382,12 @@ impl ApplicationHandler<PtyWake> for App {
                     });
                 // F3：安装包已就绪（静默下载完成）且未「稍后」时弹窗——点
                 // 「立即更新」直接拉起已下好的安装器（Warp 式预下载）。
-                let update_modal: Option<update::UpdateInfo> = if state.update_ready.is_some()
-                    && !state.update_dismissed
-                {
-                    state.update_available.clone()
-                } else {
-                    None
-                };
+                let update_modal: Option<update::UpdateInfo> =
+                    if state.update_ready.is_some() && !state.update_dismissed {
+                        state.update_available.clone()
+                    } else {
+                        None
+                    };
                 let mut update_action: Option<UpdateAction> = None;
                 // 边缘 resize 光标反馈（窗口外缘 → 对应方向；None=不在边缘）：本帧
                 // 在 run_ui 闭包末用 egui set_cursor_icon 注入（走 egui 光标缓存、
@@ -8366,48 +8422,52 @@ impl ApplicationHandler<PtyWake> for App {
                     // ── 「回到底部」浮动按钮（窗格上滚超过一整屏时，底部
                     // 居中的圆形向下箭头；点击回到最新输出）──
                     for (sid, rect) in &scroll_to_bottom_targets {
-                        let resp = egui::Area::new(egui::Id::new((
-                            "lumen_scroll_to_bottom",
-                            *sid,
-                        )))
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(rect.min)
-                        .show(ui.ctx(), |ui| {
-                            let (r, resp) =
-                                ui.allocate_exact_size(rect.size(), egui::Sense::click());
-                            let hovered = resp.hovered();
-                            let p = ui.painter();
-                            let c = r.center();
-                            let radius = r.width() / 2.0;
-                            // 圆底：平时弹层灰、hover 强调色（Warp 式白底）。
-                            p.circle_filled(
-                                c,
-                                radius,
-                                if hovered { modal_pal.accent } else { modal_pal.bg_panel },
-                            );
-                            p.circle_stroke(
-                                c,
-                                radius,
-                                egui::Stroke::new(1.0, modal_pal.panel_outline),
-                            );
-                            // 向下箭头（竖杆 + 两撇箭头头），hover 反相配色。
-                            let arrow =
-                                if hovered { modal_pal.accent_fg } else { modal_pal.fg };
-                            let st = egui::Stroke::new(2.0, arrow);
-                            p.line_segment(
-                                [egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 5.0)],
-                                st,
-                            );
-                            p.line_segment(
-                                [egui::pos2(c.x - 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
-                                st,
-                            );
-                            p.line_segment(
-                                [egui::pos2(c.x + 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
-                                st,
-                            );
-                            resp
-                        });
+                        let resp = egui::Area::new(egui::Id::new(("lumen_scroll_to_bottom", *sid)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(rect.min)
+                            .show(ui.ctx(), |ui| {
+                                let (r, resp) =
+                                    ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                                let hovered = resp.hovered();
+                                let p = ui.painter();
+                                let c = r.center();
+                                let radius = r.width() / 2.0;
+                                // 圆底：平时弹层灰、hover 强调色（Warp 式白底）。
+                                p.circle_filled(
+                                    c,
+                                    radius,
+                                    if hovered {
+                                        modal_pal.accent
+                                    } else {
+                                        modal_pal.bg_panel
+                                    },
+                                );
+                                p.circle_stroke(
+                                    c,
+                                    radius,
+                                    egui::Stroke::new(1.0, modal_pal.panel_outline),
+                                );
+                                // 向下箭头（竖杆 + 两撇箭头头），hover 反相配色。
+                                let arrow = if hovered {
+                                    modal_pal.accent_fg
+                                } else {
+                                    modal_pal.fg
+                                };
+                                let st = egui::Stroke::new(2.0, arrow);
+                                p.line_segment(
+                                    [egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 5.0)],
+                                    st,
+                                );
+                                p.line_segment(
+                                    [egui::pos2(c.x - 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
+                                    st,
+                                );
+                                p.line_segment(
+                                    [egui::pos2(c.x + 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
+                                    st,
+                                );
+                                resp
+                            });
                         if resp.inner.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
@@ -8427,8 +8487,10 @@ impl ApplicationHandler<PtyWake> for App {
                             .order(egui::Order::Foreground)
                             .fixed_pos(track.min)
                             .show(ui.ctx(), |ui| {
-                                let (_r, resp) = ui
-                                    .allocate_exact_size(track.size(), egui::Sense::click_and_drag());
+                                let (_r, resp) = ui.allocate_exact_size(
+                                    track.size(),
+                                    egui::Sense::click_and_drag(),
+                                );
                                 resp
                             })
                             .inner;
@@ -8442,8 +8504,9 @@ impl ApplicationHandler<PtyWake> for App {
                                 return 0;
                             }
                             let top = (p.y - track.top() - anchor).clamp(0.0, movable);
-                            (sb as f32 * (1.0 - top / movable)).round().clamp(0.0, sb as f32)
-                                as usize
+                            (sb as f32 * (1.0 - top / movable))
+                                .round()
+                                .clamp(0.0, sb as f32) as usize
                         };
                         if resp.drag_started() {
                             // 抓滑块 → 锚点 = 指针到滑块顶的距离（跟手）；
@@ -8748,9 +8811,7 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                     }
                     Some(UpdateAction::Skip) => {
-                        if let Some(tag) =
-                            state.update_available.as_ref().map(|i| i.tag.clone())
-                        {
+                        if let Some(tag) = state.update_available.as_ref().map(|i| i.tag.clone()) {
                             state.settings.update.skip_version = Some(tag);
                             if let Some(err) = state.settings.save() {
                                 log::warn!("F3：写盘跳过版本失败: {err}");
@@ -8819,8 +8880,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // scrollbar_drag 会滞留 Some → 滚动条恒高亮、状态机不闭环。指针
                 // 松开是 OS 级事实，本帧非按下态即无条件清零（与 divider 的
                 // layout_dirty/B3-8 松手兜底同款惯例）。
-                if state.scrollbar_drag.is_some()
-                    && !state.egui_ctx.input(|i| i.pointer.any_down())
+                if state.scrollbar_drag.is_some() && !state.egui_ctx.input(|i| i.pointer.any_down())
                 {
                     state.scrollbar_drag = None;
                 }
@@ -8932,8 +8992,12 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.is_mirror_active() {
                     let ppp = state.egui_ctx.pixels_per_point();
                     let tr = shell_out.term_rect;
-                    state.mirror_rect_px =
-                        Some((tr.min.x * ppp, tr.min.y * ppp, tr.width() * ppp, tr.height() * ppp));
+                    state.mirror_rect_px = Some((
+                        tr.min.x * ppp,
+                        tr.min.y * ppp,
+                        tr.width() * ppp,
+                        tr.height() * ppp,
+                    ));
                     // Phase 4：多窗格各格内容矩形物理像素 + session_id（鼠标命中→点焦点 / per-pane 选区）。
                     state.mirror_pane_rects_px.clear();
                     for (i, mp) in state.remote_ws.mirror_panes().iter().enumerate() {
@@ -8973,8 +9037,11 @@ impl ApplicationHandler<PtyWake> for App {
                                     let pw = (rect.width() * ppp).max(1.0) as u32;
                                     let ph = (rect.height() * ppp).max(1.0) as u32;
                                     let (rows, cols) = state.renderer.grid_size_for(pw, ph);
-                                    (rows > 0 && cols > 0)
-                                        .then_some((mp.session_id, rows as u16, cols as u16))
+                                    (rows > 0 && cols > 0).then_some((
+                                        mp.session_id,
+                                        rows as u16,
+                                        cols as u16,
+                                    ))
                                 })
                                 .collect();
                             if !sizes.is_empty() {
@@ -9147,7 +9214,7 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
 
-                // —— 窗格级动作（F5 批2）：顶栏「＋」新增 / 窗格 ✕ 关闭
+                // —— 窗格级动作（F5 批2）：工具栏「＋」新增 / 窗格 ✕ 关闭
                 // （语义同 Ctrl+Shift+D / Ctrl+Shift+W）。结构变更由下方
                 // layout_pane_ids 对照检测，本帧跳过矩形应用与终端渲染。
                 if shell_out.new_pane {
@@ -9173,8 +9240,8 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(pi) = shell_out.pane_maximize {
                     state.toggle_maximize_pane(state.active_tab, pi);
                 }
-                // —— 一键恢复默认布局（P15）：顶栏「▦」——全部比例
-                // 均分 + 最大化态先退出，复位后落盘。
+                // —— 一键恢复默认布局（P15）：工具栏③复位按钮——全部
+                // 比例均分 + 最大化态先退出，复位后落盘。
                 if shell_out.layout_reset {
                     state.reset_pane_layout();
                 }
@@ -9284,24 +9351,40 @@ impl ApplicationHandler<PtyWake> for App {
                     use lumen_protocol::remote::PaneOpKind;
                     if let Some(tab_id) = state.remote_ws.subscribed_tab() {
                         if let Some(idx) = shell_out.mirror_pane_close {
-                            if let Some(sid) =
-                                state.remote_ws.mirror_panes().get(idx).map(|p| p.session_id)
+                            if let Some(sid) = state
+                                .remote_ws
+                                .mirror_panes()
+                                .get(idx)
+                                .map(|p| p.session_id)
                             {
                                 state.remote_ws.send_pane_op(tab_id, sid, PaneOpKind::Close);
                             }
                         }
                         if let Some(idx) = shell_out.mirror_pane_maximize {
-                            if let Some(sid) =
-                                state.remote_ws.mirror_panes().get(idx).map(|p| p.session_id)
+                            if let Some(sid) = state
+                                .remote_ws
+                                .mirror_panes()
+                                .get(idx)
+                                .map(|p| p.session_id)
                             {
-                                state
-                                    .remote_ws
-                                    .send_pane_op(tab_id, sid, PaneOpKind::ToggleMaximize);
+                                state.remote_ws.send_pane_op(
+                                    tab_id,
+                                    sid,
+                                    PaneOpKind::ToggleMaximize,
+                                );
                             }
                         }
                         if let Some((src, dst)) = shell_out.mirror_pane_swap {
-                            let a = state.remote_ws.mirror_panes().get(src).map(|p| p.session_id);
-                            let b = state.remote_ws.mirror_panes().get(dst).map(|p| p.session_id);
+                            let a = state
+                                .remote_ws
+                                .mirror_panes()
+                                .get(src)
+                                .map(|p| p.session_id);
+                            let b = state
+                                .remote_ws
+                                .mirror_panes()
+                                .get(dst)
+                                .map(|p| p.session_id);
                             if let (Some(a), Some(b)) = (a, b) {
                                 state.remote_ws.send_pane_op(
                                     tab_id,
@@ -9662,7 +9745,7 @@ impl ApplicationHandler<PtyWake> for App {
                     info!("已登出（profile.json 已删除）");
                     state.profile = None;
                     state.auth_token = None; // 清共享 token 句柄
-                    // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
+                                             // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
                     state.remote.stop();
                     // M5.3：停止远程控制 WS 引擎，清远程会话/配对态。
                     state.remote_ws.stop();
@@ -9695,10 +9778,13 @@ impl ApplicationHandler<PtyWake> for App {
                 // 复制：本地文件 → **系统剪贴板**（CF_HDROP，与资源管理器及任意应用互通，海风哥
                 // 反馈核心）；远程文件路径在被控端、进不了系统剪贴板 → 存 Lumen 内部（仅供下载到本地）。
                 if let Some((side, path, name, is_dir, size)) = shell_out.file_copy {
-                    log::info!("[文件剪贴板] 复制: side={side:?} is_dir={is_dir} size={size} path={path}");
+                    log::info!(
+                        "[文件剪贴板] 复制: side={side:?} is_dir={is_dir} size={size} path={path}"
+                    );
                     match side {
                         remote_ws::ClipSide::Local => {
-                            let ok = clipboard_files::copy_files(&[std::path::PathBuf::from(&path)]);
+                            let ok =
+                                clipboard_files::copy_files(&[std::path::PathBuf::from(&path)]);
                             // 清 Lumen 内部远程剪贴板：避免随后本地粘贴误走「下载」分支（系统优先）。
                             state.remote_ws.clear_file_clipboard();
                             // 片6：本地复制已抢占系统剪贴板（CF_HDROP），让 OLE 线程释放可能残留的
@@ -10332,9 +10418,9 @@ impl ApplicationHandler<PtyWake> for App {
                         let cur = frame.cursor;
                         let term = frame.term;
                         let sel = frame.selection; // part4b 镜像选区高亮
-                        // part3d：离屏尺寸取**镜像网格的自然像素**（网格×cell + 四周 padding），
-                        // 使被控端整屏完整渲染进纹理、不裁底行（被控端屏比控制端大时尤其关键）；
-                        // shell 端 Image 再缩放铺满终端区（替代已移除的 SSH 视口跟随）。
+                                                   // part3d：离屏尺寸取**镜像网格的自然像素**（网格×cell + 四周 padding），
+                                                   // 使被控端整屏完整渲染进纹理、不裁底行（被控端屏比控制端大时尤其关键）；
+                                                   // shell 端 Image 再缩放铺满终端区（替代已移除的 SSH 视口跟随）。
                         let (cell_w, cell_h) = state.renderer.cell_size();
                         let pad = state.renderer.padding();
                         let (grows, gcols) = {
@@ -10358,7 +10444,9 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                         }
                         if let Err(e) =
-                            state.renderer.render(MIRROR_OFFSCREEN_ID, term, sel, cur, None, None)
+                            state
+                                .renderer
+                                .render(MIRROR_OFFSCREEN_ID, term, sel, cur, None, None)
                         {
                             error!("镜像渲染失败: {e:#}");
                         }
