@@ -1,9 +1,12 @@
 //! 应用工具栏（F12 批1，海风哥 2026-07-16 需求）：标题栏之下的
-//! 全宽横条，统一收纳原散落在标题栏上的功能按钮：
+//! 全宽横条，统一收纳原散落在标题栏上的功能按钮。
+//! **左端**（视图开关组）：
 //! - ①侧栏（会话列表）显隐开关（与设置 sidebar_visible 同状态源）
 //! - ②文件树显隐开关（与 Ctrl+B 同状态源）
+//!
+//! **右端**（窗格操作组，海风哥 2026-07-17 验收反馈迁至最右）：
 //! - ③还原窗格大小（pane_count > 1 才可用，恢复均分）
-//! - ④「＋」新增窗格（满 MAX_PANES 禁用 + 悬停提示）
+//! - ④「＋」新增窗格（居最右；满 MAX_PANES 禁用 + 悬停提示）
 //!
 //! 标题栏（topbar）自此只留拖动区 + 头像 + 窗控三按钮。
 //! 工具栏**不是**窗口拖动区：空白处不响应拖动/双击最大化/右键
@@ -18,7 +21,7 @@
 //!
 //! UI 只产出动作（[`ToolbarOutput`]），可见性写盘、窗格复位与新增
 //! 由上层（shell/mod.rs → main.rs）执行。后续新增按钮按既有热区/
-//! 间距规格向右追加即可（组内 [`BTN_GAP`]、组间 [`GROUP_GAP`]）。
+//! 间距规格（组内 [`BTN_GAP`]）追加：左组向右接、右组向左接。
 
 use crate::i18n;
 use crate::session::MAX_PANES;
@@ -31,12 +34,12 @@ pub const HEIGHT: f32 = 32.0;
 /// 图标按钮热区宽 × 高（逻辑像素，沿用 topbar R8 规格 28×26）。
 const BTN_W: f32 = 28.0;
 const BTN_H: f32 = 26.0;
-/// 按钮组前缘内边距（与 topbar 左组一致）。
+/// 左端按钮组前缘内边距（与 topbar 左组一致）。
 const LEFT_MARGIN: f32 = 10.0;
+/// 右端按钮组后缘内边距（与左缘对称）。
+const RIGHT_MARGIN: f32 = 10.0;
 /// 组内按钮间距（R8.2 规格 4）。
 const BTN_GAP: f32 = 4.0;
-/// 功能组之间的间距（①②视图开关组 | ③④窗格操作组）。
-const GROUP_GAP: f32 = 12.0;
 
 /// 一帧工具栏 UI 的产出。
 #[derive(Default)]
@@ -98,43 +101,30 @@ pub fn show(
                 );
             }
 
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // 双端布局（同 topbar 迁移前的模式）：外层 RTL 先画右端
+            // 窗格操作组（先加的在最右），余下空间内层切回 LTR 画左端
+            // 视图开关组。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let s = i18n::strings();
-                ui.add_space(LEFT_MARGIN);
+                ui.add_space(RIGHT_MARGIN);
 
-                // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
+                // ④「＋」新增窗格（F5，居最右）：满 MAX_PANES 禁用 + 悬停提示。
                 {
-                    let (sb_rect, sb_resp) =
+                    let enabled = pane_count < MAX_PANES;
+                    let (plus_rect, plus_resp) =
                         ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
-                    draw_icon_sidebar(ui, sb_rect, view.sidebar_visible, pal);
-                    let tip = if view.sidebar_visible {
-                        s.topbar_sidebar_hide_tip
+                    draw_icon_plus(ui, plus_rect, enabled, pal);
+                    let tip = if enabled {
+                        s.topbar_new_pane_tip.to_owned()
                     } else {
-                        s.topbar_sidebar_show_tip
+                        i18n::fmt1(s.topbar_max_panes_fmt, MAX_PANES)
                     };
-                    if sb_resp.on_hover_text(tip).clicked() {
-                        out.toggle_sidebar = Some(!view.sidebar_visible);
+                    if plus_resp.on_hover_text(tip).clicked() && enabled {
+                        out.new_pane = true;
                     }
                 }
 
                 ui.add_space(BTN_GAP);
-
-                // ② 显示/隐藏文件树（codicon list-tree 风格）
-                {
-                    let (ft_rect, ft_resp) =
-                        ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
-                    draw_icon_filetree(ui, ft_rect, view.filetree_visible, pal);
-                    let tip = if view.filetree_visible {
-                        s.topbar_filetree_hide_tip
-                    } else {
-                        s.topbar_filetree_show_tip
-                    };
-                    if ft_resp.on_hover_text(tip).clicked() {
-                        out.toggle_filetree = Some(!view.filetree_visible);
-                    }
-                }
-
-                ui.add_space(GROUP_GAP);
 
                 // ③ 还原窗格大小（田字格图标；单窗格无可复位，禁用态）
                 {
@@ -152,23 +142,42 @@ pub fn show(
                     }
                 }
 
-                ui.add_space(BTN_GAP);
+                // 余下空间：左端视图开关组（LTR）。
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_space(LEFT_MARGIN);
 
-                // ④「＋」新增窗格（F5）：满 MAX_PANES 禁用 + 悬停提示。
-                {
-                    let enabled = pane_count < MAX_PANES;
-                    let (plus_rect, plus_resp) =
-                        ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
-                    draw_icon_plus(ui, plus_rect, enabled, pal);
-                    let tip = if enabled {
-                        s.topbar_new_pane_tip.to_owned()
-                    } else {
-                        i18n::fmt1(s.topbar_max_panes_fmt, MAX_PANES)
-                    };
-                    if plus_resp.on_hover_text(tip).clicked() && enabled {
-                        out.new_pane = true;
+                    // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
+                    {
+                        let (sb_rect, sb_resp) =
+                            ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
+                        draw_icon_sidebar(ui, sb_rect, view.sidebar_visible, pal);
+                        let tip = if view.sidebar_visible {
+                            s.topbar_sidebar_hide_tip
+                        } else {
+                            s.topbar_sidebar_show_tip
+                        };
+                        if sb_resp.on_hover_text(tip).clicked() {
+                            out.toggle_sidebar = Some(!view.sidebar_visible);
+                        }
                     }
-                }
+
+                    ui.add_space(BTN_GAP);
+
+                    // ② 显示/隐藏文件树（codicon list-tree 风格）
+                    {
+                        let (ft_rect, ft_resp) =
+                            ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
+                        draw_icon_filetree(ui, ft_rect, view.filetree_visible, pal);
+                        let tip = if view.filetree_visible {
+                            s.topbar_filetree_hide_tip
+                        } else {
+                            s.topbar_filetree_show_tip
+                        };
+                        if ft_resp.on_hover_text(tip).clicked() {
+                            out.toggle_filetree = Some(!view.filetree_visible);
+                        }
+                    }
+                });
             });
         });
     out
@@ -378,11 +387,12 @@ mod toolbar_layout_tests {
         });
     }
 
-    /// 绘制哨兵：一帧的绘制图元里左端区域（x<200）应存在四按钮图标的
-    /// 线段图元（①框+分隔线 ②竖干+横枝 ③田字中线 ④十字）——按钮绘制
-    /// 被条件分支意外跳过时此测试失败。
+    /// 绘制哨兵：一帧的绘制图元里，左端区域（x<200）应存在①②图标的
+    /// 线段图元（①框内分隔线 ②竖干+三横枝），右端区域（x>1000，屏宽
+    /// 1200）应存在③④图标的线段图元（③田字两中线 ④十字两线）——
+    /// 按钮绘制被条件分支意外跳过、或左右分组错位时此测试失败。
     #[test]
-    fn 工具栏_左端按钮图元存在() {
+    fn 工具栏_左右两端按钮图元存在() {
         let ctx = egui::Context::default();
         let pal = test_palette();
         let full = ctx.run_ui(test_input(), |ui| {
@@ -396,20 +406,33 @@ mod toolbar_layout_tests {
                 },
             );
         });
-        fn walk(s: &egui::epaint::Shape) -> usize {
+        fn count_segs(s: &egui::epaint::Shape, x_pred: &dyn Fn(f32) -> bool) -> usize {
             use egui::epaint::Shape;
             match s {
                 Shape::LineSegment { points, .. } => {
-                    // 四按钮组约在 x ∈ [10, 150] 范围内
-                    usize::from(points[0].x < 200.0 && points[0].y < HEIGHT)
+                    usize::from(x_pred(points[0].x) && points[0].y < HEIGHT)
                 }
-                Shape::Vec(v) => v.iter().map(walk).sum(),
+                Shape::Vec(v) => v.iter().map(|s| count_segs(s, x_pred)).sum(),
                 _ => 0,
             }
         }
-        let segs: usize = full.shapes.iter().map(|cs| walk(&cs.shape)).sum();
-        // ①分隔线 + ②竖干与三横枝 + ③田字两中线 + ④十字两线 ≥ 8 条
-        assert!(segs >= 8, "左端线段图元过少：{segs} 条——工具栏按钮没画");
+        let left: usize = full
+            .shapes
+            .iter()
+            .map(|cs| count_segs(&cs.shape, &|x| x < 200.0))
+            .sum();
+        let right: usize = full
+            .shapes
+            .iter()
+            .map(|cs| count_segs(&cs.shape, &|x| x > 1000.0))
+            .sum();
+        // 左端：①分隔线 + ②竖干与三横枝 ≥ 5 条。
+        assert!(left >= 5, "左端线段图元过少：{left} 条——视图开关按钮没画");
+        // 右端：③田字两中线 + ④十字两线 ≥ 4 条。
+        assert!(
+            right >= 4,
+            "右端线段图元过少：{right} 条——窗格操作按钮没画或没靠右"
+        );
     }
 
     /// 满额哨兵：pane_count = MAX_PANES 时「＋」为禁用态，一帧渲染
