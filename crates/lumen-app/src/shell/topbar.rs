@@ -169,7 +169,7 @@ pub fn show(
                     } else {
                         pal.fg_dim
                     };
-                    let stroke = egui::Stroke::new(1.2, fg);
+                    let stroke = egui::Stroke::new(1.2_f32, fg);
                     painter.line_segment(
                         [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
                         stroke,
@@ -197,7 +197,7 @@ pub fn show(
                     } else {
                         pal.fg_dim
                     };
-                    let stroke = egui::Stroke::new(1.2, fg);
+                    let stroke = egui::Stroke::new(1.2_f32, fg);
                     if is_maximized {
                         // 还原图标 ⧉：错位双矩形（与窗格最大化态图标同款画法）
                         let r = 3.0;
@@ -264,7 +264,7 @@ pub fn show(
                     // 「—」横线
                     painter.line_segment(
                         [egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)],
-                        egui::Stroke::new(1.5, fg),
+                        egui::Stroke::new(1.5_f32, fg),
                     );
                 }
                 if min_resp.on_hover_text(s.wc_minimize).clicked() {
@@ -409,7 +409,7 @@ fn avatar_button(
     // 悬停反馈：外圈描边（圆形按钮没有 egui 默认的底色 hover 效果）。
     if resp.hovered() {
         ui.painter()
-            .circle_stroke(center, radius, egui::Stroke::new(1.5, pal.fg_dim));
+            .circle_stroke(center, radius, egui::Stroke::new(1.5_f32, pal.fg_dim));
     }
     // 右上角角标：登录过期（红圆 + 白「!」，最优先）> 有更新（小红点）。先垫一圈顶栏底色，
     // 确保在 accent 头像底 / 顶栏底上都清晰可辨。

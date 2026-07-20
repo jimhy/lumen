@@ -216,7 +216,7 @@ pub fn show(
                 };
                 let r = 4.5_f32;
                 let c = close_rect.center();
-                let stroke = egui::Stroke::new(1.2, fg);
+                let stroke = egui::Stroke::new(1.2_f32, fg);
                 painter.line_segment(
                     [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
                     stroke,
@@ -241,7 +241,7 @@ pub fn show(
             ui.painter().vline(
                 body.min.x + NAV_WIDTH,
                 body.y_range(),
-                egui::Stroke::new(1.0, pal.bg_highlight),
+                egui::Stroke::new(1.0_f32, pal.bg_highlight),
             );
 
             let nav_rect =
@@ -472,7 +472,7 @@ fn appearance(
                 ui.painter().rect_stroke(
                     prect,
                     6.0,
-                    egui::Stroke::new(1.0, pal.bg_highlight),
+                    egui::Stroke::new(1.0_f32, pal.bg_highlight),
                     egui::StrokeKind::Inside,
                 );
                 ui.add_space(8.0);
@@ -796,11 +796,11 @@ fn theme_card(
         paint_theme_preview(ui.painter(), prev, &info.theme());
         // 描边：生效主题 accent 2px > 槽位/悬停 fg_dim 1px > 平时分隔灰。
         let stroke = if effective {
-            egui::Stroke::new(2.0, pal.accent)
+            egui::Stroke::new(2.0_f32, pal.accent)
         } else if slot == Some(true) || resp.hovered() {
-            egui::Stroke::new(1.0, pal.fg_dim)
+            egui::Stroke::new(1.0_f32, pal.fg_dim)
         } else {
-            egui::Stroke::new(1.0, pal.bg_highlight)
+            egui::Stroke::new(1.0_f32, pal.bg_highlight)
         };
         ui.painter()
             .rect_stroke(prev, 6.0, stroke, egui::StrokeKind::Inside);
@@ -923,7 +923,7 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, pal: &Palette) -> egui::Respo
     ui.painter().rect_stroke(
         rect,
         radius,
-        egui::Stroke::new(1.0, pal.bg_highlight),
+        egui::Stroke::new(1.0_f32, pal.bg_highlight),
         egui::StrokeKind::Inside,
     );
     let cx = egui::lerp((rect.min.x + radius)..=(rect.max.x - radius), t);

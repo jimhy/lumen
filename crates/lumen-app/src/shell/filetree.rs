@@ -795,7 +795,7 @@ fn panel_ui(
                 } else {
                     pal.fg_dim
                 };
-                let stroke = egui::Stroke::new(1.2, fg);
+                let stroke = egui::Stroke::new(1.2_f32, fg);
                 let c = search_rect.center();
                 // 放大镜圆（圆心偏左上，半径 4.5）
                 let lens_r = 4.5_f32;
@@ -2612,7 +2612,7 @@ fn paint_tri(painter: &egui::Painter, rect: egui::Rect, open: bool, color: egui:
 fn paint_refresh_small(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
     let r = 4.0_f32;
-    let stroke = egui::Stroke::new(1.3, color);
+    let stroke = egui::Stroke::new(1.3_f32, color);
     let seg = 10usize;
     let (start, sweep) = (60.0_f32, 280.0_f32);
     let pts: Vec<egui::Pos2> = (0..=seg)

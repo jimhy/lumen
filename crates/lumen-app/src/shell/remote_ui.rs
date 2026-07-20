@@ -184,7 +184,7 @@ pub fn banner(
             };
             egui::Frame::new()
                 .fill(pal.bg_panel)
-                .stroke(egui::Stroke::new(1.5, accent))
+                .stroke(egui::Stroke::new(1.5_f32, accent))
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {

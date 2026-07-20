@@ -171,7 +171,7 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
                     let fg = if close_resp.hovered() { pal.fg } else { pal.fg_dim };
                     let r = 4.5_f32;
                     let c = close_rect.center();
-                    let stroke = egui::Stroke::new(1.2, fg);
+                    let stroke = egui::Stroke::new(1.2_f32, fg);
                     painter.line_segment(
                         [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
                         stroke,

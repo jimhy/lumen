@@ -330,16 +330,16 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
     // 列表选中/文字选区底：中性灰（egui 默认为蓝）。
     v.selection.bg_fill = pal.selection;
     // 输入框聚焦边框（TextEdit has_focus 取 selection.stroke）：主文字色。
-    v.selection.stroke = egui::Stroke::new(1.0, pal.fg);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, pal.fg);
     // 链接色随强调色走白/近黑（egui 默认为蓝）。
     v.hyperlink_color = pal.accent;
     // 文本输入光标：egui 默认浅蓝（深）/深蓝（浅），改主文字色。
-    v.text_cursor.stroke = egui::Stroke::new(2.0, pal.fg);
+    v.text_cursor.stroke = egui::Stroke::new(2.0_f32, pal.fg);
     // egui 内部警示/错误文字与本色板语义色对齐。
     v.warn_fg_color = pal.warn;
     v.error_fg_color = pal.error;
     v.window_corner_radius = egui::CornerRadius::same(10);
-    v.window_stroke = egui::Stroke::new(1.0, pal.bg_highlight);
+    v.window_stroke = egui::Stroke::new(1.0_f32, pal.bg_highlight);
     // 弹窗/菜单/窗口去半透明投影（海风哥 2026-06-14：弹窗背景不要半透明）。
     // egui 默认 window/popup_shadow 是 from_black_alpha(96) 的柔和黑投影，把弹窗
     // 周围终端内容压暗、显半透明观感；改无投影，靠上面 window_stroke 实色边框
@@ -351,27 +351,27 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
     // bg_highlight → 按下/选中 selection，深色逐级递亮、浅色递深。
     let corner = egui::CornerRadius::same(6);
     v.widgets.noninteractive.corner_radius = corner;
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, pal.fg);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pal.bg_highlight);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, pal.fg);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, pal.bg_highlight);
     v.widgets.inactive.corner_radius = corner;
     v.widgets.inactive.weak_bg_fill = pal.btn_bg;
     // bg_fill 同步走灰阶（滑块轨道/勾选框底等非弱填充控件）。
     v.widgets.inactive.bg_fill = pal.btn_bg;
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, pal.fg);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, pal.fg);
     v.widgets.hovered.corner_radius = corner;
     v.widgets.hovered.weak_bg_fill = pal.bg_highlight;
     v.widgets.hovered.bg_fill = pal.bg_highlight;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, pal.fg_dim);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, pal.fg);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, pal.fg_dim);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, pal.fg);
     v.widgets.active.corner_radius = corner;
     v.widgets.active.weak_bg_fill = pal.selection;
     v.widgets.active.bg_fill = pal.selection;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, pal.fg_dim);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.5, pal.fg);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, pal.fg_dim);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, pal.fg);
     v.widgets.open.corner_radius = corner;
     v.widgets.open.weak_bg_fill = pal.bg_highlight;
     v.widgets.open.bg_fill = pal.bg_panel;
-    v.widgets.open.fg_stroke = egui::Stroke::new(1.0, pal.fg);
+    v.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, pal.fg);
 
     ctx.set_global_style(style);
 }

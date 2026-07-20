@@ -1143,7 +1143,7 @@ pub fn show(
                         }
                         let rr = 3.5;
                         let cstroke =
-                            egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
+                            egui::Stroke::new(1.2_f32, if cresp.hovered() { pal.fg } else { bar_fg });
                         painter.line_segment(
                             [
                                 egui::pos2(cc.x - rr, cc.y - rr),
@@ -1177,7 +1177,7 @@ pub fn show(
                             painter.circle_filled(mc, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
                         }
                         let mstroke =
-                            egui::Stroke::new(1.2, if mresp.hovered() { pal.fg } else { bar_fg });
+                            egui::Stroke::new(1.2_f32, if mresp.hovered() { pal.fg } else { bar_fg });
                         let sq = 3.0;
                         if multi.maximized == Some(i) {
                             // 还原：双框错位。
@@ -1245,7 +1245,7 @@ pub fn show(
                         painter.rect_stroke(
                             rect.round_to_pixels(ppp),
                             0.0,
-                            egui::Stroke::new(1.5, pal.accent),
+                            egui::Stroke::new(1.5_f32, pal.accent),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -1259,7 +1259,7 @@ pub fn show(
                             painter.rect_stroke(
                                 rects[dst].round_to_pixels(ppp),
                                 0.0,
-                                egui::Stroke::new(2.0, pal.accent),
+                                egui::Stroke::new(2.0_f32, pal.accent),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -1491,7 +1491,7 @@ pub fn show(
                         }
                         let r = 3.5;
                         let stroke =
-                            egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
+                            egui::Stroke::new(1.2_f32, if cresp.hovered() { pal.fg } else { bar_fg });
                         painter.line_segment(
                             [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
                             stroke,
@@ -1530,7 +1530,7 @@ pub fn show(
                             painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
                         }
                         let stroke =
-                            egui::Stroke::new(1.2, if mresp.hovered() { pal.fg } else { bar_fg });
+                            egui::Stroke::new(1.2_f32, if mresp.hovered() { pal.fg } else { bar_fg });
                         if maximized.is_some() {
                             // 还原图标 ⧉：错位双矩形——后框只画露出的
                             // 上右两边，前框完整（前框底色填充挡住后框
@@ -1728,7 +1728,7 @@ pub fn show(
                     ui.painter().rect_stroke(
                         rect,
                         0.0,
-                        egui::Stroke::new(1.0, pal.accent),
+                        egui::Stroke::new(1.0_f32, pal.accent),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -1817,7 +1817,7 @@ pub fn show(
                         rects[dst].round_to_pixels(ppp),
                         0.0,
                         pal.accent.gamma_multiply(0.08),
-                        egui::Stroke::new(2.0, pal.accent),
+                        egui::Stroke::new(2.0_f32, pal.accent),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -1841,7 +1841,7 @@ pub fn show(
                     chip,
                     4.0,
                     pal.bg_panel.gamma_multiply(0.85),
-                    egui::Stroke::new(1.0, pal.bg_highlight),
+                    egui::Stroke::new(1.0_f32, pal.bg_highlight),
                     egui::StrokeKind::Inside,
                 );
                 painter.galley(chip.min + pad, galley, pal.fg);
@@ -2150,7 +2150,7 @@ fn sidebar_ui(
             } else {
                 pal.fg_dim
             };
-            let stroke = egui::Stroke::new(1.2, fg);
+            let stroke = egui::Stroke::new(1.2_f32, fg);
             painter.line_segment([egui::pos2(c.x - r, c.y), egui::pos2(c.x + r, c.y)], stroke);
             painter.line_segment([egui::pos2(c.x, c.y - r), egui::pos2(c.x, c.y + r)], stroke);
         }
@@ -2558,7 +2558,7 @@ fn draw_busy_spinner(ui: &egui::Ui, center: egui::Pos2, half: f32, color: egui::
 fn draw_session_icon(ui: &egui::Ui, center: egui::Pos2, active: bool, pal: &theme::Palette) {
     let painter = ui.painter();
     let fg = if active { pal.fg } else { pal.fg_dim };
-    let stroke = egui::Stroke::new(1.3, fg);
+    let stroke = egui::Stroke::new(1.3_f32, fg);
     // 外框 18×15，圆角 3，0.5 像素对齐（防模糊）。
     let bw = 18.0_f32;
     let bh = 15.0_f32;

@@ -120,7 +120,7 @@ pub fn show(ctx: &egui::Context, st: &mut ToastState, pal: &theme::Palette) {
                     let color = t.kind.color(pal);
                     egui::Frame::new()
                         .fill(pal.bg_panel)
-                        .stroke(egui::Stroke::new(1.0, color))
+                        .stroke(egui::Stroke::new(1.0_f32, color))
                         .corner_radius(egui::CornerRadius::same(6))
                         .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {

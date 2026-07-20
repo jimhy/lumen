@@ -8445,7 +8445,7 @@ impl ApplicationHandler<PtyWake> for App {
                                 p.circle_stroke(
                                     c,
                                     radius,
-                                    egui::Stroke::new(1.0, modal_pal.panel_outline),
+                                    egui::Stroke::new(1.0_f32, modal_pal.panel_outline),
                                 );
                                 // 向下箭头（竖杆 + 两撇箭头头），hover 反相配色。
                                 let arrow = if hovered {
@@ -8453,7 +8453,7 @@ impl ApplicationHandler<PtyWake> for App {
                                 } else {
                                     modal_pal.fg
                                 };
-                                let st = egui::Stroke::new(2.0, arrow);
+                                let st = egui::Stroke::new(2.0_f32, arrow);
                                 p.line_segment(
                                     [egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 5.0)],
                                     st,
@@ -8604,7 +8604,7 @@ impl ApplicationHandler<PtyWake> for App {
                                         let painter = ui.painter();
                                         let c = r.center();
                                         painter.circle_filled(c, 13.0, p.accent);
-                                        let st = egui::Stroke::new(1.8, p.accent_fg);
+                                        let st = egui::Stroke::new(1.8_f32, p.accent_fg);
                                         // 向下箭头（竖杆 + 两撇箭头头）
                                         painter.line_segment(
                                             [

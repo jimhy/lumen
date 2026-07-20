@@ -197,7 +197,7 @@ fn draw_icon_sidebar(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palet
         painter.rect_filled(rect, 4.0, pal.bg_highlight);
     }
     let fg = if visible { pal.fg } else { pal.fg_dim };
-    let stroke = egui::Stroke::new(1.2, fg);
+    let stroke = egui::Stroke::new(1.2_f32, fg);
     let c = rect.center();
     // 外框 18×14，圆角 2.5，像素对齐
     let bw = 18.0_f32;
@@ -243,7 +243,7 @@ fn draw_icon_filetree(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Pale
         painter.rect_filled(rect, 4.0, pal.bg_highlight);
     }
     let fg = if visible { pal.fg } else { pal.fg_dim };
-    let stroke = egui::Stroke::new(1.2, fg);
+    let stroke = egui::Stroke::new(1.2_f32, fg);
     let c = rect.center();
     // 树形高度 14，竖干偏左 8px
     let tree_h = 14.0_f32;
@@ -285,7 +285,7 @@ fn draw_icon_grid(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette)
     } else {
         pal.fg_dim
     };
-    let stroke = egui::Stroke::new(1.2, fg);
+    let stroke = egui::Stroke::new(1.2_f32, fg);
     let c = rect.center();
     // 16×14，比例对齐侧栏/树形框
     let bw = 16.0_f32;
@@ -332,7 +332,7 @@ fn draw_icon_plus(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette)
     } else {
         pal.fg_dim
     };
-    let stroke = egui::Stroke::new(1.2, fg);
+    let stroke = egui::Stroke::new(1.2_f32, fg);
     let c = rect.center();
     // 十字中心像素对齐（round to 0.5，与其余图标同法）
     let cx = (c.x + 0.5).floor() - 0.5;

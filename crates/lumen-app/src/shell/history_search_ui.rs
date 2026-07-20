@@ -157,7 +157,7 @@ pub fn show(
             painter.rect_stroke(
                 panel_rect,
                 PANEL_RADIUS,
-                egui::Stroke::new(1.0, pal.panel_outline),
+                egui::Stroke::new(1.0_f32, pal.panel_outline),
                 egui::StrokeKind::Inside,
             );
 
