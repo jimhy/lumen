@@ -40,8 +40,8 @@ jobs:
       - name: 检出
         uses: actions/checkout@v4
 
-      - name: 安装 Rust（stable）
-        uses: dtolnay/rust-toolchain@stable
+      - name: 安装 Rust（pin 1.97.0，见 ci.yml 工具链说明）
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cargo 缓存
         uses: Swatinem/rust-cache@v2
@@ -145,7 +145,7 @@ jobs:
             libwayland-dev \
             pkg-config fonts-dejavu-core
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       # 独立缓存 key，与 ci.yml 的笼统 Linux 缓存隔离（避免 24.04 glibc 2.39
       # 产物污染 22.04，见 package-linux.yml 注释）。
       - uses: Swatinem/rust-cache@v2

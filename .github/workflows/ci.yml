@@ -6,6 +6,12 @@
 # - Linux / macOS：正式 build + test（阻塞）。Windows 专属能力在非 Windows
 #   走跨平台实现或优雅降级（见各模块 cfg(not(windows)) 分支）。
 #   Linux runner 需装 wgpu/winit/arboard/rfd 依赖的 X11/Wayland/GTK 运行库。
+#
+# Rust 工具链 pin 到固定版本（dtolnay/rust-toolchain@1.97.0），不追滚动
+# stable：滚动 stable 会因新版编译器/clippy 引入的 lint 让 main 无端变红
+# （2026-07 实测 1.96→1.97 触发 f32:From<f64> fallback 47 处 + 格式化宏多余
+# 引用），与代码改动无关。要升级 Rust：改这里的版本号 + 本地同版验证后再提。
+# release.yml / package-linux.yml / package-macos.yml 同步 pin 同一版本。
 
 name: ci
 
@@ -28,7 +34,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -57,7 +63,7 @@ jobs:
             fonts-dejavu-core
           # 渲染器需一个真实等宽字体（pick_mono_family 命中 DejaVu Sans Mono）；
           # headless runner 默认可能无等宽字体，否则字体测量测试会挂。
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: 测试（含全 crate 构建）
         run: cargo test --workspace
@@ -67,7 +73,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: 测试（含全 crate 构建）
         run: cargo test --workspace
