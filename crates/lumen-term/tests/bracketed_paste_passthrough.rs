@@ -129,7 +129,7 @@ fn bracketed_paste_多行整体执行验证() {
 
     println!(
         "  清理后文本（utf8 lossy，截 600 字符）：{:?}",
-        &cleaned.chars().take(600).collect::<String>()
+        cleaned.chars().take(600).collect::<String>()
     );
     println!("  独立结果行「3」出现: {result_line_3}");
     println!("  「>>」续行提示符出现: {continuation}");
