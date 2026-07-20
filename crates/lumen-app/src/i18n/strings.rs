@@ -204,7 +204,12 @@ pub struct Strings {
     pub login_err_bad_credentials: &'static str,
 
     // ── 文件树 UI ────────────────────────────────────────────────────
-    /// 刷新 tooltip
+    /// 刷新 tooltip（旧·工具条全局刷新按钮；P15 对齐远程树后按钮已移除，
+    /// 目录级刷新走行内图标、tooltip 复用 `remote_refresh_dir_tip`）
+    // ALLOW: P15 起无代码读取此字段；保留字段是为了维持三语文件的编译期
+    // 完备性检查（删字段会导致 zh_cn/zh_tw/en 三语实例编译报错），与同
+    // 结构体 footer_running_text 同款处理。
+    #[allow(dead_code)]
     pub filetree_refresh_tip: &'static str,
     /// 搜索按钮 tooltip
     pub filetree_search_tip: &'static str,
@@ -232,7 +237,7 @@ pub struct Strings {
     pub filetree_loading: &'static str,
     /// part3c-2 远程树工具条「显示隐藏项」勾选框
     pub remote_show_hidden: &'static str,
-    /// part3c-2 远程树目录行悬停刷新图标 tooltip
+    /// part3c-2 远程树目录行悬停刷新图标 tooltip（P15 起本地树行内刷新同款复用）
     pub remote_refresh_dir_tip: &'static str,
     /// part3c-2 远程视图未控制任何设备时的占位（远程 tab 未连接）
     pub remote_not_connected: &'static str,

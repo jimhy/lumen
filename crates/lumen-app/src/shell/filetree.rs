@@ -38,6 +38,11 @@
 //! - 鼠标双击激活在 egui_ltreeview 0.7.0 存在上游 bug（Activate 不可
 //!   达，P8「双击文件不打开」的根因），以 [`merge_double_click_activation`]
 //!   合成规避，详见该函数文档。
+//!
+//! 需求池 P15：目录行（含树根）悬停时名字右侧出行内刷新图标（对齐
+//! 远程树 #6 的样式与语义），点击只重拉该目录（[`FileTreeState::refresh_dir`]
+//! 链路，展开状态不丢）；工具条右上角的全局刷新按钮移除（远程树工具条
+//! 无全局刷新，两边口径一致）。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -205,7 +210,7 @@ enum Dialog {
     ConfirmDelete { path: PathBuf, is_dir: bool },
 }
 
-/// 右键菜单点选的动作（菜单闭包经 RefCell 回传，树绘制结束后处理）。
+/// 右键菜单/行内图标点选的动作（闭包经 RefCell 回传，树绘制结束后处理）。
 enum MenuAction {
     /// 进入文件夹（cd 过去，与双击目录同一条链路：忙闸门 + 提示）。
     EnterDir(PathBuf),
@@ -223,6 +228,10 @@ enum MenuAction {
     CopyFiles { path: PathBuf, is_dir: bool },
     /// part3c-2 #7：把剪贴板里的远程项粘贴（下载）到此本地目录。
     PasteInto(PathBuf),
+    /// P15 行内刷新：只重拉该目录最新内容。非菜单项——目录行悬停时
+    /// 名字右侧的刷新图标（对齐远程树 #6）点击产生，借同一 RefCell
+    /// 通道回传（ltreeview 的 label 闭包里拿不到 `&mut FileTreeState`）。
+    RefreshDir(PathBuf),
 }
 
 /// 文件树的跨帧状态。
@@ -404,9 +413,10 @@ impl FileTreeState {
         self.close_search();
     }
 
-    /// 重建节点表（「刷新」按钮也走这里，代价是展开状态一并丢失——
-    /// 换取 id 分配的简单与确定性）。代次号 +1：在途后台读取的回包
-    /// 全部作废，防旧根/旧树的结果污染新节点表。
+    /// 重建节点表（仅换根走这里；P15 起工具条全局刷新按钮已移除，
+    /// 目录级刷新走 [`Self::refresh_dir`]，不丢展开状态）。代价是展开
+    /// 状态一并丢失——换取 id 分配的简单与确定性。代次号 +1：在途
+    /// 后台读取的回包全部作废，防旧根/旧树的结果污染新节点表。
     fn reset_nodes(&mut self) {
         self.nodes.clear();
         self.listings.clear();
@@ -759,98 +769,15 @@ fn panel_ui(
     can_paste: bool,
     out: &mut FileTreeOutput,
 ) {
-    // —— 工具条：根目录名（悬停看全路径）+ 搜索/刷新 ——
+    // —— 工具条：根目录名（悬停看全路径）+ 搜索 ——
     // 问题7：收起按钮已删除（开合由顶栏②与 Ctrl+B 统一管理）。
+    // P15：全局刷新按钮已移除，与远程树工具条口径对齐（远程工具条只有根名
+    // + 「显示隐藏项」，无全局刷新）；目录级刷新走目录行悬停的行内刷新图标
+    // （见 add_node 的 Dir 分支），不再有丢整树展开状态的重建入口。i18n key
+    // `filetree_refresh_tip` 暂无使用方，按纪律保留字段不删。
     let s = crate::i18n::strings();
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // —— 刷新按钮：24×24 热区，painter 画圆弧箭头 ——
-            let (refresh_rect, refresh_resp) =
-                ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-            {
-                let painter = ui.painter();
-                if refresh_resp.hovered() {
-                    painter.rect_filled(
-                        refresh_rect,
-                        egui::CornerRadius::same(4),
-                        pal.bg_highlight,
-                    );
-                }
-                let fg = if refresh_resp.hovered() {
-                    pal.fg
-                } else {
-                    pal.fg_dim
-                };
-                let stroke = egui::Stroke::new(1.2, fg);
-                let c = refresh_rect.center();
-                // 圆弧箭头：用 11 段折线逼近约 270° 圆弧（从 45° 到 315°，顺时针）
-                // 半径 5.0，圆心在热区中心偏上 0.5px 以视觉居中
-                let r = 5.0_f32;
-                let arc_cx = c.x;
-                let arc_cy = c.y + 0.5;
-                // 起点角度 45°（右上），终点角度 315°（右下），顺时针即角度递减
-                // 逼近段数 11，覆盖约 270°
-                let start_deg = 45.0_f32;
-                let sweep_deg = -270.0_f32; // 顺时针 270°
-                let n = 11usize;
-                let mut arc_pts: Vec<egui::Pos2> = (0..=n)
-                    .map(|i| {
-                        let t = i as f32 / n as f32;
-                        let angle = (start_deg + t * sweep_deg).to_radians();
-                        egui::pos2(
-                            arc_cx + r * angle.cos(),
-                            arc_cy - r * angle.sin(), // egui y 轴向下，sin 取反
-                        )
-                    })
-                    .collect();
-                // 绘制折线段
-                for w in arc_pts.windows(2) {
-                    painter.line_segment([w[0], w[1]], stroke);
-                }
-                // 末端箭头（位于弧终点约 315°，朝向切线方向）
-                // 切线方向：顺时针圆弧末端切线沿 225° 方向（向左下），箭头两短线
-                let end_pt = arc_pts.pop().unwrap_or(c);
-                let arrow_len = 3.5_f32;
-                // 末端切线角度（顺时针弧末端切线 = 起始角 + 顺时针 270° - 90°）
-                // 实际切线朝 (45° - 270° - 90°) = -315° ≡ 45° 向下即约 -45° + 180° = 135°
-                // 更直观：末端点约在 315°（右下），顺时针切线方向向左 = 约 180°+45°=225°
-                let tangent_deg: f32 = 225.0;
-                let tangent_rad = tangent_deg.to_radians();
-                let perp1 = (tangent_deg + 40.0).to_radians();
-                let perp2 = (tangent_deg - 40.0).to_radians();
-                painter.line_segment(
-                    [
-                        end_pt,
-                        egui::pos2(
-                            end_pt.x
-                                + arrow_len * tangent_rad.cos()
-                                + arrow_len * 0.6 * perp1.cos(),
-                            end_pt.y
-                                - arrow_len * tangent_rad.sin()
-                                - arrow_len * 0.6 * perp1.sin(),
-                        ),
-                    ],
-                    stroke,
-                );
-                painter.line_segment(
-                    [
-                        end_pt,
-                        egui::pos2(
-                            end_pt.x
-                                + arrow_len * tangent_rad.cos()
-                                + arrow_len * 0.6 * perp2.cos(),
-                            end_pt.y
-                                - arrow_len * tangent_rad.sin()
-                                - arrow_len * 0.6 * perp2.sin(),
-                        ),
-                    ],
-                    stroke,
-                );
-            }
-            if refresh_resp.on_hover_text(s.filetree_refresh_tip).clicked() {
-                st.reset_nodes();
-            }
-
             // —— 搜索开关按钮：24×24 热区，painter 画放大镜 ——
             // 激活态用 accent 色；点击展开输入行，再点收起并清空（Esc 同义）。
             let (search_rect, search_resp) =
@@ -1152,6 +1079,11 @@ fn handle_menu_action(
         }
         MenuAction::PasteInto(dir) => {
             out.file_paste_dir = Some(dir);
+        }
+        MenuAction::RefreshDir(dir) => {
+            // P15 行内刷新：走既有目录级刷新链路（展开状态收集→恢复、
+            // 「加载中…」占位、代次+请求号防旧回包全部复用，不丢展开状态）。
+            st.refresh_dir(&dir);
         }
     }
 }
@@ -1487,6 +1419,9 @@ fn add_node(
             let name = display_name(&path);
             let is_root = id == 0;
             let can_paste = load.can_paste;
+            // P15 行内刷新闭包的捕获件（label_ui 是 move 闭包，path 另 clone 一份）。
+            let rf_path = path.clone();
+            let fg_dim = pal.fg_dim;
             // activatable：双击/回车在目录上触发 cd（ltreeview 随之禁用
             // 双击开合，展开/折叠走左侧 closer 三角，与 Warp 一致）。
             // 根目录默认展开，其余默认收起（懒加载的前提）。
@@ -1499,11 +1434,54 @@ fn add_node(
                     .drop_allowed(false)
                     // R8.2：用 label_ui + truncate() 确保目录名带省略号截断。
                     .label_ui(move |ui| {
+                        // P15：行内刷新图标常驻预留 16+2px（名字截断点前移），
+                        // 悬停出图标时名字不跳动；名字→图标间距 2.0 与远程树行同款。
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.set_max_width((ui.available_width() - 18.0).max(0.0));
                         ui.add(
                             egui::Label::new(egui::RichText::new(&name))
                                 .selectable(false)
                                 .truncate(),
                         );
+                        // P15 行内刷新（照抄远程树 #6 样式/语义）：悬停目录行时名字
+                        // 右侧出现小刷新图标，点击只重拉该目录（refresh_dir 链路，
+                        // 展开状态不丢）。ltreeview 拖动时会把本行再画进 Order::Tooltip
+                        // 的拖动浮层（label 闭包同帧跑第二遍）——浮层内跳过，防止
+                        // 同 id 命中区重复注册（点击判定错乱 + debug 重复 id 警告）。
+                        if ui.layer_id().order == egui::Order::Tooltip {
+                            return;
+                        }
+                        let (rf_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        // 显式稳定 id（同远程树范式）：ltreeview 的行 Response 不外露，
+                        // 命中区后注册居上层，点击被图标独占、不连带触发行选中。
+                        let rf_resp = ui.interact(
+                            rf_rect,
+                            egui::Id::new(("lumen_local_rf", id)),
+                            egui::Sense::click(),
+                        );
+                        // 悬停判定：指针落在「行横带」（可视区左缘→图标右缘 ×
+                        // 本行高）——覆盖三角/名字/图标区，与远程树
+                        // 「row/tri/rf 任一 hovered」观感一致（行 Response 拿不到，
+                        // 用指针位置对带判定）。
+                        let band = egui::Rect::from_x_y_ranges(
+                            ui.clip_rect().left()..=rf_rect.right(),
+                            ui.max_rect().y_range(),
+                        );
+                        let hovered = rf_resp.hovered()
+                            || ui
+                                .ctx()
+                                .pointer_hover_pos()
+                                .is_some_and(|p| band.contains(p));
+                        if hovered {
+                            paint_refresh_small(ui.painter(), rf_rect, fg_dim);
+                            if rf_resp
+                                .on_hover_text(crate::i18n::strings().remote_refresh_dir_tip)
+                                .clicked()
+                            {
+                                *menu.borrow_mut() = Some(MenuAction::RefreshDir(rf_path.clone()));
+                            }
+                        }
                     })
                     .context_menu(move |ui| {
                         dir_context_menu(ui, &path, is_root, can_paste, menu);
@@ -2629,7 +2607,8 @@ fn paint_tri(painter: &egui::Painter, rect: egui::Rect, open: bool, color: egui:
     painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
-/// 远程树目录行悬停时的小刷新图标（painter 画约 280° 圆弧 + 箭头）。
+/// 目录行悬停时的小刷新图标（painter 画约 280° 圆弧 + 箭头）。
+/// 远程树 #6 首创，P15 起本地树目录行同款复用。
 fn paint_refresh_small(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
     let r = 4.0_f32;
@@ -3323,6 +3302,99 @@ mod tests {
             vec![7],
             "双击第二击应产生 SetSelected，供合成激活使用"
         );
+    }
+
+    /// P15 哨兵：本地目录行的行内刷新图标（对齐远程树 #6）。断言三件事：
+    /// ① 目录行注册了行内刷新命中矩形（显式稳定 id 可查回）、文件行没有；
+    /// ② 点击图标后仅该目录 listing 被作废（refresh_dir 链路：代次不变、
+    ///    节点表不整树重建——展开状态因此得以保留）；
+    /// ③ 下一帧以推进的请求号重派发该目录的后台读取。
+    #[test]
+    fn 行内刷新_目录行命中区与点击只刷新该目录() {
+        let root = lr_tmp("rowrf");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut st = FileTreeState::default();
+        // 跑一帧完整面板（show 需要顶层 ui；run_ui 提供 CentralPanel）。
+        let frame = |st: &mut FileTreeState, events: Vec<egui::Event>, t: f64| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(480.0, 360.0),
+                )),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(raw, |ui| {
+                let _ = show(ui, st, Some(&root), true, &theme::DARK, 220.0, false);
+            });
+        };
+        // 帧 0：建树 + 根目录懒加载派发；随后轮询收回包（真实盘 IO）。
+        frame(&mut st, Vec::new(), 0.0);
+        let mut t = 0.05;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while st.pending.contains_key(&0) {
+            assert!(Instant::now() < deadline, "等待根目录后台读取超时");
+            std::thread::sleep(Duration::from_millis(20));
+            frame(&mut st, Vec::new(), t);
+            t += 0.05;
+        }
+        let seq_before = st.load_seq;
+        assert!(
+            st.listings.get(&0).is_some_and(|l| l.children.len() == 2),
+            "根 listing 应含 sub 目录与 a.txt 两项"
+        );
+        // ① 目录行（树根 id=0）注册了行内刷新命中区；文件行没有。
+        let rf_rect = ctx
+            .read_response(egui::Id::new(("lumen_local_rf", 0usize)))
+            .expect("目录行应注册行内刷新命中区")
+            .rect;
+        let file_id = st
+            .nodes
+            .iter()
+            .position(|n| matches!(n.kind, NodeKind::File))
+            .expect("节点表中应有文件节点");
+        assert!(
+            ctx.read_response(egui::Id::new(("lumen_local_rf", file_id)))
+                .is_none(),
+            "文件行不应注册行内刷新命中区"
+        );
+        // ② 悬停目录行 → 点击图标中心（按下/抬起分两帧，与真实输入一致）。
+        let pos = rf_rect.center();
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(&mut st, vec![egui::Event::PointerMoved(pos)], t);
+        t += 0.05;
+        let epoch_before = st.epoch;
+        let nodes_before = st.nodes.len();
+        frame(&mut st, vec![button(true)], t);
+        t += 0.05;
+        frame(&mut st, vec![button(false)], t);
+        t += 0.05;
+        assert!(
+            !st.listings.contains_key(&0),
+            "点击行内刷新后该目录 listing 应被作废（待下一帧重派发）"
+        );
+        assert_eq!(st.epoch, epoch_before, "目录级刷新不得整树重建（代次不变）");
+        assert_eq!(
+            st.nodes.len(),
+            nodes_before,
+            "目录级刷新不得整树重建（节点表未重置）"
+        );
+        // ③ 下一帧 ensure_listing 重派发：请求号推进（旧回包按号作废）。
+        frame(&mut st, Vec::new(), t);
+        assert!(
+            st.pending.get(&0).is_some_and(|&s| s > seq_before),
+            "刷新应以更新的请求号重派发该目录的后台读取"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
