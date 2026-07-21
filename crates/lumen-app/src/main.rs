@@ -2932,6 +2932,38 @@ impl AppState {
         true
     }
 
+    /// DECSET 1007 Alternate Scroll：真实鼠标上报关闭、当前又在备用屏时，
+    /// 把每档滚轮转换成一次普通光标上/下键写入 PTY。Codex 的 transcript /
+    /// pager 全屏覆盖层使用这条路径。Shift 仍强制让位给 Lumen 本地回看。
+    fn report_alternate_scroll_wheel(&mut self, up: bool, notches: usize) -> bool {
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        #[cfg(feature = "input-editor")]
+        if self.mouse_on_footer() {
+            return false;
+        }
+        let Some((pane_idx, _id, _col, _row)) = self.viewport_cell_under_mouse() else {
+            return false;
+        };
+        if pane_idx != self.tabs[self.active_tab].focused {
+            return false;
+        }
+        let pane = &self.tabs[self.active_tab].panes[pane_idx];
+        if pane.term.mouse_protocol().is_on()
+            || !pane.term.is_alt_screen()
+            || !pane.term.alternate_scroll()
+        {
+            return false;
+        }
+        let buf = input::encode_alternate_scroll(up, notches);
+        if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&buf) {
+            log::error!("备用屏滚轮转方向键写 PTY 失败: {e:#}");
+        }
+        self.window.request_redraw();
+        true
+    }
+
     /// 指针移动上报：协议为 Button（仅按住拖动时）或 Any（任意移动）时，把
     /// 移动编码成鼠标 motion 事件写 PTY，返回 `true`（调用方跳过本地拖选 /
     /// 链接 hover）；否则 `false` 走本地逻辑。Shift 按下时让位本地。
@@ -7637,10 +7669,12 @@ impl ApplicationHandler<PtyWake> for App {
                 if lines == 0 {
                     return;
                 }
-                // 镜像态（远程视图）控制端滚轮：按**被控端焦点会话的鼠标上报模式**
-                // 路由（与本地态对称，不按端特判，对 Claude/codex 等任何 TUI 通用）：
-                //   - 开了鼠标上报（如 Claude/codex 全屏 ?1003h）→ 把滚轮编码成鼠标
+                // 镜像态（远程视图）控制端滚轮：按**被控端焦点会话的终端模式**
+                // 路由（与本地态对称，不按程序名特判）：
+                //   - 开了鼠标上报（如 Claude 全屏 ?1003h）→ 把滚轮编码成鼠标
                 //     上报，`send_input` 转发给被控端 PTY，程序自己滚、重绘同步两端；
+                //   - 备用屏开启 Alternate Scroll（如 Codex transcript 的 ?1007h）→
+                //     转成光标上/下键转发；
                 //   - 没开（PowerShell / inline）→ 滚控制端**本地镜像 scrollback** 回看，
                 //     不转发、不碰被控端（各端各看各的历史，原设计语义）。
                 // Shift+滚轮强制本地回看（逃生通道）。坐标取镜像窗格内单元格、目标
@@ -7664,31 +7698,32 @@ impl ApplicationHandler<PtyWake> for App {
                             .find(|p| p.session_id == sid)
                             .and_then(|mp| {
                                 let proto = mp.term.mouse_protocol();
-                                if !proto.is_on() {
-                                    return None;
-                                }
-                                let enc = mp.term.mouse_encoding();
-                                let kind = if up {
-                                    MouseEventKind::WheelUp
-                                } else {
-                                    MouseEventKind::WheelDown
-                                };
-                                let mut buf = Vec::new();
-                                for _ in 0..notches {
-                                    if let Some(b) = encode_mouse(
-                                        proto,
-                                        enc,
-                                        MouseEvent {
-                                            kind,
-                                            col,
-                                            row,
-                                            mods,
-                                        },
-                                    ) {
-                                        buf.extend_from_slice(&b);
+                                if proto.is_on() {
+                                    let enc = mp.term.mouse_encoding();
+                                    let kind = if up {
+                                        MouseEventKind::WheelUp
+                                    } else {
+                                        MouseEventKind::WheelDown
+                                    };
+                                    let mut buf = Vec::new();
+                                    for _ in 0..notches {
+                                        if let Some(b) = encode_mouse(
+                                            proto,
+                                            enc,
+                                            MouseEvent {
+                                                kind,
+                                                col,
+                                                row,
+                                                mods,
+                                            },
+                                        ) {
+                                            buf.extend_from_slice(&b);
+                                        }
                                     }
+                                    return (!buf.is_empty()).then_some(buf);
                                 }
-                                (!buf.is_empty()).then_some(buf)
+                                (mp.term.is_alt_screen() && mp.term.alternate_scroll())
+                                    .then(|| input::encode_alternate_scroll(up, notches))
                             }),
                         _ => None,
                     };
@@ -7702,11 +7737,14 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // 鼠标上报开启（如 Claude 的全屏 TUI）时，滚轮交给程序：编码成
                 // SGR/X10 鼠标按钮 64(上)/65(下)写 PTY，程序自己滚它的视口——
-                // 不再滚本地 scrollback（备用屏本就无 scrollback 可滚）。否则
-                // 维持本地 scrollback 滚动。Shift+滚轮强制本地（逃生通道）。
+                // 不再滚本地 scrollback。否则，备用屏的 DECSET 1007（如 Codex
+                // transcript）把滚轮转成方向键；最后才回退本地 scrollback。
+                // Shift+滚轮始终强制本地（逃生通道）。
                 let up = lines > 0;
                 let notches = lines.unsigned_abs().div_ceil(3).max(1);
-                if state.report_mouse_wheel(up, notches) {
+                if state.report_mouse_wheel(up, notches)
+                    || state.report_alternate_scroll_wheel(up, notches)
+                {
                     return;
                 }
                 state

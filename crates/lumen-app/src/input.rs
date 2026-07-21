@@ -116,6 +116,16 @@ pub fn encode_key(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// DECSET 1007 Alternate Scroll 的滚轮输入：每档模拟一次普通光标上/下键。
+///
+/// 1007 不属于鼠标上报协议；仅当上层确认「备用屏 + 1007 开 + mouse protocol
+/// Off」时调用。即使应用开启 ConPTY `?9001`，该终端侧转换仍输出普通 VT
+/// 光标键；Codex 使用默认光标键模式，因此编码为 CSI A/B。
+pub(crate) fn encode_alternate_scroll(up: bool, steps: usize) -> Vec<u8> {
+    let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+    seq.repeat(steps.max(1))
+}
+
 fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
     let seq: &[u8] = match key {
         NamedKey::Enter => b"\r",
@@ -154,4 +164,16 @@ fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(seq.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_alternate_scroll;
+
+    #[test]
+    fn alternate_scroll_编码上下方向与档数() {
+        assert_eq!(encode_alternate_scroll(true, 2), b"\x1b[A\x1b[A");
+        assert_eq!(encode_alternate_scroll(false, 3), b"\x1b[B\x1b[B\x1b[B");
+        assert_eq!(encode_alternate_scroll(true, 0), b"\x1b[A");
+    }
 }

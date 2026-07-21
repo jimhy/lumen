@@ -283,16 +283,7 @@ impl Grid {
     pub fn scroll_up_one(&mut self, keep_history: bool) {
         if let Some(top) = self.screen.pop_front() {
             if keep_history {
-                self.scrollback.push_back(top);
-                if self.scrollback.len() > self.scrollback_limit {
-                    self.scrollback.pop_front();
-                    self.dropped_lines += 1;
-                }
-                // 用户正在回看历史时锚定内容：偏移随历史增长同步
-                // +1，视图不会被新输出推着走。
-                if self.display_offset > 0 {
-                    self.display_offset = (self.display_offset + 1).min(self.scrollback.len());
-                }
+                self.push_scrollback(top);
             } else {
                 self.dropped_lines += 1;
             }
@@ -301,17 +292,50 @@ impl Grid {
         self.dirty = true;
     }
 
-    /// 滚动区 `[top, bottom]`（含端点）内上滚 n 行，区外不动，不进历史。
-    pub fn scroll_region_up(&mut self, top: usize, bottom: usize, n: usize) {
+    /// 滚动区 `[top, bottom]`（含端点）内上滚 n 行，区外不动。
+    ///
+    /// `keep_history` 仅在滚动区从屏幕首行开始（`top == 0`）时生效：移出的
+    /// 顶行进入 scrollback，而 `bottom` 下方的固定 UI 行保持原位。这是 xterm
+    /// 兼容行为，Codex inline TUI 正是用该序列把已完成对话写入终端历史。
+    /// 非顶部滚动区永不进历史；备用屏调用方也应传 `false`。
+    pub fn scroll_region_up(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        n: usize,
+        keep_history: bool,
+    ) {
         let bottom = bottom.min(self.rows - 1);
         if top > bottom {
             return;
         }
-        for _ in 0..n {
-            self.screen.remove(top);
+        // 超过区域高度后只会继续移除刚插入的空行；视觉等价但会制造虚假
+        // 历史，故按区域高度夹紧。
+        let count = n.min(bottom - top + 1);
+        for _ in 0..count {
+            let Some(removed) = self.screen.remove(top) else {
+                break;
+            };
+            if keep_history && top == 0 {
+                self.push_scrollback(removed);
+            }
             self.screen.insert(bottom, Row::new(self.cols));
         }
         self.dirty = true;
+    }
+
+    /// 追加一行 scrollback，并统一维护容量、绝对行基准和回看视口锚定。
+    fn push_scrollback(&mut self, row: Row) {
+        self.scrollback.push_back(row);
+        if self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
+            self.dropped_lines += 1;
+        }
+        // 用户正在回看历史时锚定内容：偏移随历史增长同步 +1，视图不会被
+        // 新输出推着走。
+        if self.display_offset > 0 {
+            self.display_offset = (self.display_offset + 1).min(self.scrollback.len());
+        }
     }
 
     /// 滚动区 `[top, bottom]` 内下滚 n 行（顶部插入空行）。
@@ -668,6 +692,33 @@ mod tests {
         assert_eq!(g.display_offset(), 2);
         g.scroll_display(-99);
         assert_eq!(g.display_offset(), 0);
+    }
+
+    #[test]
+    fn 顶部区域大步滚动_按高度夹紧并维护历史容量与回看锚点() {
+        let mut g = Grid::new(3, 2, 2);
+        for (row, ch) in ['A', 'B', 'C'].into_iter().enumerate() {
+            g.cell_mut(row, 0).ch = ch;
+        }
+        g.scroll_up_one(true); // 历史 A；屏幕 B/C/空。
+        g.cell_mut(2, 0).ch = 'D';
+        g.scroll_up_one(true); // 历史 A/B；屏幕 C/D/空。
+        g.cell_mut(2, 0).ch = 'E';
+        g.scroll_display(1);
+        let abs_before = g.absolute_cursor_line();
+
+        // 区域只有两行：即使 n 很大，也只能把 C/D 各送入历史一次。
+        g.scroll_region_up(0, 1, 99, true);
+
+        assert_eq!(g.scrollback_len(), 2, "历史容量应封顶为 2");
+        assert_eq!(g.display_offset(), 2, "回看视口应随新历史锚定并夹紧");
+        assert_eq!(g.view_top_abs_line(), 2, "已淘汰 A/B，最旧可见历史应为 C");
+        assert!(g.line_by_abs(0).is_none());
+        assert!(g.line_by_abs(1).is_none());
+        assert_eq!(g.line_by_abs(2).expect("历史 C")[0].ch, 'C');
+        assert_eq!(g.line_by_abs(3).expect("历史 D")[0].ch, 'D');
+        assert_eq!(g.absolute_cursor_line(), abs_before + 2);
+        assert_eq!(g.row(2)[0].ch, 'E', "区域下方固定行不得移动");
     }
 
     #[test]

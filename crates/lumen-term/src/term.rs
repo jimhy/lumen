@@ -274,9 +274,35 @@ impl Terminal {
         self.inner.effective_mouse_protocol()
     }
 
+    /// 指定鼠标上报协议的 DECSET 开关是否独立开启。
+    ///
+    /// 与只返回当前最高级别的 [`Self::mouse_protocol`] 不同，本方法保留
+    /// `9/1000/1002/1003` 的叠加状态，供远程镜像等需要无损快照的场景使用。
+    /// 传入 [`MouseProtocol::Off`] 时，仅当四个协议都未开启才返回 `true`。
+    pub fn mouse_protocol_enabled(&self, protocol: MouseProtocol) -> bool {
+        match protocol {
+            MouseProtocol::Off => !self.inner.mouse_x10
+                && !self.inner.mouse_normal
+                && !self.inner.mouse_button
+                && !self.inner.mouse_any,
+            MouseProtocol::X10 => self.inner.mouse_x10,
+            MouseProtocol::Normal => self.inner.mouse_normal,
+            MouseProtocol::Button => self.inner.mouse_button,
+            MouseProtocol::Any => self.inner.mouse_any,
+        }
+    }
+
     /// 当前鼠标坐标 / 按钮编码（DECSET 1006 = SGR，否则默认 X10）。
     pub fn mouse_encoding(&self) -> MouseEncoding {
         self.inner.mouse_encoding
+    }
+
+    /// 是否开启 Alternate Scroll（DECSET 1007）。
+    ///
+    /// 该模式与鼠标上报正交：应用位于备用屏且未开启鼠标上报时，终端模拟器
+    /// 应把滚轮转换为光标上/下键序列。Codex 的全屏 transcript/pager 使用它。
+    pub fn alternate_scroll(&self) -> bool {
+        self.inner.alternate_scroll
     }
 
     /// 是否开启焦点上报（DEC 1004）：窗口获/失焦应发 `ESC[I` / `ESC[O`。
@@ -409,6 +435,8 @@ struct TermInner {
     mouse_any: bool,
     /// 鼠标坐标 / 按钮编码（DECSET 1006 = SGR，否则默认 X10 字节编码）。
     mouse_encoding: MouseEncoding,
+    /// Alternate Scroll（DECSET 1007）：备用屏内把滚轮转换为光标上下键。
+    alternate_scroll: bool,
     /// 焦点上报（DECSET 1004）：窗口获/失焦时应发 `ESC[I` / `ESC[O`。
     focus_event: bool,
     /// 事件序号，用于判断「显示光标」与「ESU」的先后。
@@ -448,6 +476,7 @@ impl TermInner {
             mouse_button: false,
             mouse_any: false,
             mouse_encoding: MouseEncoding::Default,
+            alternate_scroll: false,
             focus_event: false,
             event_seq: 0,
             last_cursor_show_seq: 0,
@@ -510,13 +539,19 @@ impl TermInner {
     /// 光标下移一行；到滚动区底部则滚动。
     fn linefeed(&mut self) {
         if self.grid.cursor.row == self.scroll_bottom {
-            // 全屏滚动区且非备用屏时，滚出的行进入历史。
+            // 全屏滚动区沿用整屏快路径；顶部起始的局部滚动区也须把移出
+            // 顶行送入主屏历史——Codex inline TUI 用它固定底部 composer、
+            // 同时把已完成对话写进 terminal scrollback。
             let full = self.scroll_top == 0 && self.scroll_bottom == self.grid.rows() - 1;
             if full {
                 self.grid.scroll_up_one(self.saved_main.is_none());
             } else {
-                self.grid
-                    .scroll_region_up(self.scroll_top, self.scroll_bottom, 1);
+                self.grid.scroll_region_up(
+                    self.scroll_top,
+                    self.scroll_bottom,
+                    1,
+                    self.saved_main.is_none(),
+                );
             }
         } else if self.grid.cursor.row + 1 < self.grid.rows() {
             self.grid.cursor.row += 1;
@@ -934,7 +969,12 @@ impl Perform for TermInner {
             }
             'M' => {
                 if cur.row >= self.scroll_top && cur.row <= self.scroll_bottom {
-                    self.grid.scroll_region_up(cur.row, self.scroll_bottom, n);
+                    self.grid.scroll_region_up(
+                        cur.row,
+                        self.scroll_bottom,
+                        n,
+                        self.saved_main.is_none(),
+                    );
                 }
             }
             '@' => {
@@ -962,9 +1002,12 @@ impl Perform for TermInner {
                 let blank = self.blank();
                 self.grid.fill_region(cur.row, cur.col, cur.row, end, blank);
             }
-            'S' => self
-                .grid
-                .scroll_region_up(self.scroll_top, self.scroll_bottom, n),
+            'S' => self.grid.scroll_region_up(
+                self.scroll_top,
+                self.scroll_bottom,
+                n,
+                self.saved_main.is_none(),
+            ),
             'T' => self
                 .grid
                 .scroll_region_down(self.scroll_top, self.scroll_bottom, n),
@@ -1015,6 +1058,10 @@ impl Perform for TermInner {
                                 self.mouse_encoding =
                                     if on { MouseEncoding::Sgr } else { MouseEncoding::Default };
                             }
+                            // Alternate Scroll：备用屏 + 无鼠标上报时由上层把滚轮
+                            // 转成 cursor up/down；不要并入 MouseProtocol（点击/移动
+                            // 不应因此上报）。
+                            1007 => self.alternate_scroll = on,
                             // 焦点上报（DEC 1004）。
                             1004 => self.focus_event = on,
                             2026 => {
@@ -1108,6 +1155,7 @@ impl Perform for TermInner {
                     1002 => bool_to_decrqm(self.mouse_button),
                     1003 => bool_to_decrqm(self.mouse_any),
                     1006 => bool_to_decrqm(self.mouse_encoding == MouseEncoding::Sgr),
+                    1007 => bool_to_decrqm(self.alternate_scroll),
                     1004 => bool_to_decrqm(self.focus_event),
                     _ => 0,
                 };
@@ -1727,6 +1775,24 @@ mod tests {
     }
 
     #[test]
+    fn alternate_scroll_模式解析与查询应答() {
+        let mut t = term();
+        assert!(!t.alternate_scroll());
+
+        t.advance(b"\x1b[?1007h");
+        assert!(t.alternate_scroll());
+        // 1007 与真实鼠标上报正交，不能误开 MouseProtocol。
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+        t.advance(b"\x1b[?1007$p");
+        assert_eq!(t.take_responses(), b"\x1b[?1007;1$y".to_vec());
+
+        t.advance(b"\x1b[?1007l");
+        assert!(!t.alternate_scroll());
+        t.advance(b"\x1b[?1007$p");
+        assert_eq!(t.take_responses(), b"\x1b[?1007;2$y".to_vec());
+    }
+
+    #[test]
     fn 备用屏切换不动鼠标模式() {
         // 鼠标上报与 alt screen 正交：进出备用屏不应清掉鼠标协议。
         let mut t = term();
@@ -1741,10 +1807,11 @@ mod tests {
     #[test]
     fn ris_重置鼠标模式() {
         let mut t = term();
-        t.advance(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h");
+        t.advance(b"\x1b[?1003h\x1b[?1006h\x1b[?1007h\x1b[?1004h");
         t.advance(b"\x1bc"); // RIS
         assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
         assert_eq!(t.mouse_encoding(), MouseEncoding::Default);
+        assert!(!t.alternate_scroll());
         assert!(!t.focus_event());
     }
 
@@ -1784,6 +1851,71 @@ mod tests {
         t.advance(b"\x1b[2;4r"); // 滚动区 2-4 行
         t.advance(b"\x1b[4;1Ha\r\nb"); // 在底部触发区内滚动
         assert_eq!(t.grid().scrollback_len(), 0);
+    }
+
+    /// Codex inline TUI 把底部 composer 留在滚动区外，并通过顶部起始的
+    /// DECSTBM + CRLF 把已完成对话写入宿主终端历史。滚出首行必须进入
+    /// scrollback，同时区域下方的固定 UI 行不能移动。
+    #[test]
+    fn codex式顶部局部滚动区_换行进入历史且底部保持固定() {
+        let mut t = term();
+        t.advance(
+            b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HKEEP4\x1b[5;1HKEEP5",
+        );
+        t.advance(b"\x1b[1;3r\x1b[3;1H\r\nNEW");
+
+        assert_eq!(t.grid().scrollback_len(), 1, "滚出的 A 行应进入历史");
+        let history: String = t
+            .grid()
+            .line_by_abs(0)
+            .expect("首条历史行")
+            .cells()
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(history.starts_with('A'));
+        let rows = screen_text(&t);
+        assert!(rows[0].starts_with('B'));
+        assert!(rows[1].starts_with('C'));
+        assert!(rows[2].starts_with("NEW"));
+        assert!(rows[3].starts_with("KEEP4"), "滚动区下方第 4 行不得移动");
+        assert!(rows[4].starts_with("KEEP5"), "滚动区下方第 5 行不得移动");
+    }
+
+    #[test]
+    fn 顶部局部滚动区_su进入历史_备用屏不进历史() {
+        let mut main = term();
+        main.advance(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[1;3r\x1b[S");
+        assert_eq!(main.grid().scrollback_len(), 1, "主屏顶部 SU 应进入历史");
+
+        let mut alt = term();
+        alt.advance(b"\x1b[?1049h\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[1;3r\x1b[S");
+        assert_eq!(alt.grid().scrollback_len(), 0, "备用屏始终不保留 scrollback");
+    }
+
+    #[test]
+    fn 删行_仅主屏首行进入历史() {
+        let mut top = term();
+        top.advance(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[1;1H\x1b[M");
+        assert_eq!(top.grid().scrollback_len(), 1, "主屏首行 DL 应保留被删行");
+        let rows = screen_text(&top);
+        assert!(rows[0].starts_with('B'));
+        assert!(rows[1].starts_with('C'));
+
+        let mut below_top = term();
+        below_top.advance(b"\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[2;1H\x1b[M");
+        assert_eq!(
+            below_top.grid().scrollback_len(),
+            0,
+            "非首行 DL 属于区内编辑，不应生成历史"
+        );
+        let rows = screen_text(&below_top);
+        assert!(rows[0].starts_with('A'));
+        assert!(rows[1].starts_with('C'));
+
+        let mut alt = term();
+        alt.advance(b"\x1b[?1049h\x1b[1;1HX\x1b[2;1HY\x1b[1;1H\x1b[M");
+        assert_eq!(alt.grid().scrollback_len(), 0, "备用屏 DL 不保留历史");
     }
 
     #[test]

@@ -32,7 +32,8 @@ use lumen_term::{Cell, CellFlags, Color, Grid, MouseEncoding, MouseProtocol, Row
 #[must_use]
 pub fn screen_snapshot_vt(term: &Terminal) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-    // 先重发当前终端模式（鼠标上报协议/编码/焦点/win32），使控制端**中途接入**时
+    // 先重发当前终端模式（鼠标上报协议/编码/Alternate Scroll/焦点/win32），
+    // 使控制端**中途接入**时
     // 镜像 `Terminal` 复现这些状态。否则订阅前已发的 DECSET（如 Claude 全屏的
     // ?1003h/?1006h）丢失，控制端无从判定该不该把滚轮上报转发给被控端
     // （2026-06-30 控制端滚轮路由依赖镜像 term 的 mouse_protocol）。
@@ -193,7 +194,8 @@ fn push_scroll_region(out: &mut Vec<u8>, term: &Terminal) {
 
 /// 把终端**当前鼠标/输入相关私有模式**序列化为等效 DECSET 字节，供 [`screen_snapshot_vt`]
 /// 前置——使控制端中途接入时镜像 `Terminal` 重放即复现这些状态。含鼠标上报协议/
-/// SGR 编码/焦点事件/win32 输入，以及括号粘贴（?2004）：控制端粘贴按**镜像** term
+/// SGR 编码/Alternate Scroll（?1007）/焦点事件/win32 输入，以及括号粘贴（?2004）：
+/// 控制端粘贴按**镜像** term
 /// 的 `bracketed_paste` 决定是否包 200~/201~（remote_ws.rs `send_paste`），订阅前
 /// 被控端应用（claude/Ink 等）已发的 `?2004h` 若不重放，中途接入后的多行粘贴不
 /// 包裹、被被控端逐行执行（2026-07 修；此前注释「镜像不粘贴」与 send_paste 实现
@@ -205,15 +207,26 @@ fn terminal_modes_vt(term: &Terminal) -> Vec<u8> {
     if term.bracketed_paste() {
         out.extend_from_slice(b"\x1b[?2004h");
     }
-    match term.mouse_protocol() {
-        MouseProtocol::Off => {}
-        MouseProtocol::X10 => out.extend_from_slice(b"\x1b[?9h"),
-        MouseProtocol::Normal => out.extend_from_slice(b"\x1b[?1000h"),
-        MouseProtocol::Button => out.extend_from_slice(b"\x1b[?1002h"),
-        MouseProtocol::Any => out.extend_from_slice(b"\x1b[?1003h"),
+    // 四个协议开关在 Terminal 内独立保存，必须逐个重放。只序列化当前最高
+    // 级别会丢掉被遮住的低级别；应用随后复位最高级别时，镜像就无法像源端
+    // 一样降级，甚至会误走 ?1007 Alternate Scroll 分支。
+    if term.mouse_protocol_enabled(MouseProtocol::X10) {
+        out.extend_from_slice(b"\x1b[?9h");
+    }
+    if term.mouse_protocol_enabled(MouseProtocol::Normal) {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+    if term.mouse_protocol_enabled(MouseProtocol::Button) {
+        out.extend_from_slice(b"\x1b[?1002h");
+    }
+    if term.mouse_protocol_enabled(MouseProtocol::Any) {
+        out.extend_from_slice(b"\x1b[?1003h");
     }
     if term.mouse_encoding() == MouseEncoding::Sgr {
         out.extend_from_slice(b"\x1b[?1006h");
+    }
+    if term.alternate_scroll() {
+        out.extend_from_slice(b"\x1b[?1007h");
     }
     if term.focus_event() {
         out.extend_from_slice(b"\x1b[?1004h");
@@ -401,7 +414,7 @@ mod tests {
     fn 备用屏快照复现主备两级并可正确退出() {
         let mut src = Terminal::new(4, 20, 100);
         src.advance(b"main-line-1\r\nmain-line-2\r\n"); // 主屏内容
-        src.advance(b"\x1b[?1049h"); // 进备用屏
+        src.advance(b"\x1b[?1049h\x1b[?1007h"); // 进备用屏 + Codex 式 Alternate Scroll
         src.advance(b"\x1b[HALT-FULLSCREEN"); // alt 屏内容（顶行）
         assert!(src.is_alt_screen(), "src 应处于备用屏");
         let snap = screen_snapshot_vt(&src);
@@ -410,6 +423,7 @@ mod tests {
         let mut dst = Terminal::new(4, 20, 100);
         dst.advance(&snap);
         assert!(dst.is_alt_screen(), "镜像重放后应处于备用屏");
+        assert!(dst.alternate_scroll(), "镜像应复现 ?1007 Alternate Scroll");
         assert_eq!(visible_text(&dst)[0], "ALT-FULLSCREEN", "镜像应显示 alt 内容");
         assert!(
             visible_text(&dst).iter().all(|l| !l.contains("main-line")),
@@ -631,6 +645,29 @@ mod tests {
         assert_eq!(dst.mouse_encoding(), MouseEncoding::Sgr, "镜像应复现 SGR 编码");
         assert!(dst.focus_event(), "镜像应复现焦点事件");
         assert!(dst.win32_input(), "镜像应复现 win32 输入");
+    }
+
+    /// 多个鼠标协议可以叠开；快照后复位最高级别时，两端都应降到仍开启的
+    /// 低级别。否则 1007 同时开启时，镜像会把滚轮误转成方向键。
+    #[test]
+    fn 快照保留鼠标协议叠加状态_复位后正确降级() {
+        let mut src = Terminal::new(4, 10, 50);
+        src.advance(b"\x1b[?1049h\x1b[?1002h\x1b[?1003h\x1b[?1007h");
+        let snap = screen_snapshot_vt(&src);
+
+        let mut dst = Terminal::new(4, 10, 50);
+        dst.advance(&snap);
+        assert_eq!(dst.mouse_protocol(), MouseProtocol::Any);
+        assert!(dst.alternate_scroll());
+
+        src.advance(b"\x1b[?1003l");
+        dst.advance(b"\x1b[?1003l");
+        assert_eq!(src.mouse_protocol(), MouseProtocol::Button);
+        assert_eq!(
+            dst.mouse_protocol(),
+            MouseProtocol::Button,
+            "镜像复位 1003 后也应降回仍开启的 1002，而非误变 Off"
+        );
     }
 
     /// 未开鼠标上报时快照不应启用它（镜像保持 Off → 滚轮走本地回看）。
