@@ -6,6 +6,7 @@ members = [
     "crates/lumen-renderer",
     "crates/lumen-app",
     "crates/lumen-editor",
+    "crates/lumen-ssh",
     # M5 远程控制新增：协议（跨平台，client/server 共享）+ 云服务端。
     # server 仅用纯跨平台 crate，Linux 发布用 `cargo build -p lumen-server`
     # 只编其依赖树，不触及 windows-sys/ConPTY 等客户端 crate。
@@ -30,6 +31,7 @@ lumen-term = { path = "crates/lumen-term" }
 lumen-renderer = { path = "crates/lumen-renderer" }
 lumen-editor = { path = "crates/lumen-editor" }
 lumen-protocol = { path = "crates/lumen-protocol" }
+lumen-ssh = { path = "crates/lumen-ssh" }
 
 anyhow = "1"
 arboard = "3"
@@ -181,6 +183,10 @@ tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 # 主线程范式**隔离**（tokio 关在 P2P 线程内，不污染主线程）。current-thread 只需
 # rt/net/time/sync/macros，不引 rt-multi-thread。server 已用 tokio 1（full），版本兼容。
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+# P1 SSH 传输：固定 russh 版本并关闭默认 aws-lc-rs，统一使用 ring；rsa
+# 显式开启以兼容常见 OpenSSH RSA 私钥/agent identity。该组合不依赖系统 OpenSSL。
+russh = { version = "=0.62.4", default-features = false, features = ["ring", "rsa"] }
+zeroize = "1"
 # QUIC 栈：rustls 0.23 + ring 后端，与 tungstenite 的 rustls-tls-native-roots 同源
 # （Cargo.lock 已有 rustls 0.23 / ring 0.17，不新增加密栈）。default-features = false
 # 关掉默认 aws-lc-rs，改 rustls-ring，避免 Windows 上 aws-lc 的 C 编译依赖。QUIC 自带
