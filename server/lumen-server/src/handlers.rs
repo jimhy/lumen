@@ -129,8 +129,9 @@ pub async fn login(
 
 /// `POST /auth/refresh`：用现有**有效** token（经 [`AuthUser`] 提取器校验通过）换发新 token，
 /// 客户端在快到期时调用，避免 7 天到期后对 WS / `/devices` / `/heartbeat` 全面 401 掉线。
-/// 无需查库 / 密码——`AuthUser` 已从旧 token 解出 `user_id`/`device_id`；旧 token 已过期则提取器
-/// 直接 401（续期失败，需重新登录）。在线状态由心跳维持，此处不重复刷 `last_seen`。
+/// 无需密码；`AuthUser` 除验签外还会确认设备仍存在，因此旧 token 已过期或设备
+/// 已被删除都会直接 401（续期失败，需重新登录）。在线状态由心跳维持，此处不
+/// 重复刷 `last_seen`。
 pub async fn refresh(
     State(state): State<AppState>,
     user: AuthUser,

@@ -76,6 +76,104 @@ pub async fn init_schema(pool: &Pool) -> anyhow::Result<()> {
                 created_at BIGINT NOT NULL,
                 PRIMARY KEY (user_id, dev_lo, dev_hi)
             );
+
+            -- SSH 清单同步独立于 settings_sync：账号级 head 在事务中加行锁，
+            -- 为分组、服务器和墓碑分配严格单调 revision。
+            CREATE TABLE IF NOT EXISTS ssh_sync_heads (
+                user_id          TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                current_revision BIGINT NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS ssh_groups (
+                user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                id               TEXT NOT NULL,
+                name             TEXT NOT NULL,
+                sort_order       BIGINT NOT NULL,
+                created_at_ms    BIGINT NOT NULL,
+                updated_at_ms    BIGINT NOT NULL,
+                revision         BIGINT NOT NULL,
+                updated_by_device TEXT NOT NULL,
+                PRIMARY KEY (user_id, id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ssh_groups_user_name_ci_idx
+                ON ssh_groups (user_id, lower(name));
+            CREATE INDEX IF NOT EXISTS ssh_groups_user_revision_idx
+                ON ssh_groups (user_id, revision);
+            CREATE TABLE IF NOT EXISTS ssh_profiles (
+                user_id             TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                id                  TEXT NOT NULL,
+                name                TEXT NOT NULL,
+                host                TEXT NOT NULL,
+                port                INTEGER NOT NULL,
+                username            TEXT NOT NULL,
+                auth_method         TEXT NOT NULL,
+                group_id            TEXT,
+                sort_order          BIGINT NOT NULL,
+                initial_directory   TEXT,
+                connect_timeout_secs BIGINT NOT NULL,
+                keep_alive_secs     BIGINT,
+                monitor_enabled     BOOLEAN NOT NULL,
+                host_key_algorithm  TEXT,
+                host_key_fingerprint TEXT,
+                created_at_ms       BIGINT NOT NULL,
+                updated_at_ms       BIGINT NOT NULL,
+                revision            BIGINT NOT NULL,
+                updated_by_device   TEXT NOT NULL,
+                PRIMARY KEY (user_id, id)
+            );
+            CREATE INDEX IF NOT EXISTS ssh_profiles_user_revision_idx
+                ON ssh_profiles (user_id, revision);
+            CREATE INDEX IF NOT EXISTS ssh_profiles_user_group_idx
+                ON ssh_profiles (user_id, group_id);
+            CREATE TABLE IF NOT EXISTS ssh_tombstones (
+                user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                entity_kind      TEXT NOT NULL,
+                entity_id        TEXT NOT NULL,
+                revision         BIGINT NOT NULL,
+                deleted_by_device TEXT NOT NULL,
+                deleted_at       BIGINT NOT NULL,
+                PRIMARY KEY (user_id, entity_kind, entity_id),
+                CHECK (entity_kind IN ('group', 'profile'))
+            );
+            CREATE INDEX IF NOT EXISTS ssh_tombstones_user_revision_idx
+                ON ssh_tombstones (user_id, revision);
+            CREATE TABLE IF NOT EXISTS ssh_mutations (
+                user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                mutation_id   TEXT NOT NULL,
+                device_id     TEXT NOT NULL,
+                base_revision BIGINT NOT NULL,
+                request_digest TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                revision      BIGINT,
+                error_code    TEXT,
+                created_at    BIGINT NOT NULL,
+                PRIMARY KEY (user_id, mutation_id)
+            );
+            -- 兼容曾启动过 SSH sync 开发版 schema 的数据库。旧行无法可靠重建
+            -- 请求正文摘要，保留 NULL 并在其 mutation_id 被重试时安全拒绝。
+            ALTER TABLE ssh_mutations
+                ADD COLUMN IF NOT EXISTS request_digest TEXT;
+            CREATE TABLE IF NOT EXISTS ssh_sync_checkpoints (
+                user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id  TEXT NOT NULL,
+                cursor     BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                PRIMARY KEY (user_id, device_id)
+            );
+            -- 最小安全审计：只存 id、操作、设备与结果；绝不存配置正文。
+            CREATE TABLE IF NOT EXISTS ssh_sync_audit (
+                id          BIGSERIAL PRIMARY KEY,
+                user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id   TEXT NOT NULL,
+                mutation_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id   TEXT NOT NULL,
+                operation   TEXT NOT NULL,
+                result      TEXT NOT NULL,
+                revision    BIGINT,
+                created_at  BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ssh_sync_audit_user_created_idx
+                ON ssh_sync_audit (user_id, created_at);
             "#,
         )
         .await?;

@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod remote;
+pub mod ssh_sync;
 
 /// 协议版本号。任何破坏性变更必须递增；登录响应回传，客户端可比对。
 ///
@@ -46,6 +47,8 @@ pub mod routes {
     pub const SYNC_SETTINGS: &str = "/api/v1/sync/settings";
     /// 命令历史同步：`GET ?since=<ts_ms>` 拉取 / `POST` 推送。
     pub const SYNC_HISTORY: &str = "/api/v1/sync/history";
+    /// SSH 服务器清单增量同步 `POST`（与偏好 blob、远程控制协议完全独立）。
+    pub const SYNC_SSH: &str = "/api/v1/sync/ssh";
     /// 设备心跳 `POST`（保持本设备在线，刷新 `last_seen`；M5.2）。
     pub const HEARTBEAT: &str = "/api/v1/heartbeat";
     /// 远程控制 WebSocket 长连接 `GET`（升级；M5.3 终端远程，需 `Authorization` 头）。
