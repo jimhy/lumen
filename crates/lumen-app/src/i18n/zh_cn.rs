@@ -263,6 +263,8 @@ pub static STRINGS: Strings = Strings {
     topbar_reset_layout_tip: "恢复窗格默认大小",
     topbar_tab_local: "本地",
     topbar_tab_remote: "远程",
+    topbar_tab_ssh: "SSH",
+    ssh_select_server: "请选择 SSH 服务器",
     remote_list_title: "设备",
     remote_online: "在线",
     remote_offline: "离线",

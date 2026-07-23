@@ -268,6 +268,8 @@ pub static STRINGS: Strings = Strings {
     topbar_reset_layout_tip: "Reset pane sizes",
     topbar_tab_local: "Local",
     topbar_tab_remote: "Remote",
+    topbar_tab_ssh: "SSH",
+    ssh_select_server: "Select an SSH server",
     remote_list_title: "Devices",
     remote_online: "Online",
     remote_offline: "Offline",

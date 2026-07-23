@@ -29,6 +29,56 @@ pub const FONT_SIZE_MAX: f32 = 32.0;
 /// 默认终端字号（与 lumen-renderer 的初始值一致）。
 pub const FONT_SIZE_DEFAULT: f32 = 15.0;
 
+/// 顶栏工作模式。序列化为稳定的小写字符串；反序列化额外兼容旧版
+/// `view_mode: false/true`，分别迁移为本地/远程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewMode {
+    #[default]
+    Local,
+    Remote,
+    Ssh,
+}
+
+impl ViewMode {
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    pub const fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
+    }
+
+    pub const fn is_ssh(self) -> bool {
+        matches!(self, Self::Ssh)
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Compatible {
+            Legacy(bool),
+            Named(String),
+        }
+
+        match Compatible::deserialize(deserializer)? {
+            Compatible::Legacy(false) => Ok(Self::Local),
+            Compatible::Legacy(true) => Ok(Self::Remote),
+            Compatible::Named(name) => match name.as_str() {
+                "local" => Ok(Self::Local),
+                "remote" => Ok(Self::Remote),
+                "ssh" => Ok(Self::Ssh),
+                _ => Err(serde::de::Error::custom(format!("未知 view_mode：{name}"))),
+            },
+        }
+    }
+}
+
 /// 左侧会话 tab 栏宽度下限（逻辑像素；P10 拖宽范围与加载夹紧共用）。
 pub const SIDEBAR_WIDTH_MIN: f32 = 140.0;
 /// 左侧会话 tab 栏宽度上限。
@@ -162,10 +212,10 @@ pub struct LayoutSettings {
     /// （与 [`Default`] 一致），平滑升级无感知。
     #[serde(default = "default_filetree_visible")]
     pub filetree_visible: bool,
-    /// 当前视图（M5.2）：false = 本地（默认），true = 远程（设备栏）。
-    /// 顶栏「本地/远程」tab 切换；`#[serde(default)]` 旧文件缺字段补 false。
-    #[serde(default = "default_view_mode")]
-    pub view_mode: bool,
+    /// 当前工作模式：本地（默认）/远程/SSH。
+    /// 旧版布尔值 `false/true` 由 [`ViewMode`] 兼容迁移为本地/远程。
+    #[serde(default)]
+    pub view_mode: ViewMode,
 }
 
 /// sidebar_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
@@ -183,11 +233,6 @@ fn default_filetree_visible() -> bool {
     true
 }
 
-/// view_mode 字段的 serde default 函数（旧文件缺字段时补 false = 本地）。
-fn default_view_mode() -> bool {
-    false
-}
-
 impl Default for LayoutSettings {
     fn default() -> Self {
         Self {
@@ -196,7 +241,7 @@ impl Default for LayoutSettings {
             sidebar_visible: true,
             remote_list_visible: true,
             filetree_visible: true,
-            view_mode: false,
+            view_mode: ViewMode::Local,
         }
     }
 }
@@ -481,7 +526,8 @@ impl Settings {
                     d.filetree_visible,
                     path,
                 );
-                // view_mode（M5.2）：旧文件缺字段静默补 false（本地）。
+                // view_mode：旧布尔值 false/true 兼容迁移为 Local/Remote；
+                // 缺字段或非法值静默补 Local。
                 s.layout.view_mode = lenient_field(
                     ly,
                     "view_mode",
@@ -766,7 +812,7 @@ mod tests {
                 sidebar_visible: true,
                 remote_list_visible: false,
                 filetree_visible: false,
-                view_mode: true,
+                view_mode: ViewMode::Ssh,
             },
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,
@@ -1308,6 +1354,35 @@ mod tests {
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert!(loaded.layout.remote_list_visible);
-        assert!(loaded.layout.view_mode, "其余合法字段应保留");
+        assert_eq!(
+            loaded.layout.view_mode,
+            ViewMode::Remote,
+            "旧版 true 应迁移为远程模式"
+        );
+    }
+
+    #[test]
+    fn 三态模式序列化与旧布尔值兼容() {
+        assert_eq!(
+            serde_json::to_string(&ViewMode::Local).unwrap(),
+            r#""local""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ViewMode::Remote).unwrap(),
+            r#""remote""#
+        );
+        assert_eq!(serde_json::to_string(&ViewMode::Ssh).unwrap(), r#""ssh""#);
+        assert_eq!(
+            serde_json::from_str::<ViewMode>("false").unwrap(),
+            ViewMode::Local
+        );
+        assert_eq!(
+            serde_json::from_str::<ViewMode>("true").unwrap(),
+            ViewMode::Remote
+        );
+        assert_eq!(
+            serde_json::from_str::<ViewMode>(r#""ssh""#).unwrap(),
+            ViewMode::Ssh
+        );
     }
 }

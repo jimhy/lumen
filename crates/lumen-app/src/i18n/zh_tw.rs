@@ -269,6 +269,8 @@ pub static STRINGS: Strings = Strings {
     topbar_reset_layout_tip: "還原窗格預設大小",
     topbar_tab_local: "本地",
     topbar_tab_remote: "遠端",
+    topbar_tab_ssh: "SSH",
+    ssh_select_server: "請選擇 SSH 伺服器",
     remote_list_title: "裝置",
     remote_online: "線上",
     remote_offline: "離線",

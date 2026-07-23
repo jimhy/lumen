@@ -1169,13 +1169,7 @@ impl AppState {
             }
         }
         self.last_local_input = now;
-        self.terminal_focused = !(self.shell_state.settings.open
-            || self.shell_state.login.open
-            || self.shell_state.history_search.open
-            || self.shell_state.completion.open
-            || self.shell_state.renaming.is_some()
-            || self.shell_state.pane_renaming.is_some()
-            || self.shell_state.filetree.dialog_open());
+        self.terminal_focused = self.terminal_focus_allowed();
         self.update_window_title();
         app_lock::set_window_capture_protection(&self.window, false);
         self.window.request_redraw();
@@ -1392,7 +1386,7 @@ impl AppState {
         // part3d 控制端：进入远程视图且尚未订阅任何会话 → 自动订阅列表首个，使镜像立即有内容
         // （否则用户须先手动点列表项；首个=被控端侧栏顺序首位）。订阅后本分支不再触发。
         if self.remote_ws.is_controlling()
-            && self.settings.layout.view_mode
+            && self.settings.layout.view_mode.is_remote()
             && self.remote_ws.subscribed_tab().is_none()
         {
             if let Some(first) = self.remote_ws.remote_tabs().first().map(|t| t.id) {
@@ -1788,7 +1782,67 @@ impl AppState {
     /// 控制端镜像视图是否生效（控制中 且 处于「远程」视图）：决定键盘是否转发给
     /// 被控端而非本地执行（bug3：切回「本地」视图则本地输入、不转发、不画镜像）。
     fn is_mirror_active(&self) -> bool {
-        self.remote_ws.is_controlling() && self.settings.layout.view_mode
+        self.remote_ws.is_controlling() && self.settings.layout.view_mode.is_remote()
+    }
+
+    /// 当前工作模式和覆盖层是否允许把键盘/IME 焦点交给终端。
+    ///
+    /// SSH 终端接入前，SSH 模式必须始终返回 false，避免任何后台本地
+    /// Session 因 tab 激活、弹窗关闭等旁路重新获得输入。
+    fn terminal_focus_allowed(&self) -> bool {
+        !self.settings.layout.view_mode.is_ssh()
+            && !(self.shell_state.settings.open
+                || self.shell_state.login.open
+                || self.shell_state.history_search.open
+                || self.shell_state.completion.open
+                || self.shell_state.renaming.is_some()
+                || self.shell_state.pane_renaming.is_some()
+                || self.shell_state.filetree.dialog_open())
+    }
+
+    /// 工作模式切换的唯一状态入口。保持后台本地 PTY / 远程连接运行，
+    /// 只切换本机可见域并清理上一模式遗留的交互状态。
+    fn switch_view_mode(&mut self, next: settings::ViewMode) -> bool {
+        if self.settings.layout.view_mode == next {
+            return false;
+        }
+
+        // 必须在改 view_mode 前补发 Release：远程镜像输入路由依赖旧模式。
+        self.release_held_report_buttons();
+        self.settings.layout.view_mode = next;
+
+        self.terminal_focused = self.terminal_focus_allowed();
+        self.filetree_hovered = false;
+        self.hovered_link = None;
+        self.hover_probe_cell = None;
+        self.scrollbar_drag = None;
+        self.autoscroll_drag = 0;
+        self.autoscroll_at = None;
+        self.last_left_click = None;
+        self.pane_rects_px.clear();
+        self.pane_close_rects_px.clear();
+        self.divider_rects_px.clear();
+        self.panel_resize_rects_px.clear();
+        self.mirror_rect_px = None;
+        self.mirror_pane_rects_px.clear();
+        self.remote_ws.clear_mirror_selection();
+
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                pane.selecting = false;
+                #[cfg(feature = "input-editor")]
+                {
+                    pane.preedit = None;
+                }
+            }
+        }
+
+        if next.is_remote() {
+            self.remote.request_refresh();
+        }
+        self.update_window_title();
+        self.window.request_redraw();
+        true
     }
 
     fn dispatch(
@@ -3924,7 +3978,7 @@ impl AppState {
     /// （`bypass_egui` 的 `terminal_focused && Ime` 项已覆盖），故对 Win11
     /// 正常路径零影响；仅焦点翻转窗口期生效。
     fn ime_should_route_to_composer(&self) -> bool {
-        if self.app_lock.is_locked() {
+        if self.app_lock.is_locked() || self.settings.layout.view_mode.is_ssh() {
             return false;
         }
         #[cfg(feature = "input-editor")]
@@ -3993,13 +4047,7 @@ impl AppState {
         // 自行退出触发的 activate 可能发生在用户正往设置页/登录表单/
         // 重命名框打字时，无脑置 true 会让在途按键直写邻位会话的 PTY
         // （bypass_egui 即刻生效，等不到下一帧的纠偏）。
-        self.terminal_focused = !(self.shell_state.settings.open
-            || self.shell_state.login.open
-            || self.shell_state.history_search.open
-            || self.shell_state.completion.open
-            || self.shell_state.renaming.is_some()
-            || self.shell_state.pane_renaming.is_some()
-            || self.shell_state.filetree.dialog_open());
+        self.terminal_focused = self.terminal_focus_allowed();
         // 防御（composer Win10 IME）：切 tab 复位焦点窗格的 IME 预编辑残留，
         // 防止切回时上一 tab 半成品组合串串入。激进修复（见
         // ime_should_route_to_composer）负责焦点翻转期首字直达 composer。
@@ -4627,6 +4675,11 @@ impl AppState {
                 .set_title(&format!("Lumen — {}", i18n::strings().lock_screen_title));
             return;
         }
+        if self.settings.layout.view_mode.is_ssh() {
+            self.window
+                .set_title(&format!("Lumen [ime-r4] — {}", i18n::strings().topbar_tab_ssh));
+            return;
+        }
         let title = self.tabs[self.active_tab].display_title();
         // [BUILD-MARKER r4]（composer-IME 取证临时）：标题栏带版本标记，海风哥
         // 一眼确认跑的是不是带修复的新版，不用翻日志。坐实后连同诊断一并移除。
@@ -4964,7 +5017,7 @@ impl AppState {
     /// Lumen 内部剪贴板（下载源）；本地视图 → 复制选中本地项到系统剪贴板（CF_HDROP，与资源管理器
     /// 互通）。无选中则忽略。
     fn filetree_ctrl_c(&mut self) {
-        if self.settings.layout.view_mode {
+        if self.settings.layout.view_mode.is_remote() {
             // 远程视图：复制选中的被控端项 → Lumen 内部剪贴板（远程路径进不了系统剪贴板，仅供下载）。
             if let Some((path, name, is_dir, size)) = self
                 .remote_ws
@@ -4997,7 +5050,10 @@ impl AppState {
                     .toast
                     .push(shell::toast::ToastKind::Info, msg);
             }
-        } else if let Some((path, _is_dir)) = self.shell_state.filetree.selected_item() {
+        } else if self.settings.layout.view_mode.is_local() {
+            let Some((path, _is_dir)) = self.shell_state.filetree.selected_item() else {
+                return;
+            };
             // 本地视图：复制选中项 → 系统剪贴板（CF_HDROP），清 Lumen 内部远程剪贴板。
             let ok = clipboard_files::copy_files(&[path]);
             self.remote_ws.clear_file_clipboard();
@@ -5025,7 +5081,7 @@ impl AppState {
     /// 无文本时连信号都没）。按当前视图定目标目录：远程视图 → 选中目录 / 树根（上传）；本地视图 →
     /// 选中目录 / 树根（下载或本机复制）。无目标目录则忽略。
     fn filetree_ctrl_v(&mut self) {
-        if self.settings.layout.view_mode {
+        if self.settings.layout.view_mode.is_remote() {
             // 远程视图：上传到选中的远程目录（或树根）。
             let dir = self.remote_ws.remote_filetree().and_then(|ft| {
                 ft.selected_dir()
@@ -5034,7 +5090,10 @@ impl AppState {
             if let Some(dir) = dir {
                 self.do_file_paste(remote_ws::ClipSide::Remote, dir);
             }
-        } else if let Some(dir) = self.shell_state.filetree.paste_target_dir() {
+        } else if self.settings.layout.view_mode.is_local() {
+            let Some(dir) = self.shell_state.filetree.paste_target_dir() else {
+                return;
+            };
             // 本地视图：下载 / 本机复制到选中目录（或树根）。
             self.do_file_paste(remote_ws::ClipSide::Local, dir.display().to_string());
         }
@@ -5828,6 +5887,9 @@ impl App {
 
         // 在 app_settings 被 move 进 AppState 之前读出 classic_mode（第十八轮）。
         let init_force_fallback = app_settings.classic_mode;
+        // SSH 模式启动时先停在服务器选择层，绝不能让后台本地 PTY
+        // 取得键盘/IME 焦点。
+        let init_terminal_focused = !app_settings.layout.view_mode.is_ssh();
         // auto_check 初值（app_settings 随后 move 进 settings 字段，先取出）。
         let init_auto_check = app_settings.update.auto_check;
         // 生效代理初值（同上，先取出 owned）。
@@ -5918,7 +5980,7 @@ impl App {
             pane_close_rects_px: Vec::new(),
             divider_rects_px: Vec::new(),
             panel_resize_rects_px: Vec::new(),
-            terminal_focused: true,
+            terminal_focused: init_terminal_focused,
             egui_repaint_at: None,
             was_popup_open: false,
             shell_state: shell::ShellState::default(),
@@ -6828,6 +6890,7 @@ impl ApplicationHandler<PtyWake> for App {
             matches!(event, WindowEvent::Ime(_)) && state.ime_should_route_to_composer();
         let bypass_egui = matches!(event, WindowEvent::RedrawRequested)
             || (!state.app_lock.is_locked()
+                && !state.settings.layout.view_mode.is_ssh()
                 && state.terminal_focused
                 && matches!(
                     event,
@@ -6909,6 +6972,9 @@ impl ApplicationHandler<PtyWake> for App {
             // 拖放按鼠标落点窗格）。路径转义 / Compose 分流与文件树拖放
             // 共用 insert_path_into_pane。
             WindowEvent::DroppedFile(path) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
                 let idx = state.tabs[state.active_tab].focused;
                 state.insert_path_into_pane(idx, &path);
                 state.window.request_redraw();
@@ -6959,6 +7025,11 @@ impl ApplicationHandler<PtyWake> for App {
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // SSH 模式尚未接入独立会话路由时，键盘只交给上方 egui
+                //（顶栏/设置/表单），绝不落入后台本地 PTY。
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
                 // —— M4.1 批B：事件 → keymap 查表 → Action → dispatch ——
                 //
                 // 原八层 if-else 拦截链已全部平移进 keymap 静态表
@@ -8859,12 +8930,11 @@ impl ApplicationHandler<PtyWake> for App {
                     // 为 None → 画「等待 cwd」占位，绝不回落本机树（修 #2：未连接设备时远程 tab
                     // 显示本地树）。注意用 view_mode（远程 tab 选中）而非 is_mirror_active
                     // （= 控制中 且 远程 tab），否则未控制时回落本地树。
-                    remote_filetree: if state.settings.layout.view_mode {
+                    remote_filetree: if state.settings.layout.view_mode.is_remote() {
                         state.remote_ws.remote_filetree()
                     } else {
                         None
                     },
-                    remote_view_active: state.settings.layout.view_mode,
                     // part3c-2 #7：文件剪贴板来源侧 + 待决覆盖冲突项数（驱动菜单 / 覆盖模态）。
                     file_clipboard_side: state.remote_ws.file_clipboard().map(|c| c.side),
                     overwrite_conflict_count: state
@@ -8875,12 +8945,20 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
-                let scroll_to_bottom_targets = state.scroll_to_bottom_overlays();
+                let scroll_to_bottom_targets = if state.settings.layout.view_mode.is_ssh() {
+                    Vec::new()
+                } else {
+                    state.scroll_to_bottom_overlays()
+                };
                 let mut scroll_to_bottom_req: Option<SessionId> = None;
                 // 终端滚动条目标几何（同样须在借 shell_state 前算好）。
                 // 拖动/点击后把目标绝对 display_offset 记入 scroll_set_req，
                 // 闭包后落到对应 grid。
-                let scrollbar_targets = state.scrollbar_overlays();
+                let scrollbar_targets = if state.settings.layout.view_mode.is_ssh() {
+                    Vec::new()
+                } else {
+                    state.scrollbar_overlays()
+                };
                 let mut scroll_set_req: Option<(SessionId, usize)> = None;
                 let scrollbar_drag = &mut state.scrollbar_drag;
                 let shell_state = &mut state.shell_state;
@@ -10251,40 +10329,9 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
-                // M5.2：本地/远程 tab 切换 → 写 settings 并触发存盘。
+                // 三种工作模式切换 → 写 settings 并触发存盘。
                 let view_mode_changed = if let Some(v) = shell_out.toggle_view_mode {
-                    // 切视图前先补发仍按住的鼠标上报键的 Release（本地↔镜像视图是
-                    // mouse_report_held / mirror_report_sid 共用态的边界，不 flush 会两端
-                    // 幻影按住）。**务必在改 view_mode 之前**：release_held_report_buttons
-                    // 按 mirror_report_sid.is_some() 而非 view_mode 判路、send 只看
-                    // is_controlling()，故切前 flush 能把 Release 投到正确一侧。
-                    state.release_held_report_buttons();
-                    state.settings.layout.view_mode = v;
-                    // 切到远程视图：请求后台立即刷新一次设备列表。
-                    if v {
-                        state.remote.request_refresh();
-                    }
-                    // part4b：切换视图即清镜像选区/拖选态——否则远程→本地→远程后会复制
-                    // 陈旧选区、或（左键仍按住时切换）回来后产生幻影拖选。
-                    state.remote_ws.clear_mirror_selection();
-                    // F10：切视图同时清链接 hover——本地窗格 id 与镜像 session_id 来自
-                    // 两台机器、各自从 0 自增，撞号是常态；本地/镜像两条渲染循环各按自己
-                    // 的 id 过滤同一 hovered_link，切态后若鼠标不动，陈旧 hover 会被另一
-                    // 态按撞号命中、误画一条下划线（直到下次 CursorMoved 重探才自愈）。
-                    // 切态即清、连带 probe（重入原格不会因 probe 相等跳过重探）。
-                    state.hovered_link = None;
-                    state.hover_probe_cell = None;
-                    // part4c：切视图复位焦点窗格 preedit（仿 activate()）——否则进镜像态前
-                    // 本地打了一半的中文组合串，退出镜像态后会残留在 footer/composer。
-                    #[cfg(feature = "input-editor")]
-                    {
-                        let ti = state.active_tab;
-                        let pi = state.tabs[ti].focused;
-                        if let Some(p) = state.tabs[ti].panes.get_mut(pi) {
-                            p.preedit = None;
-                        }
-                    }
-                    true
+                    state.switch_view_mode(v)
                 } else {
                     false
                 };

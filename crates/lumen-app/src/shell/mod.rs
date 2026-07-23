@@ -232,10 +232,6 @@ pub struct ShellInput<'a> {
     pub remote_mirror_multi: Option<MirrorMultiInput>,
     /// M5.3 part3c-1：被控端推来的文件树快照（Some = 已收到首份快照）。
     pub remote_filetree: Option<&'a crate::remote_ws::RemoteFileTree>,
-    /// M5.3 part3c-1：是否处于远程视图（控制中+远程视图，= `is_mirror_active`）。为真则
-    /// 文件树栏一律画被控端只读树（快照未到则空树+「等待 cwd」占位），**不回落本地树**
-    /// ——否则会把本机目录树画进远程栏、且点击 cd/打开误作用于控制端本机（本地/远程串扰）。
-    pub remote_view_active: bool,
     /// M5.3 part3c-2 #7：文件剪贴板来源侧（None=空）。本地树据此决定是否显示「粘贴到此目录」
     /// （= 剪贴板为 Remote，下载目标）；远程树据此（= 剪贴板为 Local，上传目标）。
     pub file_clipboard_side: Option<crate::remote_ws::ClipSide>,
@@ -317,8 +313,8 @@ pub struct ShellOutput {
     pub toggle_remote_list: Option<bool>,
     /// 工具栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
     pub toggle_filetree: Option<bool>,
-    /// 本地/远程视图切换（M5.2）：main 写 settings.layout.view_mode + 存盘。
-    pub toggle_view_mode: Option<bool>,
+    /// 本地/远程/SSH 工作模式切换：main 写 settings.layout.view_mode + 存盘。
+    pub toggle_view_mode: Option<crate::settings::ViewMode>,
     /// 选中了某远程设备（M5.2）：main 记 active_device_id。
     pub activate_device: Option<String>,
     /// 提交远程设备改名（M5.2）：(设备 id, 新名)。
@@ -500,8 +496,11 @@ pub fn show(
     app_lock: settings_ui::AppLockInput<'_>,
     is_maximized: bool,
 ) -> ShellOutput {
+    let view_mode = app_settings.layout.view_mode;
+    let is_remote_view = view_mode.is_remote();
+    let is_ssh_view = view_mode.is_ssh();
     // 远程视图但未连上任何设备：隐藏会话栏 / 文件树栏，命令行区中央显示「未连接任何设备」占位。
-    let is_remote_unconnected = input.remote_view_active
+    let is_remote_unconnected = is_remote_view
         && !input
             .remote_session
             .is_some_and(|sess| matches!(sess.role, lumen_protocol::remote::Role::Controller));
@@ -669,7 +668,7 @@ pub fn show(
     if tb.open_feedback {
         out.open_feedback = true;
     }
-    // M5.2：本地/远程 tab 切换 → 转发给 main（写 settings.layout.view_mode + 存盘）。
+    // 三种工作模式切换 → 转发给 main（写 settings.layout.view_mode + 存盘）。
     if let Some(v) = tb.toggle_view_mode {
         out.toggle_view_mode = Some(v);
     }
@@ -719,7 +718,8 @@ pub fn show(
         input.panes.len(),
         pal,
         toolbar::ViewState {
-            remote_view: app_settings.layout.view_mode,
+            remote_view: is_remote_view,
+            session_actions_enabled: !is_ssh_view,
             remote_list_visible: app_settings.layout.remote_list_visible,
             sidebar_visible: app_settings.layout.sidebar_visible,
             filetree_visible: st.filetree.visible,
@@ -752,7 +752,7 @@ pub fn show(
         egui::Rect::from_x_y_ranges(edge_x - grab..=edge_x + grab, y)
     };
     // 远程设备列表（M5.2）：仅远程 tab 显示，置于会话栏左侧（第三列）。
-    if app_settings.layout.view_mode && app_settings.layout.remote_list_visible {
+    if is_remote_view && app_settings.layout.remote_list_visible {
         let rl_resp = egui::Panel::left("lumen_remote_list")
             .default_size(crate::settings::REMOTE_LIST_WIDTH_DEFAULT)
             .size_range(
@@ -816,7 +816,7 @@ pub fn show(
             .push(edge_rect(rl_resp.response.rect.max.x, root));
     }
 
-    if app_settings.layout.sidebar_visible && !is_remote_unconnected {
+    if app_settings.layout.sidebar_visible && !is_remote_unconnected && !is_ssh_view {
         // 可拖宽（P10）。default_size 只在 egui 无面板记忆（首帧）时生效
         // = 还原持久化宽度；此后宽度由 egui 面板自管，实际值经
         // sidebar_width 报回 main，松手时写盘。
@@ -892,7 +892,9 @@ pub fn show(
     // 否则画本地树。`panel_width/rect` 两路同构，下方描边/拖宽手柄逻辑无需分支。
     // 片1 为占位桩（仅按 RootChanged 的 cwd 画占位）；片2 换成交互式浏览树。
     use crate::remote_ws::ClipSide;
-    let (ft_panel_width, ft_panel_rect, ft_external_drop) = if input.remote_view_active {
+    let (ft_panel_width, ft_panel_rect, ft_external_drop) = if is_ssh_view {
+        (None, None, None)
+    } else if is_remote_view {
         // 远程视图：一律画被控端 Option B 浏览树（只读渲染）。cwd 未到时画占位，绝不回落
         // 本地树（否则点击串扰控制端本机）。交互意图（展开点击 / 显示隐藏 / 复制粘贴）收集到
         // rout，由 main 闭包后以 &mut state.remote_ws 施加。远程树可粘贴 = 系统剪贴板有文件
@@ -1041,7 +1043,7 @@ pub fn show(
     // AltScreen 时 footer 隐藏（ComposerView::hidden），但状态栏仍保持可见以便
     // 用户随时知道当前模式（与 footer 逻辑独立）。
     #[cfg(feature = "input-editor")]
-    {
+    if !is_ssh_view {
         let sb_resp = egui::Panel::bottom("lumen_statusbar")
             .exact_size(statusbar::HEIGHT)
             .show_separator_line(false)
@@ -1081,6 +1083,19 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
+
+            // SSH 服务器/会话使用独立领域；未选择服务器时不得渲染或
+            // 命中后台本地终端。
+            if is_ssh_view {
+                ui.painter().text(
+                    area.center(),
+                    egui::Align2::CENTER_CENTER,
+                    crate::i18n::strings().ssh_select_server,
+                    egui::FontId::proportional(16.0),
+                    pal.fg_dim,
+                );
+                return;
+            }
 
             // 远程视图未连接任何设备：中央居中显示占位，跳过所有终端 / 镜像渲染。
             if is_remote_unconnected {

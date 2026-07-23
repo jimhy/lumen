@@ -61,6 +61,8 @@ pub struct ToolbarOutput {
 pub struct ViewState {
     /// 是否为远程视图；仅为 true 时渲染设备栏按钮。
     pub remote_view: bool,
+    /// 当前工作模式是否允许本地会话/窗格/文件树操作。
+    pub session_actions_enabled: bool,
     /// 远程设备栏当前是否可见。
     pub remote_list_visible: bool,
     /// 会话栏（①）当前是否可见。
@@ -115,8 +117,9 @@ pub fn show(
                 let s = i18n::strings();
                 ui.add_space(RIGHT_MARGIN);
 
-                // ④「＋」新增窗格（F5，居最右）：满 MAX_PANES 禁用 + 悬停提示。
-                {
+                // SSH 服务器选择页不操作后台本地 Session。
+                if view.session_actions_enabled {
+                    // ④「＋」新增窗格（F5，居最右）：满 MAX_PANES 禁用 + 悬停提示。
                     let enabled = pane_count < MAX_PANES;
                     let (plus_rect, plus_resp) =
                         ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
@@ -129,12 +132,10 @@ pub fn show(
                     if plus_resp.on_hover_text(tip).clicked() && enabled {
                         out.new_pane = true;
                     }
-                }
 
-                ui.add_space(BTN_GAP);
+                    ui.add_space(BTN_GAP);
 
-                // ③ 还原窗格大小（田字格图标；单窗格无可复位，禁用态）
-                {
+                    // ③ 还原窗格大小（田字格图标；单窗格无可复位，禁用态）
                     let enabled = pane_count > 1;
                     let (reset_rect, reset_resp) =
                         ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
@@ -170,8 +171,8 @@ pub fn show(
                         ui.add_space(BTN_GAP);
                     }
 
-                    // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
-                    {
+                    if view.session_actions_enabled {
+                        // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
                         let (sb_rect, sb_resp) =
                             ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
                         draw_icon_sidebar(ui, sb_rect, view.sidebar_visible, pal);
@@ -183,12 +184,10 @@ pub fn show(
                         if sb_resp.on_hover_text(tip).clicked() {
                             out.toggle_sidebar = Some(!view.sidebar_visible);
                         }
-                    }
 
-                    ui.add_space(BTN_GAP);
+                        ui.add_space(BTN_GAP);
 
-                    // ② 显示/隐藏文件树（codicon list-tree 风格）
-                    {
+                        // ② 显示/隐藏文件树（codicon list-tree 风格）
                         let (ft_rect, ft_resp) =
                             ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
                         draw_icon_filetree(ui, ft_rect, view.filetree_visible, pal);
@@ -436,6 +435,7 @@ mod toolbar_layout_tests {
                 &pal,
                 ViewState {
                     remote_view: false,
+                    session_actions_enabled: true,
                     remote_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: true,
@@ -465,6 +465,7 @@ mod toolbar_layout_tests {
                 &pal,
                 ViewState {
                     remote_view: false,
+                    session_actions_enabled: true,
                     remote_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: false,
@@ -514,6 +515,7 @@ mod toolbar_layout_tests {
                 &pal,
                 ViewState {
                     remote_view: false,
+                    session_actions_enabled: true,
                     remote_list_visible: true,
                     sidebar_visible: false,
                     filetree_visible: true,
@@ -540,6 +542,7 @@ mod toolbar_layout_tests {
                     &pal,
                     ViewState {
                         remote_view,
+                        session_actions_enabled: true,
                         remote_list_visible: true,
                         sidebar_visible: true,
                         filetree_visible: true,

@@ -495,6 +495,10 @@ pub struct Strings {
     pub topbar_tab_local: &'static str,
     /// 顶栏「远程」tab（M5.2）
     pub topbar_tab_remote: &'static str,
+    /// 顶栏「SSH」tab
+    pub topbar_tab_ssh: &'static str,
+    /// SSH 模式尚未选择服务器时的占位提示
+    pub ssh_select_server: &'static str,
     /// 远程设备列表标题（M5.2）
     pub remote_list_title: &'static str,
     /// 设备在线
