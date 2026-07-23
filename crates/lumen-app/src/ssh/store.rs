@@ -12,6 +12,7 @@ use lumen_protocol::ssh_sync::{
     SshSyncResponse, SSH_SYNC_SCHEMA_VERSION,
 };
 
+use super::credentials::{CredentialReference, CredentialSlot};
 use super::inventory::{InventoryError, SshInventory};
 use super::local::{SshLocalBinding, StorageScope};
 use super::model::{new_id, GroupId, NewSshProfile, ProfileId};
@@ -407,20 +408,25 @@ impl SshStore {
             .retain(|mutation| !acknowledged_ids.contains(mutation.mutation_id.as_str()));
         next_sync.server_cursor = next_sync.server_cursor.max(response.next_cursor);
 
-        for ack in &response.acks {
-            if ack.status != SshMutationStatus::Rejected && ack.error_code.is_none() {
-                continue;
+        // 旧回包仍可幂等确认它实际发送过的 mutation，但绝不能据旧的 rejected
+        // ack 删除当前较新的本地实体或凭据绑定。冲突清理由当前游标回包或权威
+        // tombstone 驱动。
+        if !stale_response {
+            for ack in &response.acks {
+                if ack.status != SshMutationStatus::Rejected && ack.error_code.is_none() {
+                    continue;
+                }
+                let mutation = sent_mutations
+                    .get(ack.mutation_id.as_str())
+                    .ok_or(StoreError::InvalidSync("ack 不属于请求快照"))?;
+                cleanup_rejected_local_entity(
+                    &mut next_inventory,
+                    &mut next_bindings,
+                    &next_sync.outbox,
+                    &mutation.operation,
+                    ack.error_code.as_deref(),
+                );
             }
-            let mutation = sent_mutations
-                .get(ack.mutation_id.as_str())
-                .ok_or(StoreError::InvalidSync("ack 不属于请求快照"))?;
-            cleanup_rejected_local_entity(
-                &mut next_inventory,
-                &mut next_bindings,
-                &next_sync.outbox,
-                &mutation.operation,
-                ack.error_code.as_deref(),
-            );
         }
 
         let mut latest_by_entity: HashMap<(String, String), SshSyncChange> = HashMap::new();
@@ -1028,19 +1034,33 @@ fn validate_binding(inventory: &SshInventory, binding: &SshLocalBinding) -> Resu
             return Err(StoreError::InvalidBinding("私钥路径非法或过长"));
         }
     }
-    for reference in [
-        binding.password_credential_ref.as_deref(),
-        binding.key_passphrase_credential_ref.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (reference, expected_slot) in [
+        (
+            binding.password_credential_ref.as_deref(),
+            CredentialSlot::Password,
+        ),
+        (
+            binding.key_passphrase_credential_ref.as_deref(),
+            CredentialSlot::KeyPassphrase,
+        ),
+    ] {
+        let Some(reference) = reference else {
+            continue;
+        };
         if reference.is_empty()
             || reference.trim() != reference
             || reference.chars().count() > MAX_CREDENTIAL_REF_CHARS
             || reference.chars().any(char::is_control)
         {
             return Err(StoreError::InvalidBinding("系统凭据引用非法或过长"));
+        }
+        let parsed = reference
+            .parse::<CredentialReference>()
+            .map_err(|_| StoreError::InvalidBinding("系统凭据引用格式非法"))?;
+        if parsed.profile_id() != binding.profile_id || parsed.slot() != expected_slot {
+            return Err(StoreError::InvalidBinding(
+                "系统凭据引用与服务器或凭据用途不匹配",
+            ));
         }
     }
     Ok(())
@@ -1192,6 +1212,16 @@ mod tests {
 
     fn account_scope(suffix: u8) -> StorageScope {
         StorageScope::Account(account_id(suffix))
+    }
+
+    fn password_ref(profile_id: &str) -> String {
+        CredentialReference::password(profile_id).unwrap().target()
+    }
+
+    fn passphrase_ref(profile_id: &str) -> String {
+        CredentialReference::key_passphrase(profile_id)
+            .unwrap()
+            .target()
     }
 
     fn response_for(
@@ -1413,7 +1443,7 @@ mod tests {
             .upsert_binding(SshLocalBinding {
                 profile_id: profile_id.clone(),
                 private_key_path: Some(root.join("keys").join("id_ed25519")),
-                password_credential_ref: Some("credential-local".to_owned()),
+                password_credential_ref: Some(password_ref(&profile_id)),
                 key_passphrase_credential_ref: None,
             })
             .unwrap();
@@ -1436,12 +1466,14 @@ mod tests {
         let scope = account_scope(15);
         let mut store = SshStore::load(&root, scope.clone()).unwrap();
         let profile_id = store.create_profile(draft("safe", None)).unwrap();
+        let password_reference = password_ref(&profile_id);
+        let passphrase_reference = passphrase_ref(&profile_id);
         store
             .upsert_binding(SshLocalBinding {
-                profile_id,
+                profile_id: profile_id.clone(),
                 private_key_path: Some(root.join("PRIVATE_PATH_SENTINEL")),
-                password_credential_ref: Some("PASSWORD_REF_SENTINEL".to_owned()),
-                key_passphrase_credential_ref: Some("PASSPHRASE_REF_SENTINEL".to_owned()),
+                password_credential_ref: Some(password_reference.clone()),
+                key_passphrase_credential_ref: Some(passphrase_reference.clone()),
             })
             .unwrap();
         let request_json = serde_json::to_string(store.sync_snapshot().unwrap().request()).unwrap();
@@ -1455,10 +1487,10 @@ mod tests {
         )
         .unwrap();
         for serialized in [&request_json, &journal_json] {
+            assert!(!serialized.contains(&password_reference));
+            assert!(!serialized.contains(&passphrase_reference));
             for forbidden in [
                 "PRIVATE_PATH_SENTINEL",
-                "PASSWORD_REF_SENTINEL",
-                "PASSPHRASE_REF_SENTINEL",
                 "private_key_path",
                 "password_credential_ref",
                 "key_passphrase_credential_ref",
@@ -1498,12 +1530,18 @@ mod tests {
             .apply_sync_response(&current_snapshot, current_response)
             .unwrap();
 
-        let stale_response = response_for(
-            &stale_snapshot,
-            SshMutationStatus::Applied,
-            1,
-            vec![change(1, SshChange::UpsertGroup { group: old_group })],
-        );
+        let stale_response = SshSyncResponse {
+            schema_version: SSH_SYNC_SCHEMA_VERSION,
+            acks: vec![SshMutationAck {
+                mutation_id: stale_snapshot.request().mutations[0].mutation_id.clone(),
+                status: SshMutationStatus::Rejected,
+                revision: None,
+                error_code: Some("deleted_entity".to_owned()),
+            }],
+            changes: vec![change(1, SshChange::UpsertGroup { group: old_group })],
+            next_cursor: 1,
+            has_more: false,
+        };
         let report = store
             .apply_sync_response(&stale_snapshot, stale_response)
             .unwrap();
@@ -1614,12 +1652,14 @@ mod tests {
         let group_id = store.create_group("生产").unwrap();
         let profile_id = store.create_profile(draft("web", Some(group_id))).unwrap();
         let key_path = root.join("keys").join("id_ed25519");
+        let password_reference = password_ref(&profile_id);
+        let passphrase_reference = passphrase_ref(&profile_id);
         store
             .upsert_binding(SshLocalBinding {
                 profile_id: profile_id.clone(),
                 private_key_path: Some(key_path.clone()),
-                password_credential_ref: Some("password-secret-ref".to_owned()),
-                key_passphrase_credential_ref: Some("passphrase-secret-ref".to_owned()),
+                password_credential_ref: Some(password_reference),
+                key_passphrase_credential_ref: Some(passphrase_reference),
             })
             .unwrap();
 
@@ -1656,12 +1696,14 @@ mod tests {
         let scope = StorageScope::Local;
         let mut store = SshStore::load(&root, scope.clone()).unwrap();
         let profile_id = store.create_profile(draft("safe", None)).unwrap();
+        let password_reference = password_ref(&profile_id);
+        let passphrase_reference = passphrase_ref(&profile_id);
         store
             .upsert_binding(SshLocalBinding {
                 profile_id,
                 private_key_path: Some(root.join("PRIVATE_KEY_PATH_SENTINEL")),
-                password_credential_ref: Some("PASSWORD_REF_SENTINEL".to_owned()),
-                key_passphrase_credential_ref: Some("PASSPHRASE_REF_SENTINEL".to_owned()),
+                password_credential_ref: Some(password_reference.clone()),
+                key_passphrase_credential_ref: Some(passphrase_reference.clone()),
             })
             .unwrap();
 
@@ -1675,10 +1717,12 @@ mod tests {
                 .join("sync_state.json"),
         )
         .unwrap();
+        assert!(!sync_json.contains(&password_reference));
+        assert!(!sync_json.contains(&passphrase_reference));
+        assert!(!inventory_json.contains(&password_reference));
+        assert!(!inventory_json.contains(&passphrase_reference));
         for forbidden in [
             "PRIVATE_KEY_PATH_SENTINEL",
-            "PASSWORD_REF_SENTINEL",
-            "PASSPHRASE_REF_SENTINEL",
             "private_key_path",
             "credential_ref",
             "password",
@@ -1761,10 +1805,11 @@ mod tests {
             },
         )
         .unwrap();
+        let reference = password_ref(&profile_id);
         let binding = SshLocalBinding {
             profile_id,
             private_key_path: None,
-            password_credential_ref: Some("credential".to_owned()),
+            password_credential_ref: Some(reference),
             key_passphrase_credential_ref: None,
         };
         atomic_write_json(
@@ -1798,6 +1843,30 @@ mod tests {
             SshStore::load(&root, StorageScope::Local),
             Err(StoreError::InvalidBinding(_))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 本机凭据引用必须匹配服务器与用途() {
+        let root = temporary_root("credential-reference-scope");
+        let mut store = SshStore::load(&root, StorageScope::Local).unwrap();
+        let profile_id = store.create_profile(draft("one", None)).unwrap();
+        let other_profile_id = store.create_profile(draft("two", None)).unwrap();
+
+        for invalid_reference in [
+            password_ref(&other_profile_id),
+            passphrase_ref(&profile_id),
+            "not-a-credential-reference".to_owned(),
+        ] {
+            let result = store.upsert_binding(SshLocalBinding {
+                profile_id: profile_id.clone(),
+                private_key_path: None,
+                password_credential_ref: Some(invalid_reference),
+                key_passphrase_credential_ref: None,
+            });
+            assert!(matches!(result, Err(StoreError::InvalidBinding(_))));
+        }
+        assert!(store.binding(&profile_id).is_none());
         let _ = fs::remove_dir_all(root);
     }
 }

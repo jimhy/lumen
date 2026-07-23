@@ -7,12 +7,15 @@ use std::fmt;
 use std::str::FromStr;
 
 use lumen_ssh::SecretString;
+use rand_core::{OsRng, RngCore};
 
 /// Windows Credential Manager 对 generic credential blob 的字节上限。
 pub const MAX_SECRET_BYTES: usize = 2_560;
 const TARGET_PREFIX: &str = "Lumen/SSH/";
 const PROFILE_ID_PREFIX: &str = "ssh_";
 const PROFILE_ID_HEX_LEN: usize = 32;
+const NONCE_BYTES: usize = 16;
+const NONCE_HEX_LEN: usize = NONCE_BYTES * 2;
 
 /// 一条 SSH 本机凭据的用途。它只决定固定 target 的末段，不承载秘密。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,11 +44,13 @@ impl CredentialSlot {
 /// 已严格校验的 Credential Manager 引用。
 ///
 /// target 始终为
-/// `Lumen/SSH/<ssh_ + 32 lowercase hex>/<password|key-passphrase>`。
+/// `Lumen/SSH/<ssh_ + 32 lowercase hex>/<password|key-passphrase>/<32 lowercase hex>`。
+/// 最后一段由系统随机生成，使相同 profile ID 在不同本地作用域中也不会复用凭据。
 #[derive(Clone, PartialEq, Eq)]
 pub struct CredentialReference {
     profile_id: String,
     slot: CredentialSlot,
+    nonce: [u8; NONCE_BYTES],
 }
 
 impl CredentialReference {
@@ -53,9 +58,12 @@ impl CredentialReference {
         if !valid_profile_id(profile_id) {
             return Err(CredentialError::InvalidProfileId);
         }
+        let mut nonce = [0_u8; NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
         Ok(Self {
             profile_id: profile_id.to_owned(),
             slot,
+            nonce,
         })
     }
 
@@ -76,7 +84,12 @@ impl CredentialReference {
     }
 
     pub fn target(&self) -> String {
-        format!("{TARGET_PREFIX}{}/{}", self.profile_id, self.slot.suffix())
+        format!(
+            "{TARGET_PREFIX}{}/{}/{}",
+            self.profile_id,
+            self.slot.suffix(),
+            encode_nonce(&self.nonce)
+        )
     }
 }
 
@@ -87,15 +100,20 @@ impl FromStr for CredentialReference {
         let rest = raw
             .strip_prefix(TARGET_PREFIX)
             .ok_or(CredentialError::InvalidReference)?;
-        let (profile_id, suffix) = rest
-            .split_once('/')
+        let mut components = rest.split('/');
+        let profile_id = components.next().ok_or(CredentialError::InvalidReference)?;
+        let suffix = components.next().ok_or(CredentialError::InvalidReference)?;
+        let nonce = components
+            .next()
+            .and_then(parse_nonce)
             .ok_or(CredentialError::InvalidReference)?;
-        if suffix.contains('/') || !valid_profile_id(profile_id) {
+        if components.next().is_some() || !valid_profile_id(profile_id) {
             return Err(CredentialError::InvalidReference);
         }
         Ok(Self {
             profile_id: profile_id.to_owned(),
             slot: CredentialSlot::parse(suffix)?,
+            nonce,
         })
     }
 }
@@ -113,6 +131,39 @@ impl fmt::Debug for CredentialReference {
             .field("profile_id", &"<validated>")
             .field("slot", &self.slot)
             .finish()
+    }
+}
+
+fn encode_nonce(nonce: &[u8; NONCE_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(NONCE_HEX_LEN);
+    for byte in nonce {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn parse_nonce(raw: &str) -> Option<[u8; NONCE_BYTES]> {
+    if raw.len() != NONCE_HEX_LEN
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut nonce = [0_u8; NONCE_BYTES];
+    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+        nonce[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(nonce)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -358,29 +409,39 @@ mod tests {
     #[test]
     fn 引用严格解析且target格式固定() {
         let password = CredentialReference::password(PROFILE_ID).unwrap();
-        assert_eq!(
-            password.target(),
-            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password"
+        let password_target = password.target();
+        assert!(
+            password_target.starts_with("Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password/")
         );
         assert_eq!(
-            password.target().parse::<CredentialReference>().unwrap(),
+            password_target.len(),
+            TARGET_PREFIX.len() + PROFILE_ID.len() + 1 + 8 + 1 + 32
+        );
+        assert_eq!(
+            password_target.parse::<CredentialReference>().unwrap(),
             password
         );
         let passphrase = CredentialReference::key_passphrase(PROFILE_ID).unwrap();
-        assert_eq!(
-            passphrase.target(),
-            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/key-passphrase"
+        assert!(passphrase
+            .target()
+            .starts_with("Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/key-passphrase/"));
+        assert_ne!(
+            password.target(),
+            CredentialReference::password(PROFILE_ID).unwrap().target()
         );
 
         for invalid in [
             "",
-            "Lumen/SSH/ssh_0123456789abcdef0123456789abcde/password",
-            "Lumen/SSH/ssh_0123456789ABCDEF0123456789ABCDEF/password",
-            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/Password",
-            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/key_passphrase",
-            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password/extra",
-            "lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password",
-            "Lumen/SSH/grp_0123456789abcdef0123456789abcdef/password",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcde/password/00000000000000000000000000000000",
+            "Lumen/SSH/ssh_0123456789ABCDEF0123456789ABCDEF/password/00000000000000000000000000000000",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/Password/00000000000000000000000000000000",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/key_passphrase/00000000000000000000000000000000",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password/0000000000000000000000000000000",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password/0000000000000000000000000000000A",
+            "Lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password/00000000000000000000000000000000/extra",
+            "lumen/SSH/ssh_0123456789abcdef0123456789abcdef/password/00000000000000000000000000000000",
+            "Lumen/SSH/grp_0123456789abcdef0123456789abcdef/password/00000000000000000000000000000000",
         ] {
             assert!(invalid.parse::<CredentialReference>().is_err(), "{invalid}");
         }

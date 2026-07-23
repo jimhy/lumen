@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,7 @@ use crate::metrics::{MetricsAccumulator, ServerMetrics, LINUX_METRICS_COMMAND};
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMANDS_PER_TICK: usize = 64;
 const MAX_MONITOR_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_PRIVATE_KEY_BYTES: usize = 1024 * 1024;
 #[cfg(windows)]
 const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
@@ -743,10 +745,10 @@ async fn authenticate_private_key(
     path: &Path,
     passphrase: Option<&SecretString>,
 ) -> Result<bool, Failure> {
-    let encoded = std::fs::read_to_string(path)
-        .map(Zeroizing::new)
-        .map_err(|_| Failure::private_key("could not read the SSH private key"))?;
-    let key = russh::keys::decode_secret_key(&encoded, passphrase.map(SecretString::expose))
+    let encoded = read_private_key(path)?;
+    let encoded = std::str::from_utf8(&encoded)
+        .map_err(|_| Failure::private_key("the SSH private key is not valid UTF-8"))?;
+    let key = russh::keys::decode_secret_key(encoded, passphrase.map(SecretString::expose))
         .map_err(|_| Failure::private_key("could not decode the SSH private key"))?;
     let hash_algorithm = session
         .best_supported_rsa_hash()
@@ -761,6 +763,22 @@ async fn authenticate_private_key(
         .await
         .map(|result| result.success())
         .map_err(|_| Failure::private_key("SSH private-key authentication failed"))
+}
+
+fn read_private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, Failure> {
+    let file = std::fs::File::open(path)
+        .map_err(|_| Failure::private_key("could not read the SSH private key"))?;
+    let maximum_plus_marker = MAX_PRIVATE_KEY_BYTES.saturating_add(1);
+    let mut encoded = Zeroizing::new(Vec::with_capacity(64 * 1024));
+    file.take(maximum_plus_marker as u64)
+        .read_to_end(&mut encoded)
+        .map_err(|_| Failure::private_key("could not read the SSH private key"))?;
+    if encoded.len() > MAX_PRIVATE_KEY_BYTES {
+        return Err(Failure::private_key(
+            "the SSH private key exceeds the local safety limit",
+        ));
+    }
+    Ok(encoded)
 }
 
 type DynamicAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
@@ -1432,5 +1450,18 @@ mod tests {
         };
         assert!(disabled.validate().is_ok());
         assert_eq!(disabled.interval_option(), None);
+    }
+
+    #[test]
+    fn private_key_file_read_is_bounded() {
+        let path = std::env::temp_dir().join(format!(
+            "lumen-ssh-oversized-key-{}-{}.pem",
+            std::process::id(),
+            CONNECTION_THREAD_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, vec![b'x'; MAX_PRIVATE_KEY_BYTES + 1]).expect("write test key");
+        let result = read_private_key(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err());
     }
 }

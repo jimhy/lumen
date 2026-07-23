@@ -4,6 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use lumen_protocol::ssh_sync::{
     SshAuthMethod, SshChange, SshGroup as WireGroup, SshHostKeyTrust, SshMutation,
@@ -21,6 +23,8 @@ const SYNC_BATCH_LIMIT: u16 = 200;
 /// 服务端全局 body 上限为 1 MiB；留出约 10% 余量给 schema/游标等 JSON 外壳。
 const SYNC_REQUEST_BUDGET_BYTES: usize = 900 * 1024;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_JWT_BYTES: usize = 16 * 1024;
+const MAX_JWT_PAYLOAD_BYTES: usize = 4 * 1024;
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
@@ -292,6 +296,30 @@ fn worker_loop(
             continue;
         }
         let sent_snapshot = read_latest_snapshot(latest_snapshot);
+        // 防御切账号竞态：即使调用方错误地复用了同一个 token Arc，A worker
+        // 也不能拿 B token 把 A snapshot 发到 B。这里不把未验签 payload 当作
+        // 鉴权依据；它只做 fail-closed 路由校验，服务端仍会完整验签。
+        if !token_matches_account(&current_token, sent_snapshot.account_id()) {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            if publish_event(
+                events,
+                notifier,
+                SshSyncEvent::Failed(SshSyncFailed {
+                    account_id: sent_snapshot.account_id,
+                    error: CloudError::Decode("SSH 同步凭据与账号不匹配，已阻止上传".to_owned()),
+                }),
+            ) == PublishResult::Disconnected
+            {
+                return;
+            }
+            due = Instant::now() + SYNC_INTERVAL;
+            continue;
+        }
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
         match client.sync_ssh(&current_token, sent_snapshot.request()) {
             Ok(response) => {
                 // Drop/切账号发生在请求途中：服务端可能已收请求，但本 worker 不再
@@ -349,6 +377,34 @@ fn read_latest_snapshot(latest: &RwLock<SshSyncSnapshot>) -> SshSyncSnapshot {
         Ok(snapshot) => snapshot.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
+}
+
+#[derive(Deserialize)]
+struct JwtRoutingClaims {
+    sub: String,
+}
+
+fn token_matches_account(token: &str, expected_account_id: &str) -> bool {
+    if token.is_empty() || token.len() > MAX_JWT_BYTES {
+        return false;
+    }
+    let mut segments = token.split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    if decoded.len() > MAX_JWT_PAYLOAD_BYTES {
+        return false;
+    }
+    serde_json::from_slice::<JwtRoutingClaims>(&decoded)
+        .is_ok_and(|claims| claims.sub == expected_account_id)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,6 +545,19 @@ mod tests {
         }
     }
 
+    fn routing_token(account_id: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "sub": account_id,
+                "did": "device",
+                "exp": 4_000_000_000_u64
+            }))
+            .unwrap(),
+        );
+        format!("{header}.{payload}.test-signature")
+    }
+
     fn failed_event() -> SshSyncEvent {
         SshSyncEvent::Failed(SshSyncFailed {
             account_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
@@ -522,6 +591,22 @@ mod tests {
             PublishResult::Disconnected
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn token路由必须与snapshot账号一致且畸形值安全拒绝() {
+        let account_a = "550e8400-e29b-41d4-a716-446655440000";
+        let account_b = "550e8400-e29b-41d4-a716-446655440001";
+        let token_a = routing_token(account_a);
+        assert!(token_matches_account(&token_a, account_a));
+        assert!(!token_matches_account(&token_a, account_b));
+        for invalid in ["", "one.two", "one.two.three.four", "one.***.three"] {
+            assert!(!token_matches_account(invalid, account_a));
+        }
+        assert!(!token_matches_account(
+            &"x".repeat(MAX_JWT_BYTES + 1),
+            account_a
+        ));
     }
 
     #[test]
