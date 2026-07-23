@@ -33,13 +33,18 @@ pub use windows_impl::*;
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+    };
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsZoomed, ShowWindow, HTMAXBUTTON, SW_MAXIMIZE, SW_RESTORE, WM_NCDESTROY, WM_NCHITTEST,
-        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+        IsZoomed, ShowWindow, HTMAXBUTTON, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, SW_MAXIMIZE,
+        SW_RESTORE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+        WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT,
+        WTS_SESSION_LOCK,
     };
 
     /// 子类 ID（任意非零常量，与本模块唯一绑定）。
@@ -53,6 +58,9 @@ mod windows_impl {
     static BTN_TOP: AtomicI32 = AtomicI32::new(0);
     static BTN_RIGHT: AtomicI32 = AtomicI32::new(0);
     static BTN_BOTTOM: AtomicI32 = AtomicI32::new(0);
+    /// Windows 会话锁定 / 断开 / 睡眠恢复后，主循环应进入应用锁。
+    /// 窗口子类回调不持有 AppState 指针，只写原子标志。
+    static SECURITY_LOCK_REQUEST: AtomicBool = AtomicBool::new(false);
 
     /// 原子更新最大化按钮的**屏幕物理像素**矩形。
     ///
@@ -91,7 +99,15 @@ mod windows_impl {
                 0, // dwRefData：不传指针，避免生命周期问题
             )
         };
-        ok != 0
+        if ok == 0 {
+            return false;
+        }
+        // SAFETY: hwnd 与上方 SetWindowSubclass 相同且仍有效。注册失败
+        // 只影响系统锁屏/RDP 自动锁，不影响 Snap 与其他锁定入口。
+        if unsafe { WTSRegisterSessionNotification(hwnd as HWND, NOTIFY_FOR_THIS_SESSION) } == 0 {
+            log::warn!("WTS 会话通知注册失败，系统锁屏/RDP 断开自动锁定不可用");
+        }
+        true
     }
 
     /// 将 WM_NCHITTEST lParam 屏幕坐标解包为 (x, y)。
@@ -140,6 +156,22 @@ mod windows_impl {
         hit_rect(px, py, l, t, r, b)
     }
 
+    /// 主循环取走一次 Windows 安全锁定请求。
+    pub fn take_security_lock_request() -> bool {
+        SECURITY_LOCK_REQUEST.swap(false, Ordering::AcqRel)
+    }
+
+    /// 消息是否要求应用进入锁定。抽成纯函数便于单测。
+    fn should_request_security_lock(message: u32, wparam: WPARAM) -> bool {
+        (message == WM_WTSSESSION_CHANGE
+            && matches!(
+                wparam as u32,
+                WTS_SESSION_LOCK | WTS_REMOTE_DISCONNECT | WTS_CONSOLE_DISCONNECT
+            ))
+            || (message == WM_POWERBROADCAST
+                && matches!(wparam as u32, PBT_APMSUSPEND | PBT_APMRESUMEAUTOMATIC))
+    }
+
     /// Snap Layouts 子类窗口过程（comctl32 SetWindowSubclass 回调）。
     ///
     /// # Safety
@@ -155,6 +187,13 @@ mod windows_impl {
         _ref_data: usize,
     ) -> LRESULT {
         match umsg {
+            WM_WTSSESSION_CHANGE | WM_POWERBROADCAST
+                if should_request_security_lock(umsg, wparam) =>
+            {
+                SECURITY_LOCK_REQUEST.store(true, Ordering::Release);
+                // 只旁路记录，不改变 Windows 默认会话/电源行为。
+                unsafe { DefSubclassProc(hwnd, umsg, wparam, lparam) }
+            }
             WM_NCHITTEST => {
                 // 先让系统做标准命中测试。
                 // SAFETY: hwnd / wparam / lparam 由系统保证有效。
@@ -190,7 +229,10 @@ mod windows_impl {
                 // SAFETY: hwnd 在 WM_NCDESTROY 回调时仍处于销毁流程中、尚未
                 // 最终无效；SUBCLASS_ID 与 install() 一致，保证移除的是本模块
                 // 注册的子类而非其他子类。
-                unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
+                unsafe {
+                    WTSUnRegisterSessionNotification(hwnd);
+                    RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID);
+                }
                 // SAFETY: hwnd / wparam / lparam 由系统保证在此回调期间有效。
                 unsafe { DefSubclassProc(hwnd, umsg, wparam, lparam) }
             }
@@ -317,6 +359,24 @@ mod windows_impl {
                 hit_maximize_button(520, 27),
                 "update_button_rect + hit_maximize_button 路径应命中"
             );
+        }
+
+        #[test]
+        fn security_lock_message_filter() {
+            assert!(should_request_security_lock(
+                WM_WTSSESSION_CHANGE,
+                WTS_SESSION_LOCK as WPARAM
+            ));
+            assert!(should_request_security_lock(
+                WM_WTSSESSION_CHANGE,
+                WTS_REMOTE_DISCONNECT as WPARAM
+            ));
+            assert!(should_request_security_lock(
+                WM_POWERBROADCAST,
+                PBT_APMSUSPEND as WPARAM
+            ));
+            assert!(!should_request_security_lock(WM_WTSSESSION_CHANGE, 8));
+            assert!(!should_request_security_lock(WM_POWERBROADCAST, 7));
         }
     }
 }

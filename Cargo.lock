@@ -2144,6 +2144,8 @@ version = "1.0.15"
 dependencies = [
  "anyhow",
  "arboard",
+ "argon2",
+ "base64",
  "crossbeam-channel",
  "egui",
  "egui-wgpu",
@@ -2163,6 +2165,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "percent-encoding",
  "quinn",
+ "rand_core 0.6.4",
  "rcgen",
  "rfd",
  "rustls",
@@ -2179,6 +2182,7 @@ dependencies = [
  "winresource",
  "wl-clipboard-rs",
  "x11-clipboard",
+ "zeroize",
 ]
 
 [[package]]

@@ -268,6 +268,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn 配对码复制提示三语均不泄露敏感正文() {
+        for s in [&zh_cn::STRINGS, &zh_tw::STRINGS, &en::STRINGS] {
+            for text in [s.remote_toast_pairing_code_copied, s.toast_copy_failed] {
+                assert!(
+                    !text.chars().any(|c| c.is_ascii_digit()),
+                    "配对码复制提示不得含数字: {text}"
+                );
+                assert!(
+                    !text.contains("{}"),
+                    "配对码复制提示不得插入敏感正文: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 应用锁三语文案完整且格式参数可替换() {
+        for s in [&zh_cn::STRINGS, &zh_tw::STRINGS, &en::STRINGS] {
+            let plain = [
+                s.nav_security,
+                s.security_heading,
+                s.security_app_lock,
+                s.security_lock_disabled_hint,
+                s.security_lock_enabled_hint,
+                s.security_enable,
+                s.security_disable,
+                s.security_change_password,
+                s.security_lock_now,
+                s.security_current_password,
+                s.security_new_password,
+                s.security_confirm_password,
+                s.security_password_hint,
+                s.security_password_too_short,
+                s.security_password_too_long,
+                s.security_password_mismatch,
+                s.security_current_password_wrong,
+                s.security_operation_failed,
+                s.security_shortcut,
+                s.security_auto_lock,
+                s.security_auto_lock_off,
+                s.security_lock_on_start,
+                s.security_lock_on_resume,
+                s.security_cancel,
+                s.security_save,
+                s.lock_screen_title,
+                s.lock_screen_password_hint,
+                s.lock_screen_show_password,
+                s.lock_screen_hide_password,
+                s.lock_screen_unlock,
+                s.lock_screen_verifying,
+                s.lock_screen_wrong_password,
+                s.lock_screen_caps_lock,
+                s.lock_screen_remote_active,
+                s.lock_screen_storage_error,
+            ];
+            assert!(
+                plain.iter().all(|text| !text.trim().is_empty()),
+                "应用锁文案不得为空"
+            );
+
+            let auto_lock = fmt1(s.security_auto_lock_minutes_fmt, 15);
+            assert!(auto_lock.contains("15"), "分钟参数应已写入: {auto_lock}");
+            assert!(
+                !auto_lock.contains("{}"),
+                "分钟格式占位符应被替换: {auto_lock}"
+            );
+            let retry = fmt1(s.lock_screen_retry_fmt, 30);
+            assert!(retry.contains("30"), "秒数参数应已写入: {retry}");
+            assert!(
+                !retry.contains("{}"),
+                "重试格式占位符应被替换: {retry}"
+            );
+            assert!(
+                !s.lock_screen_remote_active.contains("{}"),
+                "锁屏远控提示必须是泛化文案，不得插入业务数据"
+            );
+        }
+    }
+
     // —— strings() 三语覆盖校验（抽查部分字段，编译期全量已保证）——
 
     #[test]

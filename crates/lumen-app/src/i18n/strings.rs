@@ -83,6 +83,8 @@ pub struct Strings {
     pub nav_keyboard_shortcuts: &'static str,
     /// 导航 "Network"（网络代理）
     pub nav_network: &'static str,
+    /// 导航 "Security"
+    pub nav_security: &'static str,
     /// 导航 "About"
     pub nav_about: &'static str,
     // Account 页
@@ -159,11 +161,86 @@ pub struct Strings {
     pub shortcut_paste: &'static str,
     pub shortcut_scroll: &'static str,
     pub shortcut_close_settings: &'static str,
+    // Security 页
+    /// Security heading
+    pub security_heading: &'static str,
+    /// 应用锁分组标题
+    pub security_app_lock: &'static str,
+    /// 应用锁默认关闭说明
+    pub security_lock_disabled_hint: &'static str,
+    /// 应用锁已启用说明
+    pub security_lock_enabled_hint: &'static str,
+    /// 启用应用锁
+    pub security_enable: &'static str,
+    /// 关闭应用锁
+    pub security_disable: &'static str,
+    /// 修改应用锁密码
+    pub security_change_password: &'static str,
+    /// 立即锁定
+    pub security_lock_now: &'static str,
+    /// 当前密码
+    pub security_current_password: &'static str,
+    /// 新密码
+    pub security_new_password: &'static str,
+    /// 确认密码
+    pub security_confirm_password: &'static str,
+    /// 密码长度提示（8–128 字符）
+    pub security_password_hint: &'static str,
+    /// 密码过短
+    pub security_password_too_short: &'static str,
+    /// 密码过长
+    pub security_password_too_long: &'static str,
+    /// 两次密码不一致
+    pub security_password_mismatch: &'static str,
+    /// 当前密码错误
+    pub security_current_password_wrong: &'static str,
+    /// 泛化操作失败提示
+    pub security_operation_failed: &'static str,
+    /// 上锁快捷键
+    pub security_shortcut: &'static str,
+    /// 自动锁定
+    pub security_auto_lock: &'static str,
+    /// 自动锁定关闭
+    pub security_auto_lock_off: &'static str,
+    /// 自动锁定分钟格式（{}=分钟数）
+    pub security_auto_lock_minutes_fmt: &'static str,
+    /// 启动时锁定
+    pub security_lock_on_start: &'static str,
+    /// 系统恢复时锁定
+    pub security_lock_on_resume: &'static str,
+    /// 安全设置对话框取消
+    pub security_cancel: &'static str,
+    /// 安全设置对话框保存
+    pub security_save: &'static str,
     // About 页
     /// About heading
     pub about_heading: &'static str,
     /// 版本标签，单参 `{}`：版本字符串
     pub about_version_fmt: &'static str,
+
+    // ── 应用锁屏 ─────────────────────────────────────────────────────
+    /// 锁屏标题
+    pub lock_screen_title: &'static str,
+    /// 锁屏密码输入提示
+    pub lock_screen_password_hint: &'static str,
+    /// 显示锁屏密码
+    pub lock_screen_show_password: &'static str,
+    /// 隐藏锁屏密码
+    pub lock_screen_hide_password: &'static str,
+    /// 解锁按钮
+    pub lock_screen_unlock: &'static str,
+    /// 密码验证中
+    pub lock_screen_verifying: &'static str,
+    /// 锁屏密码错误
+    pub lock_screen_wrong_password: &'static str,
+    /// 锁屏重试倒计时（{}=秒数）
+    pub lock_screen_retry_fmt: &'static str,
+    /// Caps Lock 提示
+    pub lock_screen_caps_lock: &'static str,
+    /// 已授权远程控制仍在进行（不得包含设备或会话信息）
+    pub lock_screen_remote_active: &'static str,
+    /// 应用锁存储损坏/不可读的泛化错误
+    pub lock_screen_storage_error: &'static str,
 
     // ── 语言设置组（设置页 Appearance 内）───────────────────────────
     /// "语言 / Language" 组标题
@@ -464,6 +541,8 @@ pub struct Strings {
     pub remote_toast_controlled_fmt: &'static str,
     /// toast：会话已结束
     pub remote_toast_session_ended: &'static str,
+    /// toast：配对码已复制（敏感信息，不插入配对码正文）
+    pub remote_toast_pairing_code_copied: &'static str,
     /// toast：M6 P2P 已切换到直连（绕开中继）
     pub remote_toast_p2p_direct: &'static str,
     /// toast：M6 P2P 已回退到中继（直连断开）

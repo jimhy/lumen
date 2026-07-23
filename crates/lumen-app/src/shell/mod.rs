@@ -12,6 +12,7 @@ pub mod completion_ui;
 pub mod filetree;
 pub mod history_search_ui;
 pub mod layout;
+pub mod lock_ui;
 pub mod login_ui;
 pub mod remote_ui;
 pub mod settings_ui;
@@ -20,6 +21,29 @@ pub mod theme;
 pub mod toast;
 pub mod toolbar;
 pub mod topbar;
+
+/// 绘制不保留撤销历史的密码输入框。
+///
+/// egui 的 `TextEdit::password(true)` 只负责遮罩显示，默认仍会把明文
+/// `(光标, String)` 存入持久化 Undoer。密码框若复用同一 Id，下一次
+/// 打开后可能通过 Ctrl+Z 恢复旧密码。这里在控件处理输入前后都清空
+/// Undoer：前清阻断上一帧/上一次打开的恢复，后清阻断本帧明文落入
+/// 后续帧。外部 String 的 zeroize 仍由各业务状态负责。
+pub(crate) fn secure_password_edit(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    edit: egui::TextEdit<'_>,
+) -> egui::Response {
+    let id = ui.make_persistent_id(id_salt);
+    if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), id) {
+        state.clear_undoer();
+        state.store(ui.ctx(), id);
+    }
+    let mut output = edit.id(id).show(ui);
+    output.state.clear_undoer();
+    output.state.store(ui.ctx(), output.response.id);
+    output.response.response
+}
 
 /// 窗格标题栏里关闭按钮的边长（逻辑像素，F5 批2 引入、F7① 迁入
 /// 标题栏常驻）。
@@ -307,6 +331,8 @@ pub struct ShellOutput {
     pub connect_device: Option<String>,
     /// M5.3：控制端提交配对码 → main 调 submit_pairing。
     pub submit_pairing_code: Option<String>,
+    /// M5.3：被控端复制来件横幅中的配对码（敏感文本，main 使用无正文 toast）。
+    pub copy_pairing_code: Option<String>,
     /// M5.3：控制端取消配对（关弹窗）→ main 调 cancel_pairing。
     pub cancel_pairing: bool,
     /// M5.3：被控端拒绝来件控制请求 → main 调 decline。
@@ -393,8 +419,7 @@ pub struct ShellOutput {
     /// 回车，转义见 filetree::path_insert_text）。元组为 (落点所在
     /// 窗格下标, 路径)；落点不在任何窗格（间隙/区外）时整体为 None。
     pub insert_path: Option<(usize, std::path::PathBuf)>,
-    /// 文件树：请求写剪贴板的文本（复制绝对/相对路径；arboard 在
-    /// main 持有）。
+    /// 文件树：请求写剪贴板的路径文本（arboard 在 main 持有）。
     pub copy_text: Option<String>,
     /// 文件树：对话框（新建/删除确认）本帧关闭（main 把焦点交还终端）。
     pub filetree_dialog_closed: bool,
@@ -450,6 +475,8 @@ pub struct ShellOutput {
     pub settings_proxy_changed: bool,
     /// 设置页 Network 改了服务端地址（M5.2）：main 落盘 + 应用 cloud 全局。
     pub settings_server_url_changed: bool,
+    /// 设置页 Security 的一次性应用锁命令；由 main 在帧后执行密码线程或写盘。
+    pub settings_security_action: Option<settings_ui::SecurityAction>,
     /// 头像菜单「更新到 vX」：有就绪更新时显示更新弹窗（main 清 dismissed）。
     pub open_update: bool,
     /// 头像菜单「更新日志」：main 打开 GitHub Releases 页。
@@ -470,6 +497,7 @@ pub fn show(
     input: &ShellInput<'_>,
     st: &mut ShellState,
     app_settings: &mut crate::settings::Settings,
+    app_lock: settings_ui::AppLockInput<'_>,
     is_maximized: bool,
 ) -> ShellOutput {
     // 远程视图但未连上任何设备：隐藏会话栏 / 文件树栏，命令行区中央显示「未连接任何设备」占位。
@@ -505,6 +533,7 @@ pub fn show(
         rename_device_ended_by_key: false,
         connect_device: None,
         submit_pairing_code: None,
+        copy_pairing_code: None,
         cancel_pairing: false,
         decline_control: false,
         end_remote_session: false,
@@ -567,6 +596,7 @@ pub fn show(
         settings_update_changed: false,
         settings_proxy_changed: false,
         settings_server_url_changed: false,
+        settings_security_action: None,
         open_update: false,
         open_whats_new: false,
         open_documentation: false,
@@ -1146,8 +1176,10 @@ pub fn show(
                             painter.circle_filled(cc, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
                         }
                         let rr = 3.5;
-                        let cstroke =
-                            egui::Stroke::new(1.2_f32, if cresp.hovered() { pal.fg } else { bar_fg });
+                        let cstroke = egui::Stroke::new(
+                            1.2_f32,
+                            if cresp.hovered() { pal.fg } else { bar_fg },
+                        );
                         painter.line_segment(
                             [
                                 egui::pos2(cc.x - rr, cc.y - rr),
@@ -1180,8 +1212,10 @@ pub fn show(
                         if mresp.hovered() {
                             painter.circle_filled(mc, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
                         }
-                        let mstroke =
-                            egui::Stroke::new(1.2_f32, if mresp.hovered() { pal.fg } else { bar_fg });
+                        let mstroke = egui::Stroke::new(
+                            1.2_f32,
+                            if mresp.hovered() { pal.fg } else { bar_fg },
+                        );
                         let sq = 3.0;
                         if multi.maximized == Some(i) {
                             // 还原：双框错位。
@@ -1494,8 +1528,10 @@ pub fn show(
                             painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
                         }
                         let r = 3.5;
-                        let stroke =
-                            egui::Stroke::new(1.2_f32, if cresp.hovered() { pal.fg } else { bar_fg });
+                        let stroke = egui::Stroke::new(
+                            1.2_f32,
+                            if cresp.hovered() { pal.fg } else { bar_fg },
+                        );
                         painter.line_segment(
                             [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
                             stroke,
@@ -1533,8 +1569,10 @@ pub fn show(
                         if mresp.hovered() {
                             painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
                         }
-                        let stroke =
-                            egui::Stroke::new(1.2_f32, if mresp.hovered() { pal.fg } else { bar_fg });
+                        let stroke = egui::Stroke::new(
+                            1.2_f32,
+                            if mresp.hovered() { pal.fg } else { bar_fg },
+                        );
                         if maximized.is_some() {
                             // 还原图标 ⧉：错位双矩形——后框只画露出的
                             // 上右两边，前框完整（前框底色填充挡住后框
@@ -1923,6 +1961,7 @@ pub fn show(
             &mut st.settings,
             app_settings,
             input.profile,
+            app_lock,
             pal,
             input.os_dark,
         );
@@ -1935,6 +1974,7 @@ pub fn show(
         out.settings_update_changed = s_out.update_changed;
         out.settings_proxy_changed = s_out.proxy_changed;
         out.settings_server_url_changed = s_out.server_url_changed;
+        out.settings_security_action = s_out.security_action;
         if s_out.log_out {
             out.logged_out = true;
         }
@@ -1981,6 +2021,9 @@ pub fn show(
     }
     {
         let b_out = remote_ui::banner(root.ctx(), input.remote_incoming, input.remote_session, pal);
+        if let Some(code) = b_out.copy_code {
+            out.copy_pairing_code = Some(code);
+        }
         if b_out.decline {
             out.decline_control = true;
         }
@@ -2565,6 +2608,46 @@ fn draw_session_icon(ui: &egui::Ui, center: egui::Pos2, active: bool, pal: &them
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 密码输入框不会保留可撤销的旧明文() {
+        egui::__run_test_ui(|ui| {
+            use egui::text::{CCursor, CCursorRange};
+            use egui::widgets::text_edit::TextEditState;
+
+            let id = ui.make_persistent_id("secure_password_test");
+            let cursor = CCursorRange::one(CCursor::new(0));
+            let mut state = TextEditState::default();
+            let mut undoer = state.undoer();
+            undoer.add_undo(&(cursor, "旧密码-secret".to_owned()));
+            state.set_undoer(undoer);
+            state.store(ui.ctx(), id);
+
+            let current = (cursor, String::new());
+            assert!(
+                TextEditState::load(ui.ctx(), id)
+                    .expect("预置状态")
+                    .undoer()
+                    .has_undo(&current),
+                "测试前应能撤销出旧密码"
+            );
+
+            let mut value = String::new();
+            secure_password_edit(
+                ui,
+                "secure_password_test",
+                egui::TextEdit::singleline(&mut value).password(true),
+            );
+
+            assert!(
+                !TextEditState::load(ui.ctx(), id)
+                    .expect("安全控件状态")
+                    .undoer()
+                    .has_undo(&current),
+                "安全密码框绘制后不得通过 Ctrl+Z 恢复旧明文"
+            );
+        });
+    }
 
     /// 两格左右布局的整格矩形（含标题栏）。
     fn two_rects() -> Vec<egui::Rect> {

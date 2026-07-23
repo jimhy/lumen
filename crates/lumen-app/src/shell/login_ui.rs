@@ -13,6 +13,7 @@
 use std::sync::mpsc::{self, Receiver};
 
 use lumen_protocol::{DeviceInfo, LoginRequest};
+use zeroize::Zeroize;
 
 use crate::cloud::{self, CloudClient, CloudError};
 use crate::i18n;
@@ -80,17 +81,31 @@ impl LoginUiState {
         self.focus_email = true;
     }
 
+    /// 本机进入锁屏时关闭登录层并清除所有凭据缓冲；已经发出的后台请求
+    /// 允许自然结束，但其结果接收端会在此丢弃，解锁后不会复活旧登录。
+    pub fn close_for_app_lock(&mut self) {
+        self.reset();
+        self.open = false;
+    }
+
     /// 清空输入/错误/在途请求（关闭或成功后调用）。
     fn reset(&mut self) {
         self.register_mode = false;
         self.email.clear();
-        self.password.clear();
-        self.password2.clear();
+        self.password.zeroize();
+        self.password2.zeroize();
         self.error = None;
         self.server_error = None;
         self.focus_email = false;
         self.submitting = false;
         self.rx = None;
+    }
+}
+
+impl Drop for LoginUiState {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.password2.zeroize();
     }
 }
 
@@ -206,25 +221,35 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
                 st.focus_email = false;
             }
             ui.add_space(8.0);
-            let pwd_edit = ui.add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut st.password)
-                    .password(true)
-                    .hint_text(s.login_password_hint)
-                    .desired_width(f32::INFINITY),
-            );
+            let pwd_edit = ui
+                .add_enabled_ui(enabled, |ui| {
+                    super::secure_password_edit(
+                        ui,
+                        "lumen_login_password",
+                        egui::TextEdit::singleline(&mut st.password)
+                            .password(true)
+                            .hint_text(s.login_password_hint)
+                            .desired_width(f32::INFINITY),
+                    )
+                })
+                .inner;
 
             // 注册模式：确认密码。
             let mut confirm_lost = false;
             if st.register_mode {
                 ui.add_space(8.0);
-                let c = ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut st.password2)
-                        .password(true)
-                        .hint_text(s.login_password_confirm_hint)
-                        .desired_width(f32::INFINITY),
-                );
+                let c = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        super::secure_password_edit(
+                            ui,
+                            "lumen_login_password_confirm",
+                            egui::TextEdit::singleline(&mut st.password2)
+                                .password(true)
+                                .hint_text(s.login_password_confirm_hint)
+                                .desired_width(f32::INFINITY),
+                        )
+                    })
+                    .inner;
                 confirm_lost = c.lost_focus();
             }
             ui.add_space(14.0);

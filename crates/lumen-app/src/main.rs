@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod action;
+mod app_lock;
 mod background;
 // M5 远程控制：客户端与 lumen-server 的 REST 通道 + 设备 id 持久化。
 // cloud.rs 提供 M5.1–M5.4 的完整 REST API；设备列表/重命名/删除、设置/历史
@@ -540,6 +541,14 @@ fn remote_icon_hash(bm: &lumen_protocol::remote::IconBitmap) -> u64 {
     h.finish()
 }
 
+/// 控制端何时拥有订阅 tab 的网格尺寸。
+///
+/// 未锁定时，本机窗口继续拥有当前 tab，控制端只接管后台 tab；锁定后
+/// 本机 Shell 停止布局，控制端必须接管当前 tab 才能保持既有远控会话可用。
+fn controller_owns_sub_viewport(tab_index: usize, active_tab: usize, app_locked: bool) -> bool {
+    tab_index != active_tab || app_locked
+}
+
 /// 终端区滚动条的逐窗格几何（仅 scrollback 非空、内容区够高的可见
 /// 窗格各一条）。run_ui 闭包内据此绘制轨道/滑块并处理拖动，闭包后把
 /// 目标 `display_offset` 落到对应 grid。几何取自上一帧 `pane_rects_px`
@@ -585,6 +594,17 @@ struct AppState {
     proxy: EventLoopProxy<PtyWake>,
     /// 应用设置（设置页编辑的数据源；变更即写盘）。
     settings: settings::Settings,
+    /// P0 本机应用锁：独立 `app_lock.json`，不进入通用设置或云同步。
+    app_lock: app_lock::AppLock,
+    /// Argon2id/DPAPI 后台作业回包通道（一次只允许一项）。
+    lock_crypto_tx: crossbeam_channel::Sender<app_lock::CryptoResponse>,
+    lock_crypto_rx: crossbeam_channel::Receiver<app_lock::CryptoResponse>,
+    /// 独立锁屏的跨帧输入/错误状态。
+    lock_ui: shell::lock_ui::LockUiState,
+    /// 非 Windows 的本应用输入空闲兜底；Windows 首选 GetLastInputInfo。
+    last_local_input: Instant,
+    /// 系统级空闲轮询节流（启用且未锁且配置自动锁定时约 1Hz）。
+    next_lock_poll: Instant,
     /// 系统当前是否深色模式（P12 Sync with OS）：启动时取
     /// `window.theme()`、运行中由 `WindowEvent::ThemeChanged` 维护；
     /// 开启跟随时主题按它在深/浅槽位间解析。
@@ -968,6 +988,297 @@ impl AppState {
         }
     }
 
+    /// 在后台执行一次应用锁密码作业。`unlock` 用于区分失败时应回写
+    /// 锁屏还是设置页；密码在调用点立即移入 `CryptoRequest` 的
+    /// `Zeroizing<String>`，主线程不保留副本。
+    fn spawn_lock_crypto(&mut self, request: app_lock::CryptoRequest, unlock: bool) {
+        if self.app_lock.crypto_busy() {
+            return;
+        }
+        self.app_lock.set_crypto_busy(true);
+        if !app_lock::spawn_crypto(request, self.lock_crypto_tx.clone(), self.proxy.clone()) {
+            self.app_lock.set_crypto_busy(false);
+            if unlock {
+                self.app_lock.mark_storage_error();
+                self.prepare_locked_ui();
+            } else {
+                self.shell_state
+                    .settings
+                    .security_operation_failed();
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// 排空后台 Argon2id/DPAPI 结果并在主线程提交状态变更。
+    fn drain_lock_crypto(&mut self) {
+        let responses: Vec<_> = self.lock_crypto_rx.try_iter().collect();
+        for response in responses {
+            self.app_lock.set_crypto_busy(false);
+            match response {
+                app_lock::CryptoResponse::Enable(Ok(verifier)) => {
+                    if self.app_lock.finish_enable(verifier).is_ok() {
+                        self.shell_state
+                            .settings
+                            .security_operation_succeeded();
+                    } else {
+                        self.shell_state
+                            .settings
+                            .security_operation_failed();
+                    }
+                }
+                app_lock::CryptoResponse::Disable(Ok(true)) => {
+                    if self.app_lock.finish_disable().is_ok() {
+                        self.shell_state
+                            .settings
+                            .security_operation_succeeded();
+                    } else {
+                        self.shell_state
+                            .settings
+                            .security_operation_failed();
+                    }
+                }
+                app_lock::CryptoResponse::Disable(Ok(false))
+                | app_lock::CryptoResponse::ChangePassword(Ok(None)) => {
+                    if self.app_lock.unlock_failure(Instant::now()).is_ok() {
+                        self.shell_state
+                            .settings
+                            .security_current_password_wrong();
+                    } else {
+                        self.app_lock.mark_storage_error();
+                        self.prepare_locked_ui();
+                    }
+                }
+                app_lock::CryptoResponse::ChangePassword(Ok(Some(verifier))) => {
+                    if self.app_lock.finish_change_password(verifier).is_ok() {
+                        self.shell_state
+                            .settings
+                            .security_operation_succeeded();
+                    } else {
+                        self.shell_state
+                            .settings
+                            .security_operation_failed();
+                    }
+                }
+                app_lock::CryptoResponse::Unlock(Ok(true)) => {
+                    if self.app_lock.unlock_success().is_ok() {
+                        self.finish_app_unlock();
+                    } else {
+                        self.app_lock.mark_storage_error();
+                        self.prepare_locked_ui();
+                    }
+                }
+                app_lock::CryptoResponse::Unlock(Ok(false)) => {
+                    if self.app_lock.unlock_failure(Instant::now()).is_ok() {
+                        self.lock_ui
+                            .set_error(shell::lock_ui::LockUiError::WrongPassword);
+                    } else {
+                        self.app_lock.mark_storage_error();
+                        self.prepare_locked_ui();
+                    }
+                }
+                app_lock::CryptoResponse::Enable(Err(_))
+                | app_lock::CryptoResponse::Disable(Err(_))
+                | app_lock::CryptoResponse::ChangePassword(Err(_)) => {
+                    self.shell_state
+                        .settings
+                        .security_operation_failed();
+                }
+                app_lock::CryptoResponse::Unlock(Err(_)) => {
+                    self.app_lock.mark_storage_error();
+                    self.prepare_locked_ui();
+                }
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    /// 进入锁屏后的本地状态清理。这里只收回本机输入与隐藏业务 UI；
+    /// PTY、远程 WS、镜像订阅和文件服务都不停止。
+    fn prepare_locked_ui(&mut self) {
+        self.release_held_report_buttons();
+        self.terminal_focused = false;
+        self.last_key_at = None;
+        self.hovered_link = None;
+        self.hover_probe_cell = None;
+        self.scrollbar_drag = None;
+        self.autoscroll_drag = 0;
+        self.autoscroll_at = None;
+        self.shell_state.renaming = None;
+        self.shell_state.pane_renaming = None;
+        self.shell_state.renaming_device = None;
+        self.shell_state.history_search.open = false;
+        self.shell_state.history_search.query.clear();
+        self.shell_state.completion.open = false;
+        self.shell_state.login.close_for_app_lock();
+        self.shell_state
+            .settings
+            .clear_sensitive_for_app_lock();
+        self.shell_state.remote_ui.reset();
+        self.lock_ui.clear();
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                pane.selecting = false;
+                #[cfg(feature = "input-editor")]
+                {
+                    pane.preedit = None;
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        snap_layouts::update_button_rect(0, 0, 0, 0);
+        app_lock::set_window_capture_protection(&self.window, true);
+        self.update_window_title();
+        self.window.request_redraw();
+    }
+
+    /// 由快捷键、设置页、空闲计时或系统恢复进入应用锁。
+    fn lock_now(&mut self) -> bool {
+        match self.app_lock.lock() {
+            Ok(true) => {
+                self.prepare_locked_ui();
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                log::error!("应用锁状态写盘失败: {e}");
+                self.shell_state
+                    .settings
+                    .security_operation_failed();
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    i18n::strings().security_operation_failed,
+                );
+                self.window.request_redraw();
+                false
+            }
+        }
+    }
+
+    /// 密码验证且清除锁定标记成功后恢复本机 UI。锁定期间累积的 PTY
+    /// 输出已持续消化；把全部窗格标记成欠帧，解锁首帧即显示最新状态。
+    fn finish_app_unlock(&mut self) {
+        self.lock_ui.clear();
+        let now = Instant::now();
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                pane.term_frame_due_since = Some(
+                    now.checked_sub(REDRAW_ABS_CAP)
+                        .unwrap_or(now),
+                );
+            }
+        }
+        self.last_local_input = now;
+        self.terminal_focused = !(self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.history_search.open
+            || self.shell_state.completion.open
+            || self.shell_state.renaming.is_some()
+            || self.shell_state.pane_renaming.is_some()
+            || self.shell_state.filetree.dialog_open());
+        self.update_window_title();
+        app_lock::set_window_capture_protection(&self.window, false);
+        self.window.request_redraw();
+    }
+
+    /// 锁定期间的唯一绘制路径。它不构造 `ShellInput`、不读取终端纹理、
+    /// 账户、设备、配对或文件树，只提交完全不透明的解锁界面。
+    fn render_app_lock(&mut self) -> Option<shell::lock_ui::LockUiOutput> {
+        let frame = self.renderer.acquire_frame()?;
+        let render_t0 = Instant::now();
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let pal = shell::theme::shell_palette(settings::theme_info(
+            self.settings.effective_theme_id(self.os_dark),
+        ));
+        let input = shell::lock_ui::LockUiInput {
+            busy: self.app_lock.crypto_busy(),
+            retry_remaining: self.app_lock.retry_remaining(render_t0),
+            remote_active: self.remote_ws.session.is_some(),
+            caps_lock: app_lock::caps_lock_on(),
+            storage_error: self.app_lock.config().storage_error(),
+        };
+        let ctx = self.egui_ctx.clone();
+        let lock_ui = &mut self.lock_ui;
+        let mut lock_output = None;
+        let full_output = ctx.run_ui(raw_input, |ui| {
+            lock_output = Some(shell::lock_ui::show(ui, lock_ui, input, &pal));
+        });
+
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        let ppp = self.egui_ctx.pixels_per_point();
+        let clipped = self.egui_ctx.tessellate(full_output.shapes, ppp);
+        let (sw, sh) = self.renderer.surface_size();
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [sw, sh],
+            pixels_per_point: ppp,
+        };
+        let device = self.renderer.device();
+        let queue = self.renderer.queue();
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(device, queue, *id, delta);
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("lumen app lock frame"),
+        });
+        let user_cmds = self.egui_renderer.update_buffers(
+            device,
+            queue,
+            &mut encoder,
+            &clipped,
+            &screen,
+        );
+        let surface_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lumen app lock pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(
+                            self.renderer.theme().background.to_wgpu(),
+                        ),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            self.egui_renderer.render(&mut pass, &clipped, &screen);
+        }
+        queue.submit(user_cmds.into_iter().chain([encoder.finish()]));
+        frame.present();
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        for id in self.pending_tex_free.drain(..) {
+            self.egui_renderer.free_texture(&id);
+        }
+
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
+        self.egui_repaint_at = if repaint_delay == Duration::ZERO {
+            Some(render_t0 + Duration::from_millis(8))
+        } else if repaint_delay < Duration::from_secs(3600) {
+            Some(render_t0 + repaint_delay)
+        } else {
+            None
+        };
+        self.last_render_at = Some(render_t0);
+        lock_output
+    }
+
     /// 按设置与系统深浅模式应用当前生效主题（P12）：终端配色（含
     /// 行排版缓存失效）+ 外壳 egui 样式联动。设置页主题/槽位/Sync
     /// with OS 变更与系统深浅切换共用此链路。
@@ -1215,13 +1526,17 @@ impl AppState {
                     );
                 }
             }
-            // part3d Phase 3 尺寸同步：应用控制端请求的订阅会话各窗格目标尺寸——**仅当该会话在
-            // 被控端为后台 tab** 时 resize 其窗格（所有权规则：前台由被控端窗口接管，避免两端抢
-            // resize）。resize 后该 tab 的几何签名变 → 下方快照块重发 SubscriptionStarted（新尺寸），
-            // 控制端镜像随之 1:1。
+            // part3d Phase 3 尺寸同步：通常只让控制端接管被控端后台 tab，避免与本地前台布局
+            // 同时抢 resize。应用锁定时本地 Shell 不再布局当前 tab，因此当前 tab 也必须临时由
+            // 控制端接管，保证既有远控会话的多窗格操作不受锁屏影响。
             if let Some((vp_tab, sizes)) = self.remote_ws.take_sub_viewport() {
                 if let Some(ti) = self.tabs.iter().position(|t| t.id == vp_tab) {
-                    if ti != self.active_tab {
+                    if controller_owns_sub_viewport(
+                        ti,
+                        self.active_tab,
+                        self.app_lock.is_locked(),
+                    ) {
+                        let mut resized_any = false;
                         for (sid, rows, cols) in sizes {
                             if let Some(pane) = self.tabs[ti].panes.iter_mut().find(|p| p.id == sid)
                             {
@@ -1229,11 +1544,16 @@ impl AppState {
                                 let g = pane.term.grid();
                                 if (g.rows(), g.cols()) != (r, c) {
                                     pane.term.resize(r, c);
+                                    resized_any = true;
                                     if let Err(e) = pane.pty.resize(rows.max(1), cols.max(1)) {
                                         log::warn!("订阅会话窗格 {sid} PTY resize 失败: {e:#}");
                                     }
                                 }
                             }
+                        }
+                        if resized_any {
+                            // 强制下一次镜像快照携带新几何，避免控制端短暂沿用旧尺寸。
+                            self.mirror_src = None;
                         }
                     }
                 }
@@ -1434,7 +1754,26 @@ impl AppState {
                 let dims = (usize::from(r).max(1), usize::from(c).max(1));
                 if self.remote_viewport != Some(dims) {
                     self.remote_viewport = Some(dims);
-                    self.window.request_redraw();
+                    if self.app_lock.is_locked() {
+                        // 锁屏不跑本机 shell 布局；被控端焦点窗格仍须
+                        // 立即跟随控制端视口，保证授权远控在锁定期间
+                        // 完整可用。只改 Terminal/PTY，不触碰本机 UI。
+                        let pane = self.focused_pane_mut();
+                        let current = {
+                            let grid = pane.term.grid();
+                            (grid.rows(), grid.cols())
+                        };
+                        if current != dims {
+                            pane.term.resize(dims.0, dims.1);
+                            if let Err(e) = pane.pty.resize(r.max(1), c.max(1)) {
+                                log::warn!("锁定期间远程视口 PTY resize 失败: {e:#}");
+                            }
+                            // 网格签名变化后下次 pump 强制重发镜像快照。
+                            self.mirror_src = None;
+                        }
+                    } else {
+                        self.window.request_redraw();
+                    }
                 }
             }
         } else if self.remote_viewport.take().is_some() {
@@ -3585,6 +3924,9 @@ impl AppState {
     /// （`bypass_egui` 的 `terminal_focused && Ime` 项已覆盖），故对 Win11
     /// 正常路径零影响；仅焦点翻转窗口期生效。
     fn ime_should_route_to_composer(&self) -> bool {
+        if self.app_lock.is_locked() {
+            return false;
+        }
         #[cfg(feature = "input-editor")]
         {
             let overlay = self.shell_state.settings.open
@@ -4280,6 +4622,11 @@ impl AppState {
     /// 窗口标题跟随激活 tab（与侧栏条目同源 display_title：自定义名 >
     /// 焦点窗格 cwd > OSC 标题 > 「会话 N」，恒非空）。
     fn update_window_title(&self) {
+        if self.app_lock.is_locked() {
+            self.window
+                .set_title(&format!("Lumen — {}", i18n::strings().lock_screen_title));
+            return;
+        }
         let title = self.tabs[self.active_tab].display_title();
         // [BUILD-MARKER r4]（composer-IME 取证临时）：标题栏带版本标记，海风哥
         // 一眼确认跑的是不是带修复的新版，不用翻日志。坐实后连同诊断一并移除。
@@ -5488,6 +5835,11 @@ impl App {
 
         // F3：后台更新线程 → 主循环的消息通道。
         let (update_tx, update_rx) = crossbeam_channel::unbounded();
+        // P0 应用锁：配置独立于 settings.json；密码作业在后台线程，
+        // 结果沿 bounded(1) 通道回主循环。
+        let app_lock = app_lock::AppLock::load();
+        let (lock_crypto_tx, lock_crypto_rx) = crossbeam_channel::bounded(1);
+        let now = Instant::now();
 
         let mut state = AppState {
             perf,
@@ -5503,6 +5855,12 @@ impl App {
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
+            app_lock,
+            lock_crypto_tx,
+            lock_crypto_rx,
+            lock_ui: shell::lock_ui::LockUiState::default(),
+            last_local_input: now,
+            next_lock_poll: now,
             os_dark,
             last_sessions_snapshot: None,
             layout_dirty: false,
@@ -5610,6 +5968,9 @@ impl App {
         }
         // 窗口标题对齐激活会话（恢复多会话时 active 可能非 0）。
         state.update_window_title();
+        if state.app_lock.is_locked() {
+            state.prepare_locked_ui();
+        }
 
         // 片6 虚拟文件剪贴板：启动专用 STA OLE 线程。OLE 线程经 clip_fetch_tx 请主线程把远程
         // 文件下到临时文件（资源管理器粘贴远程虚拟文件时触发）；rx 在 user_event 排空。非 Windows
@@ -5745,6 +6106,9 @@ impl ApplicationHandler<PtyWake> for App {
         if state.tabs.is_empty() {
             return; // 退出流程中（exit 后仍可能有滞后事件）
         }
+        // 应用锁密码线程复用 PtyWake 唤醒主循环；先提交结果，再处理
+        // PTY/远程事件，解锁首帧即可与最新终端状态对齐。
+        state.drain_lock_crypto();
         // F3：drain 更新消息（发现新版/检查结果/下载完成）。下载完成会拉起
         // 安装器并请求优雅退出——走与 CloseRequested 同路径（落盘 + flush
         // 历史 + exit），让安装器替换 exe。
@@ -6264,11 +6628,46 @@ impl ApplicationHandler<PtyWake> for App {
         //   （其余仍在同步区间的窗格由 RedrawRequested 的逐窗格门控
         //   各自跳过，保留上一完整帧）。
         let now = Instant::now();
+
+        // 应用锁退避与自动入口。软件锁默认关闭；所有入口都先经过
+        // is_enabled 门控，因此缺少 app_lock.json 的旧用户零行为变化。
+        let retry_was_active = !state.app_lock.retry_remaining(now).is_zero();
+        state.app_lock.expire_retry_if_due(now);
+        if retry_was_active && state.app_lock.retry_remaining(now).is_zero() {
+            state.lock_ui.clear_error();
+            state.window.request_redraw();
+        }
+        #[cfg(target_os = "windows")]
+        if snap_layouts::take_security_lock_request()
+            && state.app_lock.is_enabled()
+            && state.app_lock.config().lock_on_resume()
+        {
+            state.lock_now();
+        }
+        if state.app_lock.is_enabled()
+            && !state.app_lock.is_locked()
+            && state.app_lock.config().idle_timeout_minutes() > 0
+            && now >= state.next_lock_poll
+        {
+            state.next_lock_poll = now + Duration::from_secs(1);
+            let idle = app_lock::system_idle_duration()
+                .unwrap_or_else(|| now.saturating_duration_since(state.last_local_input));
+            let limit = Duration::from_secs(
+                u64::from(state.app_lock.config().idle_timeout_minutes()) * 60,
+            );
+            if idle >= limit {
+                state.lock_now();
+            }
+        }
+
         // 拖选边缘 auto-scroll：本地终端 或 镜像（远程视图）拖选进行中、鼠标停在内容区
         // 上/下边缘外时，按节流定时滚动一行 + 续选（露出 scrollback 上/下内容），并安排
         // 下次 tick。优先于下方渲染调度——它自带 request_redraw + WaitUntil 自维持节拍。
         let mirror_selecting = state.remote_ws.mirror_pane_selecting_sid().is_some();
-        if state.autoscroll_drag != 0 && (state.focused_pane().selecting || mirror_selecting) {
+        if !state.app_lock.is_locked()
+            && state.autoscroll_drag != 0
+            && (state.focused_pane().selecting || mirror_selecting)
+        {
             if state.autoscroll_at.is_none_or(|t| now >= t) {
                 if mirror_selecting {
                     state.tick_autoscroll_mirror_drag();
@@ -6285,6 +6684,17 @@ impl ApplicationHandler<PtyWake> for App {
         }
         // 未到点计划中的最早时刻（含 egui 计划）。
         let mut wake: Option<Instant> = None;
+        if state.app_lock.is_enabled()
+            && !state.app_lock.is_locked()
+            && state.app_lock.config().idle_timeout_minutes() > 0
+        {
+            wake = Some(state.next_lock_poll);
+        }
+        let retry_remaining = state.app_lock.retry_remaining(now);
+        if !retry_remaining.is_zero() {
+            let tick = now + retry_remaining.min(Duration::from_secs(1));
+            wake = Some(wake.map_or(tick, |w| w.min(tick)));
+        }
         // 任一窗格到点且可渲染 → 立即重绘。
         let mut fire = false;
         // 有到点但被同步区间顺延的窗格。
@@ -6367,6 +6777,37 @@ impl ApplicationHandler<PtyWake> for App {
             return; // 退出流程中（exit 后仍可能有滞后事件）
         }
 
+        // 非 Windows 的自动锁空闲计时兜底；Windows 实际判定优先使用
+        // GetLastInputInfo，但仍同步记录，API 失败时可退回本应用事件。
+        if matches!(
+            &event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::Touch(_)
+        ) {
+            state.last_local_input = Instant::now();
+        }
+
+        // 应用锁快捷键属于最外层本机安全入口：在 egui/终端快捷键之前
+        // 精确匹配，启用后无论当前打开设置页还是其他覆盖层都可立即锁定。
+        if state.app_lock.is_enabled() && !state.app_lock.is_locked() {
+            if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+                if key.state == ElementState::Pressed
+                    && !key.repeat
+                    && state
+                        .app_lock
+                        .config()
+                        .shortcut()
+                        .matches(state.modifiers, key.physical_key)
+                    && state.lock_now()
+                {
+                    return;
+                }
+            }
+        }
+
         // —— egui 先行消化事件 ——
         // 终端聚焦时键盘与 IME 整体绕过 egui：Tab/方向键不被 egui 的
         // 焦点导航偷走、IME 提交不被双投。其余事件先喂 egui（面板悬停
@@ -6386,12 +6827,13 @@ impl ApplicationHandler<PtyWake> for App {
         let ime_route_composer =
             matches!(event, WindowEvent::Ime(_)) && state.ime_should_route_to_composer();
         let bypass_egui = matches!(event, WindowEvent::RedrawRequested)
-            || (state.terminal_focused
+            || (!state.app_lock.is_locked()
+                && state.terminal_focused
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
                 ))
-            || ime_route_composer
+            || (!state.app_lock.is_locked() && ime_route_composer)
             // 诊断开关（B1）：无交互桌面的自动化环境里物理光标不在窗口
             // 内，每个注入的 WM_MOUSEMOVE 都伴随系统补发的 WM_MOUSELEAVE
             // （TrackMouseEvent 语义），egui 的指针态被清空导致注入的
@@ -6430,6 +6872,24 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.request_redraw();
                 }
             }
+        }
+
+        // 锁定期间只允许窗口生命周期/布局事件继续进入业务分支。
+        // 键鼠/IME 已在上方交给锁屏 egui，随后必须在最外层截断，绝不
+        // 到达终端、文件树、设置、配对或窗口拖动等普通交互。
+        if state.app_lock.is_locked()
+            && !matches!(
+                &event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Destroyed
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::ScaleFactorChanged { .. }
+                    | WindowEvent::ThemeChanged(_)
+                    | WindowEvent::RedrawRequested
+                    | WindowEvent::ModifiersChanged(_)
+            )
+        {
+            return;
         }
 
         match event {
@@ -7762,14 +8222,59 @@ impl ApplicationHandler<PtyWake> for App {
                 // wgpu swapchain 释放时触发次生 panic。
                 // 守卫：最小化态 (is_minimized == true) 或宽/高 < 120
                 // 物理像素（160×28 小条实测值）时跳过整帧渲染与布局。
-                {
-                    let sz = state.window.inner_size();
-                    const MIN_RENDERABLE: u32 = 120;
-                    let too_small = sz.width < MIN_RENDERABLE || sz.height < MIN_RENDERABLE;
-                    let minimized = state.window.is_minimized().unwrap_or(false);
-                    if minimized || too_small {
+                let locked = state.app_lock.is_locked();
+                let sz = state.window.inner_size();
+                const MIN_RENDERABLE: u32 = 120;
+                let too_small = sz.width < MIN_RENDERABLE || sz.height < MIN_RENDERABLE;
+                let minimized = state.window.is_minimized().unwrap_or(false);
+                if minimized || sz.width == 0 || sz.height == 0 || (too_small && !locked) {
+                    // 锁定态即便最小化不重画，窗口捕获保护也已同步开启，
+                    // DWM 缩略图不会继续暴露锁前 surface。
+                    return;
+                }
+                if locked {
+                    let Some(lock_out) = state.render_app_lock() else {
+                        // Surface Lost/Outdated 的恢复不能依赖偶发后续事件；
+                        // 锁屏是安全帧，失败后主动补排，直到覆盖旧业务帧。
+                        state.egui_repaint_at =
+                            Some(Instant::now() + Duration::from_millis(16));
+                        state.window.request_redraw();
+                        return;
+                    };
+                    if lock_out.close {
+                        state.persist_sessions();
+                        #[cfg(feature = "input-editor")]
+                        state.history.flush_on_exit();
+                        event_loop.exit();
                         return;
                     }
+                    if lock_out.minimize {
+                        state.window.set_minimized(true);
+                    }
+                    if let Some(mut password) = lock_out.unlock_password {
+                        if !state.app_lock.crypto_busy()
+                            && state.app_lock.retry_remaining(Instant::now()).is_zero()
+                            && !state.app_lock.config().storage_error()
+                        {
+                            if let Some(verifier) = state.app_lock.protected_verifier() {
+                                state.spawn_lock_crypto(
+                                    app_lock::CryptoRequest::unlock(password, verifier),
+                                    true,
+                                );
+                            } else {
+                                use zeroize::Zeroize as _;
+                                password.zeroize();
+                                state.app_lock.mark_storage_error();
+                                state.prepare_locked_ui();
+                            }
+                        } else {
+                            // 防御：UI 在 busy/退避/存储错误时不会产出密码，
+                            // 若陈旧事件仍到达也先覆写明文再丢弃。
+                            use zeroize::Zeroize as _;
+                            password.zeroize();
+                        }
+                    }
+                    return;
                 }
                 // surface 帧先行取得：失败（Lost/Outdated 已就地重配）则
                 // 本帧整体跳过——egui 输入与 textures_delta 都未消费，
@@ -8380,6 +8885,11 @@ impl ApplicationHandler<PtyWake> for App {
                 let scrollbar_drag = &mut state.scrollbar_drag;
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
+                let app_lock_input = shell::settings_ui::AppLockInput {
+                    config: state.app_lock.config(),
+                    busy: state.app_lock.crypto_busy(),
+                    retry_remaining: state.app_lock.retry_remaining(Instant::now()),
+                };
                 // F3 更新弹窗配色（当前主题色板；app_settings 借用后用 disjoint
                 // 的 state.os_dark 求生效主题）。
                 let modal_pal = shell::theme::shell_palette(settings::theme_info(
@@ -8446,6 +8956,7 @@ impl ApplicationHandler<PtyWake> for App {
                         &shell_input,
                         shell_state,
                         app_settings,
+                        app_lock_input,
                         is_maximized,
                     ));
                     // 边缘 resize 光标：放在 shell::show 之后设，覆盖边缘处控件的
@@ -9012,6 +9523,26 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(code) = shell_out.submit_pairing_code {
                     state.remote_ws.submit_pairing(code);
                 }
+                if let Some(code) = shell_out.copy_pairing_code {
+                    let ok = matches!(
+                        state.clipboard.as_mut().map(|c| c.set_text(code)),
+                        Some(Ok(()))
+                    );
+                    if ok {
+                        state.shell_state.toast.push(
+                            shell::toast::ToastKind::Info,
+                            i18n::strings().remote_toast_pairing_code_copied,
+                        );
+                    } else {
+                        error!("写剪贴板失败（复制配对码）");
+                        state.shell_state.toast.push(
+                            shell::toast::ToastKind::Error,
+                            i18n::strings().toast_copy_failed,
+                        );
+                    }
+                    // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
+                    state.window.request_redraw();
+                }
                 if shell_out.cancel_pairing {
                     state.remote_ws.cancel_pairing();
                 }
@@ -9576,6 +10107,91 @@ impl ApplicationHandler<PtyWake> for App {
                     // 打开期间键盘/IME 恒归 egui（覆盖层之下终端的 PTY
                     // 消化与渲染照常进行，只是不收键盘）。
                     state.terminal_focused = false;
+                }
+                if let Some(security_action) = shell_out.settings_security_action {
+                    match security_action {
+                        shell::settings_ui::SecurityAction::Enable { password } => {
+                            state.spawn_lock_crypto(
+                                app_lock::CryptoRequest::enable(password),
+                                false,
+                            );
+                        }
+                        shell::settings_ui::SecurityAction::Disable {
+                            mut current_password,
+                        } => {
+                            if !state
+                                .app_lock
+                                .retry_remaining(Instant::now())
+                                .is_zero()
+                            {
+                                use zeroize::Zeroize as _;
+                                current_password.zeroize();
+                            } else if let Some(verifier) = state.app_lock.protected_verifier() {
+                                state.spawn_lock_crypto(
+                                    app_lock::CryptoRequest::disable(
+                                        current_password,
+                                        verifier,
+                                    ),
+                                    false,
+                                );
+                            } else {
+                                use zeroize::Zeroize as _;
+                                current_password.zeroize();
+                                state
+                                    .shell_state
+                                    .settings
+                                    .security_operation_failed();
+                            }
+                        }
+                        shell::settings_ui::SecurityAction::ChangePassword {
+                            mut current_password,
+                            mut new_password,
+                        } => {
+                            if !state
+                                .app_lock
+                                .retry_remaining(Instant::now())
+                                .is_zero()
+                            {
+                                use zeroize::Zeroize as _;
+                                current_password.zeroize();
+                                new_password.zeroize();
+                            } else if let Some(verifier) = state.app_lock.protected_verifier() {
+                                state.spawn_lock_crypto(
+                                    app_lock::CryptoRequest::change(
+                                        current_password,
+                                        new_password,
+                                        verifier,
+                                    ),
+                                    false,
+                                );
+                            } else {
+                                use zeroize::Zeroize as _;
+                                current_password.zeroize();
+                                new_password.zeroize();
+                                state
+                                    .shell_state
+                                    .settings
+                                    .security_operation_failed();
+                            }
+                        }
+                        shell::settings_ui::SecurityAction::UpdatePreferences(prefs) => {
+                            if let Err(e) = state.app_lock.apply_preferences(prefs) {
+                                log::error!("应用锁偏好写盘失败: {e}");
+                                state
+                                    .shell_state
+                                    .settings
+                                    .security_operation_failed();
+                            }
+                            state.window.request_redraw();
+                        }
+                        shell::settings_ui::SecurityAction::LockNow => {
+                            // 本帧 surface 尚未 present；直接结束普通 UI 帧，
+                            // 下一次 redraw 只绘制不透明锁屏，避免提交一帧旧业务内容。
+                            if state.lock_now() {
+                                return;
+                            }
+                        }
+                    }
                 }
                 if shell_out.settings_font_changed {
                     // 字体/字号即时生效：重建字体度量（行排版缓存随之
@@ -10713,12 +11329,19 @@ impl ApplicationHandler<PtyWake> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_order, estimate_restored_pane_px, load_icon, maximized_overflow,
-        width_worth_persisting, PaneLayout,
+        controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
+        maximized_overflow, width_worth_persisting, PaneLayout,
     };
 
     // ── 本机复制粘贴（local→local，海风哥本轮新增）单测 ───────────────────
     use super::{local_copy_item, unique_copy_name, CopyStats};
+
+    #[test]
+    fn 锁屏期间控制端接管当前订阅页尺寸() {
+        assert!(controller_owns_sub_viewport(1, 0, false));
+        assert!(!controller_owns_sub_viewport(0, 0, false));
+        assert!(controller_owns_sub_viewport(0, 0, true));
+    }
 
     #[test]
     fn 副本名_不冲突原样_冲突加序号() {

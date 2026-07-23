@@ -8,11 +8,14 @@
 //! Esc / 右上角 ✕ 关闭。设置页打开期间 PTY 消化与终端渲染照常进行
 //! ——覆盖层只是 UI 层。
 
+use crate::app_lock::{self, AppLockFile, LockShortcut, PasswordPolicyError, Preferences};
 use crate::i18n::{self, Language};
 use crate::profile::Profile;
 use crate::settings::{self, Settings};
 
 use super::theme::Palette;
+use std::time::Duration;
+use zeroize::Zeroize;
 
 // rfd 文件对话框（P13）：Windows 原生 IFileOpenDialog，同步调用。
 use rfd;
@@ -64,15 +67,17 @@ enum Category {
     Account,
     Appearance,
     Shortcuts,
+    Security,
     Network,
     About,
 }
 
 impl Category {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Account,
         Self::Appearance,
         Self::Shortcuts,
+        Self::Security,
         Self::Network,
         Self::About,
     ];
@@ -84,10 +89,27 @@ impl Category {
             Self::Account => s.nav_account,
             Self::Appearance => s.nav_appearance,
             Self::Shortcuts => s.nav_keyboard_shortcuts,
+            Self::Security => s.nav_security,
             Self::Network => s.nav_network,
             Self::About => s.nav_about,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityForm {
+    Enable,
+    Disable,
+    ChangePassword,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityFeedback {
+    PasswordTooShort,
+    PasswordTooLong,
+    PasswordMismatch,
+    CurrentPasswordWrong,
+    OperationFailed,
 }
 
 /// 设置页的跨帧 UI 状态。
@@ -112,6 +134,13 @@ pub struct SettingsUiState {
     bg_opacity_drag: Option<f32>,
     /// 背景图暗化滑块拖动中的预览值（松手才写盘）。
     bg_dim_drag: Option<f32>,
+    /// 应用锁设置表单。密码只存在于这些短生命周期缓冲中；切换分类、
+    /// 取消、关闭设置页和销毁状态时都会主动清零。
+    security_form: Option<SecurityForm>,
+    security_current_password_buf: String,
+    security_new_password_buf: String,
+    security_confirm_password_buf: String,
+    security_feedback: Option<SecurityFeedback>,
 }
 
 impl SettingsUiState {
@@ -125,6 +154,7 @@ impl SettingsUiState {
         self.font_size_drag = None;
         self.bg_opacity_drag = None;
         self.bg_dim_drag = None;
+        self.clear_security_form();
     }
 
     /// 打开设置页并定位到 Keyboard shortcuts 分类（头像菜单入口）。
@@ -132,6 +162,69 @@ impl SettingsUiState {
         self.open_with(settings);
         self.category = Category::Shortcuts;
     }
+
+    /// main 在启用、关闭或改密成功后调用。关闭表单并清零所有明文。
+    pub fn security_operation_succeeded(&mut self) {
+        self.clear_security_form();
+    }
+
+    /// main 在后台校验发现当前密码不正确时调用。
+    pub fn security_current_password_wrong(&mut self) {
+        self.clear_security_passwords();
+        self.security_feedback = Some(SecurityFeedback::CurrentPasswordWrong);
+    }
+
+    /// main 在密码线程或本地持久化失败时调用。
+    pub fn security_operation_failed(&mut self) {
+        self.clear_security_passwords();
+        self.security_feedback = Some(SecurityFeedback::OperationFailed);
+    }
+
+    /// 进入本机锁屏前清除设置页中的全部应用锁密码缓冲。
+    pub fn clear_sensitive_for_app_lock(&mut self) {
+        self.clear_security_form();
+    }
+
+    fn open_security_form(&mut self, form: SecurityForm) {
+        self.clear_security_passwords();
+        self.security_feedback = None;
+        self.security_form = Some(form);
+    }
+
+    fn clear_security_passwords(&mut self) {
+        self.security_current_password_buf.zeroize();
+        self.security_new_password_buf.zeroize();
+        self.security_confirm_password_buf.zeroize();
+    }
+
+    fn clear_security_form(&mut self) {
+        self.clear_security_passwords();
+        self.security_form = None;
+        self.security_feedback = None;
+    }
+}
+
+impl Drop for SettingsUiState {
+    fn drop(&mut self) {
+        self.clear_security_passwords();
+    }
+}
+
+/// 设置页发给 main 的应用锁命令。UI 只做输入与密码策略检查；昂贵的
+/// Argon2id 哈希/校验由 app_lock 后台线程完成。
+pub enum SecurityAction {
+    Enable {
+        password: String,
+    },
+    Disable {
+        current_password: String,
+    },
+    ChangePassword {
+        current_password: String,
+        new_password: String,
+    },
+    UpdatePreferences(Preferences),
+    LockNow,
 }
 
 /// 一帧设置页 UI 的产出。
@@ -163,6 +256,16 @@ pub struct SettingsOutput {
     pub proxy_changed: bool,
     /// Network 页改了服务端地址（M5.2）：main 落盘 + 应用到 cloud 全局。
     pub server_url_changed: bool,
+    /// Security 页的一次性命令；每帧最多产生一个。
+    pub security_action: Option<SecurityAction>,
+}
+
+/// 设置页本帧所需的本机应用锁只读快照。
+#[derive(Clone, Copy)]
+pub struct AppLockInput<'a> {
+    pub config: &'a AppLockFile,
+    pub busy: bool,
+    pub retry_remaining: Duration,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -173,9 +276,15 @@ pub fn show(
     st: &mut SettingsUiState,
     settings: &mut Settings,
     profile: Option<&Profile>,
+    app_lock: AppLockInput<'_>,
     pal: &Palette,
     os_dark: bool,
 ) -> SettingsOutput {
+    let AppLockInput {
+        config: lock,
+        busy: lock_busy,
+        retry_remaining: lock_retry_remaining,
+    } = app_lock;
     let mut out = SettingsOutput::default();
     let screen = ctx.content_rect();
 
@@ -261,7 +370,10 @@ pub fn show(
                 .show(&mut content_ui, |ui| match st.category {
                     Category::Account => account(ui, profile, pal, &mut out),
                     Category::Appearance => appearance(ui, st, settings, pal, &mut out, os_dark),
-                    Category::Shortcuts => shortcuts(ui, pal),
+                    Category::Shortcuts => shortcuts(ui, pal, lock),
+                    Category::Security => {
+                        security(ui, st, lock, lock_busy, lock_retry_remaining, pal, &mut out)
+                    }
                     Category::Network => network(ui, settings, pal, &mut out),
                     Category::About => about(ui, settings, pal, &mut out),
                 });
@@ -269,6 +381,9 @@ pub fn show(
     // Esc（顶层 modal 且无弹层打开时）或 backdrop 点击 → 关闭。
     if modal.should_close() {
         out.closed = true;
+    }
+    if out.closed {
+        st.clear_security_form();
     }
     out
 }
@@ -291,6 +406,9 @@ fn nav(ui: &mut egui::Ui, st: &mut SettingsUiState, pal: &Palette) {
         })
         .min_size(egui::vec2(ui.available_width(), 30.0));
         if ui.add(btn).clicked() {
+            if st.category == Category::Security && cat != Category::Security {
+                st.clear_security_form();
+            }
             st.category = cat;
         }
     }
@@ -933,8 +1051,314 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, pal: &Palette) -> egui::Respo
     resp
 }
 
+/// Security：应用锁默认关闭；密码仅在表单缓冲与本帧命令中短暂停留，
+/// UI 不做 Argon2id 运算，也不接触持久化格式。
+fn security(
+    ui: &mut egui::Ui,
+    st: &mut SettingsUiState,
+    lock: &AppLockFile,
+    lock_busy: bool,
+    retry_remaining: Duration,
+    pal: &Palette,
+    out: &mut SettingsOutput,
+) {
+    let s = i18n::strings();
+    let lock_waiting = !retry_remaining.is_zero();
+    let lock_blocked = lock_credentials_blocked(lock_busy, retry_remaining);
+    heading(ui, pal, s.security_heading);
+
+    ui.label(
+        egui::RichText::new(s.security_app_lock)
+            .size(14.0)
+            .strong()
+            .color(pal.fg),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(if lock.enabled() {
+            s.security_lock_enabled_hint
+        } else {
+            s.security_lock_disabled_hint
+        })
+        .size(11.0)
+        .color(pal.fg_dim),
+    );
+    ui.add_space(12.0);
+
+    ui.add_enabled_ui(!lock_blocked, |ui| {
+        ui.horizontal(|ui| {
+            if lock.enabled() {
+                if ui.button(s.security_lock_now).clicked() && out.security_action.is_none() {
+                    out.security_action = Some(SecurityAction::LockNow);
+                }
+                if ui.button(s.security_change_password).clicked() {
+                    st.open_security_form(SecurityForm::ChangePassword);
+                }
+                if ui.button(s.security_disable).clicked() {
+                    st.open_security_form(SecurityForm::Disable);
+                }
+            } else if ui.button(s.security_enable).clicked() {
+                st.open_security_form(SecurityForm::Enable);
+            }
+        });
+    });
+
+    if lock_waiting {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(i18n::fmt1(
+                s.lock_screen_retry_fmt,
+                retry_remaining.as_secs().max(1),
+            ))
+            .size(11.0)
+            .color(pal.warn),
+        );
+        ui.ctx().request_repaint_after(Duration::from_millis(200));
+    }
+
+    if lock.enabled() {
+        ui.add_space(20.0);
+        let mut prefs = lock.preferences();
+        let before = prefs;
+        ui.add_enabled_ui(!lock_busy, |ui| {
+            ui.label(
+                egui::RichText::new(s.security_shortcut)
+                    .size(14.0)
+                    .strong()
+                    .color(pal.fg),
+            );
+            ui.add_space(6.0);
+            egui::ComboBox::from_id_salt("lumen_security_shortcut_combo")
+                .width(200.0)
+                .selected_text(prefs.shortcut.label())
+                .show_ui(ui, |ui| {
+                    for shortcut in LockShortcut::ALL {
+                        ui.selectable_value(&mut prefs.shortcut, shortcut, shortcut.label());
+                    }
+                });
+
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new(s.security_auto_lock)
+                    .size(14.0)
+                    .strong()
+                    .color(pal.fg),
+            );
+            ui.add_space(6.0);
+            let idle_label = |minutes| {
+                if minutes == 0 {
+                    s.security_auto_lock_off.to_owned()
+                } else {
+                    i18n::fmt1(s.security_auto_lock_minutes_fmt, minutes)
+                }
+            };
+            egui::ComboBox::from_id_salt("lumen_security_idle_timeout_combo")
+                .width(200.0)
+                .selected_text(idle_label(prefs.idle_timeout_minutes))
+                .show_ui(ui, |ui| {
+                    for minutes in app_lock::IDLE_TIMEOUT_MINUTES {
+                        ui.selectable_value(
+                            &mut prefs.idle_timeout_minutes,
+                            minutes,
+                            idle_label(minutes),
+                        );
+                    }
+                });
+
+            ui.add_space(16.0);
+            security_toggle_row(ui, &mut prefs.lock_on_start, s.security_lock_on_start, pal);
+            ui.add_space(8.0);
+            security_toggle_row(
+                ui,
+                &mut prefs.lock_on_resume,
+                s.security_lock_on_resume,
+                pal,
+            );
+        });
+        if prefs != before && out.security_action.is_none() {
+            out.security_action = Some(SecurityAction::UpdatePreferences(prefs));
+        }
+    }
+
+    if let Some(form) = st.security_form {
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(12.0);
+        security_password_form(ui, st, form, lock_blocked, pal, out);
+    }
+}
+
+fn lock_credentials_blocked(busy: bool, retry_remaining: Duration) -> bool {
+    busy || !retry_remaining.is_zero()
+}
+
+fn security_toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, pal: &Palette) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(pal.fg));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            toggle_switch(ui, value, pal);
+        });
+    });
+}
+
+fn security_password_form(
+    ui: &mut egui::Ui,
+    st: &mut SettingsUiState,
+    form: SecurityForm,
+    lock_blocked: bool,
+    pal: &Palette,
+    out: &mut SettingsOutput,
+) {
+    let s = i18n::strings();
+    let title = match form {
+        SecurityForm::Enable => s.security_enable,
+        SecurityForm::Disable => s.security_disable,
+        SecurityForm::ChangePassword => s.security_change_password,
+    };
+    ui.label(egui::RichText::new(title).size(14.0).strong().color(pal.fg));
+    ui.add_space(8.0);
+
+    ui.add_enabled_ui(!lock_blocked, |ui| {
+        if matches!(form, SecurityForm::Disable | SecurityForm::ChangePassword) {
+            security_password_edit(
+                ui,
+                s.security_current_password,
+                &mut st.security_current_password_buf,
+                "lumen_security_current_password",
+                pal,
+            );
+            ui.add_space(8.0);
+        }
+        if matches!(form, SecurityForm::Enable | SecurityForm::ChangePassword) {
+            security_password_edit(
+                ui,
+                s.security_new_password,
+                &mut st.security_new_password_buf,
+                "lumen_security_new_password",
+                pal,
+            );
+            ui.add_space(8.0);
+            security_password_edit(
+                ui,
+                s.security_confirm_password,
+                &mut st.security_confirm_password_buf,
+                "lumen_security_confirm_password",
+                pal,
+            );
+            ui.label(
+                egui::RichText::new(s.security_password_hint)
+                    .size(11.0)
+                    .color(pal.fg_dim),
+            );
+        }
+    });
+
+    if let Some(feedback) = st.security_feedback {
+        let text = match feedback {
+            SecurityFeedback::PasswordTooShort => s.security_password_too_short,
+            SecurityFeedback::PasswordTooLong => s.security_password_too_long,
+            SecurityFeedback::PasswordMismatch => s.security_password_mismatch,
+            SecurityFeedback::CurrentPasswordWrong => s.security_current_password_wrong,
+            SecurityFeedback::OperationFailed => s.security_operation_failed,
+        };
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(text).size(11.0).color(pal.warn));
+    }
+
+    ui.add_space(12.0);
+    let mut cancel = false;
+    let mut submit = false;
+    ui.horizontal(|ui| {
+        cancel = ui.button(s.security_cancel).clicked();
+        submit = ui
+            .add_enabled(!lock_blocked, egui::Button::new(s.security_save))
+            .clicked();
+    });
+    if cancel {
+        st.clear_security_form();
+    } else if submit {
+        submit_security_form(st, form, out);
+    }
+}
+
+fn security_password_edit(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    id_source: &'static str,
+    pal: &Palette,
+) {
+    ui.label(egui::RichText::new(label).color(pal.fg_dim));
+    super::secure_password_edit(
+        ui,
+        id_source,
+        egui::TextEdit::singleline(value)
+            .password(true)
+            .desired_width(360.0),
+    );
+}
+
+fn submit_security_form(st: &mut SettingsUiState, form: SecurityForm, out: &mut SettingsOutput) {
+    if out.security_action.is_some() {
+        return;
+    }
+    st.security_feedback = None;
+
+    let policy_feedback = |password: &str| match app_lock::validate_password(password) {
+        Ok(()) => None,
+        Err(PasswordPolicyError::TooShort) => Some(SecurityFeedback::PasswordTooShort),
+        Err(PasswordPolicyError::TooLong) => Some(SecurityFeedback::PasswordTooLong),
+    };
+
+    match form {
+        SecurityForm::Enable => {
+            if let Some(feedback) = policy_feedback(&st.security_new_password_buf) {
+                st.security_feedback = Some(feedback);
+                return;
+            }
+            if st.security_new_password_buf != st.security_confirm_password_buf {
+                st.security_feedback = Some(SecurityFeedback::PasswordMismatch);
+                return;
+            }
+            let password = std::mem::take(&mut st.security_new_password_buf);
+            st.security_confirm_password_buf.zeroize();
+            st.security_current_password_buf.zeroize();
+            out.security_action = Some(SecurityAction::Enable { password });
+        }
+        SecurityForm::Disable => {
+            if let Some(feedback) = policy_feedback(&st.security_current_password_buf) {
+                st.security_feedback = Some(feedback);
+                return;
+            }
+            let current_password = std::mem::take(&mut st.security_current_password_buf);
+            st.security_new_password_buf.zeroize();
+            st.security_confirm_password_buf.zeroize();
+            out.security_action = Some(SecurityAction::Disable { current_password });
+        }
+        SecurityForm::ChangePassword => {
+            if let Some(feedback) = policy_feedback(&st.security_current_password_buf)
+                .or_else(|| policy_feedback(&st.security_new_password_buf))
+            {
+                st.security_feedback = Some(feedback);
+                return;
+            }
+            if st.security_new_password_buf != st.security_confirm_password_buf {
+                st.security_feedback = Some(SecurityFeedback::PasswordMismatch);
+                return;
+            }
+            let current_password = std::mem::take(&mut st.security_current_password_buf);
+            let new_password = std::mem::take(&mut st.security_new_password_buf);
+            st.security_confirm_password_buf.zeroize();
+            out.security_action = Some(SecurityAction::ChangePassword {
+                current_password,
+                new_password,
+            });
+        }
+    }
+}
+
 /// Keyboard shortcuts：只读列表（表驱动；键位列固定，说明列走 i18n 表）。
-fn shortcuts(ui: &mut egui::Ui, pal: &Palette) {
+fn shortcuts(ui: &mut egui::Ui, pal: &Palette, lock: &AppLockFile) {
     let s = i18n::strings();
     heading(ui, pal, s.shortcuts_heading);
     // 说明列与键位列保持同序（与 SHORTCUT_KEYS 同索引）。
@@ -959,6 +1383,13 @@ fn shortcuts(ui: &mut egui::Ui, pal: &Palette) {
                 ui.label(egui::RichText::new(*desc).color(pal.fg_dim));
                 ui.end_row();
             }
+            ui.label(
+                egui::RichText::new(lock.shortcut().label())
+                    .monospace()
+                    .color(pal.fg),
+            );
+            ui.label(egui::RichText::new(s.security_shortcut).color(pal.fg_dim));
+            ui.end_row();
         });
 }
 
@@ -1043,4 +1474,74 @@ fn network(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut 
             .size(11.0)
             .color(pal.fg_dim),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 密码操作在校验中或退避期内均被阻止() {
+        assert!(!lock_credentials_blocked(false, Duration::ZERO));
+        assert!(lock_credentials_blocked(true, Duration::ZERO));
+        assert!(lock_credentials_blocked(false, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn 启用锁提交后移走密码并清空确认缓冲() {
+        let mut st = SettingsUiState::default();
+        st.security_new_password_buf = "安全密码-abcd".to_owned();
+        st.security_confirm_password_buf = "安全密码-abcd".to_owned();
+        let mut out = SettingsOutput::default();
+
+        submit_security_form(&mut st, SecurityForm::Enable, &mut out);
+
+        match out.security_action.take() {
+            Some(SecurityAction::Enable { password }) => {
+                assert_eq!(password, "安全密码-abcd");
+            }
+            _ => panic!("应产生启用应用锁命令"),
+        }
+        assert!(st.security_new_password_buf.is_empty());
+        assert!(st.security_confirm_password_buf.is_empty());
+    }
+
+    #[test]
+    fn 改密要求两次输入一致且不会提前移走密码() {
+        let mut st = SettingsUiState::default();
+        st.security_current_password_buf = "current-password".to_owned();
+        st.security_new_password_buf = "new-password-1".to_owned();
+        st.security_confirm_password_buf = "new-password-2".to_owned();
+        let mut out = SettingsOutput::default();
+
+        submit_security_form(&mut st, SecurityForm::ChangePassword, &mut out);
+
+        assert!(out.security_action.is_none());
+        assert_eq!(
+            st.security_feedback,
+            Some(SecurityFeedback::PasswordMismatch)
+        );
+        assert_eq!(st.security_current_password_buf, "current-password");
+        assert_eq!(st.security_new_password_buf, "new-password-1");
+    }
+
+    #[test]
+    fn 后台密码错误反馈会清空所有敏感缓冲() {
+        let mut st = SettingsUiState::default();
+        st.security_form = Some(SecurityForm::ChangePassword);
+        st.security_current_password_buf = "current-password".to_owned();
+        st.security_new_password_buf = "new-password".to_owned();
+        st.security_confirm_password_buf = "new-password".to_owned();
+
+        st.security_current_password_wrong();
+
+        assert!(st.security_current_password_buf.is_empty());
+        assert!(st.security_new_password_buf.is_empty());
+        assert!(st.security_confirm_password_buf.is_empty());
+        assert_eq!(
+            st.security_feedback,
+            Some(SecurityFeedback::CurrentPasswordWrong)
+        );
+        assert_eq!(st.security_form, Some(SecurityForm::ChangePassword));
+    }
 }

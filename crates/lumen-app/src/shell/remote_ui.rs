@@ -15,6 +15,7 @@ use crate::i18n;
 use crate::remote_ws::{ActiveSession, IncomingControl, PairingPrompt};
 
 use super::theme::Palette;
+use zeroize::Zeroize;
 
 /// 配对码输入弹窗宽度（逻辑像素）。
 const CARD_WIDTH: f32 = 300.0;
@@ -38,7 +39,7 @@ impl RemoteUiState {
     pub fn reset(&mut self) {
         self.open = false;
         self.focus = false;
-        self.code.clear();
+        self.code.zeroize();
     }
 
     /// 标记配对模态首次出现：聚焦输入框、清空残留。
@@ -46,7 +47,7 @@ impl RemoteUiState {
         if !self.open {
             self.open = true;
             self.focus = true;
-            self.code.clear();
+            self.code.zeroize();
         }
     }
 }
@@ -56,6 +57,8 @@ impl RemoteUiState {
 pub struct RemoteUiOutput {
     /// 控制端提交配对码。
     pub submit_code: Option<String>,
+    /// 被控端把来件横幅中的配对码复制到系统剪贴板（不含展示分组空格）。
+    pub copy_code: Option<String>,
     /// 控制端取消配对（关弹窗）。
     pub cancel_pairing: bool,
     /// 被控端拒绝来件控制请求。
@@ -211,6 +214,11 @@ pub fn banner(
                                     .monospace()
                                     .color(accent),
                             );
+                            if ui.button(s.remote_menu_copy).clicked() {
+                                // 横幅为便于口述按 3-3-3 分组；剪贴板只写原始数字，
+                                // 且复制本身不触碰配对状态或 RemoteUiState 焦点。
+                                out.copy_code = Some(clipboard_code(&inc.pairing_code));
+                            }
                             ui.add_space(10.0);
                             if ui.button(s.remote_decline).clicked() {
                                 out.decline = true;
@@ -252,6 +260,14 @@ fn group_code(code: &str) -> String {
         .collect()
 }
 
+/// 生成写入系统剪贴板的配对码：只保留前 9 个 ASCII 数字，不带 UI 分组字符。
+fn clipboard_code(code: &str) -> String {
+    code.chars()
+        .filter(char::is_ascii_digit)
+        .take(CODE_LEN)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +277,13 @@ mod tests {
         assert_eq!(group_code("123456789"), "123 456 789");
         assert_eq!(group_code("12"), "12");
         assert_eq!(group_code(""), "");
+    }
+
+    #[test]
+    fn 剪贴板配对码是无分隔纯数字() {
+        assert_eq!(clipboard_code("123456789"), "123456789");
+        assert_eq!(clipboard_code("123 456-789"), "123456789");
+        assert_eq!(clipboard_code("1234567890"), "123456789");
     }
 
     #[test]
