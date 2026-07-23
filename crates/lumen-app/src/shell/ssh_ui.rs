@@ -2,19 +2,24 @@
 //!
 //! 本模块只负责展示和收集用户意图。它不持有 [`SshInventory`] 的可变引用，
 //! 也不直接写磁盘或发起连接；调用方应依次处理 [`SshUiOutput::actions`]。
-//! 表单有意不包含密码、口令、私钥正文或本机私钥路径。
+//! 可同步的 [`NewSshProfile`] 与仅存在于本机内存中的密码始终由不同类型承载。
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use egui::{Color32, RichText};
 
-use super::theme::Palette;
+use super::{secure_password_edit, theme::Palette};
 use crate::ssh::{
-    AuthMethod, GroupId, NewSshProfile, ProfileId, SshGroup, SshInventory, SshProfile,
+    AuthMethod, GroupId, HostKeyTrust, NewSshProfile, ProfileId, SshGroup, SshInventory, SshProfile,
 };
 
 const ROW_HEIGHT: f32 = 30.0;
 const SECTION_GAP: f32 = 8.0;
+static NEXT_PROFILE_FORM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// SSH 页面文案。
 ///
@@ -51,6 +56,8 @@ pub struct SshUiText {
     pub auth_password: &'static str,
     pub auth_private_key: &'static str,
     pub auth_agent: &'static str,
+    pub password_required_hint: &'static str,
+    pub password_saved_hint: &'static str,
     pub group: &'static str,
     pub initial_directory: &'static str,
     pub connect_timeout: &'static str,
@@ -60,6 +67,17 @@ pub struct SshUiText {
     pub seconds: &'static str,
     pub save: &'static str,
     pub create: &'static str,
+    pub test_connection: &'static str,
+    pub test_connecting: &'static str,
+    pub test_success: &'static str,
+    pub test_failed: &'static str,
+    pub test_host_key_unknown: &'static str,
+    pub test_host_key_changed: &'static str,
+    pub test_trust_and_retry: &'static str,
+    pub host_key_algorithm: &'static str,
+    pub host_key_fingerprint: &'static str,
+    pub host_key_expected: &'static str,
+    pub host_key_presented: &'static str,
     pub cancel: &'static str,
     pub confirm_delete: &'static str,
 }
@@ -96,6 +114,8 @@ impl Default for SshUiText {
             auth_password: "密码",
             auth_private_key: "私钥",
             auth_agent: "SSH Agent",
+            password_required_hint: "密码只安全保存在当前设备，不会同步。",
+            password_saved_hint: "留空则沿用当前设备已保存的密码。",
             group: "分组",
             initial_directory: "初始目录",
             connect_timeout: "连接超时",
@@ -105,6 +125,17 @@ impl Default for SshUiText {
             seconds: "秒",
             save: "保存",
             create: "创建",
+            test_connection: "测试连接",
+            test_connecting: "正在测试连接…",
+            test_success: "连接和认证成功",
+            test_failed: "测试连接失败",
+            test_host_key_unknown: "首次连接需要确认服务器主机密钥。",
+            test_host_key_changed: "服务器主机密钥已变化，测试已阻断。",
+            test_trust_and_retry: "信任并重新测试",
+            host_key_algorithm: "算法",
+            host_key_fingerprint: "SHA-256 指纹",
+            host_key_expected: "已保存",
+            host_key_presented: "服务器返回",
             cancel: "取消",
             confirm_delete: "确认删除",
         }
@@ -145,6 +176,8 @@ impl SshUiText {
             auth_password: strings.ssh_auth_password,
             auth_private_key: strings.ssh_auth_private_key,
             auth_agent: strings.ssh_auth_agent,
+            password_required_hint: strings.ssh_password_required_hint,
+            password_saved_hint: strings.ssh_password_saved_hint,
             group: strings.ssh_group,
             initial_directory: strings.ssh_initial_directory,
             connect_timeout: strings.ssh_connect_timeout,
@@ -154,6 +187,17 @@ impl SshUiText {
             seconds: strings.ssh_seconds,
             save: strings.ssh_save,
             create: strings.ssh_create,
+            test_connection: strings.ssh_test_connection,
+            test_connecting: strings.ssh_test_connecting,
+            test_success: strings.ssh_test_success,
+            test_failed: strings.ssh_test_failed,
+            test_host_key_unknown: strings.ssh_test_host_key_unknown,
+            test_host_key_changed: strings.ssh_test_host_key_changed,
+            test_trust_and_retry: strings.ssh_test_trust_and_retry,
+            host_key_algorithm: strings.ssh_host_key_algorithm,
+            host_key_fingerprint: strings.ssh_host_key_fingerprint,
+            host_key_expected: strings.ssh_host_key_expected,
+            host_key_presented: strings.ssh_host_key_presented,
             cancel: strings.ssh_cancel,
             confirm_delete: strings.ssh_confirm_delete,
         }
@@ -164,10 +208,96 @@ impl SshUiText {
 pub struct SshUiInput<'a> {
     pub inventory: &'a SshInventory,
     pub text: &'a SshUiText,
+    pub connection_test: Option<&'a crate::ssh_runtime::ConnectionTestView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSubmitIntent {
+    Save,
+    TestConnection,
+}
+
+/// 新建/编辑表单的一次性提交。
+///
+/// `draft` 只包含允许持久化和同步的元数据；`password` 仅在主线程消费，
+/// 未消费或处理失败时由 [`Drop`] 清零。
+pub struct SshProfileSubmission {
+    form_id: u64,
+    connection_revision: u64,
+    host_key_verified_for_current_endpoint: bool,
+    editing_id: Option<ProfileId>,
+    draft: NewSshProfile,
+    password: String,
+    intent: ProfileSubmitIntent,
+}
+
+impl SshProfileSubmission {
+    pub(crate) const fn form_id(&self) -> u64 {
+        self.form_id
+    }
+
+    pub(crate) const fn connection_revision(&self) -> u64 {
+        self.connection_revision
+    }
+
+    pub(crate) const fn host_key_verified_for_current_endpoint(&self) -> bool {
+        self.host_key_verified_for_current_endpoint
+    }
+
+    #[cfg(test)]
+    fn editing_id(&self) -> Option<&str> {
+        self.editing_id.as_deref()
+    }
+
+    pub(crate) fn take_editing_id(&mut self) -> Option<ProfileId> {
+        self.editing_id.take()
+    }
+
+    pub(crate) fn take_draft(&mut self) -> NewSshProfile {
+        std::mem::take(&mut self.draft)
+    }
+
+    #[cfg(test)]
+    fn password(&self) -> &str {
+        &self.password
+    }
+
+    pub(crate) fn take_password(&mut self) -> String {
+        std::mem::take(&mut self.password)
+    }
+
+    pub(crate) const fn intent(&self) -> ProfileSubmitIntent {
+        self.intent
+    }
+}
+
+impl fmt::Debug for SshProfileSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SshProfileSubmission")
+            .field("form_id", &self.form_id)
+            .field("connection_revision", &self.connection_revision)
+            .field(
+                "host_key_verified_for_current_endpoint",
+                &self.host_key_verified_for_current_endpoint,
+            )
+            .field("editing_id", &self.editing_id)
+            .field("draft", &self.draft)
+            .field("password", &"<redacted>")
+            .field("intent", &self.intent)
+            .finish()
+    }
+}
+
+impl Drop for SshProfileSubmission {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.password.zeroize();
+    }
 }
 
 /// UI 向存储与连接层发送的动作。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SshUiAction {
     CreateGroup {
         name: String,
@@ -178,13 +308,6 @@ pub enum SshUiAction {
     },
     DeleteGroup {
         id: GroupId,
-    },
-    CreateProfile {
-        draft: NewSshProfile,
-    },
-    UpdateProfile {
-        id: ProfileId,
-        draft: NewSshProfile,
     },
     DeleteProfile {
         id: ProfileId,
@@ -197,15 +320,19 @@ pub enum SshUiAction {
     ConnectProfile {
         id: ProfileId,
     },
+    SubmitProfile(SshProfileSubmission),
+    CancelConnectionTest {
+        form_id: u64,
+    },
 }
 
 /// 单帧输出。动作按用户在本帧的操作顺序排列。
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct SshUiOutput {
     pub actions: Vec<SshUiAction>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum Dialog {
     CreateGroup { name: String },
     RenameGroup { id: GroupId, name: String },
@@ -214,14 +341,17 @@ enum Dialog {
     DeleteProfile { id: ProfileId, name: String },
 }
 
-#[derive(Debug, Clone)]
 struct ProfileForm {
+    form_id: u64,
+    connection_revision: u64,
+    host_key_verified_for_current_endpoint: bool,
     editing_id: Option<ProfileId>,
     name: String,
     host: String,
     port: u16,
     username: String,
     auth_method: AuthMethod,
+    password: String,
     group_id: Option<GroupId>,
     initial_directory: String,
     connect_timeout_secs: u32,
@@ -229,6 +359,48 @@ struct ProfileForm {
     keep_alive_secs: u32,
     monitor_enabled: bool,
     trusted_host_key: Option<crate::ssh::HostKeyTrust>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConnectionFields {
+    host: String,
+    port: u16,
+    username: String,
+}
+
+impl fmt::Debug for ProfileForm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProfileForm")
+            .field("form_id", &self.form_id)
+            .field("connection_revision", &self.connection_revision)
+            .field(
+                "host_key_verified_for_current_endpoint",
+                &self.host_key_verified_for_current_endpoint,
+            )
+            .field("editing_id", &self.editing_id)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_method", &self.auth_method)
+            .field("password", &"<redacted>")
+            .field("group_id", &self.group_id)
+            .field("initial_directory", &self.initial_directory)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("keep_alive_enabled", &self.keep_alive_enabled)
+            .field("keep_alive_secs", &self.keep_alive_secs)
+            .field("monitor_enabled", &self.monitor_enabled)
+            .field("trusted_host_key", &self.trusted_host_key)
+            .finish()
+    }
+}
+
+impl Drop for ProfileForm {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.password.zeroize();
+    }
 }
 
 impl ProfileForm {
@@ -257,12 +429,16 @@ impl ProfileForm {
 
     fn from_draft(editing_id: Option<ProfileId>, draft: NewSshProfile) -> Self {
         Self {
+            form_id: next_profile_form_id(),
+            connection_revision: 0,
+            host_key_verified_for_current_endpoint: false,
             editing_id,
             name: draft.name,
             host: draft.host,
             port: draft.port,
             username: draft.username,
             auth_method: draft.auth_method,
+            password: String::new(),
             group_id: draft.group_id,
             initial_directory: draft.initial_directory.unwrap_or_default(),
             connect_timeout_secs: draft.connect_timeout_secs,
@@ -284,6 +460,9 @@ impl ProfileForm {
                 .group_id
                 .as_deref()
                 .is_none_or(|id| inventory.group(id).is_some())
+            && (self.auth_method != AuthMethod::Password
+                || self.editing_id.is_some()
+                || !self.password.is_empty())
     }
 
     fn to_draft(&self) -> NewSshProfile {
@@ -301,6 +480,80 @@ impl ProfileForm {
             trusted_host_key: self.trusted_host_key.clone(),
         }
     }
+
+    fn test_submission(&mut self) -> SshProfileSubmission {
+        // 即使连接字段未变化，重复点击测试也必须产生新的 revision，
+        // 防止上一轮异步回包覆盖或伪装成本轮结果。
+        self.bump_connection_revision();
+        SshProfileSubmission {
+            form_id: self.form_id,
+            connection_revision: self.connection_revision,
+            host_key_verified_for_current_endpoint: self.host_key_verified_for_current_endpoint,
+            editing_id: self.editing_id.clone(),
+            draft: self.to_draft(),
+            // 测试期间表单保持打开，因此只在这条一次性消息中创建一份
+            // 受 Drop 保护的副本；原缓冲仍由 ProfileForm 负责清零。
+            password: self.password.clone(),
+            intent: ProfileSubmitIntent::TestConnection,
+        }
+    }
+
+    fn save_submission(&mut self) -> SshProfileSubmission {
+        SshProfileSubmission {
+            form_id: self.form_id,
+            connection_revision: self.connection_revision,
+            host_key_verified_for_current_endpoint: self.host_key_verified_for_current_endpoint,
+            editing_id: self.editing_id.clone(),
+            draft: self.to_draft(),
+            password: std::mem::take(&mut self.password),
+            intent: ProfileSubmitIntent::Save,
+        }
+    }
+
+    fn connection_fields(&self) -> ConnectionFields {
+        ConnectionFields {
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone(),
+        }
+    }
+
+    fn reconcile_connection_field_changes(
+        &mut self,
+        previous_fields: &ConnectionFields,
+        previous_auth: AuthMethod,
+        password_changed: bool,
+    ) {
+        let endpoint_changed = self.host != previous_fields.host
+            || self.port != previous_fields.port
+            || self.username != previous_fields.username;
+        let auth_changed = self.auth_method != previous_auth;
+        if endpoint_changed {
+            self.trusted_host_key = None;
+            self.host_key_verified_for_current_endpoint = false;
+        }
+        if endpoint_changed || auth_changed || password_changed {
+            self.bump_connection_revision();
+        }
+    }
+
+    fn trust_host_key(&mut self, trust: HostKeyTrust) {
+        if self.trusted_host_key.as_ref() != Some(&trust)
+            || !self.host_key_verified_for_current_endpoint
+        {
+            self.trusted_host_key = Some(trust);
+            self.host_key_verified_for_current_endpoint = true;
+            self.bump_connection_revision();
+        }
+    }
+
+    fn bump_connection_revision(&mut self) {
+        self.connection_revision = self.connection_revision.saturating_add(1);
+    }
+}
+
+fn next_profile_form_id() -> u64 {
+    NEXT_PROFILE_FORM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,6 +637,11 @@ pub fn show(
         if state.dragged_profile_id.is_some() {
             state.cancel_drag();
         } else {
+            if let Some(Dialog::EditProfile(form)) = state.dialog.as_ref() {
+                out.actions.push(SshUiAction::CancelConnectionTest {
+                    form_id: form.form_id,
+                });
+            }
             state.dialog = None;
         }
     }
@@ -935,14 +1193,17 @@ fn profile_editor(
     pal: &Palette,
     out: &mut SshUiOutput,
 ) -> bool {
+    let previous_connection_fields = form.connection_fields();
+    let previous_auth_method = form.auth_method;
+    let mut password_changed = false;
     egui::Grid::new("ssh_profile_form_grid")
         .num_columns(2)
         .spacing([12.0, 8.0])
         .show(ui, |ui| {
-            form_text_row(ui, input.text.profile_name, &mut form.name, pal);
-            form_text_row(ui, input.text.host, &mut form.host, pal);
-            form_number_row(ui, input.text.port, &mut form.port, "");
-            form_text_row(ui, input.text.username, &mut form.username, pal);
+            let _ = form_text_row(ui, input.text.profile_name, &mut form.name, pal);
+            let _ = form_text_row(ui, input.text.host, &mut form.host, pal);
+            let _ = form_number_row(ui, input.text.port, &mut form.port, "");
+            let _ = form_text_row(ui, input.text.username, &mut form.username, pal);
 
             ui.label(input.text.auth_method);
             egui::ComboBox::from_id_salt("ssh_profile_auth_method")
@@ -964,7 +1225,35 @@ fn profile_editor(
                         input.text.auth_agent,
                     );
                 });
+            if previous_auth_method != form.auth_method && form.auth_method != AuthMethod::Password
+            {
+                use zeroize::Zeroize as _;
+                form.password.zeroize();
+            }
             ui.end_row();
+
+            if form.auth_method == AuthMethod::Password {
+                ui.label(input.text.auth_password);
+                ui.vertical(|ui| {
+                    password_changed |= secure_password_edit(
+                        ui,
+                        "ssh_profile_password",
+                        egui::TextEdit::singleline(&mut form.password)
+                            .password(true)
+                            .desired_width(260.0)
+                            .text_color(pal.fg)
+                            .background_color(pal.extreme_bg),
+                    )
+                    .changed();
+                    let hint = if form.editing_id.is_some() {
+                        input.text.password_saved_hint
+                    } else {
+                        input.text.password_required_hint
+                    };
+                    ui.label(RichText::new(hint).small().color(pal.fg_dim));
+                });
+                ui.end_row();
+            }
 
             ui.label(input.text.group);
             egui::ComboBox::from_id_salt("ssh_profile_group")
@@ -987,13 +1276,13 @@ fn profile_editor(
                 });
             ui.end_row();
 
-            form_text_row(
+            let _ = form_text_row(
                 ui,
                 input.text.initial_directory,
                 &mut form.initial_directory,
                 pal,
             );
-            form_number_row(
+            let _ = form_number_row(
                 ui,
                 input.text.connect_timeout,
                 &mut form.connect_timeout_secs,
@@ -1017,11 +1306,45 @@ fn profile_editor(
             ui.end_row();
         });
 
+    form.reconcile_connection_field_changes(
+        &previous_connection_fields,
+        previous_auth_method,
+        password_changed,
+    );
+    draw_connection_test_status(ui, form, &input, pal, out);
+
     let mut keep_open = true;
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.button(input.text.cancel).clicked() {
+            out.actions.push(SshUiAction::CancelConnectionTest {
+                form_id: form.form_id,
+            });
             keep_open = false;
+        }
+        let test_connecting = matching_connection_test(form, &input).is_some_and(|test| {
+            matches!(
+                &test.state,
+                crate::ssh_runtime::ConnectionTestState::Connecting
+            )
+        });
+        let test_label = if test_connecting {
+            input.text.test_connecting
+        } else {
+            input.text.test_connection
+        };
+        if ui
+            .add_enabled(
+                form.valid(input.inventory) && !test_connecting,
+                egui::Button::new(test_label),
+            )
+            .clicked()
+        {
+            out.actions.push(SshUiAction::CancelConnectionTest {
+                form_id: form.form_id,
+            });
+            out.actions
+                .push(SshUiAction::SubmitProfile(form.test_submission()));
         }
         let button_text = if form.editing_id.is_some() {
             input.text.save
@@ -1032,44 +1355,157 @@ fn profile_editor(
             .add_enabled(form.valid(input.inventory), egui::Button::new(button_text))
             .clicked()
         {
-            let draft = form.to_draft();
-            let action = match &form.editing_id {
-                Some(id) => SshUiAction::UpdateProfile {
-                    id: id.clone(),
-                    draft,
-                },
-                None => SshUiAction::CreateProfile { draft },
-            };
-            out.actions.push(action);
+            out.actions.push(SshUiAction::CancelConnectionTest {
+                form_id: form.form_id,
+            });
+            out.actions
+                .push(SshUiAction::SubmitProfile(form.save_submission()));
             keep_open = false;
         }
     });
     keep_open
 }
 
-fn form_text_row(ui: &mut egui::Ui, label: &str, value: &mut String, pal: &Palette) {
-    ui.label(label);
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .desired_width(260.0)
-            .text_color(pal.fg)
-            .background_color(pal.extreme_bg),
-    );
-    ui.end_row();
+fn matching_connection_test<'a>(
+    form: &ProfileForm,
+    input: &SshUiInput<'a>,
+) -> Option<&'a crate::ssh_runtime::ConnectionTestView> {
+    input.connection_test.filter(|test| {
+        test.connection_revision == form.connection_revision
+            && test.matches_target(
+                form.form_id,
+                form.host.trim(),
+                form.port,
+                form.username.trim(),
+            )
+    })
 }
 
-fn form_number_row<T>(ui: &mut egui::Ui, label: &str, value: &mut T, suffix: &str)
+fn draw_connection_test_status(
+    ui: &mut egui::Ui,
+    form: &mut ProfileForm,
+    input: &SshUiInput<'_>,
+    pal: &Palette,
+    out: &mut SshUiOutput,
+) {
+    let Some(test) = matching_connection_test(form, input) else {
+        return;
+    };
+
+    ui.add_space(10.0);
+    match &test.state {
+        crate::ssh_runtime::ConnectionTestState::Connecting => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(input.text.test_connecting).color(pal.warn));
+            });
+        }
+        crate::ssh_runtime::ConnectionTestState::Success => {
+            ui.label(RichText::new(input.text.test_success).color(pal.success));
+        }
+        crate::ssh_runtime::ConnectionTestState::Error { message } => {
+            ui.label(RichText::new(input.text.test_failed).color(pal.error));
+            ui.label(RichText::new(message).small().color(pal.fg_dim));
+        }
+        crate::ssh_runtime::ConnectionTestState::AwaitingHostKey {
+            algorithm,
+            fingerprint,
+        } => {
+            ui.label(RichText::new(input.text.test_host_key_unknown).color(pal.warn));
+            connection_test_key_row(ui, input.text.host_key_algorithm, algorithm, pal);
+            connection_test_key_row(ui, input.text.host_key_fingerprint, fingerprint, pal);
+            if ui
+                .add_enabled(
+                    form.valid(input.inventory),
+                    egui::Button::new(input.text.test_trust_and_retry),
+                )
+                .clicked()
+            {
+                form.trust_host_key(HostKeyTrust {
+                    algorithm: algorithm.clone(),
+                    fingerprint: fingerprint.clone(),
+                });
+                out.actions.push(SshUiAction::CancelConnectionTest {
+                    form_id: form.form_id,
+                });
+                out.actions
+                    .push(SshUiAction::SubmitProfile(form.test_submission()));
+            }
+        }
+        crate::ssh_runtime::ConnectionTestState::HostKeyChanged {
+            expected_algorithm,
+            expected_fingerprint,
+            presented_algorithm,
+            presented_fingerprint,
+        } => {
+            ui.label(RichText::new(input.text.test_host_key_changed).color(pal.error));
+            ui.label(
+                RichText::new(input.text.host_key_expected)
+                    .strong()
+                    .color(pal.fg),
+            );
+            connection_test_key_row(ui, input.text.host_key_algorithm, expected_algorithm, pal);
+            connection_test_key_row(
+                ui,
+                input.text.host_key_fingerprint,
+                expected_fingerprint,
+                pal,
+            );
+            ui.label(
+                RichText::new(input.text.host_key_presented)
+                    .strong()
+                    .color(pal.fg),
+            );
+            connection_test_key_row(ui, input.text.host_key_algorithm, presented_algorithm, pal);
+            connection_test_key_row(
+                ui,
+                input.text.host_key_fingerprint,
+                presented_fingerprint,
+                pal,
+            );
+        }
+    }
+}
+
+fn connection_test_key_row(ui: &mut egui::Ui, label: &str, value: &str, pal: &Palette) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("{label}:")).small().color(pal.fg_dim));
+        ui.label(RichText::new(value).small().monospace().color(pal.fg));
+    });
+}
+
+fn form_text_row(ui: &mut egui::Ui, label: &str, value: &mut String, pal: &Palette) -> bool {
+    ui.label(label);
+    let changed = ui
+        .add(
+            egui::TextEdit::singleline(value)
+                .desired_width(260.0)
+                .text_color(pal.fg)
+                .background_color(pal.extreme_bg),
+        )
+        .changed();
+    ui.end_row();
+    changed
+}
+
+fn form_number_row<T>(ui: &mut egui::Ui, label: &str, value: &mut T, suffix: &str) -> bool
 where
     T: egui::emath::Numeric,
 {
     ui.label(label);
-    ui.horizontal(|ui| {
-        ui.add(egui::DragValue::new(value).range(1..=86_400));
-        if !suffix.is_empty() {
-            ui.label(suffix);
-        }
-    });
+    let changed = ui
+        .horizontal(|ui| {
+            let changed = ui
+                .add(egui::DragValue::new(value).range(1..=86_400))
+                .changed();
+            if !suffix.is_empty() {
+                ui.label(suffix);
+            }
+            changed
+        })
+        .inner;
     ui.end_row();
+    changed
 }
 
 fn auth_method_text(method: AuthMethod, text: &SshUiText) -> &'static str {
@@ -1221,5 +1657,181 @@ mod tests {
         assert_eq!(draft.auth_method, AuthMethod::Password);
         assert_eq!(draft.keep_alive_secs, Some(30));
         assert!(draft.trusted_host_key.is_none());
+    }
+
+    #[test]
+    fn 新建密码认证必须填写密码且秘密不进入同步草稿() {
+        let inventory = SshInventory::default();
+        let mut form = ProfileForm::create();
+        form.name = "server".to_owned();
+        form.host = "server.example.test".to_owned();
+        form.username = "alice".to_owned();
+
+        assert!(!form.valid(&inventory));
+        form.password = "local-only-secret".to_owned();
+        assert!(form.valid(&inventory));
+
+        let draft = form.to_draft();
+        assert_eq!(draft.host, "server.example.test");
+        assert_eq!(draft.username, "alice");
+        assert!(!format!("{draft:?}").contains("local-only-secret"));
+        assert!(!format!("{form:?}").contains("local-only-secret"));
+    }
+
+    #[test]
+    fn 编辑密码留空有效且测试提交保持表单秘密() {
+        let inventory = inventory();
+        let profile = inventory.profiles().first().unwrap();
+        let mut form = ProfileForm::edit(profile);
+        assert!(form.password.is_empty());
+        assert!(form.valid(&inventory));
+
+        form.password = "one-shot-secret".to_owned();
+        let previous_revision = form.connection_revision;
+        let mut submission = form.test_submission();
+        assert_eq!(submission.intent(), ProfileSubmitIntent::TestConnection);
+        assert_eq!(submission.form_id(), form.form_id);
+        assert_eq!(
+            submission.connection_revision(),
+            previous_revision.saturating_add(1)
+        );
+        assert_eq!(submission.connection_revision(), form.connection_revision);
+        assert_eq!(submission.editing_id(), Some(profile.id.as_str()));
+        assert_eq!(submission.password(), "one-shot-secret");
+        assert_eq!(form.password, "one-shot-secret");
+        assert!(!format!("{submission:?}").contains("one-shot-secret"));
+        assert_eq!(submission.take_password(), "one-shot-secret");
+        assert!(submission.password().is_empty());
+    }
+
+    #[test]
+    fn 每次打开服务器表单使用不同测试标识() {
+        let first = ProfileForm::create();
+        let second = ProfileForm::create();
+        assert_ne!(first.form_id, second.form_id);
+        assert!(!first.host_key_verified_for_current_endpoint);
+        assert!(!second.host_key_verified_for_current_endpoint);
+    }
+
+    #[test]
+    fn 显式信任会写入当前endpoint证明并随提交携带() {
+        let mut form = ProfileForm::create();
+        let previous_revision = form.connection_revision;
+        form.trust_host_key(HostKeyTrust {
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint: "SHA256:presented".to_owned(),
+        });
+        assert!(form.host_key_verified_for_current_endpoint);
+        assert!(form.connection_revision > previous_revision);
+
+        let submission = form.test_submission();
+        assert!(submission.host_key_verified_for_current_endpoint());
+        assert_eq!(submission.connection_revision(), form.connection_revision);
+    }
+
+    #[test]
+    fn 连接测试结果必须同时匹配表单标识与结构化目标() {
+        let mut form = ProfileForm::create();
+        form.host = " server.example.test ".to_owned();
+        form.port = 2222;
+        form.username = " alice ".to_owned();
+        let mut view = crate::ssh_runtime::ConnectionTestView {
+            form_id: form.form_id,
+            connection_revision: form.connection_revision,
+            host: "server.example.test".to_owned(),
+            port: 2222,
+            username: "alice".to_owned(),
+            state: crate::ssh_runtime::ConnectionTestState::Success,
+        };
+        let text = SshUiText::default();
+        let inventory = SshInventory::default();
+        let input = SshUiInput {
+            inventory: &inventory,
+            text: &text,
+            connection_test: Some(&view),
+        };
+        assert!(matching_connection_test(&form, &input).is_some());
+
+        view.username = "mallory".to_owned();
+        let stale_input = SshUiInput {
+            inventory: &inventory,
+            text: &text,
+            connection_test: Some(&view),
+        };
+        assert!(matching_connection_test(&form, &stale_input).is_none());
+    }
+
+    #[test]
+    fn endpoint变化立即清除已信任主机密钥与证明并推进revision() {
+        fn assert_endpoint_change_clears(change: impl FnOnce(&mut ProfileForm)) {
+            let mut form = ProfileForm::create();
+            form.trusted_host_key = Some(HostKeyTrust {
+                algorithm: "ssh-ed25519".to_owned(),
+                fingerprint: "SHA256:trusted".to_owned(),
+            });
+            form.host_key_verified_for_current_endpoint = true;
+            let previous_fields = form.connection_fields();
+            let previous_auth = form.auth_method;
+            let previous_revision = form.connection_revision;
+
+            change(&mut form);
+            form.reconcile_connection_field_changes(&previous_fields, previous_auth, false);
+
+            assert!(form.trusted_host_key.is_none());
+            assert!(!form.host_key_verified_for_current_endpoint);
+            assert!(form.connection_revision > previous_revision);
+        }
+
+        assert_endpoint_change_clears(|form| form.host = "new.example.test".to_owned());
+        assert_endpoint_change_clears(|form| form.port = 2222);
+        assert_endpoint_change_clears(|form| form.username = "other".to_owned());
+    }
+
+    #[test]
+    fn 密码或认证方式变化会让旧连接测试结果失效() {
+        let mut form = ProfileForm::create();
+        form.host = "server.example.test".to_owned();
+        form.port = 22;
+        form.username = "alice".to_owned();
+        let text = SshUiText::default();
+        let inventory = SshInventory::default();
+        let mut view = crate::ssh_runtime::ConnectionTestView {
+            form_id: form.form_id,
+            connection_revision: form.connection_revision,
+            host: form.host.clone(),
+            port: form.port,
+            username: form.username.clone(),
+            state: crate::ssh_runtime::ConnectionTestState::Success,
+        };
+        let current_input = SshUiInput {
+            inventory: &inventory,
+            text: &text,
+            connection_test: Some(&view),
+        };
+        assert!(matching_connection_test(&form, &current_input).is_some());
+
+        let previous_fields = form.connection_fields();
+        let previous_auth = form.auth_method;
+        form.auth_method = AuthMethod::Agent;
+        form.reconcile_connection_field_changes(&previous_fields, previous_auth, false);
+        let stale_auth_input = SshUiInput {
+            inventory: &inventory,
+            text: &text,
+            connection_test: Some(&view),
+        };
+        assert!(matching_connection_test(&form, &stale_auth_input).is_none());
+
+        view.connection_revision = form.connection_revision;
+        let previous_fields = form.connection_fields();
+        let previous_auth = form.auth_method;
+        form.auth_method = AuthMethod::Password;
+        form.password = "new-secret".to_owned();
+        form.reconcile_connection_field_changes(&previous_fields, previous_auth, true);
+        let stale_password_input = SshUiInput {
+            inventory: &inventory,
+            text: &text,
+            connection_test: Some(&view),
+        };
+        assert!(matching_connection_test(&form, &stale_password_input).is_none());
     }
 }

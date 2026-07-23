@@ -41,6 +41,7 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub username: String,
     pub credential: Credential,
+    pub mode: ConnectionMode,
     pub trusted_host_key: Option<HostKeyIdentity>,
     pub terminal: TerminalSize,
     pub connect_timeout: Duration,
@@ -62,6 +63,7 @@ impl ConnectionConfig {
             port,
             username: username.into(),
             credential,
+            mode: ConnectionMode::InteractiveShell,
             trusted_host_key: None,
             terminal: TerminalSize::default(),
             connect_timeout: Duration::from_secs(15),
@@ -104,6 +106,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("credential", &self.credential.kind_name())
+            .field("mode", &self.mode)
             .field("trusted_host_key", &self.trusted_host_key)
             .field("terminal", &self.terminal)
             .field("connect_timeout", &self.connect_timeout)
@@ -112,6 +115,17 @@ impl fmt::Debug for ConnectionConfig {
             .field("queues", &self.queues)
             .finish()
     }
+}
+
+/// Work performed after strict host-key verification and authentication.
+///
+/// Probe connections intentionally stop before opening a session channel,
+/// allocating a PTY, requesting a shell, or starting Linux monitoring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectionMode {
+    #[default]
+    InteractiveShell,
+    Probe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +288,9 @@ pub enum Event {
     Connected {
         host_key: HostKeyIdentity,
     },
+    ConnectionTestSucceeded {
+        host_key: HostKeyIdentity,
+    },
     Data(Vec<u8>),
     ExtendedData {
         stream: u32,
@@ -313,6 +330,10 @@ impl fmt::Debug for Event {
                 .finish(),
             Self::Connected { host_key } => formatter
                 .debug_struct("Connected")
+                .field("host_key", host_key)
+                .finish(),
+            Self::ConnectionTestSucceeded { host_key } => formatter
+                .debug_struct("ConnectionTestSucceeded")
                 .field("host_key", host_key)
                 .finish(),
             Self::Data(data) => formatter
@@ -570,14 +591,16 @@ async fn run_connection(
     cancelled: Arc<AtomicBool>,
 ) -> Result<DisconnectReason, Failure> {
     sink.emit(Event::Connecting)?;
+    let mode = config.mode;
     let host_key_decision = Arc::new(Mutex::new(None));
     let handler = StrictHostKeyHandler {
         expected: config.trusted_host_key.take(),
         decision: Arc::clone(&host_key_decision),
     };
+    let (keepalive_interval, keepalive_max) = effective_keepalive(mode, config.keepalive);
     let russh_config = Arc::new(client::Config {
-        keepalive_interval: config.keepalive.interval_option(),
-        keepalive_max: config.keepalive.maximum_missed_replies,
+        keepalive_interval,
+        keepalive_max,
         nodelay: true,
         ..client::Config::default()
     });
@@ -644,6 +667,21 @@ async fn run_connection(
         return Err(Failure::authentication("SSH authentication was rejected"));
     }
 
+    if !opens_interactive_shell(mode) {
+        if cancelled.load(Ordering::Acquire) {
+            disconnect_quickly(&session).await;
+            return Ok(DisconnectReason::HandleDropped);
+        }
+        sink.emit(Event::ConnectionTestSucceeded {
+            host_key: trusted_host_key,
+        })?;
+        // This return is deliberately before channel_open_session. Therefore
+        // a probe cannot allocate a PTY, request a shell, or enter drive_shell
+        // (the only place where Linux metrics collection is scheduled).
+        disconnect_quickly(&session).await;
+        return Ok(DisconnectReason::Requested);
+    }
+
     let shell_result = unless_cancelled(session.channel_open_session(), &cancelled).await;
     let Some(shell_result) = shell_result else {
         disconnect_quickly(&session).await;
@@ -690,6 +728,23 @@ async fn run_connection(
     .await;
     disconnect_quickly(&session).await;
     loop_result
+}
+
+const fn opens_interactive_shell(mode: ConnectionMode) -> bool {
+    matches!(mode, ConnectionMode::InteractiveShell)
+}
+
+fn effective_keepalive(
+    mode: ConnectionMode,
+    keepalive: KeepaliveConfig,
+) -> (Option<Duration>, usize) {
+    match mode {
+        ConnectionMode::InteractiveShell => (
+            keepalive.interval_option(),
+            keepalive.maximum_missed_replies,
+        ),
+        ConnectionMode::Probe => (None, 0),
+    }
 }
 
 fn host_key_rejection_or_failure(
@@ -1347,6 +1402,57 @@ fn validate_text(value: &str, maximum_bytes: usize, field: &'static str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_defaults_to_interactive_shell() {
+        let config = ConnectionConfig::new("example.test", 22, "alice", Credential::agent());
+        assert_eq!(config.mode, ConnectionMode::InteractiveShell);
+        assert!(opens_interactive_shell(config.mode));
+
+        let (interval, maximum_missed_replies) = effective_keepalive(config.mode, config.keepalive);
+        assert_eq!(interval, Some(Duration::from_secs(30)));
+        assert_eq!(maximum_missed_replies, 3);
+    }
+
+    #[test]
+    fn probe_debug_and_execution_plan_are_explicit_and_secret_safe() {
+        let mut config = ConnectionConfig::new(
+            "example.test",
+            22,
+            "alice",
+            Credential::password("probe-password-must-not-leak"),
+        );
+        config.mode = ConnectionMode::Probe;
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("Probe"));
+        assert!(debug.contains("password"));
+        assert!(!debug.contains("probe-password-must-not-leak"));
+        assert!(!opens_interactive_shell(config.mode));
+
+        let (interval, maximum_missed_replies) = effective_keepalive(config.mode, config.keepalive);
+        assert_eq!(interval, None);
+        assert_eq!(maximum_missed_replies, 0);
+    }
+
+    #[test]
+    fn probe_success_has_a_dedicated_public_event() {
+        let host_key = HostKeyIdentity::new(
+            "ssh-ed25519",
+            "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC",
+        );
+        let event = Event::ConnectionTestSucceeded {
+            host_key: host_key.clone(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("ConnectionTestSucceeded"));
+        assert!(debug.contains("ssh-ed25519"));
+
+        match event {
+            Event::ConnectionTestSucceeded { host_key: reported } => assert_eq!(reported, host_key),
+            _ => panic!("probe success must use its dedicated event"),
+        }
+    }
 
     #[test]
     fn connection_debug_redacts_all_credentials() {

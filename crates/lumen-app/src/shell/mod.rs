@@ -177,6 +177,29 @@ pub struct SshCredentialSubmission {
 }
 
 impl SshCredentialSubmission {
+    /// 为已经落盘并取得稳定 profile id 的密码认证配置构造一次性提交。
+    ///
+    /// 调用方仍须在保存前通过 [`Self::matches_target`] 复核结构化目标；
+    /// 未消费的密码由 [`Drop`] 清零。
+    pub(crate) fn from_password(
+        profile_id: String,
+        host: String,
+        port: u16,
+        username: String,
+        password: String,
+    ) -> Self {
+        Self {
+            profile_id,
+            expected_host: host,
+            expected_port: port,
+            expected_username: username,
+            kind: SshCredentialKind::Password,
+            password,
+            private_key_path: None,
+            key_passphrase: String::new(),
+        }
+    }
+
     pub(crate) fn profile_id(&self) -> &str {
         &self.profile_id
     }
@@ -359,6 +382,8 @@ pub struct ShellInput<'a> {
     pub ssh_inventory: &'a crate::ssh::SshInventory,
     /// 当前激活 SSH 会话的连接/监控快照。
     pub ssh_runtime: Option<&'a crate::ssh_runtime::RuntimeView>,
+    /// SSH 新建/编辑表单正在进行的一次性连接测试。
+    pub ssh_connection_test: Option<&'a crate::ssh_runtime::ConnectionTestView>,
     /// 当前激活 SSH 终端的离屏纹理。
     pub ssh_terminal_tex: Option<egui::TextureId>,
     /// 当前选中的远程设备 id（高亮用）。
@@ -993,6 +1018,7 @@ pub fn show(
                     ssh_ui::SshUiInput {
                         inventory: input.ssh_inventory,
                         text: &text,
+                        connection_test: input.ssh_connection_test,
                     },
                     pal,
                 );
@@ -3295,6 +3321,29 @@ mod tests {
             "a@b",
             SshCredentialKind::Password,
         ));
+    }
+
+    #[test]
+    fn ssh密码提交安全构造器只设置密码认证字段() {
+        let mut submission = SshCredentialSubmission::from_password(
+            "ssh_0123456789abcdef0123456789abcdef".to_owned(),
+            "server.example.test".to_owned(),
+            2222,
+            "alice".to_owned(),
+            "one-shot-secret".to_owned(),
+        );
+        assert!(submission.matches_target(
+            "ssh_0123456789abcdef0123456789abcdef",
+            "server.example.test",
+            2222,
+            "alice",
+            SshCredentialKind::Password,
+        ));
+        assert!(submission.kind() == SshCredentialKind::Password);
+        assert!(submission.private_key_path().is_none());
+        assert!(submission.key_passphrase().is_empty());
+        assert_eq!(submission.take_password(), "one-shot-secret");
+        assert!(submission.password().is_empty());
     }
 
     /// 两格左右布局的整格矩形（含标题栏）。

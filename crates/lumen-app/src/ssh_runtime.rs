@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use lumen_ssh::{
-    Command, ConnectionConfig, Credential, DisconnectReason, Event, EventErrorKind,
+    Command, ConnectionConfig, ConnectionMode, Credential, DisconnectReason, Event, EventErrorKind,
     HostKeyIdentity, KeepaliveConfig, MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
 };
 use lumen_term::Terminal;
@@ -70,6 +70,46 @@ pub struct RuntimeView {
     pub changed_host_key: Option<ChangedHostKey>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionTestState {
+    Connecting,
+    AwaitingHostKey {
+        algorithm: String,
+        fingerprint: String,
+    },
+    Success,
+    Error {
+        message: String,
+    },
+    HostKeyChanged {
+        expected_algorithm: String,
+        expected_fingerprint: String,
+        presented_algorithm: String,
+        presented_fingerprint: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionTestView {
+    pub form_id: u64,
+    /// 表单连接字段的单调修订号；不包含也不派生任何秘密。
+    pub connection_revision: u64,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub state: ConnectionTestState,
+}
+
+impl ConnectionTestView {
+    #[must_use]
+    pub fn matches_target(&self, form_id: u64, host: &str, port: u16, username: &str) -> bool {
+        self.form_id == form_id
+            && self.host == host
+            && self.port == port
+            && self.username == username
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
     pub active_terminal_changed: bool,
@@ -80,6 +120,8 @@ pub struct DrainOutcome {
     pub credential_failures: Vec<String>,
     /// 本批成功进入 Connected 的 profile；调用方可清除其强制提示标记。
     pub connected_profiles: Vec<String>,
+    /// 当前服务器表单的独立连接测试状态发生变化。
+    pub connection_test_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,9 +151,7 @@ impl EndpointIdentity {
     }
 
     fn matches_profile(&self, profile: &SshProfile) -> bool {
-        self.host == profile.host
-            && self.port == profile.port
-            && self.username == profile.username
+        self.host == profile.host && self.port == profile.port && self.username == profile.username
     }
 }
 
@@ -172,10 +212,19 @@ impl RuntimeSession {
     }
 }
 
+struct ConnectionTestAttempt {
+    form_id: u64,
+    connection_revision: u64,
+    endpoint_identity: EndpointIdentity,
+    connection: Option<SshConnection>,
+    state: ConnectionTestState,
+}
+
 #[derive(Default)]
 pub struct SshRuntime {
     sessions: HashMap<String, RuntimeSession>,
     active_profile_id: Option<String>,
+    connection_test: Option<ConnectionTestAttempt>,
 }
 
 impl SshRuntime {
@@ -207,11 +256,7 @@ impl SshRuntime {
         }
     }
 
-    pub fn start(
-        &mut self,
-        profile: &SshProfile,
-        credential: Credential,
-    ) -> Result<(), String> {
+    pub fn start(&mut self, profile: &SshProfile, credential: Credential) -> Result<(), String> {
         self.active_profile_id = Some(profile.id.clone());
         let session = self
             .sessions
@@ -231,28 +276,8 @@ impl SshRuntime {
             let grid = session.terminal.grid();
             (grid.rows().max(1), grid.cols().max(1))
         };
-        let mut config =
-            ConnectionConfig::new(&profile.host, profile.port, &profile.username, credential);
+        let mut config = connection_config(profile, credential);
         config.terminal = terminal_size(rows, columns);
-        config.connect_timeout =
-            Duration::from_secs(u64::from(profile.connect_timeout_secs.clamp(1, 300)));
-        config.keepalive = match profile.keep_alive_secs {
-            Some(seconds) => KeepaliveConfig {
-                enabled: true,
-                // Transport deliberately rejects sub-five-second keepalives.
-                interval: Duration::from_secs(u64::from(seconds.clamp(5, 3_600))),
-                maximum_missed_replies: 3,
-            },
-            None => KeepaliveConfig {
-                enabled: false,
-                ..KeepaliveConfig::default()
-            },
-        };
-        config.metrics = MetricsConfig {
-            enabled: profile.monitor_enabled,
-            ..MetricsConfig::default()
-        };
-        config.trusted_host_key = profile.trusted_host_key.as_ref().map(host_key_identity);
 
         match SshConnection::start(config) {
             Ok(connection) => {
@@ -267,6 +292,109 @@ impl SshRuntime {
                 Err(message)
             }
         }
+    }
+
+    /// Start an isolated network/host-key/authentication probe for one editor form.
+    ///
+    /// The transport probe stops before opening a channel, PTY or remote shell. It is
+    /// deliberately separate from `sessions`, so testing an unsaved draft cannot
+    /// replace the active terminal or affect another server's connection.
+    pub fn start_connection_test(
+        &mut self,
+        form_id: u64,
+        connection_revision: u64,
+        profile: &SshProfile,
+        credential: Credential,
+    ) -> Result<(), String> {
+        // Dropping a prior handle only signals its actor; it never joins on the UI thread.
+        self.connection_test.take();
+
+        let endpoint_identity = EndpointIdentity::from_profile(profile);
+        let mut config = connection_config(profile, credential);
+        config.mode = ConnectionMode::Probe;
+        // Defense in depth. The transport also forces both features off for Probe.
+        config.keepalive = KeepaliveConfig {
+            enabled: false,
+            ..KeepaliveConfig::default()
+        };
+        config.metrics = MetricsConfig {
+            enabled: false,
+            ..MetricsConfig::default()
+        };
+
+        match SshConnection::start(config) {
+            Ok(connection) => {
+                self.connection_test = Some(ConnectionTestAttempt {
+                    form_id,
+                    connection_revision,
+                    endpoint_identity,
+                    connection: Some(connection),
+                    state: ConnectionTestState::Connecting,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.connection_test = Some(ConnectionTestAttempt {
+                    form_id,
+                    connection_revision,
+                    endpoint_identity,
+                    connection: None,
+                    state: ConnectionTestState::Error {
+                        message: message.clone(),
+                    },
+                });
+                Err(message)
+            }
+        }
+    }
+
+    pub fn fail_connection_test(
+        &mut self,
+        form_id: u64,
+        connection_revision: u64,
+        profile: &SshProfile,
+        message: impl Into<String>,
+    ) {
+        self.connection_test = Some(ConnectionTestAttempt {
+            form_id,
+            connection_revision,
+            endpoint_identity: EndpointIdentity::from_profile(profile),
+            connection: None,
+            state: ConnectionTestState::Error {
+                message: message.into(),
+            },
+        });
+    }
+
+    pub fn cancel_connection_test(&mut self, form_id: u64) -> bool {
+        if self
+            .connection_test
+            .as_ref()
+            .is_some_and(|attempt| attempt.form_id == form_id)
+        {
+            self.connection_test = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cancel_any_connection_test(&mut self) -> bool {
+        self.connection_test.take().is_some()
+    }
+
+    #[must_use]
+    pub fn connection_test_view(&self) -> Option<ConnectionTestView> {
+        let attempt = self.connection_test.as_ref()?;
+        Some(ConnectionTestView {
+            form_id: attempt.form_id,
+            connection_revision: attempt.connection_revision,
+            host: attempt.endpoint_identity.host.clone(),
+            port: attempt.endpoint_identity.port,
+            username: attempt.endpoint_identity.username.clone(),
+            state: attempt.state.clone(),
+        })
     }
 
     pub fn disconnect_active(&mut self) {
@@ -418,13 +546,38 @@ impl SshRuntime {
                     && session.state == ConnectionState::Connected;
             }
         }
+        outcome.connection_test_changed = self.drain_connection_test();
         outcome
+    }
+
+    fn drain_connection_test(&mut self) -> bool {
+        let Some(attempt) = self.connection_test.as_mut() else {
+            return false;
+        };
+        let before_state = attempt.state.clone();
+        let before_live = attempt.connection.is_some();
+        let mut events = Vec::new();
+        if let Some(connection) = &attempt.connection {
+            connection.drain(&mut events);
+        }
+        for event in events {
+            let disconnected = matches!(event, Event::Disconnected { .. });
+            apply_connection_test_event(attempt, event);
+            if disconnected {
+                attempt.connection = None;
+            }
+        }
+        before_state != attempt.state || before_live != attempt.connection.is_some()
     }
 
     pub fn has_live_connections(&self) -> bool {
         self.sessions
             .values()
             .any(|session| session.connection.is_some())
+            || self
+                .connection_test
+                .as_ref()
+                .is_some_and(|attempt| attempt.connection.is_some())
     }
 
     pub fn has_active_terminal(&self) -> bool {
@@ -437,7 +590,8 @@ impl SshRuntime {
     }
 
     pub fn active_blocks_input(&self) -> bool {
-        self.active_session().is_some_and(RuntimeSession::blocks_input)
+        self.active_session()
+            .is_some_and(RuntimeSession::blocks_input)
     }
 
     pub fn active_terminal(&self) -> Option<&Terminal> {
@@ -473,14 +627,15 @@ impl SshRuntime {
                     algorithm: identity.algorithm.clone(),
                     sha256_fingerprint: identity.sha256_fingerprint.clone(),
                 }),
-            changed_host_key: session.changed_host_key.as_ref().map(
-                |(expected, presented)| ChangedHostKey {
+            changed_host_key: session
+                .changed_host_key
+                .as_ref()
+                .map(|(expected, presented)| ChangedHostKey {
                     expected_algorithm: expected.algorithm.clone(),
                     expected_sha256_fingerprint: expected.sha256_fingerprint.clone(),
                     presented_algorithm: presented.algorithm.clone(),
                     presented_sha256_fingerprint: presented.sha256_fingerprint.clone(),
-                },
-            ),
+                }),
         })
     }
 
@@ -517,8 +672,7 @@ impl SshRuntime {
         self.sessions.get(&profile.id).is_some_and(|session| {
             session.endpoint_identity.matches_profile(profile)
                 && session.unknown_host_key.as_ref().is_some_and(|identity| {
-                    identity.algorithm == algorithm
-                        && identity.sha256_fingerprint == fingerprint
+                    identity.algorithm == algorithm && identity.sha256_fingerprint == fingerprint
                 })
         })
     }
@@ -539,6 +693,83 @@ impl SshRuntime {
     fn active_session_mut(&mut self) -> Option<&mut RuntimeSession> {
         let profile_id = self.active_profile_id.as_ref()?.clone();
         self.sessions.get_mut(&profile_id)
+    }
+}
+
+fn connection_config(profile: &SshProfile, credential: Credential) -> ConnectionConfig {
+    let mut config =
+        ConnectionConfig::new(&profile.host, profile.port, &profile.username, credential);
+    config.connect_timeout =
+        Duration::from_secs(u64::from(profile.connect_timeout_secs.clamp(1, 300)));
+    config.keepalive = match profile.keep_alive_secs {
+        Some(seconds) => KeepaliveConfig {
+            enabled: true,
+            // Transport deliberately rejects sub-five-second keepalives.
+            interval: Duration::from_secs(u64::from(seconds.clamp(5, 3_600))),
+            maximum_missed_replies: 3,
+        },
+        None => KeepaliveConfig {
+            enabled: false,
+            ..KeepaliveConfig::default()
+        },
+    };
+    config.metrics = MetricsConfig {
+        enabled: profile.monitor_enabled,
+        ..MetricsConfig::default()
+    };
+    config.trusted_host_key = profile.trusted_host_key.as_ref().map(host_key_identity);
+    config
+}
+
+fn apply_connection_test_event(attempt: &mut ConnectionTestAttempt, event: Event) {
+    match event {
+        Event::Connecting => {
+            attempt.state = ConnectionTestState::Connecting;
+        }
+        Event::HostKeyUnknown { presented } => {
+            attempt.state = ConnectionTestState::AwaitingHostKey {
+                algorithm: presented.algorithm,
+                fingerprint: presented.sha256_fingerprint,
+            };
+        }
+        Event::HostKeyChanged {
+            expected,
+            presented,
+        } => {
+            attempt.state = ConnectionTestState::HostKeyChanged {
+                expected_algorithm: expected.algorithm,
+                expected_fingerprint: expected.sha256_fingerprint,
+                presented_algorithm: presented.algorithm,
+                presented_fingerprint: presented.sha256_fingerprint,
+            };
+        }
+        Event::ConnectionTestSucceeded { .. } => {
+            attempt.state = ConnectionTestState::Success;
+        }
+        Event::Error(error) => {
+            attempt.state = ConnectionTestState::Error {
+                message: error.message,
+            };
+        }
+        Event::Disconnected { reason } => {
+            if matches!(attempt.state, ConnectionTestState::Connecting) {
+                attempt.state = ConnectionTestState::Error {
+                    message: disconnect_reason(reason).to_owned(),
+                };
+            }
+        }
+        Event::Connected { .. }
+        | Event::Data(_)
+        | Event::ExtendedData { .. }
+        | Event::Eof
+        | Event::ExitStatus(_)
+        | Event::ExitSignal { .. }
+        | Event::Metrics(_)
+        | Event::MetricsError { .. } => {
+            attempt.state = ConnectionTestState::Error {
+                message: "SSH connection test received an unexpected shell event".to_owned(),
+            };
+        }
     }
 }
 
@@ -580,6 +811,12 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
         Event::Connected { .. } => {
             session.state = ConnectionState::Connected;
             session.detail = None;
+            false
+        }
+        Event::ConnectionTestSucceeded { .. } => {
+            session.state = ConnectionState::Error;
+            session.detail =
+                Some("An SSH connection test event reached an interactive session".to_owned());
             false
         }
         Event::Data(bytes) | Event::ExtendedData { data: bytes, .. } => {
@@ -689,10 +926,7 @@ pub fn format_metrics(metrics: &ServerMetrics) -> MetricsSummary {
         .cpu_usage_percent
         .map_or_else(|| "—".to_owned(), |value| format!("{value:.1}%"));
     let memory = used_total(metrics.memory.used_bytes, metrics.memory.total_bytes);
-    let root_disk = used_total(
-        metrics.root_disk.used_bytes,
-        metrics.root_disk.total_bytes,
-    );
+    let root_disk = used_total(metrics.root_disk.used_bytes, metrics.root_disk.total_bytes);
     let load = format!(
         "{:.2} / {:.2} / {:.2}",
         metrics.load_average_1m, metrics.load_average_5m, metrics.load_average_15m
@@ -812,6 +1046,84 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn connection_test_view_requires_exact_structured_target() {
+        let runtime = SshRuntime {
+            connection_test: Some(ConnectionTestAttempt {
+                form_id: 7,
+                connection_revision: 3,
+                endpoint_identity: EndpointIdentity {
+                    host: "b@c".to_owned(),
+                    port: 22,
+                    username: "a".to_owned(),
+                },
+                connection: None,
+                state: ConnectionTestState::Connecting,
+            }),
+            ..SshRuntime::default()
+        };
+        let view = runtime.connection_test_view().expect("test view");
+        assert_eq!(view.connection_revision, 3);
+        assert!(view.matches_target(7, "b@c", 22, "a"));
+        assert!(!view.matches_target(7, "c", 22, "a@b"));
+        assert!(!view.matches_target(8, "b@c", 22, "a"));
+    }
+
+    #[test]
+    fn probe_result_preserves_host_key_and_success_across_disconnect() {
+        let mut attempt = ConnectionTestAttempt {
+            form_id: 9,
+            connection_revision: 4,
+            endpoint_identity: EndpointIdentity {
+                host: "server.example".to_owned(),
+                port: 22,
+                username: "alice".to_owned(),
+            },
+            connection: None,
+            state: ConnectionTestState::Connecting,
+        };
+        apply_connection_test_event(
+            &mut attempt,
+            Event::HostKeyUnknown {
+                presented: HostKeyIdentity::new(
+                    "ssh-ed25519",
+                    "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC",
+                ),
+            },
+        );
+        assert!(matches!(
+            attempt.state,
+            ConnectionTestState::AwaitingHostKey { .. }
+        ));
+        apply_connection_test_event(
+            &mut attempt,
+            Event::Disconnected {
+                reason: DisconnectReason::HostKeyUnknown,
+            },
+        );
+        assert!(matches!(
+            attempt.state,
+            ConnectionTestState::AwaitingHostKey { .. }
+        ));
+
+        apply_connection_test_event(
+            &mut attempt,
+            Event::ConnectionTestSucceeded {
+                host_key: HostKeyIdentity::new(
+                    "ssh-ed25519",
+                    "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC",
+                ),
+            },
+        );
+        apply_connection_test_event(
+            &mut attempt,
+            Event::Disconnected {
+                reason: DisconnectReason::Requested,
+            },
+        );
+        assert_eq!(attempt.state, ConnectionTestState::Success);
     }
 
     #[test]
@@ -944,24 +1256,18 @@ mod tests {
         second.id = "ssh_abcdef0123456789abcdef0123456789".to_owned();
         second.name = "prod".to_owned();
         let mut runtime = SshRuntime::default();
-        assert_eq!(
-            runtime.select_for_connect(&first),
-            ConnectIntent::Password
-        );
-        assert_eq!(
-            runtime.select_for_connect(&second),
-            ConnectIntent::Password
-        );
+        assert_eq!(runtime.select_for_connect(&first), ConnectIntent::Password);
+        assert_eq!(runtime.select_for_connect(&second), ConnectIntent::Password);
         assert_eq!(runtime.sessions.len(), 2);
-        assert_eq!(runtime.active_profile_id.as_deref(), Some(second.id.as_str()));
+        assert_eq!(
+            runtime.active_profile_id.as_deref(),
+            Some(second.id.as_str())
+        );
     }
 
     #[test]
     fn only_password_authentication_and_private_key_errors_invalidate_saved_credentials() {
-        for kind in [
-            EventErrorKind::Authentication,
-            EventErrorKind::PrivateKey,
-        ] {
+        for kind in [EventErrorKind::Authentication, EventErrorKind::PrivateKey] {
             assert!(event_is_saved_credential_failure(&Event::Error(
                 lumen_ssh::EventError {
                     kind,

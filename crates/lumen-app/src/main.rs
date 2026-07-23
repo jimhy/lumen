@@ -721,6 +721,33 @@ fn ssh_profile_draft(
     }
 }
 
+fn ssh_test_profile(form_id: u64, draft: &ssh::NewSshProfile) -> ssh::SshProfile {
+    ssh::SshProfile {
+        id: format!("ssh_{form_id:032x}"),
+        name: draft.name.clone(),
+        host: draft.host.clone(),
+        port: draft.port,
+        username: draft.username.clone(),
+        auth_method: draft.auth_method,
+        group_id: draft.group_id.clone(),
+        sort_order: 0,
+        initial_directory: draft.initial_directory.clone(),
+        connect_timeout_secs: draft.connect_timeout_secs,
+        keep_alive_secs: draft.keep_alive_secs,
+        monitor_enabled: false,
+        trusted_host_key: draft.trusted_host_key.clone(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    }
+}
+
+fn ssh_profile_matches_test_target(saved: &ssh::SshProfile, test: &ssh::SshProfile) -> bool {
+    saved.host == test.host
+        && saved.port == test.port
+        && saved.username == test.username
+        && saved.auth_method == test.auth_method
+}
+
 /// 「回到底部」按钮要操作的视口所有者。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollToBottomAction {
@@ -1318,11 +1345,12 @@ impl AppState {
         self.shell_state.history_search.query.clear();
         self.shell_state.completion.open = false;
         self.shell_state.login.close_for_app_lock();
-        self.shell_state
-            .settings
-            .clear_sensitive_for_app_lock();
+        self.shell_state.settings.clear_sensitive_for_app_lock();
         self.shell_state.remote_ui.reset();
         self.shell_state.ssh_ui.close_for_app_lock();
+        // 表单测试不是已建立的工作会话；锁屏关闭表单时一并丢弃其
+        // 一次性 probe 与凭据副本。正式 SSH actor 仍继续后台运行。
+        self.ssh_runtime.cancel_any_connection_test();
         // Dropping the one-shot dialog zeroizes password/passphrase buffers.
         // The SSH actors themselves intentionally continue in the background.
         self.shell_state.ssh_credentials = None;
@@ -2450,11 +2478,24 @@ impl AppState {
         use shell::ssh_ui::SshUiAction;
 
         for action in actions {
-            if let SshUiAction::ConnectProfile { id } = &action {
-                self.shell_state.ssh_ui.select_profile(Some(id.clone()));
-                self.begin_ssh_profile_connect(id);
-                continue;
-            }
+            let action = match action {
+                SshUiAction::ConnectProfile { id } => {
+                    self.shell_state.ssh_ui.select_profile(Some(id.clone()));
+                    self.begin_ssh_profile_connect(&id);
+                    continue;
+                }
+                SshUiAction::SubmitProfile(submission) => {
+                    self.apply_ssh_profile_submission(submission);
+                    continue;
+                }
+                SshUiAction::CancelConnectionTest { form_id } => {
+                    if self.ssh_runtime.cancel_connection_test(form_id) {
+                        self.window.request_redraw();
+                    }
+                    continue;
+                }
+                action => action,
+            };
 
             let Some(store) = self.ssh_store.as_mut() else {
                 self.shell_state.toast.push(
@@ -2464,24 +2505,11 @@ impl AppState {
                 continue;
             };
 
-            let mut created_profile = None;
             let mut deleted_profile = None;
-            let mut changed_binding = None;
             let result = match action {
                 SshUiAction::CreateGroup { name } => store.create_group(&name).map(|_| ()),
                 SshUiAction::RenameGroup { id, name } => store.rename_group(&id, &name),
                 SshUiAction::DeleteGroup { id } => store.delete_group(&id),
-                SshUiAction::CreateProfile { draft } => store.create_profile(draft).map(|id| {
-                    created_profile = Some(id);
-                }),
-                SshUiAction::UpdateProfile { id, draft } => {
-                    let before = store.binding(&id).cloned();
-                    let result = store.update_profile(&id, draft);
-                    if result.is_ok() {
-                        changed_binding = Some((before, store.binding(&id).cloned()));
-                    }
-                    result
-                }
                 SshUiAction::DeleteProfile { id } => {
                     let binding = store.binding(&id).cloned();
                     let result = store.delete_profile(&id);
@@ -2495,17 +2523,15 @@ impl AppState {
                     target_group_id,
                     target_index,
                 } => store.move_profile(&id, target_group_id.as_deref(), target_index),
-                SshUiAction::ConnectProfile { .. } => unreachable!("连接动作已在上方处理"),
+                SshUiAction::ConnectProfile { .. }
+                | SshUiAction::SubmitProfile(_)
+                | SshUiAction::CancelConnectionTest { .. } => {
+                    unreachable!("特殊 SSH UI 动作已在上方处理")
+                }
             };
             match result {
                 Ok(()) => {
                     self.notify_ssh_local_change();
-                    if let Some(id) = created_profile {
-                        self.shell_state.ssh_ui.select_profile(Some(id));
-                    }
-                    if let Some((before, after)) = changed_binding {
-                        self.delete_obsolete_ssh_secrets(before.as_ref(), after.as_ref());
-                    }
                     if let Some((id, binding)) = deleted_profile {
                         self.ssh_runtime.remove_profile(&id);
                         self.ssh_force_credential_prompt.remove(&id);
@@ -2525,6 +2551,163 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn apply_ssh_profile_submission(&mut self, submission: shell::ssh_ui::SshProfileSubmission) {
+        use shell::ssh_ui::ProfileSubmitIntent;
+
+        match submission.intent() {
+            ProfileSubmitIntent::Save => self.save_ssh_profile_submission(submission),
+            ProfileSubmitIntent::TestConnection => {
+                self.begin_ssh_connection_test(submission);
+            }
+        }
+    }
+
+    fn save_ssh_profile_submission(&mut self, mut submission: shell::ssh_ui::SshProfileSubmission) {
+        let form_id = submission.form_id();
+        self.ssh_runtime.cancel_connection_test(form_id);
+        let host_key_verified_for_endpoint = submission.host_key_verified_for_current_endpoint();
+        let editing_id = submission.take_editing_id();
+        let draft = submission.take_draft();
+        let mut password = zeroize::Zeroizing::new(submission.take_password());
+
+        let saved = (|| -> Result<(String, Option<ssh::SshLocalBinding>), String> {
+            let store = self
+                .ssh_store
+                .as_mut()
+                .ok_or_else(|| "SSH 配置存储不可用，请先处理启动时的存储错误".to_owned())?;
+            match editing_id {
+                Some(id) => {
+                    let previous = store.binding(&id).cloned();
+                    if host_key_verified_for_endpoint {
+                        store
+                            .update_profile_with_verified_host_key(&id, draft)
+                            .map_err(|error| error.to_string())?;
+                    } else {
+                        store
+                            .update_profile(&id, draft)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok((id, previous))
+                }
+                None => store
+                    .create_profile(draft)
+                    .map(|id| (id, None))
+                    .map_err(|error| error.to_string()),
+            }
+        })();
+
+        let (profile_id, previous_binding) = match saved {
+            Ok(saved) => saved,
+            Err(error) => {
+                log::error!("SSH 服务器表单保存失败: {error}");
+                self.shell_state
+                    .toast
+                    .push(shell::toast::ToastKind::Error, error);
+                self.window.request_redraw();
+                return;
+            }
+        };
+        let profile = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.inventory().profile(&profile_id))
+            .cloned();
+        let Some(profile) = profile else {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器已保存，但无法重新读取配置",
+            );
+            self.window.request_redraw();
+            return;
+        };
+
+        let mut credential_save_failed = false;
+        if !password.is_empty() {
+            if profile.auth_method == ssh::AuthMethod::Password {
+                let credential_submission = shell::SshCredentialSubmission::from_password(
+                    profile.id.clone(),
+                    profile.host.clone(),
+                    profile.port,
+                    profile.username.clone(),
+                    std::mem::take(&mut *password),
+                );
+                if self
+                    .save_ssh_credential_submission(&profile, credential_submission)
+                    .is_err()
+                {
+                    credential_save_failed = true;
+                }
+            } else {
+                log::warn!("忽略认证方式已变化的 SSH 密码表单缓冲");
+            }
+        }
+
+        let current_binding = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile_id))
+            .cloned();
+        self.delete_obsolete_ssh_secrets(previous_binding.as_ref(), current_binding.as_ref());
+        self.notify_ssh_local_change();
+        self.shell_state
+            .ssh_ui
+            .select_profile(Some(profile_id.clone()));
+        if credential_save_failed {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器已保存，但密码无法安全写入本机凭据存储",
+            );
+        }
+        self.window.request_redraw();
+    }
+
+    fn begin_ssh_connection_test(&mut self, mut submission: shell::ssh_ui::SshProfileSubmission) {
+        let form_id = submission.form_id();
+        let connection_revision = submission.connection_revision();
+        let editing_id = submission.take_editing_id();
+        let draft = submission.take_draft();
+        let mut password = zeroize::Zeroizing::new(submission.take_password());
+        let profile = ssh_test_profile(form_id, &draft);
+
+        let saved_credential = || -> Option<lumen_ssh::Credential> {
+            let profile_id = editing_id.as_deref()?;
+            let saved_profile = self.ssh_store.as_ref()?.inventory().profile(profile_id)?;
+            if !ssh_profile_matches_test_target(saved_profile, &profile) {
+                return None;
+            }
+            self.load_saved_ssh_credential(saved_profile).ok().flatten()
+        };
+
+        let credential = match profile.auth_method {
+            ssh::AuthMethod::Password if !password.is_empty() => Some(
+                lumen_ssh::Credential::password(std::mem::take(&mut *password)),
+            ),
+            ssh::AuthMethod::Password | ssh::AuthMethod::PrivateKey => saved_credential(),
+            ssh::AuthMethod::Agent => Some(lumen_ssh::Credential::agent()),
+        };
+        let Some(credential) = credential else {
+            let message = match profile.auth_method {
+                ssh::AuthMethod::Password => "请输入密码，或先保存本机密码后再测试连接",
+                ssh::AuthMethod::PrivateKey => "请先保存服务器并绑定本机私钥，再测试连接",
+                ssh::AuthMethod::Agent => unreachable!("SSH Agent 不需要本机表单凭据"),
+            };
+            self.ssh_runtime
+                .fail_connection_test(form_id, connection_revision, &profile, message);
+            self.window.request_redraw();
+            return;
+        };
+
+        if let Err(error) = self.ssh_runtime.start_connection_test(
+            form_id,
+            connection_revision,
+            &profile,
+            credential,
+        ) {
+            log::warn!("启动 SSH 连接测试失败: {error}");
+        }
+        self.window.request_redraw();
     }
 
     /// 删除旧 binding 中已不再被新 binding 引用的 Credential Manager
@@ -3045,7 +3228,9 @@ impl AppState {
         }
         if !self.app_lock.is_locked()
             && self.settings.layout.view_mode.is_ssh()
-            && (outcome.active_terminal_changed || outcome.active_status_changed)
+            && (outcome.active_terminal_changed
+                || outcome.active_status_changed
+                || outcome.connection_test_changed)
         {
             self.window.request_redraw();
         }
@@ -10359,6 +10544,7 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 let ssh_runtime_view = state.ssh_runtime.active_view();
+                let ssh_connection_test_view = state.ssh_runtime.connection_test_view();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -10435,6 +10621,7 @@ impl ApplicationHandler<PtyWake> for App {
                         .as_ref()
                         .map_or(&state.ssh_empty_inventory, ssh::SshStore::inventory),
                     ssh_runtime: ssh_runtime_view.as_ref(),
+                    ssh_connection_test: ssh_connection_test_view.as_ref(),
                     ssh_terminal_tex: state.ssh_texture,
                     active_device_id: state.remote.active_device_id.as_deref(),
                     remote_pairing: state.remote_ws.pairing.as_ref(),
@@ -13007,11 +13194,11 @@ impl ApplicationHandler<PtyWake> for App {
 mod tests {
     use super::{
         canonical_ssh_account_id, clear_shared_token, controller_owns_sub_viewport, drain_order,
-        estimate_restored_pane_px, load_icon, maximized_overflow,
-        scroll_to_bottom_action,
+        estimate_restored_pane_px, load_icon, maximized_overflow, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
-        should_trigger_ssh_sync_after_local_change, ssh_sync_identity, view_mode_shortcut,
-        width_worth_persisting, PaneLayout, ScrollToBottomAction,
+        should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
+        ssh_sync_identity, ssh_test_profile, view_mode_shortcut, width_worth_persisting,
+        PaneLayout, ScrollToBottomAction,
     };
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
@@ -13056,6 +13243,32 @@ mod tests {
             view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::KeyS)),
             None
         );
+    }
+
+    #[test]
+    fn ssh测试连接使用独立profile且凭据回退按结构化目标匹配() {
+        let draft = crate::ssh::NewSshProfile {
+            name: "test".to_owned(),
+            host: "b@c".to_owned(),
+            username: "a".to_owned(),
+            auth_method: crate::ssh::AuthMethod::Password,
+            monitor_enabled: true,
+            ..Default::default()
+        };
+        let saved = ssh_test_profile(41, &draft);
+        assert_eq!(saved.id, "ssh_00000000000000000000000000000029");
+        assert!(!saved.monitor_enabled, "Probe 不得启动服务器监控");
+        assert!(ssh_profile_matches_test_target(&saved, &saved));
+
+        let mut colliding = saved.clone();
+        colliding.host = "c".to_owned();
+        colliding.username = "a@b".to_owned();
+        assert_eq!(
+            format!("{}@{}", saved.username, saved.host),
+            format!("{}@{}", colliding.username, colliding.host),
+            "回归样例必须能碰撞旧展示字符串"
+        );
+        assert!(!ssh_profile_matches_test_target(&saved, &colliding));
     }
 
     #[test]

@@ -382,7 +382,7 @@ impl SshInventory {
     /// 应用服务端权威服务器值；认证材料不在该类型中，因此本机绑定不受覆盖。
     pub(crate) fn apply_synced_profile(
         &mut self,
-        profile: SshProfile,
+        mut profile: SshProfile,
     ) -> Result<(), InventoryError> {
         let mut next = self.clone();
         if let Some(existing) = next
@@ -390,6 +390,12 @@ impl SshInventory {
             .iter_mut()
             .find(|existing| existing.id == profile.id)
         {
+            // 主机密钥信任绑定 host+port。远端完整值没有携带“刚验证”
+            // 证明，因此 endpoint 变化时必须在本机失效，不能把旧信任
+            // 静默迁移到另一台服务器。
+            if existing.host != profile.host || existing.port != profile.port {
+                profile.trusted_host_key = None;
+            }
             *existing = profile;
         } else {
             next.profiles.push(profile);
@@ -808,6 +814,27 @@ mod tests {
         inventory.delete_profile(&b).unwrap();
         assert!(inventory.profile(&b).is_none());
         assert_eq!(inventory.profile(&a).unwrap().sort_order, 0);
+    }
+
+    #[test]
+    fn 远端更新endpoint时不会迁移旧主机密钥信任() {
+        let mut inventory = SshInventory::default();
+        let trust = crate::ssh::HostKeyTrust {
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint: "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC".to_owned(),
+        };
+        let mut original = draft("original", None);
+        original.trusted_host_key = Some(trust.clone());
+        let profile_id = inventory.create_profile(original).unwrap();
+        let mut remote = inventory.profile(&profile_id).unwrap().clone();
+        remote.host = "other.example.com".to_owned();
+        remote.trusted_host_key = Some(trust);
+
+        inventory.apply_synced_profile(remote).unwrap();
+
+        let profile = inventory.profile(&profile_id).unwrap();
+        assert_eq!(profile.host, "other.example.com");
+        assert!(profile.trusted_host_key.is_none());
     }
 
     #[test]

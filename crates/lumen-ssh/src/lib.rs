@@ -16,7 +16,7 @@ pub use metrics::{
     SystemMemoryMetrics,
 };
 pub use transport::{
-    Command, CommandSendError, ConnectionConfig, DisconnectReason, Event, EventError,
-    EventErrorKind, EventReceiveError, KeepaliveConfig, MetricsConfig, QueueConfig, SshConnection,
-    StartError, TerminalSize,
+    Command, CommandSendError, ConnectionConfig, ConnectionMode, DisconnectReason, Event,
+    EventError, EventErrorKind, EventReceiveError, KeepaliveConfig, MetricsConfig, QueueConfig,
+    SshConnection, StartError, TerminalSize,
 };

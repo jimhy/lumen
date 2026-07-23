@@ -398,6 +398,37 @@ impl SshStore {
     }
 
     pub fn update_profile(&mut self, id: &str, draft: NewSshProfile) -> Result<(), StoreError> {
+        self.update_profile_inner(id, draft, false)
+    }
+
+    /// 更新服务器，并声明 draft 中的主机密钥刚刚在当前 endpoint 的
+    /// 未知密钥确认流程中由用户明确接受过。
+    ///
+    /// 普通更新在 host/port 变化时一律丢弃随 draft 带来的旧信任；
+    /// 只有持有当前表单一次性验证结果的调用方才能使用此入口保留新信任。
+    pub fn update_profile_with_verified_host_key(
+        &mut self,
+        id: &str,
+        draft: NewSshProfile,
+    ) -> Result<(), StoreError> {
+        self.update_profile_inner(id, draft, true)
+    }
+
+    fn update_profile_inner(
+        &mut self,
+        id: &str,
+        mut draft: NewSshProfile,
+        host_key_verified_for_endpoint: bool,
+    ) -> Result<(), StoreError> {
+        let previous = self
+            .inventory
+            .profile(id)
+            .ok_or(InventoryError::ProfileNotFound)?;
+        let endpoint_changed = previous.host != draft.host.trim() || previous.port != draft.port;
+        if endpoint_changed && !host_key_verified_for_endpoint {
+            draft.trusted_host_key = None;
+        }
+
         let mut next_inventory = self.inventory.clone();
         next_inventory.update_profile(id, draft)?;
         let mut next_bindings = self.bindings.clone();
@@ -1490,6 +1521,46 @@ mod tests {
             group_id,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn endpoint变化默认清除旧主机密钥且仅显式验证可保留() {
+        let root = temporary_root("host-key-endpoint-binding");
+        let mut store = SshStore::load(&root, StorageScope::Local).unwrap();
+        let trust = crate::ssh::HostKeyTrust {
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint: "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC".to_owned(),
+        };
+        let mut original = draft("host-key", None);
+        original.trusted_host_key = Some(trust.clone());
+        let profile_id = store.create_profile(original).unwrap();
+
+        let mut unverified_move = draft("host-key", None);
+        unverified_move.host = "moved.example.com".to_owned();
+        unverified_move.trusted_host_key = Some(trust.clone());
+        store.update_profile(&profile_id, unverified_move).unwrap();
+        assert!(store
+            .inventory()
+            .profile(&profile_id)
+            .unwrap()
+            .trusted_host_key
+            .is_none());
+
+        let mut verified_move = draft("host-key", None);
+        verified_move.host = "verified.example.com".to_owned();
+        verified_move.trusted_host_key = Some(trust.clone());
+        store
+            .update_profile_with_verified_host_key(&profile_id, verified_move)
+            .unwrap();
+        assert_eq!(
+            store
+                .inventory()
+                .profile(&profile_id)
+                .unwrap()
+                .trusted_host_key
+                .as_ref(),
+            Some(&trust)
+        );
     }
 
     fn account_id(suffix: u8) -> String {
