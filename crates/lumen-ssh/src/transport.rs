@@ -147,25 +147,32 @@ impl Default for TerminalSize {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepaliveConfig {
+    pub enabled: bool,
     pub interval: Duration,
     pub maximum_missed_replies: usize,
 }
 
 impl KeepaliveConfig {
     fn validate(self) -> Result<(), StartError> {
-        if self.interval < Duration::from_secs(5)
-            || self.interval > Duration::from_secs(3600)
-            || !(1..=100).contains(&self.maximum_missed_replies)
+        if self.enabled
+            && (self.interval < Duration::from_secs(5)
+                || self.interval > Duration::from_secs(3600)
+                || !(1..=100).contains(&self.maximum_missed_replies))
         {
             return Err(StartError::InvalidConfig("keepalive"));
         }
         Ok(())
+    }
+
+    fn interval_option(self) -> Option<Duration> {
+        self.enabled.then_some(self.interval)
     }
 }
 
 impl Default for KeepaliveConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             interval: Duration::from_secs(30),
             maximum_missed_replies: 3,
         }
@@ -567,7 +574,7 @@ async fn run_connection(
         decision: Arc::clone(&host_key_decision),
     };
     let russh_config = Arc::new(client::Config {
-        keepalive_interval: Some(config.keepalive.interval),
+        keepalive_interval: config.keepalive.interval_option(),
         keepalive_max: config.keepalive.maximum_missed_replies,
         nodelay: true,
         ..client::Config::default()
@@ -1411,5 +1418,19 @@ mod tests {
             Err(CommandSendError::InvalidTerminalSize)
         );
         assert!(receiver.is_empty());
+    }
+
+    #[test]
+    fn keepalive_can_be_disabled_explicitly() {
+        let enabled = KeepaliveConfig::default();
+        assert_eq!(enabled.interval_option(), Some(Duration::from_secs(30)));
+
+        let disabled = KeepaliveConfig {
+            enabled: false,
+            interval: Duration::ZERO,
+            maximum_missed_replies: 0,
+        };
+        assert!(disabled.validate().is_ok());
+        assert_eq!(disabled.interval_option(), None);
     }
 }
