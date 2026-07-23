@@ -291,6 +291,34 @@ impl FrameActivity {
     }
 }
 
+/// 应用自管备用屏视口距底部的输入侧估算。
+///
+/// DECSET 1007 只规定终端把滚轮转换成方向键，并不回报 TUI 内部的滚动
+/// 位置。Lumen 因此只能按成功转发的滚轮档数做饱和估算，用来决定何时
+/// 显示「回到底部」按钮；它不是终端模式或应用状态的真实副本。
+#[derive(Debug, Default)]
+struct AlternateScrollTracker {
+    distance_hint: usize,
+}
+
+impl AlternateScrollTracker {
+    fn note_wheel(&mut self, up: bool, steps: usize) {
+        if up {
+            self.distance_hint = self.distance_hint.saturating_add(steps);
+        } else {
+            self.distance_hint = self.distance_hint.saturating_sub(steps);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.distance_hint = 0;
+    }
+
+    fn distance_hint(&self) -> usize {
+        self.distance_hint
+    }
+}
+
 /// 一个终端会话的全部独立状态。
 ///
 /// Drop 即随 `PtySession` 杀掉 shell 子进程（关 tab = 杀进程）；
@@ -347,6 +375,8 @@ pub struct Session {
     title_activity: TitleActivity,
     /// 备用屏 DEC 2026 同步帧动画。覆盖不把状态写入标题的 TUI。
     frame_activity: FrameActivity,
+    /// DECSET 1007 滚轮已让应用内部视口离开底部的距离估算。
+    alternate_scroll_tracker: AlternateScrollTracker,
     /// M4.1 批D1：焦点窗格的输入编辑器（`input-editor` feature 门控）。
     /// 挂在窗格生命周期内，模式切换不清缓冲（草稿保全）。
     #[cfg(feature = "input-editor")]
@@ -450,6 +480,7 @@ impl Session {
             has_unseen_output: false,
             title_activity,
             frame_activity,
+            alternate_scroll_tracker: AlternateScrollTracker::default(),
             #[cfg(feature = "input-editor")]
             editor: Editor::default(),
             #[cfg(feature = "input-editor")]
@@ -488,12 +519,39 @@ impl Session {
     /// ConPTY 合并了若干动画帧也不会漏判；OSC 9;4 进度由 Terminal
     /// 直接维护活动状态，DEC 2026 则用 ESU 单调标记识别连续 TUI 帧。
     pub fn advance_terminal(&mut self, bytes: &[u8]) {
+        let used_alternate_scroll = self.uses_application_alternate_scroll();
         self.term.advance(bytes);
+        let uses_alternate_scroll = self.uses_application_alternate_scroll();
+        if !uses_alternate_scroll || uses_alternate_scroll != used_alternate_scroll {
+            self.alternate_scroll_tracker.reset();
+        }
         let now = Instant::now();
         self.title_activity
             .observe(self.term.title_revision(), now);
         self.frame_activity
             .observe(self.term.esu_mark(), self.term.is_alt_screen(), now);
+    }
+
+    /// 当前滚轮是否由 DECSET 1007 转交给备用屏应用自己处理。
+    pub fn uses_application_alternate_scroll(&self) -> bool {
+        self.term.is_alt_screen()
+            && self.term.alternate_scroll()
+            && !self.term.mouse_protocol().is_on()
+    }
+
+    /// 记录一次已成功写入 PTY 的 Alternate Scroll 滚轮输入。
+    pub fn note_alternate_scroll_wheel(&mut self, up: bool, steps: usize) {
+        self.alternate_scroll_tracker.note_wheel(up, steps);
+    }
+
+    /// 应用自管备用屏视口距底部的估算行数。
+    pub fn alternate_scroll_distance_hint(&self) -> usize {
+        self.alternate_scroll_tracker.distance_hint()
+    }
+
+    /// 已知应用视口回到底部，清除输入侧估算。
+    pub fn reset_alternate_scroll_distance_hint(&mut self) {
+        self.alternate_scroll_tracker.reset();
     }
 
     /// 当前窗格是否处于终端协议所表达的运行状态。
@@ -830,6 +888,24 @@ mod tests {
         activity.observe(11, true, resumed);
         activity.observe(14, true, resumed + Duration::from_millis(120));
         assert!(activity.is_busy(resumed + Duration::from_millis(120)));
+    }
+
+    #[test]
+    fn alternate_scroll距离估算_上下滚动饱和且可重置() {
+        let mut tracker = AlternateScrollTracker::default();
+        tracker.note_wheel(true, 25);
+        assert_eq!(tracker.distance_hint(), 25);
+
+        tracker.note_wheel(false, 10);
+        assert_eq!(tracker.distance_hint(), 15);
+        tracker.note_wheel(false, 99);
+        assert_eq!(tracker.distance_hint(), 0, "向下越界必须饱和在底部");
+
+        tracker.note_wheel(true, usize::MAX);
+        tracker.note_wheel(true, 1);
+        assert_eq!(tracker.distance_hint(), usize::MAX, "向上越界必须饱和");
+        tracker.reset();
+        assert_eq!(tracker.distance_hint(), 0);
     }
 
     #[test]

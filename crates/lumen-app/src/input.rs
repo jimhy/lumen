@@ -19,50 +19,56 @@ pub fn encode_key_win32(event: &KeyEvent, mods: ModifiersState, down: bool) -> O
             };
             (vk, ch as u32)
         }
-        Key::Named(named) => {
-            let vk: u16 = match named {
-                NamedKey::Enter => 0x0D,
-                NamedKey::Tab => 0x09,
-                NamedKey::Backspace => 0x08,
-                NamedKey::Escape => 0x1B,
-                NamedKey::Space => 0x20,
-                NamedKey::PageUp => 0x21,
-                NamedKey::PageDown => 0x22,
-                NamedKey::End => 0x23,
-                NamedKey::Home => 0x24,
-                NamedKey::ArrowLeft => 0x25,
-                NamedKey::ArrowUp => 0x26,
-                NamedKey::ArrowRight => 0x27,
-                NamedKey::ArrowDown => 0x28,
-                NamedKey::Insert => 0x2D,
-                NamedKey::Delete => 0x2E,
-                NamedKey::F1 => 0x70,
-                NamedKey::F2 => 0x71,
-                NamedKey::F3 => 0x72,
-                NamedKey::F4 => 0x73,
-                NamedKey::F5 => 0x74,
-                NamedKey::F6 => 0x75,
-                NamedKey::F7 => 0x76,
-                NamedKey::F8 => 0x77,
-                NamedKey::F9 => 0x78,
-                NamedKey::F10 => 0x79,
-                NamedKey::F11 => 0x7A,
-                NamedKey::F12 => 0x7B,
-                _ => return None,
-            };
-            let uc = match named {
-                NamedKey::Enter => 0x0D,
-                NamedKey::Tab => 0x09,
-                NamedKey::Backspace => 0x08,
-                NamedKey::Escape => 0x1B,
-                NamedKey::Space => 0x20,
-                _ => 0,
-            };
-            (vk, uc)
-        }
+        Key::Named(named) => win32_named_key(*named)?,
         _ => return None,
     };
 
+    Some(encode_win32_key(vk, uc, mods, down))
+}
+
+fn win32_named_key(key: NamedKey) -> Option<(u16, u32)> {
+    let vk: u16 = match key {
+        NamedKey::Enter => 0x0D,
+        NamedKey::Tab => 0x09,
+        NamedKey::Backspace => 0x08,
+        NamedKey::Escape => 0x1B,
+        NamedKey::Space => 0x20,
+        NamedKey::PageUp => 0x21,
+        NamedKey::PageDown => 0x22,
+        NamedKey::End => 0x23,
+        NamedKey::Home => 0x24,
+        NamedKey::ArrowLeft => 0x25,
+        NamedKey::ArrowUp => 0x26,
+        NamedKey::ArrowRight => 0x27,
+        NamedKey::ArrowDown => 0x28,
+        NamedKey::Insert => 0x2D,
+        NamedKey::Delete => 0x2E,
+        NamedKey::F1 => 0x70,
+        NamedKey::F2 => 0x71,
+        NamedKey::F3 => 0x72,
+        NamedKey::F4 => 0x73,
+        NamedKey::F5 => 0x74,
+        NamedKey::F6 => 0x75,
+        NamedKey::F7 => 0x76,
+        NamedKey::F8 => 0x77,
+        NamedKey::F9 => 0x78,
+        NamedKey::F10 => 0x79,
+        NamedKey::F11 => 0x7A,
+        NamedKey::F12 => 0x7B,
+        _ => return None,
+    };
+    let uc = match key {
+        NamedKey::Enter => 0x0D,
+        NamedKey::Tab => 0x09,
+        NamedKey::Backspace => 0x08,
+        NamedKey::Escape => 0x1B,
+        NamedKey::Space => 0x20,
+        _ => 0,
+    };
+    Some((vk, uc))
+}
+
+fn encode_win32_key(vk: u16, uc: u32, mods: ModifiersState, down: bool) -> Vec<u8> {
     // dwControlKeyState 位。
     let mut cs = 0u32;
     if mods.shift_key() {
@@ -76,7 +82,7 @@ pub fn encode_key_win32(event: &KeyEvent, mods: ModifiersState, down: bool) -> O
     }
 
     let kd = if down { 1 } else { 0 };
-    Some(format!("\x1b[{vk};0;{uc};{kd};{cs};1_").into_bytes())
+    format!("\x1b[{vk};0;{uc};{kd};{cs};1_").into_bytes()
 }
 
 /// 把一次按键编码成要写入 PTY 的字节。返回 None 表示不产生输入。
@@ -126,6 +132,22 @@ pub(crate) fn encode_alternate_scroll(up: bool, steps: usize) -> Vec<u8> {
     seq.repeat(steps.max(1))
 }
 
+/// 应用自管滚动视口（如 Codex transcript）跳到底部所需的无修饰 End。
+///
+/// 普通 VT 只发送一次 `CSI F`。DEC 9001 win32-input-mode 需要把
+/// VK_END 的按下与抬起成对送入 ConPTY，避免留下幽灵按键状态。
+pub(crate) fn encode_plain_end(win32_input: bool) -> Vec<u8> {
+    let mods = ModifiersState::default();
+    if !win32_input {
+        return encode_named(NamedKey::End, mods).expect("End 必须有 VT 编码");
+    }
+
+    let (vk, uc) = win32_named_key(NamedKey::End).expect("End 必须有 win32 编码");
+    let mut bytes = encode_win32_key(vk, uc, mods, true);
+    bytes.extend_from_slice(&encode_win32_key(vk, uc, mods, false));
+    bytes
+}
+
 fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
     let seq: &[u8] = match key {
         NamedKey::Enter => b"\r",
@@ -168,12 +190,25 @@ fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_alternate_scroll;
+    use super::{encode_alternate_scroll, encode_plain_end};
 
     #[test]
     fn alternate_scroll_编码上下方向与档数() {
         assert_eq!(encode_alternate_scroll(true, 2), b"\x1b[A\x1b[A");
         assert_eq!(encode_alternate_scroll(false, 3), b"\x1b[B\x1b[B\x1b[B");
         assert_eq!(encode_alternate_scroll(true, 0), b"\x1b[A");
+    }
+
+    #[test]
+    fn 回到底部_普通vt发送无修饰end() {
+        assert_eq!(encode_plain_end(false), b"\x1b[F");
+    }
+
+    #[test]
+    fn 回到底部_win32发送end按下与抬起() {
+        assert_eq!(
+            encode_plain_end(true),
+            b"\x1b[35;0;0;1;0;1_\x1b[35;0;0;0;0;1_"
+        );
     }
 }
