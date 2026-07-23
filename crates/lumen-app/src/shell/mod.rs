@@ -107,6 +107,68 @@ pub struct ShellState {
     pub remote_ui: remote_ui::RemoteUiState,
     /// SSH 服务器列表、分组、拖放与编辑弹窗的跨帧状态。
     pub ssh_ui: ssh_ui::SshUiState,
+    /// SSH 密码/私钥仅驻留在本机内存中的单次连接对话框。
+    pub ssh_credentials: Option<SshCredentialDialog>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SshCredentialKind {
+    Password,
+    PrivateKey,
+}
+
+pub struct SshCredentialDialog {
+    profile_id: String,
+    profile_name: String,
+    expected_endpoint: String,
+    kind: SshCredentialKind,
+    password: String,
+    private_key_path: Option<std::path::PathBuf>,
+    key_passphrase: String,
+}
+
+impl SshCredentialDialog {
+    pub(crate) fn open(
+        profile_id: String,
+        profile_name: String,
+        expected_endpoint: String,
+        kind: SshCredentialKind,
+    ) -> Self {
+        Self {
+            profile_id,
+            profile_name,
+            expected_endpoint,
+            kind,
+            password: String::new(),
+            private_key_path: None,
+            key_passphrase: String::new(),
+        }
+    }
+}
+
+impl Drop for SshCredentialDialog {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.password.zeroize();
+        self.key_passphrase.zeroize();
+    }
+}
+
+pub enum SshRuntimeAction {
+    ConnectWithCredential {
+        profile_id: String,
+        expected_endpoint: String,
+        credential: lumen_ssh::Credential,
+    },
+    Disconnect,
+    TrustHostKey {
+        profile_id: String,
+        algorithm: String,
+        fingerprint: String,
+    },
+    DismissHostKey {
+        profile_id: String,
+    },
 }
 
 /// 激活 tab 中一个窗格的展示数据（终端工作区分屏用，F5）。
@@ -220,6 +282,10 @@ pub struct ShellInput<'a> {
     pub remote_devices: &'a [lumen_protocol::DeviceRecord],
     /// 当前账号（或未登录作用域）的 SSH 服务器与分组库存。
     pub ssh_inventory: &'a crate::ssh::SshInventory,
+    /// 当前激活 SSH 会话的连接/监控快照。
+    pub ssh_runtime: Option<&'a crate::ssh_runtime::RuntimeView>,
+    /// 当前激活 SSH 终端的离屏纹理。
+    pub ssh_terminal_tex: Option<egui::TextureId>,
     /// 当前选中的远程设备 id（高亮用）。
     pub active_device_id: Option<&'a str>,
     /// M5.3 远程控制：控制端待配对态（Some = 渲染配对码输入模态）。
@@ -259,6 +325,8 @@ pub enum OverwriteChoice {
 pub struct ShellOutput {
     /// 终端工作区整体矩形（egui 逻辑点坐标；拖放落点判定等用）。
     pub term_rect: egui::Rect,
+    /// SSH 中央区实际终端内容矩形（扣除状态栏与监控栏）。
+    pub ssh_terminal_rect: Option<egui::Rect>,
     /// 各窗格的**终端内容矩形**（与 [`ShellInput::panes`] 同序，已
     /// 对齐物理像素；F7① 起不含顶部标题栏——标题栏上的鼠标事件不
     /// 进终端）。main.rs 据此重建离屏纹理 / resize / 路由鼠标与 IME。
@@ -323,6 +391,8 @@ pub struct ShellOutput {
     /// SSH 服务器列表 UI 的增删改、拖放与连接动作；main 串行施加到
     /// 单 owner 存储，UI 不直接修改库存。
     pub ssh_actions: Vec<ssh_ui::SshUiAction>,
+    /// SSH 凭据、主机密钥确认与断开动作。
+    pub ssh_runtime_action: Option<SshRuntimeAction>,
     /// 选中了某远程设备（M5.2）：main 记 active_device_id。
     pub activate_device: Option<String>,
     /// 提交远程设备改名（M5.2）：(设备 id, 新名)。
@@ -514,6 +584,7 @@ pub fn show(
             .is_some_and(|sess| matches!(sess.role, lumen_protocol::remote::Role::Controller));
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
+        ssh_terminal_rect: None,
         pane_rects: Vec::new(),
         mirror_pane_rects: Vec::new(),
         term_clicked: false,
@@ -535,6 +606,7 @@ pub fn show(
         toggle_filetree: None,
         toggle_view_mode: None,
         ssh_actions: Vec::new(),
+        ssh_runtime_action: None,
         activate_device: None,
         rename_device: None,
         delete_device: None,
@@ -1138,26 +1210,7 @@ pub fn show(
             // SSH 服务器/会话使用独立领域；未选择服务器时不得渲染或
             // 命中后台本地终端。
             if is_ssh_view {
-                let message = st
-                    .ssh_ui
-                    .selected_profile_id()
-                    .and_then(|id| input.ssh_inventory.profile(id))
-                    .map_or_else(
-                        || crate::i18n::strings().ssh_select_server.to_owned(),
-                        |profile| {
-                            format!(
-                                "{}\n{}@{}:{}",
-                                profile.name, profile.username, profile.host, profile.port
-                            )
-                        },
-                    );
-                ui.painter().text(
-                    area.center(),
-                    egui::Align2::CENTER_CENTER,
-                    message,
-                    egui::FontId::proportional(16.0),
-                    pal.fg_dim,
-                );
+                ssh_workspace(ui, area, input, st, pal, &mut out);
                 return;
             }
 
@@ -2019,6 +2072,10 @@ pub fn show(
             }
         });
 
+    if is_ssh_view {
+        ssh_runtime_modals(root.ctx(), input, st, pal, &mut out);
+    }
+
     // 文件树节点拖放的落点判定：要等 CentralPanel 布局出本帧窗格
     // 矩形，故放在面板之后。落在某窗格 → 请求把路径插入**该窗格**
     // 的命令行（F5 批2：目标 = 鼠标落点所在窗格，main 会先聚焦它）；
@@ -2682,6 +2739,421 @@ fn draw_session_icon(ui: &egui::Ui, center: egui::Pos2, active: bool, pal: &them
         ],
         stroke,
     );
+}
+
+fn ssh_workspace(
+    ui: &mut egui::Ui,
+    area: egui::Rect,
+    input: &ShellInput<'_>,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+) {
+    use crate::ssh_runtime::ConnectionState;
+
+    let strings = crate::i18n::strings();
+    let Some(view) = input.ssh_runtime else {
+        let message = st
+            .ssh_ui
+            .selected_profile_id()
+            .and_then(|id| input.ssh_inventory.profile(id))
+            .map_or(strings.ssh_select_server, |_| strings.ssh_connect);
+        ui.painter().text(
+            area.center(),
+            egui::Align2::CENTER_CENTER,
+            message,
+            egui::FontId::proportional(16.0),
+            pal.fg_dim,
+        );
+        return;
+    };
+
+    const HEADER_HEIGHT: f32 = 48.0;
+    const MONITOR_WIDTH: f32 = 238.0;
+    const GAP: f32 = 1.0;
+    let header = egui::Rect::from_min_max(
+        area.min,
+        egui::pos2(area.max.x, (area.min.y + HEADER_HEIGHT).min(area.max.y)),
+    );
+    let body = egui::Rect::from_min_max(
+        egui::pos2(area.min.x, (header.max.y + GAP).min(area.max.y)),
+        area.max,
+    );
+    let show_monitor = body.width() >= 560.0;
+    let monitor = show_monitor.then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2((body.max.x - MONITOR_WIDTH).max(body.min.x), body.min.y),
+            body.max,
+        )
+    });
+    let terminal = egui::Rect::from_min_max(
+        body.min,
+        egui::pos2(
+            monitor.map_or(body.max.x, |rect| rect.min.x - GAP),
+            body.max.y,
+        ),
+    );
+    if terminal.width() >= 1.0 && terminal.height() >= 1.0 {
+        out.ssh_terminal_rect = Some(terminal);
+    }
+
+    ui.painter().rect_filled(header, 0.0, pal.bg_panel);
+    let mut header_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(header.shrink2(egui::vec2(12.0, 6.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    header_ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(&view.profile_name)
+                .strong()
+                .color(pal.fg),
+        );
+        ui.label(egui::RichText::new(&view.endpoint).small().color(pal.fg_dim));
+    });
+    header_ui.separator();
+    let (status_text, status_color) = ssh_status(view.state.clone(), pal);
+    header_ui.label(
+        egui::RichText::new(format!("● {status_text}"))
+            .small()
+            .color(status_color),
+    );
+    if let Some(detail) = &view.detail {
+        header_ui
+            .label(egui::RichText::new(detail).small().color(pal.fg_dim))
+            .on_hover_text(detail);
+    }
+    if matches!(
+        view.state,
+        ConnectionState::Connecting
+            | ConnectionState::Connected
+            | ConnectionState::Disconnecting
+    ) {
+        header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(
+                    view.state != ConnectionState::Disconnecting,
+                    egui::Button::new(strings.ssh_disconnect),
+                )
+                .clicked()
+            {
+                out.ssh_runtime_action = Some(SshRuntimeAction::Disconnect);
+            }
+        });
+    }
+
+    ui.painter().rect_filled(terminal, 0.0, pal.bg_dark);
+    if let Some(texture) = input.ssh_terminal_tex {
+        ui.put(
+            terminal,
+            egui::Image::new(egui::load::SizedTexture::new(texture, terminal.size())),
+        );
+    } else {
+        ui.painter().text(
+            terminal.center(),
+            egui::Align2::CENTER_CENTER,
+            status_text,
+            egui::FontId::proportional(15.0),
+            pal.fg_dim,
+        );
+    }
+    let terminal_response = ui.interact(
+        terminal,
+        ui.id().with("ssh_terminal"),
+        egui::Sense::click(),
+    );
+    if terminal_response.clicked() {
+        out.term_clicked = true;
+    }
+
+    if let Some(monitor_rect) = monitor {
+        ui.painter().rect_filled(monitor_rect, 0.0, pal.bg_panel);
+        let mut monitor_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(monitor_rect.shrink(12.0))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        monitor_ui.label(
+            egui::RichText::new(strings.ssh_monitor_title)
+                .strong()
+                .color(pal.fg),
+        );
+        monitor_ui.add_space(8.0);
+        if let Some(metrics) = &view.metrics {
+            ssh_metric_row(
+                &mut monitor_ui,
+                strings.ssh_monitor_cpu,
+                &metrics.cpu,
+                pal,
+            );
+            ssh_metric_row(
+                &mut monitor_ui,
+                strings.ssh_monitor_memory,
+                &metrics.memory,
+                pal,
+            );
+            ssh_metric_row(
+                &mut monitor_ui,
+                strings.ssh_monitor_load,
+                &metrics.load,
+                pal,
+            );
+            ssh_metric_row(
+                &mut monitor_ui,
+                strings.ssh_monitor_disk,
+                &metrics.root_disk,
+                pal,
+            );
+            ssh_metric_row(
+                &mut monitor_ui,
+                strings.ssh_monitor_network,
+                &metrics.network,
+                pal,
+            );
+            ssh_metric_row(
+                &mut monitor_ui,
+                strings.ssh_monitor_uptime,
+                &metrics.uptime,
+                pal,
+            );
+        } else {
+            monitor_ui.label(
+                egui::RichText::new(strings.ssh_monitor_waiting)
+                    .small()
+                    .color(pal.fg_dim),
+            );
+        }
+        if let Some(error) = &view.metrics_error {
+            monitor_ui.add_space(8.0);
+            monitor_ui.label(egui::RichText::new(error).small().color(pal.warn));
+        }
+        if let Some(changed) = &view.changed_host_key {
+            monitor_ui.add_space(12.0);
+            monitor_ui.label(
+                egui::RichText::new(strings.ssh_host_key_changed_title)
+                    .strong()
+                    .color(pal.error),
+            );
+            monitor_ui.label(
+                egui::RichText::new(strings.ssh_host_key_changed_message)
+                    .small()
+                    .color(pal.fg_dim),
+            );
+            monitor_ui.add_space(6.0);
+            monitor_ui.label(
+                egui::RichText::new(strings.ssh_host_key_expected)
+                    .small()
+                    .color(pal.fg_dim),
+            );
+            monitor_ui.monospace(format!(
+                "{}\n{}",
+                changed.expected_algorithm, changed.expected_sha256_fingerprint
+            ));
+            monitor_ui.label(
+                egui::RichText::new(strings.ssh_host_key_presented)
+                    .small()
+                    .color(pal.error),
+            );
+            monitor_ui.monospace(format!(
+                "{}\n{}",
+                changed.presented_algorithm, changed.presented_sha256_fingerprint
+            ));
+        }
+    }
+}
+
+fn ssh_metric_row(ui: &mut egui::Ui, label: &str, value: &str, pal: &theme::Palette) {
+    ui.label(egui::RichText::new(label).small().color(pal.fg_dim));
+    ui.label(egui::RichText::new(value).monospace().color(pal.fg));
+    ui.add_space(5.0);
+}
+
+fn ssh_status(
+    state: crate::ssh_runtime::ConnectionState,
+    pal: &theme::Palette,
+) -> (&'static str, egui::Color32) {
+    use crate::ssh_runtime::ConnectionState;
+    let strings = crate::i18n::strings();
+    match state {
+        ConnectionState::CredentialRequired => (strings.ssh_status_credentials, pal.warn),
+        ConnectionState::Connecting => (strings.ssh_status_connecting, pal.warn),
+        ConnectionState::AwaitingHostKey => (strings.ssh_status_host_key, pal.warn),
+        ConnectionState::Connected => (strings.ssh_status_connected, pal.success),
+        ConnectionState::Disconnecting => (strings.ssh_status_disconnecting, pal.warn),
+        ConnectionState::Disconnected => (strings.ssh_status_disconnected, pal.fg_dim),
+        ConnectionState::Error => (strings.ssh_status_error, pal.error),
+        ConnectionState::HostKeyChanged => (strings.ssh_status_host_key_changed, pal.error),
+    }
+}
+
+fn ssh_runtime_modals(
+    ctx: &egui::Context,
+    input: &ShellInput<'_>,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+) {
+    let strings = crate::i18n::strings();
+    let mut submit_credentials = false;
+    let mut cancel_credentials = false;
+    if let Some(dialog) = st.ssh_credentials.as_mut() {
+        let title = match dialog.kind {
+            SshCredentialKind::Password => strings.ssh_password_title,
+            SshCredentialKind::PrivateKey => strings.ssh_private_key_title,
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("ssh_credentials_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(
+                    egui::RichText::new(&dialog.profile_name)
+                        .strong()
+                        .color(pal.fg),
+                );
+                ui.add_space(8.0);
+                match dialog.kind {
+                    SshCredentialKind::Password => {
+                        ui.label(strings.ssh_password_prompt);
+                        secure_password_edit(
+                            ui,
+                            "ssh_password_once",
+                            egui::TextEdit::singleline(&mut dialog.password)
+                                .password(true)
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                    SshCredentialKind::PrivateKey => {
+                        ui.label(strings.ssh_private_key_file);
+                        ui.horizontal(|ui| {
+                            let path = dialog
+                                .private_key_path
+                                .as_ref()
+                                .map_or_else(|| "—".to_owned(), |path| path.display().to_string());
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(path).small().color(pal.fg_dim))
+                                    .truncate(),
+                            );
+                            if ui.button(strings.ssh_choose_private_key).clicked() {
+                                dialog.private_key_path = rfd::FileDialog::new()
+                                    .set_title(strings.ssh_choose_private_key)
+                                    .pick_file();
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.label(strings.ssh_key_passphrase);
+                        secure_password_edit(
+                            ui,
+                            "ssh_key_passphrase_once",
+                            egui::TextEdit::singleline(&mut dialog.key_passphrase)
+                                .password(true)
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(strings.ssh_credentials_memory_only)
+                        .small()
+                        .color(pal.fg_dim),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(strings.ssh_cancel).clicked() {
+                        cancel_credentials = true;
+                    }
+                    let enabled = match dialog.kind {
+                        SshCredentialKind::Password => !dialog.password.is_empty(),
+                        SshCredentialKind::PrivateKey => dialog.private_key_path.is_some(),
+                    };
+                    if ui
+                        .add_enabled(enabled, egui::Button::new(strings.ssh_connect))
+                        .clicked()
+                    {
+                        submit_credentials = true;
+                    }
+                });
+            });
+    }
+    if cancel_credentials {
+        st.ssh_credentials = None;
+    } else if submit_credentials {
+        if let Some(mut dialog) = st.ssh_credentials.take() {
+            let credential = match dialog.kind {
+                SshCredentialKind::Password => {
+                    lumen_ssh::Credential::password(std::mem::take(&mut dialog.password))
+                }
+                SshCredentialKind::PrivateKey => {
+                    let Some(path) = dialog.private_key_path.take() else {
+                        return;
+                    };
+                    let passphrase = (!dialog.key_passphrase.is_empty()).then(|| {
+                        lumen_ssh::SecretString::new(std::mem::take(&mut dialog.key_passphrase))
+                    });
+                    lumen_ssh::Credential::private_key(path, passphrase)
+                }
+            };
+            out.ssh_runtime_action = Some(SshRuntimeAction::ConnectWithCredential {
+                profile_id: dialog.profile_id.clone(),
+                expected_endpoint: dialog.expected_endpoint.clone(),
+                credential,
+            });
+        }
+    }
+
+    let unknown = input
+        .ssh_runtime
+        .and_then(|view| view.unknown_host_key.as_ref());
+    if let Some(host_key) = unknown {
+        let mut accept = false;
+        let mut dismiss = false;
+        egui::Window::new(strings.ssh_host_key_unknown_title)
+            .id(egui::Id::new("ssh_host_key_unknown_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                ui.label(
+                    egui::RichText::new(strings.ssh_host_key_unknown_message).color(pal.warn),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(strings.ssh_host_key_algorithm)
+                        .small()
+                        .color(pal.fg_dim),
+                );
+                ui.monospace(&host_key.algorithm);
+                ui.label(
+                    egui::RichText::new(strings.ssh_host_key_fingerprint)
+                        .small()
+                        .color(pal.fg_dim),
+                );
+                ui.monospace(&host_key.sha256_fingerprint);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(strings.ssh_cancel).clicked() {
+                        dismiss = true;
+                    }
+                    if ui.button(strings.ssh_host_key_accept).clicked() {
+                        accept = true;
+                    }
+                });
+            });
+        if accept {
+            out.ssh_runtime_action = Some(SshRuntimeAction::TrustHostKey {
+                profile_id: host_key.profile_id.clone(),
+                algorithm: host_key.algorithm.clone(),
+                fingerprint: host_key.sha256_fingerprint.clone(),
+            });
+        } else if dismiss {
+            out.ssh_runtime_action = Some(SshRuntimeAction::DismissHostKey {
+                profile_id: host_key.profile_id.clone(),
+            });
+        }
+    }
 }
 
 #[cfg(test)]

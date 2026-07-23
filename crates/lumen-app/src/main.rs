@@ -53,6 +53,7 @@ mod settings;
 // P1 SSH：领域库存先独立落地，UI/连接/同步分批接线。
 #[allow(dead_code)]
 mod ssh;
+mod ssh_runtime;
 mod shell;
 mod single_instance;
 // M3.8 批2 Snap Layouts 子类化（仅 Windows）。
@@ -130,6 +131,11 @@ const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_
 /// M5.3 part3b 控制端镜像的离屏纹理保留 id（避开自增的会话 id，取 `u64::MAX`）。
 /// 镜像 `Terminal` 复用窗格同款 wgpu 渲染器画进此 id 的离屏纹理（上色/属性/光标）。
 const MIRROR_OFFSCREEN_ID: session::SessionId = u64::MAX;
+
+/// SSH active terminal's dedicated renderer target. Keep it below the full
+/// mirror reservation (`MAX`, then `MAX-1..MAX-MAX_PANES`) so no terminal
+/// domain can alias another domain's texture or row cache.
+const SSH_OFFSCREEN_ID: session::SessionId = MIRROR_OFFSCREEN_ID - 2 - MAX_PANES as u64;
 
 /// part3d 被控端镜像源签名：订阅会话的 `(tab_id, 各窗格(id,行,列), 焦点下标, 最大化下标)`。
 /// 变化即重发全部窗格整屏快照 + 布局（`SubscriptionStarted`）。
@@ -584,6 +590,25 @@ struct ScrollbarGeom {
     scrollback: usize,
 }
 
+fn ssh_profile_draft(
+    profile: &ssh::SshProfile,
+    trusted_host_key: Option<ssh::HostKeyTrust>,
+) -> ssh::NewSshProfile {
+    ssh::NewSshProfile {
+        name: profile.name.clone(),
+        host: profile.host.clone(),
+        port: profile.port,
+        username: profile.username.clone(),
+        auth_method: profile.auth_method,
+        group_id: profile.group_id.clone(),
+        initial_directory: profile.initial_directory.clone(),
+        connect_timeout_secs: profile.connect_timeout_secs,
+        keep_alive_secs: profile.keep_alive_secs,
+        monitor_enabled: profile.monitor_enabled,
+        trusted_host_key,
+    }
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -651,6 +676,13 @@ struct AppState {
     /// 数据目录不可用或库存损坏时的只读空库存，保证 SSH 页面仍可打开
     /// 并展示明确错误，而不是把损坏文件覆盖成空数据。
     ssh_empty_inventory: ssh::SshInventory,
+    /// SSH transports and terminal state, isolated from local PTYs and remote
+    /// mirrors. Sessions remain alive while another mode or the lock is shown.
+    ssh_runtime: ssh_runtime::SshRuntime,
+    /// Stable egui binding for [`SSH_OFFSCREEN_ID`].
+    ssh_texture: Option<egui::TextureId>,
+    /// Active SSH terminal content rectangle in physical pixels.
+    ssh_rect_px: Option<(f32, f32, f32, f32)>,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     /// 最近一次按键时刻（端到端延迟埋点用，跟随激活会话即可）。
@@ -1142,6 +1174,9 @@ impl AppState {
             .clear_sensitive_for_app_lock();
         self.shell_state.remote_ui.reset();
         self.shell_state.ssh_ui.close_for_app_lock();
+        // Dropping the one-shot dialog zeroizes password/passphrase buffers.
+        // The SSH actors themselves intentionally continue in the background.
+        self.shell_state.ssh_credentials = None;
         self.lock_ui.clear();
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
@@ -1813,18 +1848,22 @@ impl AppState {
     }
 
     /// 当前工作模式和覆盖层是否允许把键盘/IME 焦点交给终端。
-    ///
-    /// SSH 终端接入前，SSH 模式必须始终返回 false，避免任何后台本地
-    /// Session 因 tab 激活、弹窗关闭等旁路重新获得输入。
     fn terminal_focus_allowed(&self) -> bool {
-        !self.settings.layout.view_mode.is_ssh()
-            && !(self.shell_state.settings.open
-                || self.shell_state.login.open
-                || self.shell_state.history_search.open
-                || self.shell_state.completion.open
-                || self.shell_state.renaming.is_some()
-                || self.shell_state.pane_renaming.is_some()
-                || self.shell_state.filetree.dialog_open())
+        let ssh_overlay = self.settings.layout.view_mode.is_ssh()
+            && (self.shell_state.ssh_credentials.is_some()
+                || self.ssh_runtime.active_blocks_input());
+        let overlay = self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.history_search.open
+            || self.shell_state.completion.open
+            || self.shell_state.renaming.is_some()
+            || self.shell_state.pane_renaming.is_some()
+            || self.shell_state.filetree.dialog_open()
+            || ssh_overlay;
+        if overlay {
+            return false;
+        }
+        !self.settings.layout.view_mode.is_ssh() || self.ssh_runtime.active_accepts_input()
     }
 
     /// 工作模式切换的唯一状态入口。保持后台本地 PTY / 远程连接运行，
@@ -1837,6 +1876,11 @@ impl AppState {
         // 必须在改 view_mode 前补发 Release：远程镜像输入路由依赖旧模式。
         self.release_held_report_buttons();
         self.settings.layout.view_mode = next;
+        if !next.is_ssh() {
+            // A credential prompt is one-shot local state, not a connection.
+            // Switching away drops and zeroizes it; established actors remain.
+            self.shell_state.ssh_credentials = None;
+        }
 
         self.terminal_focused = self.terminal_focus_allowed();
         self.filetree_hovered = false;
@@ -1850,6 +1894,7 @@ impl AppState {
         self.pane_close_rects_px.clear();
         self.divider_rects_px.clear();
         self.panel_resize_rects_px.clear();
+        self.ssh_rect_px = None;
         self.mirror_rect_px = None;
         self.mirror_pane_rects_px.clear();
         self.remote_ws.clear_mirror_selection();
@@ -1879,10 +1924,8 @@ impl AppState {
 
         for action in actions {
             if let SshUiAction::ConnectProfile { id } = &action {
-                // 连接层接线前先保留稳定选择；后续由同一动作入口启动
-                // 独立 SSH actor，不会让 UI 直接持有连接对象。
                 self.shell_state.ssh_ui.select_profile(Some(id.clone()));
-                info!("请求连接 SSH 服务器配置 {id}");
+                self.begin_ssh_profile_connect(id);
                 continue;
             }
 
@@ -1895,6 +1938,7 @@ impl AppState {
             };
 
             let mut created_profile = None;
+            let mut deleted_profile = None;
             let result = match action {
                 SshUiAction::CreateGroup { name } => store.create_group(&name).map(|_| ()),
                 SshUiAction::RenameGroup { id, name } => store.rename_group(&id, &name),
@@ -1903,7 +1947,9 @@ impl AppState {
                     created_profile = Some(id);
                 }),
                 SshUiAction::UpdateProfile { id, draft } => store.update_profile(&id, draft),
-                SshUiAction::DeleteProfile { id } => store.delete_profile(&id),
+                SshUiAction::DeleteProfile { id } => store.delete_profile(&id).map(|()| {
+                    deleted_profile = Some(id);
+                }),
                 SshUiAction::MoveProfile {
                     id,
                     target_group_id,
@@ -1916,6 +1962,12 @@ impl AppState {
                     if let Some(id) = created_profile {
                         self.shell_state.ssh_ui.select_profile(Some(id));
                     }
+                    if let Some(id) = deleted_profile {
+                        self.ssh_runtime.remove_profile(&id);
+                        self.shell_state.ssh_credentials = None;
+                        self.ssh_rect_px = None;
+                        self.terminal_focused = false;
+                    }
                     self.window.request_redraw();
                 }
                 Err(error) => {
@@ -1926,6 +1978,215 @@ impl AppState {
                     self.window.request_redraw();
                 }
             }
+        }
+    }
+
+    fn begin_ssh_profile_connect(&mut self, profile_id: &str) {
+        let profile = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.inventory().profile(profile_id))
+            .cloned();
+        let Some(profile) = profile else {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器配置不存在或存储不可用",
+            );
+            return;
+        };
+
+        use ssh_runtime::ConnectIntent;
+        match self.ssh_runtime.select_for_connect(&profile) {
+            ConnectIntent::AlreadyRunning => {
+                self.terminal_focused = self.terminal_focus_allowed();
+            }
+            ConnectIntent::Password => {
+                self.terminal_focused = false;
+                self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
+                    profile.id,
+                    profile.name,
+                    format!("{}@{}:{}", profile.username, profile.host, profile.port),
+                    shell::SshCredentialKind::Password,
+                ));
+            }
+            ConnectIntent::PrivateKey => {
+                self.terminal_focused = false;
+                self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
+                    profile.id,
+                    profile.name,
+                    format!("{}@{}:{}", profile.username, profile.host, profile.port),
+                    shell::SshCredentialKind::PrivateKey,
+                ));
+            }
+            ConnectIntent::Agent => {
+                self.start_ssh_connection(&profile, lumen_ssh::Credential::agent());
+            }
+            ConnectIntent::AwaitingHostKey | ConnectIntent::HostKeyChanged => {
+                self.terminal_focused = false;
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    fn start_ssh_connection(
+        &mut self,
+        profile: &ssh::SshProfile,
+        credential: lumen_ssh::Credential,
+    ) {
+        match self.ssh_runtime.start(profile, credential) {
+            Ok(()) => {
+                self.terminal_focused = false;
+                self.window.request_redraw();
+            }
+            Err(error) => {
+                self.terminal_focused = false;
+                self.shell_state
+                    .toast
+                    .push(shell::toast::ToastKind::Error, error);
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn apply_ssh_runtime_action(&mut self, action: shell::SshRuntimeAction) {
+        use shell::SshRuntimeAction;
+        match action {
+            SshRuntimeAction::ConnectWithCredential {
+                profile_id,
+                expected_endpoint,
+                credential,
+            } => {
+                let profile = self
+                    .ssh_store
+                    .as_ref()
+                    .and_then(|store| store.inventory().profile(&profile_id))
+                    .cloned();
+                let Some(profile) = profile else {
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 服务器配置已不存在",
+                    );
+                    return;
+                };
+                let target_matches = expected_endpoint
+                    == format!("{}@{}:{}", profile.username, profile.host, profile.port);
+                let credential_matches = target_matches
+                    && matches!(
+                    (&credential, profile.auth_method),
+                    (lumen_ssh::Credential::Password(_), ssh::AuthMethod::Password)
+                        | (
+                            lumen_ssh::Credential::PrivateKey(_),
+                            ssh::AuthMethod::PrivateKey
+                        )
+                        | (lumen_ssh::Credential::Agent, ssh::AuthMethod::Agent)
+                    );
+                if credential_matches {
+                    self.start_ssh_connection(&profile, credential);
+                } else {
+                    // A profile edited while its dialog was open must not send
+                    // stale credentials under the new authentication method.
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 认证方式已变化，请重新连接并输入凭据",
+                    );
+                }
+            }
+            SshRuntimeAction::Disconnect => {
+                self.ssh_runtime.disconnect_active();
+                self.terminal_focused = false;
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::DismissHostKey { profile_id } => {
+                self.ssh_runtime.dismiss_unknown_host_key(&profile_id);
+                self.terminal_focused = false;
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::TrustHostKey {
+                profile_id,
+                algorithm,
+                fingerprint,
+            } => {
+                let current_profile = self
+                    .ssh_store
+                    .as_ref()
+                    .and_then(|store| store.inventory().profile(&profile_id))
+                    .cloned();
+                let exact_pending = self
+                    .ssh_runtime
+                    .active_view()
+                    .and_then(|view| {
+                        view.unknown_host_key
+                            .map(|pending| (view.endpoint, pending))
+                    })
+                    .zip(current_profile.as_ref())
+                    .is_some_and(|((endpoint, pending), profile)| {
+                        endpoint
+                            == format!("{}@{}:{}", profile.username, profile.host, profile.port)
+                            && pending.profile_id == profile_id
+                            && pending.algorithm == algorithm
+                            && pending.sha256_fingerprint == fingerprint
+                    });
+                if !exact_pending {
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 主机密钥确认已过期，请重新连接",
+                    );
+                    return;
+                }
+                let Some(profile) = current_profile else {
+                    return;
+                };
+                let draft = ssh_profile_draft(
+                    &profile,
+                    Some(ssh::HostKeyTrust {
+                        algorithm: algorithm.clone(),
+                        fingerprint: fingerprint.clone(),
+                    }),
+                );
+                let result = self
+                    .ssh_store
+                    .as_mut()
+                    .ok_or_else(|| "SSH 配置存储不可用".to_owned())
+                    .and_then(|store| {
+                        store
+                            .update_profile(&profile_id, draft)
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = result {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                    return;
+                }
+                if self.ssh_runtime.confirm_unknown_host_key(
+                    &profile_id,
+                    &algorithm,
+                    &fingerprint,
+                ) {
+                    // Never cache/reuse the credential that reached the first
+                    // host-key probe. Password/private-key modes prompt again.
+                    self.begin_ssh_profile_connect(&profile_id);
+                }
+            }
+        }
+    }
+
+    fn drain_ssh_runtime(&mut self) {
+        let outcome = self.ssh_runtime.drain();
+        if self.settings.layout.view_mode.is_ssh() && self.ssh_runtime.active_blocks_input() {
+            self.terminal_focused = false;
+        } else if outcome.active_became_connected
+            && self.settings.layout.view_mode.is_ssh()
+            && self.ssh_runtime.active_accepts_input()
+            && self.shell_state.ssh_credentials.is_none()
+        {
+            self.terminal_focused = true;
+        }
+        if !self.app_lock.is_locked()
+            && self.settings.layout.view_mode.is_ssh()
+            && (outcome.active_terminal_changed || outcome.active_status_changed)
+        {
+            self.window.request_redraw();
         }
     }
 
@@ -2423,6 +2684,48 @@ impl AppState {
             .position(|p| p.id == *sid)
     }
 
+    fn ssh_modal_open(&self) -> bool {
+        self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.ssh_credentials.is_some()
+            || self.ssh_runtime.active_blocks_input()
+    }
+
+    fn routes_input_to_ssh(&self) -> bool {
+        ssh_runtime::should_route_terminal_input(
+            self.settings.layout.view_mode,
+            self.terminal_focused,
+            self.ssh_modal_open(),
+            self.ssh_runtime.active_accepts_input(),
+        )
+    }
+
+    fn mouse_in_ssh_terminal(&self) -> bool {
+        if !self.settings.layout.view_mode.is_ssh() || self.mouse_on_panel_resize() {
+            return false;
+        }
+        let Some((x, y, width, height)) = self.ssh_rect_px else {
+            return false;
+        };
+        let (mouse_x, mouse_y) = self.mouse_pos;
+        if mouse_x < f64::from(x)
+            || mouse_y < f64::from(y)
+            || mouse_x >= f64::from(x + width)
+            || mouse_y >= f64::from(y + height)
+        {
+            return false;
+        }
+        let points_per_pixel = self.egui_ctx.pixels_per_point();
+        let position = egui::pos2(
+            mouse_x as f32 / points_per_pixel,
+            mouse_y as f32 / points_per_pixel,
+        );
+        !self
+            .egui_ctx
+            .layer_id_at(position)
+            .is_some_and(|layer| layer.order != egui::Order::Background)
+    }
+
     /// 鼠标当前位置是否落在某个窗格关闭按钮上（上一帧布局的命中区，
     /// 与 pane_rects_px 同源同陈旧度）。
     fn mouse_on_pane_close(&self) -> bool {
@@ -2624,6 +2927,27 @@ impl AppState {
             return;
         }
         self.window.set_ime_allowed(true);
+        if self.settings.layout.view_mode.is_ssh() {
+            let Some((px, py, _, _)) = self.ssh_rect_px else {
+                return;
+            };
+            let Some((row, column, _)) = self.ssh_runtime.active_cursor() else {
+                return;
+            };
+            let (cell_width, cell_height) = self.renderer.cell_size();
+            let (cursor_x, cursor_y) = self.renderer.cell_origin(row, column);
+            self.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(
+                    f64::from(px + cursor_x),
+                    f64::from(py + cursor_y),
+                ),
+                winit::dpi::PhysicalSize::new(
+                    f64::from(cell_width),
+                    f64::from(cell_height),
+                ),
+            );
+            return;
+        }
         // M5.3 part4c：镜像态把候选框定位到**镜像光标**（被控端光标）在终端区的像素位置，
         // 使控制端打中文时候选框出现在远端光标处（跟随态有效；回看态 mirror_cursor=None
         // 则跳过本次定位，候选框留在上次位置）。
@@ -6034,6 +6358,9 @@ impl App {
             profile: user_profile,
             ssh_store,
             ssh_empty_inventory: ssh::SshInventory::default(),
+            ssh_runtime: ssh_runtime::SshRuntime::default(),
+            ssh_texture: None,
+            ssh_rect_px: None,
             modifiers: ModifiersState::default(),
             clipboard,
             last_key_at: None,
@@ -6283,6 +6610,7 @@ impl ApplicationHandler<PtyWake> for App {
         // 应用锁密码线程复用 PtyWake 唤醒主循环；先提交结果，再处理
         // PTY/远程事件，解锁首帧即可与最新终端状态对齐。
         state.drain_lock_crypto();
+        state.drain_ssh_runtime();
         // F3：drain 更新消息（发现新版/检查结果/下载完成）。下载完成会拉起
         // 安装器并请求优雅退出——走与 CloseRequested 同路径（落盘 + flush
         // 历史 + exit），让安装器替换 exe。
@@ -6802,6 +7130,17 @@ impl ApplicationHandler<PtyWake> for App {
         //   （其余仍在同步区间的窗格由 RedrawRequested 的逐窗格门控
         //   各自跳过，保留上一完整帧）。
         let now = Instant::now();
+        // SSH actors intentionally do not share the local PTY wake channel.
+        // Poll only while at least one actor exists, at ~30fps. This keeps
+        // background sessions and monitoring current even behind the app lock,
+        // while an idle app returns to ControlFlow::Wait with no busy loop.
+        if state.ssh_runtime.has_live_connections() {
+            state.drain_ssh_runtime();
+        }
+        let ssh_poll_at = state
+            .ssh_runtime
+            .has_live_connections()
+            .then(|| now + Duration::from_millis(33));
 
         // 应用锁退避与自动入口。软件锁默认关闭；所有入口都先经过
         // is_enabled 门控，因此缺少 app_lock.json 的旧用户零行为变化。
@@ -6857,7 +7196,7 @@ impl ApplicationHandler<PtyWake> for App {
             return;
         }
         // 未到点计划中的最早时刻（含 egui 计划）。
-        let mut wake: Option<Instant> = None;
+        let mut wake: Option<Instant> = ssh_poll_at;
         if state.app_lock.is_enabled()
             && !state.app_lock.is_locked()
             && state.app_lock.config().idle_timeout_minutes() > 0
@@ -7034,8 +7373,8 @@ impl ApplicationHandler<PtyWake> for App {
             matches!(event, WindowEvent::Ime(_)) && state.ime_should_route_to_composer();
         let bypass_egui = matches!(event, WindowEvent::RedrawRequested)
             || (!state.app_lock.is_locked()
-                && !state.settings.layout.view_mode.is_ssh()
-                && state.terminal_focused
+                && ((!state.settings.layout.view_mode.is_ssh() && state.terminal_focused)
+                    || state.routes_input_to_ssh())
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
@@ -7169,9 +7508,16 @@ impl ApplicationHandler<PtyWake> for App {
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // SSH 模式尚未接入独立会话路由时，键盘只交给上方 egui
-                //（顶栏/设置/表单），绝不落入后台本地 PTY。
                 if state.settings.layout.view_mode.is_ssh() {
+                    if event.state == ElementState::Pressed && state.routes_input_to_ssh() {
+                        if let Some(bytes) = input::encode_key(&event, state.modifiers) {
+                            if let Err(error) = state.ssh_runtime.send_input(bytes) {
+                                log::warn!("SSH 输入发送失败: {error}");
+                            } else {
+                                state.last_key_at = Some(Instant::now());
+                            }
+                        }
+                    }
                     return;
                 }
                 // —— M4.1 批B：事件 → keymap 查表 → Action → dispatch ——
@@ -7615,6 +7961,9 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x, position.y);
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
 
                 // 镜像态（远程视图）：拖选进行中则更新选区终点并 return；其余
                 // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
@@ -7754,6 +8103,9 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
                 // F10：指针移出窗口，清除链接 hover 态（否则离屏纹理里残留
                 // 一条 hover 下划线，直到该窗格下次重渲才消失）。probe 也清成
                 // None，原格重入时不会因 probe 相等而跳过重新探测。
@@ -7772,6 +8124,21 @@ impl ApplicationHandler<PtyWake> for App {
                 state.release_held_report_buttons();
             }
             WindowEvent::Focused(focused) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if state
+                        .ssh_runtime
+                        .active_terminal()
+                        .is_some_and(lumen_term::Terminal::focus_event)
+                    {
+                        let sequence = if focused {
+                            b"\x1b[I".to_vec()
+                        } else {
+                            b"\x1b[O".to_vec()
+                        };
+                        let _ = state.ssh_runtime.send_input(sequence);
+                    }
+                    return;
+                }
                 // 失焦相当于交互中断：向焦点窗格补发配对 Release 再清按住态
                 // 与 motion 节流缓存。winit 在失活、非自愿丢失指针捕获时不会
                 // 合成按键释放——不补发则程序留下幻影按住、本地 held 卡住后
@@ -7795,7 +8162,15 @@ impl ApplicationHandler<PtyWake> for App {
                 state: btn_state,
                 button,
                 ..
-            } => match (button, btn_state) {
+            } => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if button == MouseButton::Left && btn_state == ElementState::Pressed {
+                        state.terminal_focused =
+                            state.mouse_in_ssh_terminal() && state.terminal_focus_allowed();
+                    }
+                    return;
+                }
+                match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
                     // 无边框窗口边缘拖动 resize（左/右/下及下方两角）：命中窗口
                     // 外缘则记下方向、下一帧 RedrawRequested 内发起系统 resize 拖动
@@ -8212,8 +8587,9 @@ impl ApplicationHandler<PtyWake> for App {
                 (MouseButton::Middle, ElementState::Released) if state.is_mirror_active() => {
                     state.report_mirror_mouse_button(MouseButton::Middle, false);
                 }
-                _ => {}
-            },
+                    _ => {}
+                }
+            }
             // IME 组合开始（焦点失而复得后的首个组合串关键）：立即把候选框
             // 钉到焦点窗格光标，**别等下一帧 RedrawRequested**——否则首字组合串
             // 会用 egui 残留的左上角位置画在最左、且 OS 自绘组合串成孤儿删不掉
@@ -8227,6 +8603,11 @@ impl ApplicationHandler<PtyWake> for App {
             // text 为空或 cursor_range 为 None + 空串 → 清空预编辑（预编辑取消）。
             // 其余态：事件本身已由 egui-winit 处理（路由已交 egui），此处忽略。
             WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    // The platform IME owns composition; only Commit is sent
+                    // to the remote UTF-8 terminal.
+                    return;
+                }
                 // 激进修复（composer Win10）：焦点翻转期首字也归 composer。
                 let route = state.ime_should_route_to_composer();
                 log::info!(
@@ -8267,6 +8648,18 @@ impl ApplicationHandler<PtyWake> for App {
                 let _ = (text, cursor);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if state.routes_input_to_ssh() {
+                        if let Err(error) =
+                            state.ssh_runtime.send_input(text.into_bytes())
+                        {
+                            log::warn!("SSH IME 文本发送失败: {error}");
+                        } else {
+                            state.last_key_at = Some(Instant::now());
+                        }
+                    }
+                    return;
+                }
                 // 仅终端聚焦时把 IME 提交文本写入 shell（焦点窗格）；
                 // egui 输入框聚焦时事件已喂给 egui 消化，再写 PTY 就是
                 // 双投。激进修复（composer Win10）：焦点翻转期 Compose 态
@@ -8317,6 +8710,21 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if !state.mouse_in_ssh_terminal() {
+                        return;
+                    }
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
+                        MouseScrollDelta::PixelDelta(position) => {
+                            (position.y / f64::from(state.renderer.cell_size().1)) as isize
+                        }
+                    };
+                    if state.ssh_runtime.scroll_active(lines) {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
                 // 终端窗格区内滚轮归终端，区外（侧栏等）归 egui；滚动
                 // 作用于**焦点窗格**（F5 拍板：键盘/IME/滚轮/选区全部
                 // 跟焦点，悬停别的窗格不抢路由——要滚哪个先点哪个）。
@@ -8993,6 +9401,21 @@ impl ApplicationHandler<PtyWake> for App {
                 // 状态栏文件传输进度（控制端活跃 Fetch/Put 聚合；空闲 None → 状态栏照常显示 cwd）。
                 // owned，借给 shell_input；须在其前算、生命周期覆盖本帧渲染。
                 let transfer_status = state.remote_ws.transfer_status();
+                if state.settings.layout.view_mode.is_ssh()
+                    && state.ssh_runtime.has_active_terminal()
+                    && state.ssh_texture.is_none()
+                {
+                    state.renderer.ensure_offscreen(SSH_OFFSCREEN_ID, 1, 1);
+                    if let Some(view) = state.renderer.offscreen_view(SSH_OFFSCREEN_ID) {
+                        state.ssh_texture =
+                            Some(state.egui_renderer.register_native_texture(
+                                state.renderer.device(),
+                                view,
+                                wgpu::FilterMode::Nearest,
+                            ));
+                    }
+                }
+                let ssh_runtime_view = state.ssh_runtime.active_view();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -9068,6 +9491,8 @@ impl ApplicationHandler<PtyWake> for App {
                         .ssh_store
                         .as_ref()
                         .map_or(&state.ssh_empty_inventory, ssh::SshStore::inventory),
+                    ssh_runtime: ssh_runtime_view.as_ref(),
+                    ssh_terminal_tex: state.ssh_texture,
                     active_device_id: state.remote.active_device_id.as_deref(),
                     remote_pairing: state.remote_ws.pairing.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
@@ -9602,8 +10027,11 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 let ssh_actions = std::mem::take(&mut shell_out.ssh_actions);
                 state.apply_ssh_ui_actions(ssh_actions);
+                if let Some(action) = shell_out.ssh_runtime_action.take() {
+                    state.apply_ssh_runtime_action(action);
+                }
                 if shell_out.term_clicked {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
                 // 文件树面板悬停态存到下一帧：winit 层 Ctrl+C/V 快捷键的门控（鼠标在文件树面板内）。
                 state.filetree_hovered = shell_out.filetree_hovered;
@@ -9689,7 +10117,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || (was_pane_renaming && shell_out.pane_rename_ended_by_key)
                     || shell_out.rename_device_ended_by_key
                 {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
                 // —— egui 弹层（右键菜单/头像菜单等 Popup）焦点路由 ——
                 // 打开期间键盘恒归 egui：右键打开菜单不经过左键焦点
@@ -9712,7 +10140,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.completion.open
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
                 state.was_popup_open = popup_open;
 
@@ -10194,7 +10622,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // 叠层场景），后判打开保证焦点不被错误交还终端 ——
                 if shell_out.settings_closed || shell_out.login_closed {
                     // 关闭后焦点交还终端（IME 强制复位链路每帧照旧执行）。
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
 
                 // —— 历史搜索面板（M4.3）输出处理 ——
@@ -10819,6 +11247,49 @@ impl ApplicationHandler<PtyWake> for App {
                 // 矩形应用与终端渲染（egui 呈现旧画面一帧，与 activate
                 // 的「先切再补帧」同款瞬态），请求下一帧按新结构重来。
                 let ppp = full_output.pixels_per_point;
+                if state.settings.layout.view_mode.is_ssh() {
+                    state.ssh_rect_px = shell_out.ssh_terminal_rect.and_then(|rect| {
+                        let (width, height) = (rect.width(), rect.height());
+                        (width.is_finite()
+                            && height.is_finite()
+                            && width >= 1.0
+                            && height >= 1.0)
+                            .then(|| {
+                                let x0 = (rect.min.x * ppp).round();
+                                let y0 = (rect.min.y * ppp).round();
+                                let x1 = (rect.max.x * ppp).round();
+                                let y1 = (rect.max.y * ppp).round();
+                                (x0, y0, x1 - x0, y1 - y0)
+                            })
+                    });
+                    if let Some((_, _, width, height)) = state.ssh_rect_px {
+                        let texture_width = width.max(1.0) as u32;
+                        let texture_height = height.max(1.0) as u32;
+                        if state.renderer.ensure_offscreen(
+                            SSH_OFFSCREEN_ID,
+                            texture_width,
+                            texture_height,
+                        ) {
+                            if let (Some(view), Some(texture)) = (
+                                state.renderer.offscreen_view(SSH_OFFSCREEN_ID),
+                                state.ssh_texture,
+                            ) {
+                                state.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    state.renderer.device(),
+                                    view,
+                                    wgpu::FilterMode::Nearest,
+                                    texture,
+                                );
+                            }
+                        }
+                        let (rows, columns) = state
+                            .renderer
+                            .grid_size_for(texture_width, texture_height);
+                        state.ssh_runtime.resize_active(rows, columns);
+                    }
+                } else {
+                    state.ssh_rect_px = None;
+                }
                 // 面板拖宽手柄命中区（P10）：raw 鼠标让位判定用
                 // （mouse_on_panel_resize）。与窗格结构无关，无条件
                 // 按本帧布局更新（文件树收起时本帧为空 = 不让位）。
@@ -11245,6 +11716,33 @@ impl ApplicationHandler<PtyWake> for App {
                             error!("渲染失败: {e:#}");
                         }
                         rendered += 1;
+                    }
+                }
+                if state.settings.layout.view_mode.is_ssh()
+                    && state.ssh_texture.is_some()
+                    && state.ssh_rect_px.is_some()
+                {
+                    if let Some(terminal) = state.ssh_runtime.active_terminal_mut() {
+                        terminal.grid_mut().take_dirty();
+                    }
+                    let cursor = state
+                        .ssh_runtime
+                        .active_cursor()
+                        .unwrap_or((0, 0, false));
+                    let (renderer, runtime) = (&mut state.renderer, &state.ssh_runtime);
+                    if let Some(terminal) = runtime.active_terminal() {
+                        if let Err(error) = renderer.render(
+                            SSH_OFFSCREEN_ID,
+                            terminal,
+                            None,
+                            cursor,
+                            None,
+                            None,
+                        ) {
+                            log::error!("SSH 终端渲染失败: {error:#}");
+                        } else {
+                            rendered += 1;
+                        }
                     }
                 }
                 if rendered > 0 {
