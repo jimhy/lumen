@@ -62,7 +62,7 @@ mod snap_layouts;
 /// F3 热更（自动更新）：查 GitHub latest Release + 下载 Inno Setup 安装包。
 mod update;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -137,9 +137,24 @@ struct ActiveSshSync {
     last_failure: Option<String>,
 }
 
-fn canonical_ssh_account_id(profile: Option<&profile::Profile>) -> Option<String> {
-    let raw = profile?.user_id.as_deref()?;
-    ssh::StorageScope::Account(raw.to_owned())
+fn profile_server_origin(
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Option<String> {
+    let profile = profile?;
+    let current = cloud::canonical_server_origin(current_server_url).ok()?;
+    (profile.auth_origin.as_deref() == Some(current.as_str())).then_some(current)
+}
+
+fn canonical_ssh_account_id(
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Option<String> {
+    let profile = profile?;
+    let server_origin = profile_server_origin(Some(profile), current_server_url)?;
+    let raw = profile.user_id.as_deref()?;
+    ssh::StorageScope::account(&server_origin, raw)
+        .ok()?
         .canonical_account_id()
         .ok()
         .flatten()
@@ -154,13 +169,18 @@ fn ssh_sync_identity(
         .token
         .as_deref()
         .filter(|token| !token.trim().is_empty())?;
-    let account_id = canonical_ssh_account_id(Some(profile))?;
-    let server_url = server_url.trim();
-    (!server_url.is_empty()).then(|| (account_id, server_url.to_owned()))
+    let server_origin = profile_server_origin(Some(profile), server_url)?;
+    let account_id = canonical_ssh_account_id(Some(profile), &server_origin)?;
+    Some((account_id, server_origin))
 }
 
-fn profile_auth_token(profile: Option<&profile::Profile>) -> Option<Arc<RwLock<String>>> {
-    profile?
+fn profile_auth_token(
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Option<Arc<RwLock<String>>> {
+    let profile = profile?;
+    profile_server_origin(Some(profile), current_server_url)?;
+    profile
         .token
         .as_ref()
         .filter(|token| !token.trim().is_empty())
@@ -179,11 +199,18 @@ fn clear_shared_token(token: &Arc<RwLock<String>>) {
 fn load_ssh_store_for_profile(
     data_root: &std::path::Path,
     profile: Option<&profile::Profile>,
+    current_server_url: &str,
 ) -> Result<ssh::SshStore, ssh::StoreError> {
-    match canonical_ssh_account_id(profile) {
-        Some(account_id) => ssh::SshStore::load_account_claiming_unclaimed(data_root, &account_id),
-        None => ssh::SshStore::load(data_root, ssh::StorageScope::Local),
-    }
+    let Some(profile) = profile else {
+        return ssh::SshStore::load(data_root, ssh::StorageScope::Local);
+    };
+    let Some(server_origin) = profile_server_origin(Some(profile), current_server_url) else {
+        return ssh::SshStore::load(data_root, ssh::StorageScope::Local);
+    };
+    let Some(account_id) = canonical_ssh_account_id(Some(profile), &server_origin) else {
+        return ssh::SshStore::load(data_root, ssh::StorageScope::Local);
+    };
+    ssh::SshStore::load_account_claiming_unclaimed(data_root, &server_origin, &account_id)
 }
 
 fn should_trigger_ssh_sync_after_local_change(
@@ -767,6 +794,9 @@ struct AppState {
     /// SSH transports and terminal state, isolated from local PTYs and remote
     /// mirrors. Sessions remain alive while another mode or the lock is shown.
     ssh_runtime: ssh_runtime::SshRuntime,
+    /// 明确发生密码认证/私钥错误的 profile。下次连接必须先让用户重输，
+    /// 避免后台反复自动尝试 Credential Manager 中的错误凭据。
+    ssh_force_credential_prompt: HashSet<String>,
     /// Stable egui binding for [`SSH_OFFSCREEN_ID`].
     ssh_texture: Option<egui::TextureId>,
     /// Active SSH terminal content rectangle in physical pixels.
@@ -2151,6 +2181,7 @@ impl AppState {
         // SSH 连接和全部瞬时 UI 都属于旧账号。切换库存前先清掉，
         // 防止旧 profile id、凭据对话框或 actor 落到新账号页面。
         self.ssh_runtime = ssh_runtime::SshRuntime::default();
+        self.ssh_force_credential_prompt.clear();
         self.shell_state.ssh_ui = shell::ssh_ui::SshUiState::default();
         self.shell_state.ssh_credentials = None;
         self.ssh_rect_px = None;
@@ -2158,7 +2189,11 @@ impl AppState {
 
         self.ssh_store = match paths::data_dir() {
             Some(data_root) => {
-                match load_ssh_store_for_profile(&data_root, self.profile.as_ref()) {
+                match load_ssh_store_for_profile(
+                    &data_root,
+                    self.profile.as_ref(),
+                    &cloud::server_url(),
+                ) {
                     Ok(store) => Some(store),
                     Err(error) => {
                         log::error!("切换账号后加载 SSH 库存失败（保留原文件）: {error}");
@@ -2177,7 +2212,7 @@ impl AppState {
                 None
             }
         };
-        self.auth_token = profile_auth_token(self.profile.as_ref());
+        self.auth_token = profile_auth_token(self.profile.as_ref(), &cloud::server_url());
         self.ensure_ssh_sync_worker();
         self.window.request_redraw();
     }
@@ -2275,23 +2310,48 @@ impl AppState {
                             .inventory()
                             .profiles()
                             .iter()
-                            .map(|profile| profile.id.clone())
+                            .map(|profile| {
+                                (
+                                    profile.id.clone(),
+                                    store.binding(&profile.id).cloned(),
+                                )
+                            })
                             .collect::<Vec<_>>();
                         match store.apply_sync_completed(completed) {
                             Ok(report) => {
                                 let removed_profiles = profiles_before
+                                    .iter()
+                                    .filter(|(id, _)| store.inventory().profile(id).is_none())
+                                    .map(|(id, _)| id.clone())
+                                    .collect::<Vec<_>>();
+                                let changed_bindings = profiles_before
                                     .into_iter()
-                                    .filter(|id| store.inventory().profile(id).is_none())
+                                    .filter_map(|(id, before)| {
+                                        let after = store.binding(&id).cloned();
+                                        (before != after).then_some((before, after))
+                                    })
                                     .collect::<Vec<_>>();
                                 let snapshot = store.sync_snapshot();
                                 let pending_mutations = store.pending_sync_mutations();
-                                Ok((report, snapshot, pending_mutations, removed_profiles))
+                                Ok((
+                                    report,
+                                    snapshot,
+                                    pending_mutations,
+                                    removed_profiles,
+                                    changed_bindings,
+                                ))
                             }
                             Err(error) => Err(error),
                         }
                     };
 
-                    let Ok((report, snapshot, pending_mutations, removed_profiles)) = applied
+                    let Ok((
+                        report,
+                        snapshot,
+                        pending_mutations,
+                        removed_profiles,
+                        changed_bindings,
+                    )) = applied
                     else {
                         let error = applied.expect_err("上方已匹配错误分支");
                         self.show_ssh_sync_failure_once(
@@ -2327,6 +2387,7 @@ impl AppState {
                             });
                         for profile_id in &removed_profiles {
                             self.ssh_runtime.remove_profile(profile_id);
+                            self.ssh_force_credential_prompt.remove(profile_id);
                         }
                         if selected_removed {
                             self.shell_state.ssh_ui.select_profile(None);
@@ -2334,6 +2395,9 @@ impl AppState {
                         self.shell_state.ssh_credentials = None;
                         self.ssh_rect_px = None;
                         self.terminal_focused = self.terminal_focus_allowed();
+                    }
+                    for (before, after) in &changed_bindings {
+                        self.delete_obsolete_ssh_secrets(before.as_ref(), after.as_ref());
                     }
                     info!(
                         "SSH 配置同步完成：ack={} changes={} rejected={} cursor={} deferred={}",
@@ -2371,6 +2435,7 @@ impl AppState {
 
             let mut created_profile = None;
             let mut deleted_profile = None;
+            let mut changed_binding = None;
             let result = match action {
                 SshUiAction::CreateGroup { name } => store.create_group(&name).map(|_| ()),
                 SshUiAction::RenameGroup { id, name } => store.rename_group(&id, &name),
@@ -2378,10 +2443,22 @@ impl AppState {
                 SshUiAction::CreateProfile { draft } => store.create_profile(draft).map(|id| {
                     created_profile = Some(id);
                 }),
-                SshUiAction::UpdateProfile { id, draft } => store.update_profile(&id, draft),
-                SshUiAction::DeleteProfile { id } => store.delete_profile(&id).map(|()| {
-                    deleted_profile = Some(id);
-                }),
+                SshUiAction::UpdateProfile { id, draft } => {
+                    let before = store.binding(&id).cloned();
+                    let result = store.update_profile(&id, draft);
+                    if result.is_ok() {
+                        changed_binding = Some((before, store.binding(&id).cloned()));
+                    }
+                    result
+                }
+                SshUiAction::DeleteProfile { id } => {
+                    let binding = store.binding(&id).cloned();
+                    let result = store.delete_profile(&id);
+                    if result.is_ok() {
+                        deleted_profile = Some((id, binding));
+                    }
+                    result
+                }
                 SshUiAction::MoveProfile {
                     id,
                     target_group_id,
@@ -2395,8 +2472,13 @@ impl AppState {
                     if let Some(id) = created_profile {
                         self.shell_state.ssh_ui.select_profile(Some(id));
                     }
-                    if let Some(id) = deleted_profile {
+                    if let Some((before, after)) = changed_binding {
+                        self.delete_obsolete_ssh_secrets(before.as_ref(), after.as_ref());
+                    }
+                    if let Some((id, binding)) = deleted_profile {
                         self.ssh_runtime.remove_profile(&id);
+                        self.ssh_force_credential_prompt.remove(&id);
+                        self.delete_obsolete_ssh_secrets(binding.as_ref(), None);
                         self.shell_state.ssh_credentials = None;
                         self.ssh_rect_px = None;
                         self.terminal_focused = false;
@@ -2411,6 +2493,134 @@ impl AppState {
                     self.window.request_redraw();
                 }
             }
+        }
+    }
+
+    /// 删除旧 binding 中已不再被新 binding 引用的 Credential Manager
+    /// 秘密。库存 generation 已在调用前提交；清理失败只产生不含 target
+    /// 的安全提示，不回滚库存，也不影响其他 profile。
+    fn delete_obsolete_ssh_secrets(
+        &mut self,
+        previous: Option<&ssh::SshLocalBinding>,
+        current: Option<&ssh::SshLocalBinding>,
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let retained = [
+            current.and_then(|binding| binding.password_credential_ref.as_deref()),
+            current.and_then(|binding| binding.key_passphrase_credential_ref.as_deref()),
+        ];
+        let mut cleanup_failed = false;
+        for raw_reference in [
+            previous.password_credential_ref.as_deref(),
+            previous.key_passphrase_credential_ref.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if retained.into_iter().flatten().any(|value| value == raw_reference) {
+                continue;
+            }
+            let Ok(reference) = raw_reference.parse::<ssh::CredentialReference>() else {
+                log::warn!("跳过格式非法的旧 SSH 本机凭据引用");
+                cleanup_failed = true;
+                continue;
+            };
+            if let Err(error) = ssh::delete_secret(&reference) {
+                log::warn!("清理旧 SSH 本机凭据失败: {error}");
+                cleanup_failed = true;
+            }
+        }
+        if cleanup_failed {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                "SSH 配置已保存，但旧的本机凭据未能完全清理",
+            );
+        }
+    }
+
+    fn open_ssh_credential_dialog(
+        &mut self,
+        profile: &ssh::SshProfile,
+        kind: shell::SshCredentialKind,
+    ) {
+        self.terminal_focused = false;
+        self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
+            profile.id.clone(),
+            profile.name.clone(),
+            profile.host.clone(),
+            profile.port,
+            profile.username.clone(),
+            kind,
+        ));
+    }
+
+    /// 从当前作用域的 local binding 与 Credential Manager 重新组装一次性
+    /// transport credential。任何缺失/损坏都返回空，让调用方提示用户；
+    /// 这里不缓存 SecretString，host-key 确认后的重试也会再次读取 vault。
+    fn load_saved_ssh_credential(
+        &self,
+        profile: &ssh::SshProfile,
+    ) -> Result<Option<lumen_ssh::Credential>, ()> {
+        let Some(binding) = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile.id))
+        else {
+            return Ok(None);
+        };
+        let read_bound_secret =
+            |raw: &str, expected_slot: ssh::CredentialSlot| -> Result<_, ()> {
+                let reference = raw.parse::<ssh::CredentialReference>().map_err(|_| ())?;
+                if reference.profile_id() != profile.id || reference.slot() != expected_slot {
+                    return Err(());
+                }
+                ssh::read_secret(&reference).map_err(|_| ())
+            };
+
+        match profile.auth_method {
+            ssh::AuthMethod::Password => {
+                let Some(raw) = binding.password_credential_ref.as_deref() else {
+                    return Ok(None);
+                };
+                let Some(secret) =
+                    read_bound_secret(raw, ssh::CredentialSlot::Password)?
+                else {
+                    return Ok(None);
+                };
+                if secret.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(lumen_ssh::Credential::password(secret)))
+            }
+            ssh::AuthMethod::PrivateKey => {
+                let Some(path) = binding.private_key_path.as_ref() else {
+                    return Ok(None);
+                };
+                if !path.is_absolute() || !path.is_file() {
+                    return Ok(None);
+                }
+                let passphrase = match binding.key_passphrase_credential_ref.as_deref() {
+                    Some(raw) => {
+                        let Some(secret) =
+                            read_bound_secret(raw, ssh::CredentialSlot::KeyPassphrase)?
+                        else {
+                            return Ok(None);
+                        };
+                        if secret.is_empty() {
+                            return Ok(None);
+                        }
+                        Some(secret)
+                    }
+                    None => None,
+                };
+                Ok(Some(lumen_ssh::Credential::private_key(
+                    path.clone(),
+                    passphrase,
+                )))
+            }
+            ssh::AuthMethod::Agent => Ok(Some(lumen_ssh::Credential::agent())),
         }
     }
 
@@ -2434,22 +2644,64 @@ impl AppState {
                 self.terminal_focused = self.terminal_focus_allowed();
             }
             ConnectIntent::Password => {
-                self.terminal_focused = false;
-                self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
-                    profile.id,
-                    profile.name,
-                    format!("{}@{}:{}", profile.username, profile.host, profile.port),
-                    shell::SshCredentialKind::Password,
-                ));
+                if self.ssh_force_credential_prompt.contains(&profile.id) {
+                    self.open_ssh_credential_dialog(
+                        &profile,
+                        shell::SshCredentialKind::Password,
+                    );
+                } else {
+                    match self.load_saved_ssh_credential(&profile) {
+                        Ok(Some(credential)) => {
+                            self.start_ssh_connection(&profile, credential);
+                        }
+                        Ok(None) => self.open_ssh_credential_dialog(
+                            &profile,
+                            shell::SshCredentialKind::Password,
+                        ),
+                        Err(()) => {
+                            log::warn!("读取 SSH 本机密码凭据失败，将要求重新输入");
+                            self.ssh_force_credential_prompt.insert(profile.id.clone());
+                            self.shell_state.toast.push(
+                                shell::toast::ToastKind::Warn,
+                                "本机 SSH 凭据不可用，请重新输入",
+                            );
+                            self.open_ssh_credential_dialog(
+                                &profile,
+                                shell::SshCredentialKind::Password,
+                            );
+                        }
+                    }
+                }
             }
             ConnectIntent::PrivateKey => {
-                self.terminal_focused = false;
-                self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
-                    profile.id,
-                    profile.name,
-                    format!("{}@{}:{}", profile.username, profile.host, profile.port),
-                    shell::SshCredentialKind::PrivateKey,
-                ));
+                if self.ssh_force_credential_prompt.contains(&profile.id) {
+                    self.open_ssh_credential_dialog(
+                        &profile,
+                        shell::SshCredentialKind::PrivateKey,
+                    );
+                } else {
+                    match self.load_saved_ssh_credential(&profile) {
+                        Ok(Some(credential)) => {
+                            self.start_ssh_connection(&profile, credential);
+                        }
+                        Ok(None) => self.open_ssh_credential_dialog(
+                            &profile,
+                            shell::SshCredentialKind::PrivateKey,
+                        ),
+                        Err(()) => {
+                            log::warn!("读取 SSH 本机私钥口令失败，将要求重新输入");
+                            self.ssh_force_credential_prompt.insert(profile.id.clone());
+                            self.shell_state.toast.push(
+                                shell::toast::ToastKind::Warn,
+                                "本机 SSH 凭据不可用，请重新输入",
+                            );
+                            self.open_ssh_credential_dialog(
+                                &profile,
+                                shell::SshCredentialKind::PrivateKey,
+                            );
+                        }
+                    }
+                }
             }
             ConnectIntent::Agent => {
                 self.start_ssh_connection(&profile, lumen_ssh::Credential::agent());
@@ -2481,14 +2733,175 @@ impl AppState {
         }
     }
 
+    /// 把对话框 submission 事务性保存到本机安全存储并组装本次连接凭据。
+    ///
+    /// 顺序固定为：写新随机 Credential Manager target → 原子提交 binding →
+    /// 删除旧 target。binding 失败时立即幂等删除新 target。任何严格复核失败
+    /// 都发生在写 secret 之前。
+    fn save_ssh_credential_submission(
+        &mut self,
+        profile: &ssh::SshProfile,
+        mut submission: shell::SshCredentialSubmission,
+    ) -> Result<lumen_ssh::Credential, ()> {
+        let expected_kind = match profile.auth_method {
+            ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
+            ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
+            ssh::AuthMethod::Agent => {
+                log::warn!("拒绝为 SSH agent 认证保存交互式凭据");
+                return Err(());
+            }
+        };
+        if !submission.matches_target(
+            &profile.id,
+            &profile.host,
+            profile.port,
+            &profile.username,
+            expected_kind,
+        ) {
+            log::warn!("拒绝已过期或认证方式不匹配的 SSH 凭据提交");
+            return Err(());
+        }
+
+        let previous = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile.id))
+            .cloned();
+        let mut binding = previous.clone().unwrap_or_else(|| ssh::SshLocalBinding {
+            profile_id: profile.id.clone(),
+            private_key_path: None,
+            password_credential_ref: None,
+            key_passphrase_credential_ref: None,
+        });
+
+        let credential = match submission.kind() {
+            shell::SshCredentialKind::Password => {
+                if submission.password().is_empty() {
+                    return Err(());
+                }
+                let reference =
+                    ssh::CredentialReference::password(&profile.id).map_err(|error| {
+                        log::warn!("创建 SSH 密码凭据引用失败: {error}");
+                    })?;
+                binding.private_key_path = None;
+                binding.password_credential_ref = Some(reference.target());
+                binding.key_passphrase_credential_ref = None;
+                let transaction = ssh::write_secret_with_commit(
+                    &reference,
+                    submission.password(),
+                    || {
+                        self.ssh_store
+                            .as_mut()
+                            .ok_or(())
+                            .and_then(|store| store.upsert_binding(binding).map_err(|_| ()))
+                    },
+                );
+                if let Err(error) = transaction {
+                    match error {
+                        ssh::CredentialTransactionError::Write(error) => {
+                            log::warn!("写入 SSH 本机密码凭据失败: {error}");
+                        }
+                        ssh::CredentialTransactionError::Commit {
+                            rollback_error, ..
+                        } => {
+                            log::warn!("提交 SSH 本机密码绑定失败");
+                            if let Some(error) = rollback_error {
+                                log::warn!("回滚新 SSH 本机密码凭据失败: {error}");
+                            }
+                        }
+                    }
+                    return Err(());
+                }
+                lumen_ssh::Credential::password(submission.take_password())
+            }
+            shell::SshCredentialKind::PrivateKey => {
+                let Some(path) = submission.private_key_path() else {
+                    return Err(());
+                };
+                if !path.is_absolute() || !path.is_file() {
+                    return Err(());
+                }
+                let new_reference = if submission.key_passphrase().is_empty() {
+                    None
+                } else {
+                    let reference = ssh::CredentialReference::key_passphrase(&profile.id)
+                        .map_err(|error| {
+                            log::warn!("创建 SSH 私钥口令引用失败: {error}");
+                        })?;
+                    Some(reference)
+                };
+                binding.private_key_path = submission.private_key_path().map(ToOwned::to_owned);
+                binding.password_credential_ref = None;
+                binding.key_passphrase_credential_ref =
+                    new_reference.as_ref().map(ssh::CredentialReference::target);
+                let transaction = match new_reference.as_ref() {
+                    Some(reference) => ssh::write_secret_with_commit(
+                        reference,
+                        submission.key_passphrase(),
+                        || {
+                            self.ssh_store
+                                .as_mut()
+                                .ok_or(())
+                                .and_then(|store| store.upsert_binding(binding).map_err(|_| ()))
+                        },
+                    ),
+                    None => self
+                        .ssh_store
+                        .as_mut()
+                        .ok_or(ssh::CredentialTransactionError::Commit {
+                            error: (),
+                            rollback_error: None,
+                        })
+                        .and_then(|store| {
+                            store.upsert_binding(binding).map_err(|_| {
+                                ssh::CredentialTransactionError::Commit {
+                                    error: (),
+                                    rollback_error: None,
+                                }
+                            })
+                        }),
+                };
+                if let Err(error) = transaction {
+                    match error {
+                        ssh::CredentialTransactionError::Write(error) => {
+                            log::warn!("写入 SSH 本机私钥口令失败: {error}");
+                        }
+                        ssh::CredentialTransactionError::Commit {
+                            rollback_error, ..
+                        } => {
+                            log::warn!("提交 SSH 本机私钥绑定失败");
+                            if let Some(error) = rollback_error {
+                                log::warn!("回滚新 SSH 本机私钥口令失败: {error}");
+                            }
+                        }
+                    }
+                    return Err(());
+                }
+                let path = submission
+                    .take_private_key_path()
+                    .expect("私钥路径已在上方严格校验");
+                let passphrase = (!submission.key_passphrase().is_empty()).then(|| {
+                    lumen_ssh::SecretString::new(submission.take_key_passphrase())
+                });
+                lumen_ssh::Credential::private_key(path, passphrase)
+            }
+        };
+
+        let current = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile.id))
+            .cloned();
+        self.delete_obsolete_ssh_secrets(previous.as_ref(), current.as_ref());
+        self.ssh_force_credential_prompt.remove(&profile.id);
+        Ok(credential)
+    }
+
     fn apply_ssh_runtime_action(&mut self, action: shell::SshRuntimeAction) {
         use shell::SshRuntimeAction;
         match action {
-            SshRuntimeAction::ConnectWithCredential {
-                profile_id,
-                expected_endpoint,
-                credential,
-            } => {
+            SshRuntimeAction::ConnectWithCredential(submission) => {
+                let profile_id = submission.profile_id().to_owned();
                 let profile = self
                     .ssh_store
                     .as_ref()
@@ -2501,26 +2914,14 @@ impl AppState {
                     );
                     return;
                 };
-                let target_matches = expected_endpoint
-                    == format!("{}@{}:{}", profile.username, profile.host, profile.port);
-                let credential_matches = target_matches
-                    && matches!(
-                    (&credential, profile.auth_method),
-                    (lumen_ssh::Credential::Password(_), ssh::AuthMethod::Password)
-                        | (
-                            lumen_ssh::Credential::PrivateKey(_),
-                            ssh::AuthMethod::PrivateKey
-                        )
-                        | (lumen_ssh::Credential::Agent, ssh::AuthMethod::Agent)
-                    );
-                if credential_matches {
+                if let Ok(credential) =
+                    self.save_ssh_credential_submission(&profile, submission)
+                {
                     self.start_ssh_connection(&profile, credential);
                 } else {
-                    // A profile edited while its dialog was open must not send
-                    // stale credentials under the new authentication method.
                     self.shell_state.toast.push(
                         shell::toast::ToastKind::Error,
-                        "SSH 认证方式已变化，请重新连接并输入凭据",
+                        "无法安全保存 SSH 本机凭据，请重新选择或输入",
                     );
                 }
             }
@@ -2544,21 +2945,10 @@ impl AppState {
                     .as_ref()
                     .and_then(|store| store.inventory().profile(&profile_id))
                     .cloned();
-                let exact_pending = self
-                    .ssh_runtime
-                    .active_view()
-                    .and_then(|view| {
-                        view.unknown_host_key
-                            .map(|pending| (view.endpoint, pending))
-                    })
-                    .zip(current_profile.as_ref())
-                    .is_some_and(|((endpoint, pending), profile)| {
-                        endpoint
-                            == format!("{}@{}:{}", profile.username, profile.host, profile.port)
-                            && pending.profile_id == profile_id
-                            && pending.algorithm == algorithm
-                            && pending.sha256_fingerprint == fingerprint
-                    });
+                let exact_pending = current_profile.as_ref().is_some_and(|profile| {
+                    self.ssh_runtime
+                        .unknown_host_key_matches(profile, &algorithm, &fingerprint)
+                });
                 if !exact_pending {
                     self.shell_state.toast.push(
                         shell::toast::ToastKind::Error,
@@ -2607,6 +2997,12 @@ impl AppState {
 
     fn drain_ssh_runtime(&mut self) {
         let outcome = self.ssh_runtime.drain();
+        for profile_id in &outcome.credential_failures {
+            self.ssh_force_credential_prompt.insert(profile_id.clone());
+        }
+        for profile_id in &outcome.connected_profiles {
+            self.ssh_force_credential_prompt.remove(profile_id);
+        }
         if self.settings.layout.view_mode.is_ssh() && self.ssh_runtime.active_blocks_input() {
             self.terminal_focused = false;
         } else if outcome.active_became_connected
@@ -6518,32 +6914,64 @@ impl App {
         }
 
         // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
-        let user_profile = profile::Profile::load();
+        let current_server_url = cloud::server_url();
+        let mut user_profile = profile::Profile::load();
+        // 旧版 profile 没有签发 origin，或者 settings 已被外部改成另一
+        // 个服务端时，绝不能拿旧 bearer token 试探当前地址。升级后安全
+        // 退出一次，用户在当前 origin 重新登录即可建立明确绑定。
+        let profile_origin_reauth_required = user_profile.as_ref().is_some_and(|profile| {
+            profile
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+                && profile_server_origin(Some(profile), &current_server_url).is_none()
+        });
+        if profile_origin_reauth_required {
+            log::warn!("登录档案缺少有效服务端来源绑定，已安全退出并要求重新登录");
+            profile::Profile::delete();
+            user_profile = None;
+        }
         match &user_profile {
             Some(p) => info!("登录态加载：{} <{}>", p.display_name, p.email),
             None => info!("登录态：未登录"),
         }
-        // 启动对账：device_id 独立文件若缺失而 profile 尚有镜像值，回写修复——把双源背离消灭在
-        // 「下次重登带空 id → 服务端造幽灵」爆发之前（修「幽灵设备」的廉价治本兜底）。
-        cloud::reconcile_device_id(user_profile.as_ref().and_then(|p| p.device_id.as_deref()));
+        // 设备 id 也按签发 origin 分区；只允许同源 profile 修复对应分区，
+        // 旧版全局 device_id 不再参与联网，避免跨自建服务关联或误认设备。
+        if let (Ok(origin), Some(profile)) = (
+            cloud::canonical_server_origin(&current_server_url),
+            user_profile.as_ref(),
+        ) {
+            cloud::reconcile_device_id_for_origin(
+                &origin,
+                profile.auth_origin.as_deref(),
+                profile.device_id.as_deref(),
+            );
+        }
 
         // SSH 库存按 Lumen 账号隔离；账号首次使用时先以不可逆认领标记
         // 导入未登录清单。无账号/账号 ID 非规范时仍只读写 Local，绝不
         // 把一份未确认归属的缓存交给同步 worker。
         let (ssh_store, ssh_store_load_error) = match paths::data_dir() {
-            Some(data_root) => match load_ssh_store_for_profile(&data_root, user_profile.as_ref()) {
-                Ok(store) => (Some(store), None),
-                Err(error) => {
-                    error!("加载 SSH 库存失败（保留原文件）: {error}");
-                    (None, Some(error.to_string()))
+            Some(data_root) => {
+                match load_ssh_store_for_profile(
+                    &data_root,
+                    user_profile.as_ref(),
+                    &current_server_url,
+                ) {
+                    Ok(store) => (Some(store), None),
+                    Err(error) => {
+                        error!("加载 SSH 库存失败（保留原文件）: {error}");
+                        (None, Some(error.to_string()))
+                    }
                 }
-            },
+            }
             None => (
                 None,
                 Some("无法解析 Lumen 数据目录，SSH 配置本次不可写".to_owned()),
             ),
         };
-        let initial_auth_token = profile_auth_token(user_profile.as_ref());
+        let initial_auth_token =
+            profile_auth_token(user_profile.as_ref(), &current_server_url);
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
@@ -6792,6 +7220,7 @@ impl App {
             ssh_sync: None,
             ssh_empty_inventory: ssh::SshInventory::default(),
             ssh_runtime: ssh_runtime::SshRuntime::default(),
+            ssh_force_credential_prompt: HashSet::new(),
             ssh_texture: None,
             ssh_rect_px: None,
             modifiers: ModifiersState::default(),
@@ -6886,6 +7315,12 @@ impl App {
                 .shell_state
                 .toast
                 .push(shell::toast::ToastKind::Error, error);
+        }
+        if profile_origin_reauth_required {
+            state.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                "为保护账号数据，升级后请在当前 Lumen 服务器重新登录",
+            );
         }
         state.ensure_ssh_sync_worker();
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -9690,36 +10125,51 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 // 共享 token 句柄（登录后懒建）：心跳 worker 自动续期时写回，WS + REST 共读同一份，
                 // 确保续期后处处用新 token（治本：免 7 天到期后全面 401）。必须单一实例供两者共享。
+                let current_server_url = cloud::server_url();
+                let account_server_origin =
+                    profile_server_origin(state.profile.as_ref(), &current_server_url)
+                        .filter(|origin| cloud::validate_server_transport(origin).is_ok());
                 if state.auth_token.is_none() {
-                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
-                        state.auth_token = Some(std::sync::Arc::new(std::sync::RwLock::new(tok)));
-                    }
+                    state.auth_token =
+                        profile_auth_token(state.profile.as_ref(), &current_server_url);
                 }
                 // M5.2：已登录但远程线程未起（启动时已登录 / 刚登录）→ 启动；
                 // 每帧收取后台心跳/设备列表回包。M5.3：远程控制 WS 同生命周期。
                 if !state.remote.is_running() {
-                    if let Some(auth) = state.auth_token.clone() {
+                    if let (Some(auth), Some(server_origin)) = (
+                        state.auth_token.clone(),
+                        account_server_origin.as_ref(),
+                    ) {
                         let exp = state.profile.as_ref().map_or(0, |p| p.token_expires_at);
                         let ctx = state.egui_ctx.clone();
                         // 传 proxy + wake_pending：设备列表后台线程拉到新数据后须唤醒空闲 winit 循环
                         // （否则停在远程视图时在线状态不自动刷新，要切 tab 才更新）。
-                        state.remote.start(
+                        if let Err(error) = state.remote.start(
+                            server_origin.clone(),
                             auth,
                             exp,
                             ctx,
                             state.proxy.clone(),
                             state.wake_pending.clone(),
-                        );
+                        ) {
+                            log::warn!("启动远程心跳失败: {}", error.user_message());
+                        }
                     }
                 }
                 if !state.remote_ws.is_running() {
-                    if let Some(auth) = state.auth_token.clone() {
-                        state.remote_ws.start(
+                    if let (Some(auth), Some(server_origin)) = (
+                        state.auth_token.clone(),
+                        account_server_origin.as_ref(),
+                    ) {
+                        if let Err(error) = state.remote_ws.start(
+                            server_origin.clone(),
                             auth,
                             state.egui_ctx.clone(),
                             state.proxy.clone(),
                             state.wake_pending.clone(),
-                        );
+                        ) {
+                            log::warn!("启动远程 WS 失败: {}", error.user_message());
+                        }
                     }
                 }
                 let _ = state.remote.poll();
@@ -11380,7 +11830,12 @@ impl ApplicationHandler<PtyWake> for App {
                 // worker，再发布新全局地址。重新登录取得新 origin 的 token 后
                 // 才会重新加载账号库存并启动 SSH 同步。
                 if shell_out.settings_server_url_changed {
-                    state.invalidate_account_for_server_url_change();
+                    let previous_origin = cloud::server_url();
+                    let next_origin =
+                        cloud::canonical_server_origin(&state.settings.server_url).ok();
+                    if next_origin.as_deref() != Some(previous_origin.as_str()) {
+                        state.invalidate_account_for_server_url_change();
+                    }
                     cloud::set_server_url(&state.settings.server_url);
                 }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
@@ -12510,10 +12965,11 @@ mod tests {
         let mut profile = crate::profile::Profile {
             user_id: Some("550E8400-E29B-41D4-A716-446655440000".to_owned()),
             token: Some("jwt-token".to_owned()),
+            auth_origin: Some("https://lumen.example".to_owned()),
             ..Default::default()
         };
         assert_eq!(
-            canonical_ssh_account_id(Some(&profile)).as_deref(),
+            canonical_ssh_account_id(Some(&profile), "https://lumen.example").as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
         assert_eq!(
@@ -12528,8 +12984,14 @@ mod tests {
         assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
         profile.token = Some("jwt-token".to_owned());
         assert!(ssh_sync_identity(Some(&profile), "   ").is_none());
+        assert!(ssh_sync_identity(Some(&profile), "https://other.example").is_none());
+        profile.auth_origin = None;
+        assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
+        profile.auth_origin = Some("https://lumen.example".to_owned());
         profile.user_id = Some("not-a-canonical-account".to_owned());
-        assert!(canonical_ssh_account_id(Some(&profile)).is_none());
+        assert!(
+            canonical_ssh_account_id(Some(&profile), "https://lumen.example").is_none()
+        );
         assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
     }
 

@@ -13,8 +13,8 @@ mod sync;
 
 #[allow(unused_imports)]
 pub use credentials::{
-    delete_secret, read_secret, write_secret, CredentialError, CredentialReference,
-    CredentialSlot, MAX_SECRET_BYTES,
+    delete_secret, read_secret, write_secret, write_secret_with_commit, CredentialError,
+    CredentialReference, CredentialSlot, CredentialTransactionError, MAX_SECRET_BYTES,
 };
 #[allow(unused_imports)]
 pub use inventory::{

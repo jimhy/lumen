@@ -11,6 +11,7 @@
 //! 未登录 + 日志警告，绝不 panic，原文件保留现场）；写盘走「同目录
 //! 临时文件 + rename」原子替换；登出 = 删除文件。
 
+use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 /// 登录档案（mock）。`None` 即未登录；顶栏头像、头像菜单、设置页
 /// Account 三处 UI 同源 main 持有的 `Option<Profile>`。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
     /// 登录邮箱。
@@ -35,12 +36,37 @@ pub struct Profile {
     /// M5：本设备 id（服务端分配；同时镜像到 `cloud::save_device_id` 持久文件）。
     #[serde(default)]
     pub device_id: Option<String>,
+    /// 签发当前登录态的 canonical 服务端 origin。
+    ///
+    /// 旧版 profile 缺少该字段时为 `None`；调用方必须 fail-closed，不得把旧 token、
+    /// device id 或账号级数据自动发送给当前设置中的任意服务端。
+    #[serde(default)]
+    pub auth_origin: Option<String>,
     /// M5：鉴权 token（JWT，短期）。**不是密码**，仅用于后续 REST 鉴权。
     #[serde(default)]
     pub token: Option<String>,
     /// M5：token 过期 Unix 秒（0 = 无）。
     #[serde(default)]
     pub token_expires_at: i64,
+}
+
+impl fmt::Debug for Profile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Profile")
+            .field("email", &self.email)
+            .field("display_name", &self.display_name)
+            .field("logged_in_at", &self.logged_in_at)
+            .field("user_id", &self.user_id)
+            .field("device_id", &self.device_id)
+            .field(
+                "auth_origin",
+                &self.auth_origin.as_ref().map(|_| "[configured]"),
+            )
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("token_expires_at", &self.token_expires_at)
+            .finish()
+    }
 }
 
 impl Profile {
@@ -54,7 +80,8 @@ impl Profile {
     }
 
     /// 由服务端登录响应构造档案（含 token / 设备 id）——真账户登录（M5）。
-    pub fn from_auth(resp: lumen_protocol::AuthResponse) -> Self {
+    pub fn from_auth(resp: lumen_protocol::AuthResponse, canonical_origin: String) -> Self {
+        let auth_origin = crate::cloud::canonical_server_origin(&canonical_origin).ok();
         let logged_in_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -65,6 +92,7 @@ impl Profile {
             logged_in_at,
             user_id: Some(resp.user.id),
             device_id: Some(resp.device_id),
+            auth_origin,
             token: Some(resp.token),
             token_expires_at: resp.expires_at,
         }
@@ -170,6 +198,10 @@ impl Profile {
     fn sanitize(&mut self) {
         self.email = self.email.trim().to_owned();
         self.display_name = self.display_name.trim().to_owned();
+        self.auth_origin = self
+            .auth_origin
+            .take()
+            .and_then(|origin| crate::cloud::canonical_server_origin(&origin).ok());
         if self.display_name.is_empty() {
             self.display_name = display_name_of(&self.email);
         }
@@ -257,6 +289,42 @@ mod tests {
     }
 
     #[test]
+    fn debug不泄漏token或服务端origin() {
+        let profile = Profile {
+            email: "user@example.com".to_owned(),
+            auth_origin: Some("https://private.example:8443".to_owned()),
+            token: Some("header.payload.signature-secret".to_owned()),
+            ..Default::default()
+        };
+        let debug = format!("{profile:?}");
+        assert!(!debug.contains("header.payload"));
+        assert!(!debug.contains("private.example"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("[configured]"));
+    }
+
+    #[test]
+    fn 服务端登录档案绑定canonical_origin() {
+        let response = lumen_protocol::AuthResponse {
+            protocol_version: 1,
+            token: "token-secret".to_owned(),
+            expires_at: 123,
+            user: lumen_protocol::UserInfo {
+                id: "user-id".to_owned(),
+                email: "user@example.com".to_owned(),
+                display_name: "user".to_owned(),
+            },
+            device_id: "device-id".to_owned(),
+        };
+        let profile = Profile::from_auth(response, "https://lumen.example".to_owned());
+        assert_eq!(
+            profile.auth_origin.as_deref(),
+            Some("https://lumen.example")
+        );
+        assert_eq!(profile.token.as_deref(), Some("token-secret"));
+    }
+
+    #[test]
     fn 损坏文件降级未登录() {
         let path = temp_path("corrupt");
         std::fs::write(&path, "{ 这不是 json !!!").expect("写测试文件失败");
@@ -293,6 +361,10 @@ mod tests {
         let p = loaded.expect("带 BOM 的合法 profile 应加载成功");
         assert_eq!(p.email, "jimhy@example.com");
         assert_eq!(p.display_name, "jimhy");
+        assert_eq!(
+            p.auth_origin, None,
+            "旧 profile 保留为无来源，供调用方 fail-closed"
+        );
     }
 
     #[test]
@@ -304,6 +376,20 @@ mod tests {
         let p = loaded.expect("应加载成功");
         assert_eq!(p.display_name, "haifeng");
         assert_eq!(p.avatar_letter(), "H");
+    }
+
+    #[test]
+    fn 非法鉴权来源加载后降为无来源() {
+        let path = temp_path("invalid_origin");
+        std::fs::write(
+            &path,
+            r#"{ "email": "user@example.com", "auth_origin": "https://user:pass@example.com/path", "token": "secret" }"#,
+        )
+        .expect("写测试文件失败");
+        let profile = Profile::load_from(&path).expect("档案主体仍可加载");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(profile.auth_origin, None);
+        assert_eq!(profile.token.as_deref(), Some("secret"));
     }
 
     #[test]

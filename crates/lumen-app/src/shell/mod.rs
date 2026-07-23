@@ -107,7 +107,7 @@ pub struct ShellState {
     pub remote_ui: remote_ui::RemoteUiState,
     /// SSH 服务器列表、分组、拖放与编辑弹窗的跨帧状态。
     pub ssh_ui: ssh_ui::SshUiState,
-    /// SSH 密码/私钥仅驻留在本机内存中的单次连接对话框。
+    /// SSH 密码/私钥本机安全保存对话框。关闭或锁屏丢弃时会清零明文缓冲。
     pub ssh_credentials: Option<SshCredentialDialog>,
 }
 
@@ -120,7 +120,9 @@ pub enum SshCredentialKind {
 pub struct SshCredentialDialog {
     profile_id: String,
     profile_name: String,
-    expected_endpoint: String,
+    expected_host: String,
+    expected_port: u16,
+    expected_username: String,
     kind: SshCredentialKind,
     password: String,
     private_key_path: Option<std::path::PathBuf>,
@@ -131,13 +133,17 @@ impl SshCredentialDialog {
     pub(crate) fn open(
         profile_id: String,
         profile_name: String,
-        expected_endpoint: String,
+        expected_host: String,
+        expected_port: u16,
+        expected_username: String,
         kind: SshCredentialKind,
     ) -> Self {
         Self {
             profile_id,
             profile_name,
-            expected_endpoint,
+            expected_host,
+            expected_port,
+            expected_username,
             kind,
             password: String::new(),
             private_key_path: None,
@@ -154,12 +160,81 @@ impl Drop for SshCredentialDialog {
     }
 }
 
+/// UI 提交给主线程的原始本机凭据。
+///
+/// 这里有意不提前构造 transport 的 opaque `Credential`：主线程必须先复核
+/// profile、endpoint 与认证方式，再把秘密写入 Credential Manager 并原子提交
+/// 本机 binding。未消费或中途失败时 Drop 会清零两个明文缓冲。
+pub struct SshCredentialSubmission {
+    profile_id: String,
+    expected_host: String,
+    expected_port: u16,
+    expected_username: String,
+    kind: SshCredentialKind,
+    password: String,
+    private_key_path: Option<std::path::PathBuf>,
+    key_passphrase: String,
+}
+
+impl SshCredentialSubmission {
+    pub(crate) fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    pub(crate) fn matches_target(
+        &self,
+        profile_id: &str,
+        host: &str,
+        port: u16,
+        username: &str,
+        kind: SshCredentialKind,
+    ) -> bool {
+        self.profile_id == profile_id
+            && self.expected_host == host
+            && self.expected_port == port
+            && self.expected_username == username
+            && self.kind == kind
+    }
+
+    pub(crate) const fn kind(&self) -> SshCredentialKind {
+        self.kind
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
+    pub(crate) fn take_password(&mut self) -> String {
+        std::mem::take(&mut self.password)
+    }
+
+    pub(crate) fn private_key_path(&self) -> Option<&std::path::Path> {
+        self.private_key_path.as_deref()
+    }
+
+    pub(crate) fn take_private_key_path(&mut self) -> Option<std::path::PathBuf> {
+        self.private_key_path.take()
+    }
+
+    pub(crate) fn key_passphrase(&self) -> &str {
+        &self.key_passphrase
+    }
+
+    pub(crate) fn take_key_passphrase(&mut self) -> String {
+        std::mem::take(&mut self.key_passphrase)
+    }
+}
+
+impl Drop for SshCredentialSubmission {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.password.zeroize();
+        self.key_passphrase.zeroize();
+    }
+}
+
 pub enum SshRuntimeAction {
-    ConnectWithCredential {
-        profile_id: String,
-        expected_endpoint: String,
-        credential: lumen_ssh::Credential,
-    },
+    ConnectWithCredential(SshCredentialSubmission),
     Disconnect,
     TrustHostKey {
         profile_id: String,
@@ -3081,25 +3156,18 @@ fn ssh_runtime_modals(
         st.ssh_credentials = None;
     } else if submit_credentials {
         if let Some(mut dialog) = st.ssh_credentials.take() {
-            let credential = match dialog.kind {
-                SshCredentialKind::Password => {
-                    lumen_ssh::Credential::password(std::mem::take(&mut dialog.password))
-                }
-                SshCredentialKind::PrivateKey => {
-                    let Some(path) = dialog.private_key_path.take() else {
-                        return;
-                    };
-                    let passphrase = (!dialog.key_passphrase.is_empty()).then(|| {
-                        lumen_ssh::SecretString::new(std::mem::take(&mut dialog.key_passphrase))
-                    });
-                    lumen_ssh::Credential::private_key(path, passphrase)
-                }
-            };
-            out.ssh_runtime_action = Some(SshRuntimeAction::ConnectWithCredential {
+            let submission = SshCredentialSubmission {
                 profile_id: dialog.profile_id.clone(),
-                expected_endpoint: dialog.expected_endpoint.clone(),
-                credential,
-            });
+                expected_host: dialog.expected_host.clone(),
+                expected_port: dialog.expected_port,
+                expected_username: dialog.expected_username.clone(),
+                kind: dialog.kind,
+                password: std::mem::take(&mut dialog.password),
+                private_key_path: dialog.private_key_path.take(),
+                key_passphrase: std::mem::take(&mut dialog.key_passphrase),
+            };
+            out.ssh_runtime_action =
+                Some(SshRuntimeAction::ConnectWithCredential(submission));
         }
     }
 
@@ -3198,6 +3266,35 @@ mod tests {
                 "安全密码框绘制后不得通过 Ctrl+Z 恢复旧明文"
             );
         });
+    }
+
+    #[test]
+    fn ssh凭据提交按结构化目标复核而非可歧义展示字符串() {
+        let submission = SshCredentialSubmission {
+            profile_id: "ssh_0123456789abcdef0123456789abcdef".to_owned(),
+            expected_host: "b@c".to_owned(),
+            expected_port: 22,
+            expected_username: "a".to_owned(),
+            kind: SshCredentialKind::Password,
+            password: "temporary-secret".to_owned(),
+            private_key_path: None,
+            key_passphrase: String::new(),
+        };
+        assert!(submission.matches_target(
+            "ssh_0123456789abcdef0123456789abcdef",
+            "b@c",
+            22,
+            "a",
+            SshCredentialKind::Password,
+        ));
+        // 两者的旧展示格式都会得到 `a@b@c:22`，但结构化比较必须拒绝。
+        assert!(!submission.matches_target(
+            "ssh_0123456789abcdef0123456789abcdef",
+            "c",
+            22,
+            "a@b",
+            SshCredentialKind::Password,
+        ));
     }
 
     /// 两格左右布局的整格矩形（含标题栏）。

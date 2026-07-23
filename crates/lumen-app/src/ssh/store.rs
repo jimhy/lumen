@@ -15,7 +15,7 @@ use lumen_protocol::ssh_sync::{
 use super::credentials::{CredentialReference, CredentialSlot};
 use super::inventory::{InventoryError, SshInventory};
 use super::local::{SshLocalBinding, StorageScope};
-use super::model::{new_id, GroupId, NewSshProfile, ProfileId};
+use super::model::{new_id, AuthMethod, GroupId, NewSshProfile, ProfileId};
 use super::sync::{
     change_entity, local_group, local_profile, mutation_entity, wire_group, wire_profile,
     SshSyncCompleted, SshSyncSnapshot, SyncJournal, SYNC_JOURNAL_FORMAT_VERSION,
@@ -24,6 +24,8 @@ use super::sync::{
 const CURRENT_FORMAT_VERSION: u32 = 1;
 const INVENTORY_FORMAT_VERSION: u32 = 1;
 const BINDINGS_FORMAT_VERSION: u32 = 1;
+const SCOPE_FORMAT_VERSION: u32 = 1;
+const UNCLAIMED_SCOPE_MARKER_VERSION: &str = "scope-v1";
 const MAX_CREDENTIAL_REF_CHARS: usize = 512;
 const MAX_PRIVATE_KEY_PATH_CHARS: usize = 4_096;
 const MAX_SYNC_OUTBOX: usize = 100_000;
@@ -123,6 +125,14 @@ struct CurrentFile {
     generation: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountScopeFile {
+    version: u32,
+    server_origin: String,
+    account_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshSyncRejection {
     pub mutation_id: String,
@@ -151,6 +161,7 @@ pub struct SshSyncApplyReport {
 /// 只把远端结果发回 owner，不得持有第二个可写 `SshStore`。
 pub struct SshStore {
     directory: PathBuf,
+    server_origin: Option<String>,
     account_id: Option<String>,
     generation: Option<String>,
     inventory: SshInventory,
@@ -179,12 +190,21 @@ impl fmt::Debug for SshStore {
 
 impl SshStore {
     pub fn load(data_root: &Path, scope: StorageScope) -> Result<Self, StoreError> {
+        let account_identity = scope
+            .account_identity()
+            .map(|(server_origin, account_id)| (server_origin.to_owned(), account_id.to_owned()));
+        let server_origin = account_identity
+            .as_ref()
+            .map(|(server_origin, _)| server_origin.clone());
         let account_id = scope
             .canonical_account_id()
             .map_err(StoreError::InvalidScope)?;
         let directory = scope
             .directory(data_root)
             .map_err(StoreError::InvalidScope)?;
+        if let Some((server_origin, account_id)) = account_identity.as_ref() {
+            initialize_or_validate_account_scope_file(&directory, server_origin, account_id)?;
+        }
         let generation = read_current_generation(&directory)?;
         let (mut inventory, bindings, sync) = match generation.as_deref() {
             Some(generation) => read_generation(&directory, generation)?,
@@ -195,6 +215,7 @@ impl SshStore {
         validate_sync_journal(&sync, account_id.as_deref())?;
         Ok(Self {
             directory,
+            server_origin,
             account_id,
             generation,
             inventory,
@@ -203,26 +224,34 @@ impl SshStore {
         })
     }
 
-    /// 首次登录时把未登录清单认领给当前账号。认领标记先写回 `unclaimed`
-    /// generation；若随后账号 generation 写入失败，下次仍只允许同一账号重试，
-    /// 绝不会把这批数据导入别的账号缓存。
+    /// 首次登录时把未登录清单认领给当前服务端 origin + 账号。认领标记先写回
+    /// `unclaimed` generation；若随后账号 generation 写入失败，下次仍只允许同一
+    /// origin + 账号重试，绝不会把这批数据导入别的存储作用域。
+    ///
+    /// 账号 generation 提交成功后会清空 `unclaimed` 的库存、binding 与临时认领
+    /// 标记。这样一个 Credential Manager target 在任一时刻只有一个活动 store owner；
+    /// 登出后的本地编辑或删除不会把账号缓存中的 binding 变成悬空引用。若进程恰在账号
+    /// 提交与清空本地之间退出，下次加载会核对两边内容完全一致后完成清理。
     ///
     /// 应在该账号第一次启动同步前调用。账号缓存已经有任何数据/游标时保持原样，
     /// 防止把 unclaimed 清单混入一个既有账号。
     pub fn load_account_claiming_unclaimed(
         data_root: &Path,
+        server_origin: &str,
         account_id: &str,
     ) -> Result<Self, StoreError> {
-        let account_scope = StorageScope::Account(account_id.to_owned());
+        let account_scope =
+            StorageScope::account(server_origin, account_id).map_err(StoreError::InvalidScope)?;
         let mut account = Self::load(data_root, account_scope)?;
+        let canonical_origin = account
+            .server_origin
+            .clone()
+            .ok_or(StoreError::InvalidScope("账号作用域缺少服务端 origin"))?;
         let canonical_account = account
             .account_id
             .clone()
             .ok_or(StoreError::InvalidScope("账号作用域缺少账号 ID"))?;
-        if !account.is_pristine_account_cache() {
-            return Ok(account);
-        }
-
+        let requested_claim = unclaimed_scope_marker(&canonical_origin, &canonical_account);
         let mut unclaimed = Self::load(data_root, StorageScope::Local)?;
         if unclaimed.inventory.groups().is_empty()
             && unclaimed.inventory.profiles().is_empty()
@@ -230,12 +259,25 @@ impl SshStore {
         {
             return Ok(account);
         }
+        let account_was_pristine = account.is_pristine_account_cache();
         match unclaimed.sync.claimed_account_id.as_deref() {
-            Some(claimed) if claimed != canonical_account => return Ok(account),
+            Some(claimed) if claimed != requested_claim => return Ok(account),
+            Some(_) if !account_was_pristine => {
+                if account.inventory != unclaimed.inventory
+                    || account.bindings != unclaimed.bindings
+                {
+                    return Err(StoreError::InvalidSync(
+                        "认领恢复时账号与 unclaimed 数据不一致",
+                    ));
+                }
+            }
             Some(_) => {}
             None => {
+                if !account_was_pristine {
+                    return Ok(account);
+                }
                 let mut claimed_sync = unclaimed.sync.clone();
-                claimed_sync.claimed_account_id = Some(canonical_account.clone());
+                claimed_sync.claimed_account_id = Some(requested_claim.clone());
                 unclaimed.commit_state(
                     unclaimed.inventory.clone(),
                     unclaimed.bindings.clone(),
@@ -244,20 +286,32 @@ impl SshStore {
             }
         }
 
-        let imported_inventory = unclaimed.inventory.clone();
-        let imported_bindings = unclaimed.bindings.clone();
-        let mut imported_sync = SyncJournal::default();
-        enqueue_inventory_diff(
-            &mut imported_sync,
-            &SshInventory::default(),
-            &imported_inventory,
+        if account_was_pristine {
+            let imported_inventory = unclaimed.inventory.clone();
+            let imported_bindings = unclaimed.bindings.clone();
+            let mut imported_sync = SyncJournal::default();
+            enqueue_inventory_diff(
+                &mut imported_sync,
+                &SshInventory::default(),
+                &imported_inventory,
+            )?;
+            account.commit_state(imported_inventory, imported_bindings, imported_sync)?;
+        }
+
+        unclaimed.commit_state(
+            SshInventory::default(),
+            Vec::new(),
+            SyncJournal::default(),
         )?;
-        account.commit_state(imported_inventory, imported_bindings, imported_sync)?;
         Ok(account)
     }
 
     pub fn account_id(&self) -> Option<&str> {
         self.account_id.as_deref()
+    }
+
+    pub fn server_origin(&self) -> Option<&str> {
+        self.server_origin.as_deref()
     }
 
     pub fn server_cursor(&self) -> i64 {
@@ -310,7 +364,18 @@ impl SshStore {
     }
 
     pub fn update_profile(&mut self, id: &str, draft: NewSshProfile) -> Result<(), StoreError> {
-        self.change_inventory(|next| next.update_profile(id, draft))
+        let mut next_inventory = self.inventory.clone();
+        next_inventory.update_profile(id, draft)?;
+        let mut next_bindings = self.bindings.clone();
+        sanitize_bindings_for_inventory_transition(
+            &self.inventory,
+            &next_inventory,
+            &mut next_bindings,
+        );
+
+        let mut next_sync = self.sync.clone();
+        enqueue_inventory_diff(&mut next_sync, &self.inventory, &next_inventory)?;
+        self.commit_state(next_inventory, next_bindings, next_sync)
     }
 
     pub fn delete_profile(&mut self, id: &str) -> Result<(), StoreError> {
@@ -481,6 +546,11 @@ impl SshStore {
             return Err(StoreError::InvalidSync("待合并远端变更数量超过上限"));
         }
         next_sync.deferred_changes = ordered_changes;
+        sanitize_bindings_for_inventory_transition(
+            &self.inventory,
+            &next_inventory,
+            &mut next_bindings,
+        );
         validate_bindings(&next_inventory, &next_bindings)?;
         validate_sync_journal(&next_sync, self.account_id.as_deref())?;
 
@@ -524,6 +594,18 @@ impl SshStore {
     ) -> Result<(), StoreError> {
         validate_bindings(&inventory, &bindings)?;
         validate_sync_journal(&sync, self.account_id.as_deref())?;
+        // `--multi-instance` 也可能让两个进程同时写同一作用域。必须把
+        // generation 复核到 current.json 原子替换的整个窗口串行化；否则
+        // 两边都可能通过旧 generation 检查，后写者覆盖前写者，并让刚删除
+        // 的旧 Credential Manager target 再次成为 current binding。
+        let _write_lock = acquire_store_write_lock(&self.directory)?;
+        match (self.server_origin.as_deref(), self.account_id.as_deref()) {
+            (Some(server_origin), Some(account_id)) => {
+                validate_account_scope_file(&self.directory, server_origin, account_id)?;
+            }
+            (None, None) => {}
+            _ => return Err(StoreError::InvalidScope("账号作用域身份不完整")),
+        }
         let actual_generation = read_current_generation(&self.directory)?;
         if actual_generation != self.generation {
             return Err(StoreError::ConcurrentModification {
@@ -590,6 +672,18 @@ impl SshStore {
     }
 }
 
+fn acquire_store_write_lock(directory: &Path) -> Result<std::fs::File, StoreError> {
+    fs::create_dir_all(directory)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".write.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
 fn enqueue_inventory_diff(
     journal: &mut SyncJournal,
     before: &SshInventory,
@@ -653,6 +747,42 @@ fn push_mutation(
     Ok(())
 }
 
+fn unclaimed_scope_marker(server_origin: &str, account_id: &str) -> String {
+    format!("{UNCLAIMED_SCOPE_MARKER_VERSION}|{server_origin}|{account_id}")
+}
+
+fn validate_unclaimed_scope_marker(marker: &str) -> Result<(), StoreError> {
+    let mut components = marker.split('|');
+    let (Some(version), Some(server_origin), Some(account_id), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return Err(StoreError::InvalidSync(
+            "unclaimed 认领标记格式非法或字段缺失",
+        ));
+    };
+    if version != UNCLAIMED_SCOPE_MARKER_VERSION {
+        return Err(StoreError::InvalidSync("unclaimed 认领标记版本不受支持"));
+    }
+    let scope = StorageScope::account(server_origin, account_id)
+        .map_err(|_| StoreError::InvalidSync("unclaimed 认领作用域非法"))?;
+    let canonical_account = scope
+        .canonical_account_id()
+        .map_err(StoreError::InvalidScope)?
+        .ok_or(StoreError::InvalidSync("unclaimed 认领账号缺失"))?;
+    let canonical_origin = scope
+        .server_origin()
+        .ok_or(StoreError::InvalidSync("unclaimed 认领 origin 缺失"))?;
+    if unclaimed_scope_marker(canonical_origin, &canonical_account) != marker {
+        return Err(StoreError::InvalidSync(
+            "unclaimed 认领作用域不是 canonical 形式",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_sync_journal(
     journal: &SyncJournal,
     account_id: Option<&str>,
@@ -671,13 +801,7 @@ fn validate_sync_journal(
             return Err(StoreError::InvalidSync("账号缓存不能带 unclaimed 认领标记"));
         }
         (None, Some(claimed)) => {
-            let canonical = StorageScope::Account(claimed.to_owned())
-                .canonical_account_id()
-                .map_err(StoreError::InvalidScope)?
-                .ok_or(StoreError::InvalidScope("认领账号 ID 缺失"))?;
-            if canonical != claimed {
-                return Err(StoreError::InvalidSync("认领账号 ID 不是 canonical UUID"));
-            }
+            validate_unclaimed_scope_marker(claimed)?;
         }
         _ => {}
     }
@@ -890,6 +1014,67 @@ fn valid_prefixed_id(id: &str, prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn expected_account_scope_file(server_origin: &str, account_id: &str) -> AccountScopeFile {
+    AccountScopeFile {
+        version: SCOPE_FORMAT_VERSION,
+        server_origin: server_origin.to_owned(),
+        account_id: account_id.to_owned(),
+    }
+}
+
+fn initialize_or_validate_account_scope_file(
+    directory: &Path,
+    server_origin: &str,
+    account_id: &str,
+) -> Result<(), StoreError> {
+    let scope_path = directory.join("scope.json");
+    match read_json::<AccountScopeFile>(&scope_path)? {
+        Some(actual) => validate_account_scope_contents(&actual, server_origin, account_id),
+        None => {
+            if directory.exists() {
+                let mut entries = fs::read_dir(directory)?;
+                if entries.next().transpose()?.is_some() {
+                    return Err(StoreError::InvalidScope(
+                        "账号目录已有数据但缺少 scope.json",
+                    ));
+                }
+            } else {
+                fs::create_dir_all(directory)?;
+            }
+            atomic_write_json(
+                &scope_path,
+                &expected_account_scope_file(server_origin, account_id),
+            )?;
+            validate_account_scope_file(directory, server_origin, account_id)
+        }
+    }
+}
+
+fn validate_account_scope_file(
+    directory: &Path,
+    server_origin: &str,
+    account_id: &str,
+) -> Result<(), StoreError> {
+    let actual = read_required_json::<AccountScopeFile>(&directory.join("scope.json"))?;
+    validate_account_scope_contents(&actual, server_origin, account_id)
+}
+
+fn validate_account_scope_contents(
+    actual: &AccountScopeFile,
+    server_origin: &str,
+    account_id: &str,
+) -> Result<(), StoreError> {
+    if actual.version != SCOPE_FORMAT_VERSION {
+        return Err(StoreError::InvalidScope("scope.json 版本不受支持"));
+    }
+    if actual.server_origin != server_origin || actual.account_id != account_id {
+        return Err(StoreError::InvalidScope(
+            "scope.json 与请求的服务端 origin 或账号不一致",
+        ));
+    }
+    Ok(())
+}
+
 fn read_current_generation(directory: &Path) -> Result<Option<String>, StoreError> {
     let Some(current) = read_json::<CurrentFile>(&directory.join("current.json"))? else {
         return Ok(None);
@@ -1016,6 +1201,47 @@ fn validate_bindings(
         }
     }
     Ok(())
+}
+
+/// 让只保留在本机的凭据绑定跟随一次库存切换，同时避免把旧 endpoint 的
+/// 密码/私钥静默用于服务端同步下来的新目标。该函数只改下一 generation
+/// 的 binding；Credential Manager 中旧 target 由主线程在提交成功后清理。
+fn sanitize_bindings_for_inventory_transition(
+    previous: &SshInventory,
+    next: &SshInventory,
+    bindings: &mut Vec<SshLocalBinding>,
+) {
+    bindings.retain_mut(|binding| {
+        let Some(previous_profile) = previous.profile(&binding.profile_id) else {
+            return false;
+        };
+        let Some(next_profile) = next.profile(&binding.profile_id) else {
+            return false;
+        };
+        if previous_profile.host != next_profile.host
+            || previous_profile.port != next_profile.port
+            || previous_profile.username != next_profile.username
+        {
+            return false;
+        }
+        match next_profile.auth_method {
+            AuthMethod::Password => {
+                binding.private_key_path = None;
+                binding.key_passphrase_credential_ref = None;
+            }
+            AuthMethod::PrivateKey => {
+                binding.password_credential_ref = None;
+            }
+            AuthMethod::Agent => {
+                binding.private_key_path = None;
+                binding.password_credential_ref = None;
+                binding.key_passphrase_credential_ref = None;
+            }
+        }
+        binding.private_key_path.is_some()
+            || binding.password_credential_ref.is_some()
+            || binding.key_passphrase_credential_ref.is_some()
+    });
 }
 
 fn validate_binding(inventory: &SshInventory, binding: &SshLocalBinding) -> Result<(), StoreError> {
@@ -1151,6 +1377,18 @@ fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
         ) -> i32;
     }
 
+    // 账号作用域多了 server hash 与 account 两层目录，正常绝对路径也可能超过
+    // Win32 的传统 MAX_PATH。`canonicalize` 在 Windows 返回 `\\?\` 扩展长度
+    // 路径；target 可能尚不存在，因此只 canonicalize 其已存在的父目录。
+    let source = fs::canonicalize(source)?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "SSH 目标路径无父目录"))?;
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "SSH 目标路径无文件名"))?;
+    let target = fs::canonicalize(target_parent)?.join(target_name);
+
     let source_wide = source
         .as_os_str()
         .encode_wide()
@@ -1184,6 +1422,8 @@ mod tests {
     use lumen_protocol::ssh_sync::{SshMutationAck, SshSyncChange, SshSyncResponse};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const TEST_ORIGIN: &str = "https://lumen.example";
+
     fn temporary_root(test_name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1211,7 +1451,7 @@ mod tests {
     }
 
     fn account_scope(suffix: u8) -> StorageScope {
-        StorageScope::Account(account_id(suffix))
+        StorageScope::account(TEST_ORIGIN, &account_id(suffix)).unwrap()
     }
 
     fn password_ref(profile_id: &str) -> String {
@@ -1435,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn unclaimed只可由首次认领账号导入且不混入其他账号() {
+    fn unclaimed只可由首次认领origin与账号导入() {
         let root = temporary_root("claim-isolation");
         let mut local = SshStore::load(&root, StorageScope::Local).unwrap();
         let profile_id = local.create_profile(draft("local", None)).unwrap();
@@ -1449,14 +1689,120 @@ mod tests {
             .unwrap();
         drop(local);
 
-        let account_a = SshStore::load_account_claiming_unclaimed(&root, &account_id(13)).unwrap();
+        let account_a =
+            SshStore::load_account_claiming_unclaimed(&root, TEST_ORIGIN, &account_id(13)).unwrap();
         assert!(account_a.inventory().profile(&profile_id).is_some());
         assert!(account_a.binding(&profile_id).is_some());
         assert!(account_a.pending_sync_mutations() > 0);
+        let claimed_local = SshStore::load(&root, StorageScope::Local).unwrap();
+        assert!(
+            claimed_local.sync.claimed_account_id.is_none(),
+            "转移完成后必须清除临时认领标记，允许后续全新的本地清单独立存在"
+        );
+        assert!(
+            claimed_local.inventory().profiles().is_empty(),
+            "认领成功后 unclaimed 不得保留会复活的服务器副本"
+        );
+        assert!(
+            claimed_local.bindings().is_empty(),
+            "Credential Manager target 必须只有账号 store 一个活动 owner"
+        );
 
-        let account_b = SshStore::load_account_claiming_unclaimed(&root, &account_id(14)).unwrap();
+        let account_b =
+            SshStore::load_account_claiming_unclaimed(&root, TEST_ORIGIN, &account_id(14)).unwrap();
         assert!(account_b.inventory().profiles().is_empty());
         assert!(account_b.bindings().is_empty());
+        let other_origin = SshStore::load_account_claiming_unclaimed(
+            &root,
+            "https://other.example",
+            &account_id(13),
+        )
+        .unwrap();
+        assert!(other_origin.inventory().profiles().is_empty());
+        assert!(other_origin.bindings().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 认领在账号提交后中断会核对并完成单owner清理() {
+        let root = temporary_root("claim-recovery");
+        let account_id = account_id(23);
+        let requested_claim = unclaimed_scope_marker(TEST_ORIGIN, &account_id);
+        let mut local = SshStore::load(&root, StorageScope::Local).unwrap();
+        let profile_id = local.create_profile(draft("recover", None)).unwrap();
+        local
+            .upsert_binding(SshLocalBinding {
+                profile_id: profile_id.clone(),
+                private_key_path: None,
+                password_credential_ref: Some(password_ref(&profile_id)),
+                key_passphrase_credential_ref: None,
+            })
+            .unwrap();
+
+        // 模拟认领标记已提交、账号 generation 也已提交，但进程在清空
+        // unclaimed 前退出。
+        let imported_inventory = local.inventory.clone();
+        let imported_bindings = local.bindings.clone();
+        let mut claimed_sync = local.sync.clone();
+        claimed_sync.claimed_account_id = Some(requested_claim);
+        local
+            .commit_state(
+                imported_inventory.clone(),
+                imported_bindings.clone(),
+                claimed_sync,
+            )
+            .unwrap();
+        let scope = StorageScope::account(TEST_ORIGIN, &account_id).unwrap();
+        let mut account = SshStore::load(&root, scope).unwrap();
+        let mut imported_sync = SyncJournal::default();
+        enqueue_inventory_diff(
+            &mut imported_sync,
+            &SshInventory::default(),
+            &imported_inventory,
+        )
+        .unwrap();
+        account
+            .commit_state(imported_inventory, imported_bindings, imported_sync)
+            .unwrap();
+        drop(account);
+        drop(local);
+
+        let recovered =
+            SshStore::load_account_claiming_unclaimed(&root, TEST_ORIGIN, &account_id).unwrap();
+        assert!(recovered.inventory().profile(&profile_id).is_some());
+        assert!(recovered.binding(&profile_id).is_some());
+        let local = SshStore::load(&root, StorageScope::Local).unwrap();
+        assert!(local.inventory().profiles().is_empty());
+        assert!(local.bindings().is_empty());
+        assert!(local.sync.claimed_account_id.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 认领完成后新建的本地清单不阻断已有账号重登() {
+        let root = temporary_root("post-claim-local");
+        let account_id = account_id(24);
+        let mut local = SshStore::load(&root, StorageScope::Local).unwrap();
+        let claimed_profile = local.create_profile(draft("claimed", None)).unwrap();
+        drop(local);
+
+        let account =
+            SshStore::load_account_claiming_unclaimed(&root, TEST_ORIGIN, &account_id).unwrap();
+        assert!(account.inventory().profile(&claimed_profile).is_some());
+        drop(account);
+
+        // 模拟登出后在 Local 作用域新建另一台服务器。账号缓存已经存在，
+        // 再次登录同账号时不应把新 Local 数据误判成崩溃恢复副本。
+        let mut local = SshStore::load(&root, StorageScope::Local).unwrap();
+        let local_profile = local.create_profile(draft("local-after-logout", None)).unwrap();
+        drop(local);
+        let account =
+            SshStore::load_account_claiming_unclaimed(&root, TEST_ORIGIN, &account_id).unwrap();
+        assert!(account.inventory().profile(&claimed_profile).is_some());
+        assert!(account.inventory().profile(&local_profile).is_none());
+        let local = SshStore::load(&root, StorageScope::Local).unwrap();
+        assert!(local.inventory().profile(&local_profile).is_some());
+        assert!(local.sync.claimed_account_id.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1643,7 +1989,8 @@ mod tests {
     #[test]
     fn 库存与本地绑定分文件且可往返加载() {
         let root = temporary_root("roundtrip");
-        let scope = StorageScope::Account("550E8400-E29B-41D4-A716-446655440000".to_owned());
+        let scope =
+            StorageScope::account(TEST_ORIGIN, "550E8400-E29B-41D4-A716-446655440000").unwrap();
         let mut store = SshStore::load(&root, scope.clone()).unwrap();
         assert_eq!(
             store.account_id(),
@@ -1664,6 +2011,16 @@ mod tests {
             .unwrap();
 
         let directory = scope.directory(&root).unwrap();
+        let scope_file =
+            read_required_json::<AccountScopeFile>(&directory.join("scope.json")).unwrap();
+        assert_eq!(
+            scope_file,
+            AccountScopeFile {
+                version: SCOPE_FORMAT_VERSION,
+                server_origin: TEST_ORIGIN.to_owned(),
+                account_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            }
+        );
         assert!(directory.join("current.json").is_file());
         let generation = read_current_generation(&directory).unwrap().unwrap();
         assert!(directory
@@ -1737,8 +2094,10 @@ mod tests {
     #[test]
     fn 不同账号读写完全隔离且重复保存可替换() {
         let root = temporary_root("isolation");
-        let scope_a = StorageScope::Account("550e8400-e29b-41d4-a716-446655440000".to_owned());
-        let scope_b = StorageScope::Account("550e8400-e29b-41d4-a716-446655440001".to_owned());
+        let scope_a =
+            StorageScope::account(TEST_ORIGIN, "550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let scope_b =
+            StorageScope::account(TEST_ORIGIN, "550e8400-e29b-41d4-a716-446655440001").unwrap();
         let mut a = SshStore::load(&root, scope_a.clone()).unwrap();
         a.create_group("A-1").unwrap();
         a.create_group("A-2").unwrap();
@@ -1754,11 +2113,77 @@ mod tests {
     }
 
     #[test]
+    fn 相同账号在不同origin的库存和游标完全隔离() {
+        let root = temporary_root("origin-isolation");
+        let account_id = "550e8400-e29b-41d4-a716-446655440000";
+        let scope_a = StorageScope::account("https://one.example", account_id).unwrap();
+        let scope_b = StorageScope::account("https://two.example", account_id).unwrap();
+        let mut first = SshStore::load(&root, scope_a.clone()).unwrap();
+        let snapshot = first.sync_snapshot().unwrap();
+        let response = response_for(
+            &snapshot,
+            SshMutationStatus::Applied,
+            7,
+            vec![change(
+                7,
+                SshChange::UpsertGroup {
+                    group: remote_group('c', "only-a", 0),
+                },
+            )],
+        );
+        first.apply_sync_response(&snapshot, response).unwrap();
+        let second = SshStore::load(&root, scope_b.clone()).unwrap();
+
+        assert_eq!(first.server_origin(), Some("https://one.example"));
+        assert_eq!(second.server_origin(), Some("https://two.example"));
+        assert_eq!(first.account_id(), second.account_id());
+        assert_eq!(first.inventory().groups().len(), 1);
+        assert_eq!(first.server_cursor(), 7);
+        assert!(second.inventory().groups().is_empty());
+        assert_eq!(second.server_cursor(), 0);
+        assert_ne!(
+            scope_a.directory(&root).unwrap(),
+            scope_b.directory(&root).unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scope元数据被篡改后加载与保存均fail_closed() {
+        let root = temporary_root("scope-tamper");
+        let scope = account_scope(22);
+        let mut loaded = SshStore::load(&root, scope.clone()).unwrap();
+        loaded.create_group("before-tamper").unwrap();
+        let scope_path = scope.directory(&root).unwrap().join("scope.json");
+        atomic_write_json(
+            &scope_path,
+            &AccountScopeFile {
+                version: SCOPE_FORMAT_VERSION,
+                server_origin: "https://attacker.example".to_owned(),
+                account_id: account_id(22),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SshStore::load(&root, scope),
+            Err(StoreError::InvalidScope(_))
+        ));
+        assert!(matches!(
+            loaded.create_group("after-tamper"),
+            Err(StoreError::InvalidScope(_))
+        ));
+        assert_eq!(loaded.inventory().groups().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn 变更保存失败时不提交内存() {
         let root = temporary_root("transaction");
         fs::write(&root, "not-a-directory").unwrap();
         let mut store = SshStore {
             directory: root.clone(),
+            server_origin: None,
             account_id: None,
             generation: None,
             inventory: SshInventory::default(),
@@ -1787,6 +2212,33 @@ mod tests {
         let loaded = SshStore::load(&root, StorageScope::Local).unwrap();
         assert_eq!(loaded.inventory().groups().len(), 1);
         assert_eq!(loaded.inventory().groups()[0].name, "first");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 并发实例写入由作用域文件锁串行且只允许一个generation胜出() {
+        let root = temporary_root("concurrent-lock");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = ["first", "second"].map(|name| {
+            let root = root.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut store = SshStore::load(&root, StorageScope::Local).unwrap();
+                barrier.wait();
+                store.create_group(name)
+            })
+        });
+        let results = handles.map(|handle| handle.join().expect("写入线程不应 panic"));
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::ConcurrentModification { .. })))
+                .count(),
+            1
+        );
+        let loaded = SshStore::load(&root, StorageScope::Local).unwrap();
+        assert_eq!(loaded.inventory().groups().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1867,6 +2319,55 @@ mod tests {
             assert!(matches!(result, Err(StoreError::InvalidBinding(_))));
         }
         assert!(store.binding(&profile_id).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 修改认证方式或endpoint会原子清理不再适用的本机绑定() {
+        let root = temporary_root("sanitize-local-binding");
+        let mut store = SshStore::load(&root, StorageScope::Local).unwrap();
+        let profile_id = store.create_profile(draft("one", None)).unwrap();
+        let password_reference = password_ref(&profile_id);
+        let passphrase_reference = passphrase_ref(&profile_id);
+        let key_path = root.join("keys").join("id_ed25519");
+        store
+            .upsert_binding(SshLocalBinding {
+                profile_id: profile_id.clone(),
+                private_key_path: Some(key_path.clone()),
+                password_credential_ref: Some(password_reference),
+                key_passphrase_credential_ref: Some(passphrase_reference.clone()),
+            })
+            .unwrap();
+
+        let mut private_key = draft("one", None);
+        private_key.auth_method = AuthMethod::PrivateKey;
+        store.update_profile(&profile_id, private_key).unwrap();
+        let binding = store.binding(&profile_id).unwrap();
+        assert_eq!(binding.private_key_path.as_ref(), Some(&key_path));
+        assert!(binding.password_credential_ref.is_none());
+        assert_eq!(
+            binding.key_passphrase_credential_ref.as_deref(),
+            Some(passphrase_reference.as_str())
+        );
+
+        let mut agent = draft("one", None);
+        agent.auth_method = AuthMethod::Agent;
+        store.update_profile(&profile_id, agent).unwrap();
+        assert!(store.binding(&profile_id).is_none());
+
+        let second_id = store.create_profile(draft("two", None)).unwrap();
+        store
+            .upsert_binding(SshLocalBinding {
+                profile_id: second_id.clone(),
+                private_key_path: None,
+                password_credential_ref: Some(password_ref(&second_id)),
+                key_passphrase_credential_ref: None,
+            })
+            .unwrap();
+        let mut moved_endpoint = draft("two", None);
+        moved_endpoint.host = "new.example.test".to_owned();
+        store.update_profile(&second_id, moved_endpoint).unwrap();
+        assert!(store.binding(&second_id).is_none());
         let _ = fs::remove_dir_all(root);
     }
 }

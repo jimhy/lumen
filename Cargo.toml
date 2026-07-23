@@ -69,6 +69,8 @@ winit = "0.30"
 wgpu = "29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
+url = "2.5"
 # 文件传输块在 JSON 里 base64 编码（lumen-protocol remote.rs 的 b64 mod），
 # 避免 Vec<u8> 序列化成数字数组膨胀 ~4x；服务端仍盲转 Value，无感知。
 base64 = "0.22"

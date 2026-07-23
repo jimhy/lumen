@@ -41,7 +41,9 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 use winit::event_loop::EventLoopProxy;
 
-use crate::cloud::server_url;
+use crate::cloud::{
+    canonical_server_origin, validate_server_transport, verified_server_origin, CloudError,
+};
 use crate::p2p::{P2pEngine, P2pEvent, SignalPayload};
 use crate::PtyWake;
 
@@ -75,6 +77,8 @@ const DIR_SERVICE_QUEUE_CAP: usize = 64;
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+/// 带 Bearer token 的 WebSocket 握手绝不跟随重定向。
+const WEBSOCKET_MAX_REDIRECTS: u8 = 0;
 /// 断线自动重挂（会话宽限恢复）：放弃前的总窗口。窗口内 WS 重连 / 对端重新上线后凭
 /// 服务端持久化的配对信任（`device_pairs`，免码直连）自动重建会话；超窗才真正拆会话。
 /// 120s ≈ 覆盖系统睡眠边缘、Wi-Fi 省电抖动、路由器重启等常见瞬断场景。
@@ -438,6 +442,8 @@ pub struct RemoteWs {
     evt_rx: Option<Receiver<WsEvent>>,
     /// 停止标志（登出 / Drop 时置位）。
     stop: Option<Arc<AtomicBool>>,
+    /// 启动时捕获并验证的服务端 origin；会话期 P2P/STUN 也只从该快照派生。
+    server_origin: Option<String>,
     /// 唤醒主线程用（被控端文件服务 worker 读盘完成后 nudge——否则空闲被控端的 ListDirResult
     /// 卡到下个偶发事件才发回，控制端目录加载慢数秒）。`start` 时存，与 WS 线程共用同套 wake。
     ctx: Option<egui::Context>,
@@ -1391,12 +1397,14 @@ impl RemoteWs {
     /// 输出同款唤醒机制，共用 `wake_pending` 去重防事件风暴）。
     pub fn start(
         &mut self,
+        server_origin: String,
         token: Arc<RwLock<String>>,
         ctx: egui::Context,
         proxy: EventLoopProxy<PtyWake>,
         wake_pending: Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), CloudError> {
         self.stop();
+        let endpoint = remote_endpoint(&server_origin)?;
         // part3c-2 #5：清上次会话残留的远程打开临时文件。成功打开的副本在会话结束时被外部
         // 程序占用、删不掉（fetch_end 不删），故启动时整目录 best-effort 清一次（删不掉的
         // 旧文件留到下次）——同时兜底所有中止路径删除失败的半成品。
@@ -1411,6 +1419,7 @@ impl RemoteWs {
         self.svc_tx = Some(svc_tx.clone());
         self.svc_rx = Some(svc_rx);
         self.stop = Some(stop.clone());
+        self.server_origin = Some(endpoint.origin);
         // 存一套 nudge 句柄：被控端文件服务 worker（spawn_list_dir）读盘完成后唤醒主线程
         // drain_service 立即发回结果（修「远程目录加载慢 ~10s」）。
         self.ctx = Some(ctx.clone());
@@ -1433,12 +1442,30 @@ impl RemoteWs {
                 log::error!("启动读目录服务 worker {i} 失败: {e}");
             }
         }
-        if let Err(e) = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("lumen-remote-ws".into())
-            .spawn(move || worker(&token, &cmd_rx, &evt_tx, &stop, &ctx, &proxy, &wake_pending))
-        {
-            log::error!("启动远程 WS 线程失败: {e}");
+            .spawn(move || {
+                worker(
+                    &endpoint.websocket_url,
+                    &token,
+                    &cmd_rx,
+                    &evt_tx,
+                    &stop,
+                    &ctx,
+                    &proxy,
+                    &wake_pending,
+                )
+            });
+        if spawned.is_err() {
+            log::error!("启动远程 WS 线程失败");
+            return Err(self.rollback_worker_start_failure());
         }
+        Ok(())
+    }
+
+    fn rollback_worker_start_failure(&mut self) -> CloudError {
+        self.stop();
+        CloudError::Network("remote websocket worker start failed".to_owned())
     }
 
     /// 登出 / 停止：终止后台线程并清空所有远程态。
@@ -1449,6 +1476,7 @@ impl RemoteWs {
         self.cmd_tx = None;
         self.evt_rx = None;
         self.stop = None;
+        self.server_origin = None;
         self.pairing = None;
         self.incoming = None;
         self.session = None;
@@ -5263,13 +5291,19 @@ impl RemoteWs {
                 // M6：会话建立 → 启动 P2P 打洞引擎（控制端发 Offer，被控端等 Offer 回 Answer）。
                 // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。传入主线程唤醒句柄——
                 // P2P 收到数据帧后须 nudge 主线程重绘（漏传则按需重绘 UI 回显延迟数秒）。
-                self.p2p = Some(P2pEngine::start(
-                    role,
-                    stun_host_from_server(),
-                    self.ctx.clone(),
-                    self.proxy.clone(),
-                    self.wake_pending.clone(),
-                ));
+                self.p2p = self
+                    .server_origin
+                    .as_deref()
+                    .and_then(|origin| stun_host_from_origin(origin).ok())
+                    .map(|stun_host| {
+                        P2pEngine::start(
+                            role,
+                            stun_host,
+                            self.ctx.clone(),
+                            self.proxy.clone(),
+                            self.wake_pending.clone(),
+                        )
+                    });
                 if was_reattach {
                     // 重挂成功：重订阅断线前的 tab（subscribed_tab 在重挂期间特意保留），
                     // 被控端强制重发 SubscriptionStarted → 快照重建镜像，与直连↔中继切换
@@ -5307,7 +5341,9 @@ fn nudge(ctx: &egui::Context, proxy: &EventLoopProxy<PtyWake>, wake_pending: &Ar
 
 /// 后台线程主体：连接 → 跑读写循环 → 断线退避重连，直到 `stop`。每次（重）连读共享 token 的
 /// **当前值**——心跳 worker 自动续期后写回同一句柄，重连即用新 token（免 7 天到期后 WS 401 连不上）。
+#[allow(clippy::too_many_arguments)] // 固定 endpoint 加现有通道/唤醒句柄，保持线程边界参数显式。
 fn worker(
+    websocket_url: &str,
     token: &Arc<RwLock<String>>,
     cmd_rx: &Receiver<RemoteC2S>,
     evt_tx: &Sender<WsEvent>,
@@ -5317,8 +5353,18 @@ fn worker(
     wake_pending: &Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        let tok = token.read().map(|g| g.clone()).unwrap_or_default();
-        match connect_ws(&tok) {
+        let tok = zeroize::Zeroizing::new(token.read().map(|g| g.clone()).unwrap_or_default());
+        // 登出/换源会先原地清 token 再置 stop。读出共享值后、真正握手前再检查一次，
+        // 尽量收窄在途旧凭据请求窗口；即使仍有在途请求，其 endpoint 也是本 worker
+        // 启动时绑定的旧 origin，绝不会读到新全局地址。
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if tok.is_empty() {
+            sleep_with_stop(RECONNECT_DELAY, stop);
+            continue;
+        }
+        match connect_ws(websocket_url, &tok) {
             Ok(mut socket) => {
                 let _ = evt_tx.send(WsEvent::Connected);
                 nudge(ctx, proxy, wake_pending);
@@ -5326,7 +5372,7 @@ fn worker(
                 let _ = evt_tx.send(WsEvent::Disconnected);
                 nudge(ctx, proxy, wake_pending);
             }
-            Err(e) => log::warn!("远程 WS 连接失败: {e}"),
+            Err(_) => log::warn!("远程 WS 连接失败"),
         }
         if stop.load(Ordering::SeqCst) {
             break;
@@ -5411,37 +5457,66 @@ fn write_msg(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, msg: &RemoteC2S)
 
 /// 建立到 `lumen-server` 的 WS 连接（带 `Authorization: Bearer` 头），并对底层
 /// `TcpStream` 设读超时。
-fn connect_ws(token: &str) -> anyhow::Result<WebSocket<MaybeTlsStream<TcpStream>>> {
-    let url = ws_url(&server_url());
-    let uri: tungstenite::http::Uri = url.parse()?;
-    let req = ClientRequestBuilder::new(uri).with_header("Authorization", format!("Bearer {token}"));
-    let (mut socket, _resp) = tungstenite::connect(req)?;
+fn connect_ws(
+    websocket_url: &str,
+    token: &str,
+) -> anyhow::Result<WebSocket<MaybeTlsStream<TcpStream>>> {
+    let uri: tungstenite::http::Uri = websocket_url
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid websocket endpoint"))?;
+    let req =
+        ClientRequestBuilder::new(uri).with_header("Authorization", format!("Bearer {token}"));
+    let (mut socket, _resp) =
+        tungstenite::client::connect_with_config(req, None, websocket_redirect_limit())?;
     set_read_timeout(socket.get_mut(), Some(READ_TIMEOUT));
     Ok(socket)
 }
 
-/// 从 server 基址推导 STUN 反射端地址（同主机、UDP 8788）：`http://host:8787` → `host:8788`。
+fn websocket_redirect_limit() -> u8 {
+    WEBSOCKET_MAX_REDIRECTS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteEndpoint {
+    origin: String,
+    websocket_url: String,
+}
+
+/// 在主线程启动 worker 前捕获并验证全部远程端点。
+fn remote_endpoint(base: &str) -> Result<RemoteEndpoint, CloudError> {
+    let origin = verified_server_origin(base)?;
+    let websocket_url = ws_url(&origin)?;
+    Ok(RemoteEndpoint {
+        origin,
+        websocket_url,
+    })
+}
+
+/// 从固定 server origin 推导 STUN 反射端地址（同主机、UDP 8788）：
+/// `http://host:8787` → `host:8788`。
 /// 用于 P2P 端点发现（自建 STUN 反射，见 `server/lumen-server/src/stun.rs`，默认端口 8788；
 /// 若 server 经 `LUMEN_STUN_BIND_ADDR` 改端口，此处需同步——Phase 2 先用默认端口）。
-fn stun_host_from_server() -> String {
-    let url = server_url();
-    let after_scheme = url.split("://").nth(1).unwrap_or(url.as_str());
-    let host = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = host.split(':').next().unwrap_or(host);
-    format!("{host}:8788")
+fn stun_host_from_origin(origin: &str) -> Result<String, CloudError> {
+    let origin = verified_server_origin(origin)?;
+    let url = url::Url::parse(&origin).map_err(|_| CloudError::InvalidServerOrigin)?;
+    match url.host() {
+        Some(url::Host::Domain(host)) => Ok(format!("{host}:8788")),
+        Some(url::Host::Ipv4(host)) => Ok(format!("{host}:8788")),
+        Some(url::Host::Ipv6(host)) => Ok(format!("[{host}]:8788")),
+        None => Err(CloudError::InvalidServerOrigin),
+    }
 }
 
 /// 把 HTTP(S) 基址转成 WS(S) URL 并拼上远程控制路径。
-fn ws_url(base: &str) -> String {
-    let b = base.trim_end_matches('/');
-    let scheme_swapped = if let Some(rest) = b.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = b.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        format!("ws://{b}")
-    };
-    format!("{scheme_swapped}{}", lumen_protocol::routes::WS)
+fn ws_url(base: &str) -> Result<String, CloudError> {
+    let origin = canonical_server_origin(base)?;
+    validate_server_transport(&origin)?;
+    let mut url = url::Url::parse(&origin).map_err(|_| CloudError::InvalidServerOrigin)?;
+    let websocket_scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(websocket_scheme)
+        .map_err(|()| CloudError::InvalidServerOrigin)?;
+    url.set_path(lumen_protocol::routes::WS);
+    Ok(url.to_string())
 }
 
 /// 给底层 `TcpStream` 设读超时（明文 / rustls 两种流均覆盖）。
@@ -5477,10 +5552,36 @@ mod tests {
 
     #[test]
     fn ws_url_转换() {
-        assert_eq!(ws_url("http://127.0.0.1:8787"), "ws://127.0.0.1:8787/api/v1/ws");
-        assert_eq!(ws_url("https://lumen.example.com"), "wss://lumen.example.com/api/v1/ws");
-        // 缺协议默认 ws://；去尾斜杠。
-        assert_eq!(ws_url("192.168.1.85:8787/"), "ws://192.168.1.85:8787/api/v1/ws");
+        assert_eq!(
+            ws_url("http://127.0.0.1:8787").as_deref(),
+            Ok("ws://127.0.0.1:8787/api/v1/ws")
+        );
+        assert_eq!(
+            ws_url("https://lumen.example.com").as_deref(),
+            Ok("wss://lumen.example.com/api/v1/ws")
+        );
+        // 裸地址默认 HTTPS/WSS。
+        assert_eq!(
+            ws_url("lumen.example.com:8787").as_deref(),
+            Ok("wss://lumen.example.com:8787/api/v1/ws")
+        );
+        assert!(matches!(
+            ws_url("http://192.168.1.85:8787"),
+            Err(CloudError::InsecureTransport)
+        ));
+    }
+
+    #[test]
+    fn ws握手禁止重定向且端点固定() {
+        assert_eq!(websocket_redirect_limit(), 0);
+        let endpoint = remote_endpoint("https://a.example.com").expect("捕获 A");
+        let later = remote_endpoint("https://b.example.com").expect("捕获 B");
+        assert_eq!(endpoint.origin, "https://a.example.com");
+        assert_eq!(
+            endpoint.websocket_url,
+            "wss://a.example.com/api/v1/ws"
+        );
+        assert_ne!(endpoint, later);
     }
 
     #[test]
@@ -5491,6 +5592,25 @@ mod tests {
         // stop 在未启动时应安全（幂等）。
         ws.stop();
         assert!(!ws.is_running());
+    }
+
+    #[test]
+    fn ws_worker启动失败会回滚全部运行态() {
+        let mut ws = RemoteWs {
+            stop: Some(Arc::new(AtomicBool::new(false))),
+            server_origin: Some("https://a.example.com".to_owned()),
+            ..RemoteWs::default()
+        };
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(cmd_tx);
+
+        let error = ws.rollback_worker_start_failure();
+
+        assert!(!ws.is_running());
+        assert!(ws.cmd_tx.is_none());
+        assert!(ws.server_origin.is_none());
+        assert_eq!(error.code(), "network");
+        assert!(!format!("{error:?}").contains("a.example.com"));
     }
 
     #[test]

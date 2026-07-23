@@ -6,6 +6,7 @@
 //! 设备 id 持久化在应用数据目录、**登出后保留**，使同一物理机跨登录复用
 //! 同一设备记录（避免在服务端重复登记设备）。
 
+use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -17,18 +18,23 @@ use lumen_protocol::{
     HistoryPushRequest, LoginRequest, RefreshResponse, RegisterRequest, RenameDeviceRequest,
     SettingsSync, UserInfo,
 };
+use sha2::{Digest, Sha256};
+use url::{Host, Url};
 
 const SSH_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 const SSH_SYNC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const SSH_SYNC_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const SSH_SYNC_MAX_ERROR_BYTES: usize = 64 * 1024;
+/// 带账号凭据的 REST 请求绝不自动跟随重定向，避免密码、Bearer token 或 SSH DTO
+/// 被 3xx 响应转发到另一个端点。
+const REST_MAX_REDIRECTS: u32 = 0;
 
 /// 进程内的服务端基址（懒初始化：环境变量 > 持久化(设置页) > **空**）。
 /// **发布版不预设任何默认服务端地址**（含 localhost）——未配置时为空串，用户须在
 /// 设置页填服务端地址；开发时用环境变量 `LUMEN_SERVER_URL` 指向本地服务端。
 static SERVER_URL: RwLock<Option<String>> = RwLock::new(None);
 
-/// 取服务端基址（已规整：去尾 `/`、缺协议补 `http://`；**未配置返回空串**）。
+/// 取服务端基址（规范 origin、缺协议补 `https://`；**未配置或无效返回空串**）。
 ///
 /// 首次读取时按「`LUMEN_SERVER_URL` 环境变量 > 持久化(设置页) > 空」初始化；
 /// 之后由 [`set_server_url`]（设置页输入）覆盖。供 `login_ui` / `remote` 共用。
@@ -38,7 +44,7 @@ pub fn server_url() -> String {
         return u;
     }
     let raw = std::env::var("LUMEN_SERVER_URL").ok().unwrap_or_default();
-    let normalized = normalize_url(&raw);
+    let normalized = canonical_server_origin(&raw).unwrap_or_default();
     if let Ok(mut g) = SERVER_URL.write() {
         *g = Some(normalized.clone());
     }
@@ -47,29 +53,87 @@ pub fn server_url() -> String {
 
 /// 设置服务端基址（设置页输入用）：更新进程内全局。持久化由 settings.json 负责。
 pub fn set_server_url(url: &str) {
-    let normalized = normalize_url(url);
+    let normalized = canonical_server_origin(url).unwrap_or_default();
     if let Ok(mut g) = SERVER_URL.write() {
         *g = Some(normalized);
     }
 }
 
-/// 规整地址：去首尾空白与尾 `/`；用户只填 `IP:端口` 时自动补 `http://`；**空则返回
-/// 空串**（不再回退任何默认地址——发布版不预设服务端）。
-fn normalize_url(raw: &str) -> String {
-    let s = raw.trim().trim_end_matches('/');
-    if s.is_empty() {
-        String::new()
-    } else if s.starts_with("http://") || s.starts_with("https://") {
-        s.to_string()
-    } else {
-        format!("http://{s}")
+/// 把用户输入严格规范为一个 HTTP(S) 服务端 origin。
+///
+/// 裸主机默认使用 HTTPS；只接受根 origin，不接受凭据、路径、查询、片段或控制字符。
+/// 返回值统一为小写 scheme / URL 规范化 host、移除默认端口且不带尾 `/`。
+pub fn canonical_server_origin(raw: &str) -> Result<String, CloudError> {
+    if raw.chars().any(char::is_control) {
+        return Err(CloudError::InvalidServerOrigin);
     }
+    let input = raw.trim();
+    if input.is_empty() {
+        return Err(CloudError::InvalidServerOrigin);
+    }
+    let candidate = if input.contains("://") {
+        input.to_owned()
+    } else {
+        format!("https://{input}")
+    };
+    let (_, remainder) = candidate
+        .split_once("://")
+        .ok_or(CloudError::InvalidServerOrigin)?;
+    let authority_end = remainder
+        .find(['/', '\\', '?', '#'])
+        .unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let suffix = &remainder[authority_end..];
+    if authority.contains('@') || authority.ends_with(':') || !matches!(suffix, "" | "/") {
+        return Err(CloudError::InvalidServerOrigin);
+    }
+    let mut url = Url::parse(&candidate).map_err(|_| CloudError::InvalidServerOrigin)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.cannot_be_a_base()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host().is_none()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(CloudError::InvalidServerOrigin);
+    }
+
+    let default_port = match url.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("scheme 已在上方限制为 http/https"),
+    };
+    if url.port() == Some(default_port) {
+        url.set_port(None)
+            .map_err(|()| CloudError::InvalidServerOrigin)?;
+    }
+    url.set_path("");
+
+    let host = match url.host().ok_or(CloudError::InvalidServerOrigin)? {
+        Host::Domain(domain) if domain.ends_with('.') => {
+            return Err(CloudError::InvalidServerOrigin);
+        }
+        Host::Domain(domain) => domain.to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
+    };
+    let mut origin = format!("{}://{host}", url.scheme());
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Ok(origin)
 }
 
-
 /// 网络/协议错误。
-#[derive(Debug, Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CloudError {
+    /// 服务端地址不是严格的 HTTP(S) 根 origin。
+    InvalidServerOrigin,
+    /// 远端明文 HTTP 被策略阻止。
+    InsecureTransport,
     /// 网络层错误（连不上、超时等）。
     Network(String),
     /// 服务端返回的业务错误（含机器码）。
@@ -85,11 +149,37 @@ pub enum CloudError {
     Decode(String),
 }
 
+impl fmt::Debug for CloudError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidServerOrigin => formatter.write_str("InvalidServerOrigin"),
+            Self::InsecureTransport => formatter.write_str("InsecureTransport"),
+            Self::Network(_) => formatter
+                .debug_tuple("Network")
+                .field(&"[redacted]")
+                .finish(),
+            Self::Api { status, .. } => formatter
+                .debug_struct("Api")
+                .field("status", status)
+                .field("code", &self.code())
+                .field("message", &"[redacted]")
+                .finish(),
+            Self::Decode(_) => formatter
+                .debug_tuple("Decode")
+                .field(&"[redacted]")
+                .finish(),
+        }
+    }
+}
+
 impl CloudError {
     /// 机器可读错误码（非 Api 变体给占位）。
     pub fn code(&self) -> &str {
         match self {
-            CloudError::Api { code, .. } => code,
+            CloudError::InvalidServerOrigin => "invalid_server_origin",
+            CloudError::InsecureTransport => "insecure_transport",
+            CloudError::Api { code, .. } if valid_api_code(code) => code,
+            CloudError::Api { .. } => "http_error",
             CloudError::Network(_) => "network",
             CloudError::Decode(_) => "decode",
         }
@@ -98,35 +188,126 @@ impl CloudError {
     /// 面向用户的中文提示。
     pub fn user_message(&self) -> String {
         match self {
+            CloudError::InvalidServerOrigin => {
+                "服务端地址无效，请填写 HTTPS 根地址（例如 https://lumen.example.com）".to_string()
+            }
+            CloudError::InsecureTransport => "为保护账号数据，远程服务端必须使用 HTTPS".to_string(),
             CloudError::Network(_) => "无法连接服务器，请检查网络或服务端地址".to_string(),
             CloudError::Decode(_) => "服务器响应异常".to_string(),
-            CloudError::Api { code, message, .. } => match code.as_str() {
+            CloudError::Api { .. } => match self.code() {
                 "invalid_credentials" => "密码错误".to_string(),
                 "email_taken" => "该邮箱已注册".to_string(),
                 "bad_request" => "邮箱或密码格式不正确".to_string(),
-                _ => message.clone(),
+                _ => "服务器拒绝了请求，请稍后重试".to_string(),
             },
         }
     }
 }
 
+fn valid_api_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn sanitize_api_message(message: &str, fallback: &str) -> String {
+    let mut clean = String::with_capacity(message.len().min(512));
+    for character in message.chars().filter(|character| !character.is_control()) {
+        if clean.len().saturating_add(character.len_utf8()) > 512 {
+            break;
+        }
+        clean.push(character);
+    }
+    let clean = clean.trim();
+    if clean.is_empty() {
+        fallback.to_owned()
+    } else {
+        clean.to_owned()
+    }
+}
+
+fn api_error(status: u16, api: Option<ApiError>, fallback: &str) -> CloudError {
+    let (code, message) = api
+        .map(|error| (error.code, error.message))
+        .unwrap_or_else(|| ("http_error".to_owned(), fallback.to_owned()));
+    let code = if valid_api_code(&code) {
+        code
+    } else {
+        "http_error".to_owned()
+    };
+    CloudError::Api {
+        status,
+        code,
+        message: sanitize_api_message(&message, fallback),
+    }
+}
+
+/// 验证已配置服务端的传输策略。
+///
+/// HTTPS 始终允许；HTTP 仅允许真正的 loopback 地址，或由运维显式设置
+/// `LUMEN_ALLOW_INSECURE_HTTP=1`。错误不携带原始 URL。
+pub fn validate_server_transport(raw: &str) -> Result<(), CloudError> {
+    let origin = canonical_server_origin(raw)?;
+    let url = Url::parse(&origin).map_err(|_| CloudError::InvalidServerOrigin)?;
+    let explicitly_allowed = std::env::var("LUMEN_ALLOW_INSECURE_HTTP")
+        .ok()
+        .is_some_and(|value| value == "1");
+    if transport_allowed(&url, explicitly_allowed)? {
+        Ok(())
+    } else {
+        Err(CloudError::InsecureTransport)
+    }
+}
+
+/// 捕获并验证一个不可变的服务端 origin，供后台任务在启动前绑定。
+///
+/// 调用方应把返回的 owned `String` move 进 worker，之后不得再读取全局 [`server_url`]。
+pub fn verified_server_origin(raw: &str) -> Result<String, CloudError> {
+    let origin = canonical_server_origin(raw)?;
+    validate_server_transport(&origin)?;
+    Ok(origin)
+}
+
+fn transport_allowed(url: &Url, explicitly_allowed: bool) -> Result<bool, CloudError> {
+    if url.scheme() == "https" {
+        return Ok(true);
+    }
+    let loopback = match url.host().ok_or(CloudError::InvalidServerOrigin)? {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    };
+    Ok(loopback || explicitly_allowed)
+}
+
 /// 与 `lumen-server` 通信的客户端。
 pub struct CloudClient {
-    base: String,
+    base: Result<String, CloudError>,
     agent: ureq::Agent,
 }
 
 impl CloudClient {
     /// 以服务端基址新建客户端（连接 10s / 读 20s 超时）。
     pub fn new(base: impl Into<String>) -> Self {
+        let raw = base.into();
+        let base = canonical_server_origin(&raw);
         let agent = ureq::AgentBuilder::new()
+            .redirects(REST_MAX_REDIRECTS)
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(20))
             .build();
-        Self {
-            base: base.into(),
-            agent,
-        }
+        Self { base, agent }
+    }
+
+    fn checked_base(&self) -> Result<&str, CloudError> {
+        let base = match &self.base {
+            Ok(base) => base.as_str(),
+            Err(error) => return Err(error.clone()),
+        };
+        validate_server_transport(base)?;
+        Ok(base)
     }
 
     /// 发一次请求，返回响应体文本；非 2xx 映射为 [`CloudError::Api`]。
@@ -137,7 +318,9 @@ impl CloudClient {
         token: Option<&str>,
         body: Option<&str>,
     ) -> Result<String, CloudError> {
-        let url = format!("{}{}", self.base, path);
+        // 必须先验证传输，之后才构造请求并附加 token / 密码请求体。
+        let base = self.checked_base()?;
+        let url = format!("{base}{path}");
         let mut req = self.agent.request(method, &url);
         if let Some(t) = token {
             req = req.set("Authorization", &format!("Bearer {t}"));
@@ -149,31 +332,27 @@ impl CloudClient {
         match result {
             Ok(resp) => resp
                 .into_string()
-                .map_err(|e| CloudError::Network(e.to_string())),
+                .map_err(|_| CloudError::Network("response read failed".to_owned())),
             Err(ureq::Error::Status(status, resp)) => {
-                let txt = resp.into_string().unwrap_or_default();
-                let api: Option<ApiError> = serde_json::from_str(&txt).ok();
-                Err(CloudError::Api {
-                    status,
-                    code: api
-                        .as_ref()
-                        .map(|a| a.code.clone())
-                        .unwrap_or_else(|| "http_error".to_string()),
-                    message: api.map(|a| a.message).unwrap_or(txt),
-                })
+                let api = read_limited_response(resp, SSH_SYNC_MAX_ERROR_BYTES)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<ApiError>(&text).ok());
+                Err(api_error(status, api, "请求被服务端拒绝"))
             }
-            Err(ureq::Error::Transport(t)) => Err(CloudError::Network(t.to_string())),
+            Err(ureq::Error::Transport(_)) => Err(CloudError::Network("request failed".to_owned())),
         }
     }
 
     /// 反序列化 JSON 响应。
     fn decode<T: serde::de::DeserializeOwned>(txt: &str) -> Result<T, CloudError> {
-        serde_json::from_str(txt).map_err(|e| CloudError::Decode(e.to_string()))
+        serde_json::from_str(txt)
+            .map_err(|_| CloudError::Decode("response decoding failed".to_owned()))
     }
 
     /// 序列化请求体。
     fn encode(v: &impl serde::Serialize) -> Result<String, CloudError> {
-        serde_json::to_string(v).map_err(|e| CloudError::Decode(e.to_string()))
+        serde_json::to_string(v)
+            .map_err(|_| CloudError::Decode("request encoding failed".to_owned()))
     }
 
     /// 注册账户。
@@ -268,13 +447,15 @@ impl CloudClient {
         token: &str,
         request: &SshSyncRequest,
     ) -> Result<SshSyncResponse, CloudError> {
+        // 与通用 send 同样：在序列化正文、附加 Bearer token 前先做传输策略检查。
+        let base = self.checked_base()?;
         let body = Self::encode(request)?;
         if body.len() > SSH_SYNC_MAX_REQUEST_BYTES {
             return Err(CloudError::Decode(
                 "SSH 同步请求超过本地安全大小限制".to_owned(),
             ));
         }
-        let url = format!("{}{}", self.base, routes::SYNC_SSH);
+        let url = format!("{base}{}", routes::SYNC_SSH);
         let result = self
             .agent
             .post(&url)
@@ -288,19 +469,10 @@ impl CloudClient {
                 let api = read_limited_response(response, SSH_SYNC_MAX_ERROR_BYTES)
                     .ok()
                     .and_then(|text| serde_json::from_str::<ApiError>(&text).ok());
-                return Err(CloudError::Api {
-                    status,
-                    code: api
-                        .as_ref()
-                        .map(|error| error.code.clone())
-                        .unwrap_or_else(|| "http_error".to_owned()),
-                    message: api
-                        .map(|error| error.message)
-                        .unwrap_or_else(|| "SSH 同步请求被服务端拒绝".to_owned()),
-                });
+                return Err(api_error(status, api, "SSH 同步请求被服务端拒绝"));
             }
-            Err(ureq::Error::Transport(error)) => {
-                return Err(CloudError::Network(error.to_string()));
+            Err(ureq::Error::Transport(_)) => {
+                return Err(CloudError::Network("SSH sync request failed".to_owned()));
             }
         };
         Self::decode(&response_text)
@@ -317,7 +489,7 @@ fn read_limited_response(
         .into_reader()
         .take(maximum_plus_marker as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| CloudError::Network(error.to_string()))?;
+        .map_err(|_| CloudError::Network("response read failed".to_owned()))?;
     if bytes.len() > maximum_bytes {
         return Err(CloudError::Decode(
             "服务器响应超过本地安全大小限制".to_owned(),
@@ -328,12 +500,97 @@ fn read_limited_response(
 
 // ——— 设备 id 持久化（登出后保留，跨登录复用）———
 
-/// 设备 id 文件路径（应用数据目录下 `device_id`）。
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    let bytes = digest.as_ref();
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+fn origin_storage_key(origin: &str) -> Result<String, CloudError> {
+    let canonical = canonical_server_origin(origin)?;
+    Ok(hex_digest(Sha256::digest(canonical.as_bytes())))
+}
+
+fn device_id_path_for_origin_at(
+    data_root: &std::path::Path,
+    origin: &str,
+) -> Result<PathBuf, CloudError> {
+    let key = origin_storage_key(origin)?;
+    Ok(data_root.join("origins").join(key).join("device_id"))
+}
+
+fn device_id_path_for_origin(origin: &str) -> Option<PathBuf> {
+    let data_root = crate::paths::data_dir()?;
+    device_id_path_for_origin_at(&data_root, origin).ok()
+}
+
+/// 读取绑定到指定 canonical origin 的设备 id。
+///
+/// 不回退旧版全局 `device_id`，避免把服务 A 的稳定设备标识发给服务 B。
+pub fn load_device_id_for_origin(origin: &str) -> Option<String> {
+    load_device_id_from(&device_id_path_for_origin(origin)?)
+}
+
+/// 保存绑定到指定 canonical origin 的设备 id。
+pub fn save_device_id_for_origin(origin: &str, id: &str) -> std::io::Result<()> {
+    let Some(data_root) = crate::paths::data_dir() else {
+        return Ok(());
+    };
+    let path = device_id_path_for_origin_at(&data_root, origin).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid server origin for device id",
+        )
+    })?;
+    save_device_id_to(&path, id)
+}
+
+/// 仅当 profile 明确属于同一 canonical origin 时，用其中的镜像 id 修复该 origin
+/// 分区的设备 id。旧 profile 没有 `auth_origin`，不会被自动迁移或上传。
+pub fn reconcile_device_id_for_origin(
+    origin: &str,
+    profile_origin: Option<&str>,
+    profile_device_id: Option<&str>,
+) -> bool {
+    let Ok(canonical) = canonical_server_origin(origin) else {
+        return false;
+    };
+    let profile_matches = profile_origin
+        .and_then(|saved| canonical_server_origin(saved).ok())
+        .is_some_and(|saved| saved == canonical);
+    if !profile_matches || load_device_id_for_origin(&canonical).is_some() {
+        return false;
+    }
+    let Some(device_id) = profile_device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    match save_device_id_for_origin(&canonical, device_id) {
+        Ok(()) => {
+            log::info!("已从同源 profile 修复服务端分区 device_id");
+            true
+        }
+        Err(error) => {
+            log::warn!("修复服务端分区 device_id 失败: {error}");
+            false
+        }
+    }
+}
+
+/// 旧版全局设备 id 文件路径。仅用于本地兼容对账，联网鉴权不得读取。
 fn device_id_path() -> Option<PathBuf> {
     crate::paths::data_file("device_id")
 }
 
-/// 读取持久化的设备 id（首次登录前为 None）。
+/// 读取旧版全局设备 id。仅供非联网的兼容逻辑使用。
 pub fn load_device_id() -> Option<String> {
     load_device_id_from(&device_id_path()?)
 }
@@ -350,7 +607,8 @@ fn load_device_id_from(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// 保存设备 id（登录成功后调用；**登出不删**，保持设备稳定）。
+/// 保存旧版全局设备 id。仅供非联网的兼容逻辑使用；新登录必须调用
+/// [`save_device_id_for_origin`]。
 ///
 /// **原子写**（同目录临时文件 + rename，与 [`crate::profile`] 同款）：老实现用 `fs::write`
 /// 截断写又静默吞错，一旦半写成空 / 写失败而 profile.json 仍有值，就会长期潜伏、直到某次
@@ -374,7 +632,8 @@ fn save_device_id_to(path: &std::path::Path, id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 启动对账：把 `device_id` 独立文件与 profile.json 里的镜像值收敛到一致。
+/// 旧版启动对账。只修复不再参与联网的全局文件；新流程使用
+/// [`reconcile_device_id_for_origin`]。
 ///
 /// 独立文件与 `profile.device_id` 是同一个 id 的两处副本，但重登只读独立文件、运行期又
 /// 从不再读它——一旦独立文件缺失 / 为空而 profile 仍有 id（历史写失败 / 外部清理 / 曾在别的
@@ -399,15 +658,24 @@ pub fn reconcile_device_id(profile_device_id: Option<&str>) -> bool {
     }
 }
 
-/// **稳定硬件标识**：Windows 读注册表 `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`。
-///
-/// 该值对「更新 app / 删本地文件 / 换数据目录 / 服务端 DB 重置」全都不变，只在重装系统时
-/// 才变，是理想的「同一物理机」稳定标识。服务端据 `(user_id, hw_id)` 幂等认领设备，从根上
-/// 杜绝「客户端带空 / 异 device_id 就分裂出幽灵设备」。读不到（受限机器 / 非 Windows）返回
-/// `None`，服务端退化回按 `device_id` 处理（无回归）。结果进程内缓存（该值恒定）。
-pub fn hardware_id() -> Option<String> {
+/// 返回原始稳定机器标识的进程内缓存，仅供生成按 origin 的不可关联伪名。
+fn raw_hardware_id() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE.get_or_init(read_machine_guid).clone()
+}
+
+/// 为指定 canonical origin 生成稳定、不可跨服务关联的硬件伪名：
+/// `SHA256(origin || 0x00 || machine_id)`。
+///
+/// 原始 MachineGuid / machine-id 永不交给自建服务端；不同 origin 得到不同伪名。
+pub fn hardware_id_for_origin(origin: &str) -> Option<String> {
+    let canonical = canonical_server_origin(origin).ok()?;
+    let machine_id = raw_hardware_id()?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hasher.update([0]);
+    hasher.update(machine_id.as_bytes());
+    Some(hex_digest(hasher.finalize()))
 }
 
 /// 读 `MachineGuid`（Windows 实现）。
@@ -536,6 +804,11 @@ fn unix_hostname() -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 账号rest请求禁止自动重定向() {
+        assert_eq!(REST_MAX_REDIRECTS, 0);
+    }
+
     /// 每个测试独立临时目录，避免并行互踩，且绝不碰真实数据目录。
     fn temp_devid_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -576,39 +849,134 @@ mod tests {
 
     #[test]
     fn 硬件标识幂等() {
-        // 值因机而异不可硬断言具体值，但同进程多次调用必一致（进程内缓存 + 机器恒定）。
-        assert_eq!(hardware_id(), hardware_id());
+        // 同一 origin 幂等，不同 origin 不可关联；对外只给 64 位十六进制摘要。
+        let a = hardware_id_for_origin("https://a.example");
+        assert_eq!(a, hardware_id_for_origin("a.example"));
+        let b = hardware_id_for_origin("https://b.example");
+        if let (Some(a), Some(b)) = (&a, &b) {
+            assert_eq!(a.len(), 64);
+            assert_ne!(a, b);
+            assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
         // Windows 上 MachineGuid 恒存在：必须真的读到一个合法 GUID（36 字符、含连字符），
-        // 否则说明注册表读取失效、hw_id 会退化、治本落空——此断言守住这条底线。
+        // 但该原值仅在本模块内参与哈希，绝不由联网 API 返回。
         #[cfg(windows)]
         {
-            let hw = hardware_id().expect("Windows 应能读到 MachineGuid");
+            let hw = raw_hardware_id().expect("Windows 应能读到 MachineGuid");
             assert_eq!(hw.len(), 36, "MachineGuid 应为 36 字符 GUID：{hw}");
             assert_eq!(hw.matches('-').count(), 4, "GUID 应含 4 个连字符：{hw}");
         }
     }
 
     #[test]
-    fn 错误码映射() {
+    fn 错误码与服务端文案不泄漏() {
         let e = CloudError::Api {
             status: 404,
             code: "user_not_found".to_string(),
             message: "x".to_string(),
         };
         assert_eq!(e.code(), "user_not_found");
+        let hostile = CloudError::Api {
+            status: 500,
+            code: "BAD\r\nCode".to_owned(),
+            message: "secret response\r\ninjection".to_owned(),
+        };
+        assert_eq!(hostile.code(), "http_error");
+        assert!(!hostile.user_message().contains("secret"));
+        assert!(!hostile.user_message().contains("BAD"));
         let net = CloudError::Network("boom".to_string());
         assert!(net.user_message().contains("无法连接"));
     }
 
     #[test]
-    fn normalize_url_规整与无默认() {
-        assert_eq!(normalize_url("1.2.3.4:8787/"), "http://1.2.3.4:8787");
-        assert_eq!(normalize_url("https://x.com/"), "https://x.com");
-        assert_eq!(normalize_url("http://a.b:8787"), "http://a.b:8787");
-        // 空 / 纯空白 → 空串（发布版不预设默认服务端地址）。
-        assert_eq!(normalize_url(""), "");
-        assert_eq!(normalize_url("   "), "");
-        // server_url 规整后绝不带尾斜杠。
-        assert!(!server_url().ends_with('/'));
+    fn canonical_origin_规范化() {
+        assert_eq!(
+            canonical_server_origin("Example.COM:443/").as_deref(),
+            Ok("https://example.com")
+        );
+        assert_eq!(
+            canonical_server_origin("HTTPS://Example.COM:443/").as_deref(),
+            Ok("https://example.com")
+        );
+        assert_eq!(
+            canonical_server_origin("http://127.0.0.1:80/").as_deref(),
+            Ok("http://127.0.0.1")
+        );
+        assert_eq!(
+            canonical_server_origin("https://[::1]:8443/").as_deref(),
+            Ok("https://[::1]:8443")
+        );
+    }
+
+    #[test]
+    fn canonical_origin_拒绝非根与注入() {
+        for invalid in [
+            "",
+            "   ",
+            "ftp://example.com",
+            "https://example.com.",
+            "https://@example.com",
+            "https://user@example.com",
+            "https://example.com:",
+            "https://example.com/./",
+            "https://example.com/a/../",
+            "https://example.com/path",
+            "https://example.com?query=1",
+            "https://example.com#fragment",
+            "https://example.com/\r\n",
+        ] {
+            assert!(
+                matches!(
+                    canonical_server_origin(invalid),
+                    Err(CloudError::InvalidServerOrigin)
+                ),
+                "应拒绝测试输入"
+            );
+        }
+    }
+
+    #[test]
+    fn 明文传输仅允许回环或显式开关() {
+        let https = Url::parse("https://example.com").expect("URL");
+        let remote_http = Url::parse("http://192.0.2.1").expect("URL");
+        let localhost = Url::parse("http://localhost:8787").expect("URL");
+        let loopback_v4 = Url::parse("http://127.0.0.1:8787").expect("URL");
+        let loopback_v6 = Url::parse("http://[::1]:8787").expect("URL");
+        assert_eq!(transport_allowed(&https, false), Ok(true));
+        assert_eq!(transport_allowed(&remote_http, false), Ok(false));
+        assert_eq!(transport_allowed(&remote_http, true), Ok(true));
+        assert_eq!(transport_allowed(&localhost, false), Ok(true));
+        assert_eq!(transport_allowed(&loopback_v4, false), Ok(true));
+        assert_eq!(transport_allowed(&loopback_v6, false), Ok(true));
+    }
+
+    #[test]
+    fn 设备id按origin分区且不读旧全局文件() {
+        let root =
+            std::env::temp_dir().join(format!("lumen_origin_device_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = device_id_path_for_origin_at(&root, "https://a.example").expect("origin A");
+        let a_equivalent =
+            device_id_path_for_origin_at(&root, "a.example:443/").expect("origin A equivalent");
+        let b = device_id_path_for_origin_at(&root, "https://b.example").expect("origin B");
+        assert_eq!(a, a_equivalent);
+        assert_ne!(a, b);
+        save_device_id_to(&a, "device-a").expect("写 A");
+        save_device_id_to(&b, "device-b").expect("写 B");
+        assert_eq!(load_device_id_from(&a).as_deref(), Some("device-a"));
+        assert_eq!(load_device_id_from(&b).as_deref(), Some("device-b"));
+        assert_eq!(
+            a.file_name().and_then(|value| value.to_str()),
+            Some("device_id")
+        );
+        assert_eq!(
+            a.parent()
+                .and_then(std::path::Path::file_name)
+                .and_then(|value| value.to_str())
+                .map(str::len),
+            Some(64)
+        );
+        assert_ne!(a, root.join("device_id"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

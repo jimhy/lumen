@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use lumen_ssh::{
-    Command, ConnectionConfig, Credential, DisconnectReason, Event, HostKeyIdentity,
-    KeepaliveConfig, MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
+    Command, ConnectionConfig, Credential, DisconnectReason, Event, EventErrorKind,
+    HostKeyIdentity, KeepaliveConfig, MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
 };
 use lumen_term::Terminal;
 
@@ -70,11 +70,16 @@ pub struct RuntimeView {
     pub changed_host_key: Option<ChangedHostKey>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
     pub active_terminal_changed: bool,
     pub active_status_changed: bool,
     pub active_became_connected: bool,
+    /// 本批明确发生密码认证或私钥解析/解密错误的 profile。
+    /// 调用方必须令这些 profile 下次连接强制提示，避免反复自动尝试坏凭据。
+    pub credential_failures: Vec<String>,
+    /// 本批成功进入 Connected 的 profile；调用方可清除其强制提示标记。
+    pub connected_profiles: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,9 +92,33 @@ pub enum ConnectIntent {
     HostKeyChanged,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EndpointIdentity {
+    host: String,
+    port: u16,
+    username: String,
+}
+
+impl EndpointIdentity {
+    fn from_profile(profile: &SshProfile) -> Self {
+        Self {
+            host: profile.host.clone(),
+            port: profile.port,
+            username: profile.username.clone(),
+        }
+    }
+
+    fn matches_profile(&self, profile: &SshProfile) -> bool {
+        self.host == profile.host
+            && self.port == profile.port
+            && self.username == profile.username
+    }
+}
+
 struct RuntimeSession {
     profile_name: String,
     endpoint: String,
+    endpoint_identity: EndpointIdentity,
     terminal: Terminal,
     connection: Option<SshConnection>,
     state: ConnectionState,
@@ -105,6 +134,7 @@ impl RuntimeSession {
         Self {
             profile_name: profile.name.clone(),
             endpoint: endpoint(profile),
+            endpoint_identity: EndpointIdentity::from_profile(profile),
             terminal: Terminal::new(DEFAULT_ROWS, DEFAULT_COLUMNS, SSH_SCROLLBACK),
             connection: None,
             state: ConnectionState::CredentialRequired,
@@ -119,6 +149,7 @@ impl RuntimeSession {
     fn refresh_metadata(&mut self, profile: &SshProfile) {
         self.profile_name.clone_from(&profile.name);
         self.endpoint = endpoint(profile);
+        self.endpoint_identity = EndpointIdentity::from_profile(profile);
     }
 
     fn is_running(&self) -> bool {
@@ -158,13 +189,15 @@ impl SshRuntime {
         if session.is_running() {
             return ConnectIntent::AlreadyRunning;
         }
-        session.refresh_metadata(profile);
+        // 未决主机密钥属于产生它的旧 endpoint。配置在弹窗期间被编辑时，
+        // 不能先用新 profile 刷新身份再复用旧指纹提示。
         if session.unknown_host_key.is_some() {
             return ConnectIntent::AwaitingHostKey;
         }
         if session.changed_host_key.is_some() {
             return ConnectIntent::HostKeyChanged;
         }
+        session.refresh_metadata(profile);
         session.state = ConnectionState::CredentialRequired;
         session.detail = None;
         match profile.auth_method {
@@ -345,8 +378,26 @@ impl SshRuntime {
                 connection.drain(&mut events);
             }
             for event in events {
+                let credential_failed = event_is_saved_credential_failure(&event);
+                let connected = matches!(&event, Event::Connected { .. });
                 let changed = apply_event(session, event);
                 terminal_changed |= changed;
+                if credential_failed
+                    && !outcome
+                        .credential_failures
+                        .iter()
+                        .any(|existing| existing == &profile_id)
+                {
+                    outcome.credential_failures.push(profile_id.clone());
+                }
+                if connected
+                    && !outcome
+                        .connected_profiles
+                        .iter()
+                        .any(|existing| existing == &profile_id)
+                {
+                    outcome.connected_profiles.push(profile_id.clone());
+                }
                 if changed {
                     // Reply before processing a later Disconnected event from
                     // the same drain batch, otherwise DSR/DA responses could
@@ -453,6 +504,25 @@ impl SshRuntime {
         matches
     }
 
+    /// 主机密钥确认提交前重新核对产生该提示的结构化 endpoint 和指纹。
+    ///
+    /// `user@host:port` 只用于展示，不能承担安全身份比较：用户名或主机名中的
+    /// `@`/`:` 可能让不同字段组合得到相同字符串。
+    pub fn unknown_host_key_matches(
+        &self,
+        profile: &SshProfile,
+        algorithm: &str,
+        fingerprint: &str,
+    ) -> bool {
+        self.sessions.get(&profile.id).is_some_and(|session| {
+            session.endpoint_identity.matches_profile(profile)
+                && session.unknown_host_key.as_ref().is_some_and(|identity| {
+                    identity.algorithm == algorithm
+                        && identity.sha256_fingerprint == fingerprint
+                })
+        })
+    }
+
     pub fn dismiss_unknown_host_key(&mut self, profile_id: &str) {
         let Some(session) = self.sessions.get_mut(profile_id) else {
             return;
@@ -470,6 +540,17 @@ impl SshRuntime {
         let profile_id = self.active_profile_id.as_ref()?.clone();
         self.sessions.get_mut(&profile_id)
     }
+}
+
+fn event_is_saved_credential_failure(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Error(error)
+            if matches!(
+                error.kind,
+                EventErrorKind::Authentication | EventErrorKind::PrivateKey
+            )
+    )
 }
 
 fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
@@ -777,6 +858,53 @@ mod tests {
     }
 
     #[test]
+    fn 主机密钥确认按结构化endpoint拒绝展示字符串碰撞() {
+        let mut original = profile(AuthMethod::Agent);
+        original.username = "a".to_owned();
+        original.host = "b@c".to_owned();
+        let mut colliding = original.clone();
+        colliding.username = "a@b".to_owned();
+        colliding.host = "c".to_owned();
+        assert_eq!(
+            endpoint(&original),
+            endpoint(&colliding),
+            "回归样例必须能碰撞旧展示字符串"
+        );
+
+        let mut runtime = SshRuntime::default();
+        assert_eq!(runtime.select_for_connect(&original), ConnectIntent::Agent);
+        let presented = HostKeyIdentity::new(
+            "ssh-ed25519",
+            "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC",
+        );
+        let session = runtime.sessions.get_mut(&original.id).expect("session");
+        apply_event(
+            session,
+            Event::HostKeyUnknown {
+                presented: presented.clone(),
+            },
+        );
+        assert!(runtime.unknown_host_key_matches(
+            &original,
+            &presented.algorithm,
+            &presented.sha256_fingerprint,
+        ));
+        assert_eq!(
+            runtime.select_for_connect(&colliding),
+            ConnectIntent::AwaitingHostKey,
+            "重新点击连接不得把未决指纹改绑到新 endpoint"
+        );
+        assert!(
+            !runtime.unknown_host_key_matches(
+                &colliding,
+                &presented.algorithm,
+                &presented.sha256_fingerprint,
+            ),
+            "host/port/username 任一字段变化都必须让旧确认失效"
+        );
+    }
+
+    #[test]
     fn metrics_summary_formats_all_required_monitor_fields() {
         let summary = format_metrics(&ServerMetrics {
             cpu_usage_percent: Some(12.5),
@@ -826,5 +954,34 @@ mod tests {
         );
         assert_eq!(runtime.sessions.len(), 2);
         assert_eq!(runtime.active_profile_id.as_deref(), Some(second.id.as_str()));
+    }
+
+    #[test]
+    fn only_password_authentication_and_private_key_errors_invalidate_saved_credentials() {
+        for kind in [
+            EventErrorKind::Authentication,
+            EventErrorKind::PrivateKey,
+        ] {
+            assert!(event_is_saved_credential_failure(&Event::Error(
+                lumen_ssh::EventError {
+                    kind,
+                    message: "safe fixed message".to_owned(),
+                }
+            )));
+        }
+        for kind in [
+            EventErrorKind::Runtime,
+            EventErrorKind::Network,
+            EventErrorKind::Agent,
+            EventErrorKind::Channel,
+            EventErrorKind::EventBackpressure,
+        ] {
+            assert!(!event_is_saved_credential_failure(&Event::Error(
+                lumen_ssh::EventError {
+                    kind,
+                    message: "safe fixed message".to_owned(),
+                }
+            )));
+        }
     }
 }

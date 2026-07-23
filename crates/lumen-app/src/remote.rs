@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lumen_protocol::DeviceRecord;
 use winit::event_loop::EventLoopProxy;
 
-use crate::cloud::{server_url, CloudClient, CloudError};
+use crate::cloud::{verified_server_origin, CloudClient, CloudError};
 use crate::PtyWake;
 
 /// 心跳 + 列表轮询周期。10s：上下线在列表里更及时反映（轻量 HTTP，几台设备开销可忽略）；
@@ -95,6 +95,9 @@ pub struct RemoteState {
     /// 当前账户 token（**共享可变**：心跳 worker 自动续期时写回，改名/删除一次性请求 + WS 重连
     /// 共读同一份，确保续期后处处用新 token）。
     token: Option<Arc<RwLock<String>>>,
+    /// 与当前 token 同时绑定的已验证 canonical origin。所有后台请求只使用此快照，
+    /// 绝不在线程里重读全局服务端地址。
+    server_origin: Option<String>,
     /// 自动续期得到的新 token（main 每帧 [`Self::take_refreshed_token`] 取走落 profile）。
     pending_token: Option<(String, i64)>,
     rx: Option<Receiver<Event>>,
@@ -108,32 +111,47 @@ impl RemoteState {
     /// `PtyWake`，否则停在远程设备视图时 30s 轮询拉到新列表也不重绘、在线状态不刷新，海风哥实测踩坑）。
     pub fn start(
         &mut self,
+        server_origin: String,
         token: Arc<RwLock<String>>,
         token_expires_at: i64,
         ctx: egui::Context,
         proxy: EventLoopProxy<PtyWake>,
         wake_pending: Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), CloudError> {
         self.stop();
+        let server_origin = verified_server_origin(&server_origin)?;
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let refresh = Arc::new(AtomicBool::new(true)); // 启动即刷一次
         self.token = Some(Arc::clone(&token));
+        self.server_origin = Some(server_origin.clone());
         self.rx = Some(rx);
         self.stop = Some(stop.clone());
         self.refresh = Some(refresh.clone());
-        std::thread::spawn(move || {
-            worker(
-                &token,
-                token_expires_at,
-                &tx,
-                &stop,
-                &refresh,
-                &ctx,
-                &proxy,
-                &wake_pending,
-            );
-        });
+        let spawned = std::thread::Builder::new()
+            .name("lumen-remote-heartbeat".to_owned())
+            .spawn(move || {
+                worker(
+                    &server_origin,
+                    &token,
+                    token_expires_at,
+                    &tx,
+                    &stop,
+                    &refresh,
+                    &ctx,
+                    &proxy,
+                    &wake_pending,
+                );
+            });
+        if spawned.is_err() {
+            return Err(self.rollback_worker_start_failure());
+        }
+        Ok(())
+    }
+
+    fn rollback_worker_start_failure(&mut self) -> CloudError {
+        self.stop();
+        CloudError::Network("remote worker start failed".to_owned())
     }
 
     /// 登出：停止后台线程、清空缓存。
@@ -142,6 +160,7 @@ impl RemoteState {
             s.store(true, Ordering::SeqCst);
         }
         self.token = None;
+        self.server_origin = None;
         self.rx = None;
         self.stop = None;
         self.refresh = None;
@@ -228,11 +247,19 @@ impl RemoteState {
 
     /// 改名设备（一次性后台请求 + 请求刷新）。
     pub fn rename_device(&self, id: String, name: String) {
-        let Some(token) = self.token.as_ref().map(read_token) else {
+        let Some((token, server_origin)) = self
+            .token
+            .as_ref()
+            .map(|token| zeroize::Zeroizing::new(read_token(token)))
+            .zip(self.server_origin.clone())
+        else {
             return;
         };
+        if token.is_empty() {
+            return;
+        }
         std::thread::spawn(move || {
-            let client = CloudClient::new(server_url());
+            let client = CloudClient::new(server_origin);
             if let Err(e) = client.rename_device(&token, &id, &name) {
                 log::warn!("远程设备改名失败: {}", e.user_message());
             }
@@ -242,14 +269,22 @@ impl RemoteState {
 
     /// 删除设备（一次性后台请求 + 请求刷新）。
     pub fn delete_device(&mut self, id: String) {
-        let Some(token) = self.token.as_ref().map(read_token) else {
+        let Some((token, server_origin)) = self
+            .token
+            .as_ref()
+            .map(|token| zeroize::Zeroizing::new(read_token(token)))
+            .zip(self.server_origin.clone())
+        else {
             return;
         };
+        if token.is_empty() {
+            return;
+        }
         if self.active_device_id.as_deref() == Some(id.as_str()) {
             self.active_device_id = None;
         }
         std::thread::spawn(move || {
-            let client = CloudClient::new(server_url());
+            let client = CloudClient::new(server_origin);
             if let Err(e) = client.delete_device(&token, &id) {
                 log::warn!("远程设备删除失败: {}", e.user_message());
             }
@@ -261,6 +296,7 @@ impl RemoteState {
 /// 后台线程主体：到点（或被请求）就心跳 + 拉列表，回传并唤醒 UI。
 #[allow(clippy::too_many_arguments)] // 与主线程共享的一组句柄/通道，拆结构体反更晦涩。
 fn worker(
+    server_origin: &str,
     token: &Arc<RwLock<String>>,
     mut expires_at: i64,
     tx: &Sender<Event>,
@@ -270,7 +306,7 @@ fn worker(
     proxy: &EventLoopProxy<PtyWake>,
     wake_pending: &Arc<AtomicBool>,
 ) {
-    let client = CloudClient::new(server_url());
+    let client = CloudClient::new(server_origin.to_owned());
     let mut last = Instant::now()
         .checked_sub(POLL_INTERVAL)
         .unwrap_or_else(Instant::now);
@@ -291,7 +327,10 @@ fn worker(
             && now.duration_since(last_refresh_try) >= TOKEN_REFRESH_RETRY
         {
             last_refresh_try = now;
-            let cur = read_token(token);
+            let cur = zeroize::Zeroizing::new(read_token(token));
+            if stop.load(Ordering::SeqCst) || cur.is_empty() {
+                break;
+            }
             if let Ok(resp) = client.refresh_token(&cur) {
                 if let Ok(mut g) = token.write() {
                     *g = resp.token.clone();
@@ -308,7 +347,10 @@ fn worker(
         let due = refresh.swap(false, Ordering::SeqCst) || now.duration_since(last) >= POLL_INTERVAL;
         if due {
             last = now;
-            let tok = read_token(token); // 共享句柄当前值（含已续期的新 token）。
+            let tok = zeroize::Zeroizing::new(read_token(token)); // 共享句柄当前值（含已续期的新 token）。
+            if stop.load(Ordering::SeqCst) || tok.is_empty() {
+                break;
+            }
             let _ = client.heartbeat(&tok);
             match client.list_devices(&tok) {
                 Ok(resp) => {
@@ -371,5 +413,24 @@ mod tests {
             *g = "xyz".into();
         }
         assert_eq!(read_token(&t), "xyz");
+    }
+
+    #[test]
+    fn worker启动失败会回滚运行态且错误安全() {
+        let mut state = RemoteState {
+            token: Some(Arc::new(RwLock::new("secret-token".to_owned()))),
+            server_origin: Some("https://a.example.com".to_owned()),
+            stop: Some(Arc::new(AtomicBool::new(false))),
+            refresh: Some(Arc::new(AtomicBool::new(true))),
+            ..RemoteState::default()
+        };
+
+        let error = state.rollback_worker_start_failure();
+
+        assert!(!state.is_running());
+        assert!(state.token.is_none());
+        assert!(state.server_origin.is_none());
+        assert!(state.refresh.is_none());
+        assert!(!format!("{error:?}").contains("secret"));
     }
 }

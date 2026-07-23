@@ -233,6 +233,38 @@ pub fn delete_secret(reference: &CredentialReference) -> Result<bool, Credential
     platform::delete_secret(reference)
 }
 
+/// “先写系统凭据、再提交本机 binding”的事务错误。
+///
+/// `E` 由 binding 提交层决定；本类型不实现 `Debug`/`Display`，避免调用方
+/// 误把更高层上下文连同凭据引用写入日志。
+pub enum CredentialTransactionError<E> {
+    Write(CredentialError),
+    Commit {
+        error: E,
+        rollback_error: Option<CredentialError>,
+    },
+}
+
+/// 写入新随机 target 后执行 binding 提交；提交失败时立即幂等回滚新 target。
+///
+/// 旧 target 必须由调用方在本函数成功后再删除，以保证任何时刻都不会出现
+/// binding 已指向尚未写入的凭据，且提交失败仍保留原 binding/secret。
+pub fn write_secret_with_commit<E>(
+    reference: &CredentialReference,
+    secret: &str,
+    commit: impl FnOnce() -> Result<(), E>,
+) -> Result<(), CredentialTransactionError<E>> {
+    write_secret(reference, secret).map_err(CredentialTransactionError::Write)?;
+    if let Err(error) = commit() {
+        let rollback_error = delete_secret(reference).err();
+        return Err(CredentialTransactionError::Commit {
+            error,
+            rollback_error,
+        });
+    }
+    Ok(())
+}
+
 fn valid_profile_id(profile_id: &str) -> bool {
     profile_id.len() == PROFILE_ID_PREFIX.len() + PROFILE_ID_HEX_LEN
         && profile_id.starts_with(PROFILE_ID_PREFIX)
@@ -513,5 +545,40 @@ mod tests {
         assert!(read_secret(&reference).unwrap().is_none());
         assert!(!delete_secret(&reference).unwrap());
         drop(cleanup);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binding提交失败会回滚刚写入的随机target() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            ^ (u128::from(std::process::id()) << 32);
+        let profile_id = format!("ssh_{nonce:032x}");
+        let reference = CredentialReference::password(&profile_id).unwrap();
+        let _ = delete_secret(&reference);
+
+        let result = write_secret_with_commit(
+            &reference,
+            "transaction-rollback-secret",
+            || Err::<(), _>("binding commit failed"),
+        );
+        match result {
+            Err(CredentialTransactionError::Commit {
+                error,
+                rollback_error,
+            }) => {
+                assert_eq!(error, "binding commit failed");
+                assert!(rollback_error.is_none());
+            }
+            Err(CredentialTransactionError::Write(_)) => {
+                panic!("Credential Manager write unexpectedly failed")
+            }
+            Ok(()) => panic!("failing binding commit unexpectedly succeeded"),
+        }
+        assert!(read_secret(&reference).unwrap().is_none());
     }
 }
