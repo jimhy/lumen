@@ -2010,7 +2010,7 @@ mod tests {
     #[test]
     fn osc9_4_其它有效状态与无效状态() {
         let mut t = term();
-        for state in [b'1', b'2', b'3', b'4'] {
+        for state in *b"1234" {
             t.advance(&[0x1b, b']', b'9', b';', b'4', b';', state, 0x07]);
             assert!(t.progress_active());
             t.advance(b"\x1b]9;4;0\x07");
