@@ -6,15 +6,22 @@
 //! 设备 id 持久化在应用数据目录、**登出后保留**，使同一物理机跨登录复用
 //! 同一设备记录（避免在服务端重复登记设备）。
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::Duration;
 
+use lumen_protocol::ssh_sync::{SshSyncRequest, SshSyncResponse};
 use lumen_protocol::{
     routes, ApiError, AuthResponse, DeviceListResponse, HistoryEntry, HistoryPullResponse,
     HistoryPushRequest, LoginRequest, RefreshResponse, RegisterRequest, RenameDeviceRequest,
     SettingsSync, UserInfo,
 };
+
+const SSH_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+const SSH_SYNC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const SSH_SYNC_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const SSH_SYNC_MAX_ERROR_BYTES: usize = 64 * 1024;
 
 /// 进程内的服务端基址（懒初始化：环境变量 > 持久化(设置页) > **空**）。
 /// **发布版不预设任何默认服务端地址**（含 localhost）——未配置时为空串，用户须在
@@ -251,6 +258,72 @@ impl CloudClient {
         let v: serde_json::Value = Self::decode(&txt)?;
         Ok(v.get("inserted").and_then(serde_json::Value::as_u64).unwrap_or(0))
     }
+
+    /// 账号级 SSH 配置增量同步。
+    ///
+    /// 与通用 REST 方法分开限制请求/响应大小和总超时。错误仅保留结构化
+    /// `ApiError`，绝不把未知响应正文塞进错误或日志。
+    pub fn sync_ssh(
+        &self,
+        token: &str,
+        request: &SshSyncRequest,
+    ) -> Result<SshSyncResponse, CloudError> {
+        let body = Self::encode(request)?;
+        if body.len() > SSH_SYNC_MAX_REQUEST_BYTES {
+            return Err(CloudError::Decode(
+                "SSH 同步请求超过本地安全大小限制".to_owned(),
+            ));
+        }
+        let url = format!("{}{}", self.base, routes::SYNC_SSH);
+        let result = self
+            .agent
+            .post(&url)
+            .timeout(SSH_SYNC_REQUEST_TIMEOUT)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_string(&body);
+        let response_text = match result {
+            Ok(response) => read_limited_response(response, SSH_SYNC_MAX_RESPONSE_BYTES)?,
+            Err(ureq::Error::Status(status, response)) => {
+                let api = read_limited_response(response, SSH_SYNC_MAX_ERROR_BYTES)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<ApiError>(&text).ok());
+                return Err(CloudError::Api {
+                    status,
+                    code: api
+                        .as_ref()
+                        .map(|error| error.code.clone())
+                        .unwrap_or_else(|| "http_error".to_owned()),
+                    message: api
+                        .map(|error| error.message)
+                        .unwrap_or_else(|| "SSH 同步请求被服务端拒绝".to_owned()),
+                });
+            }
+            Err(ureq::Error::Transport(error)) => {
+                return Err(CloudError::Network(error.to_string()));
+            }
+        };
+        Self::decode(&response_text)
+    }
+}
+
+fn read_limited_response(
+    response: ureq::Response,
+    maximum_bytes: usize,
+) -> Result<String, CloudError> {
+    let maximum_plus_marker = maximum_bytes.saturating_add(1);
+    let mut bytes = Vec::with_capacity(maximum_plus_marker.min(64 * 1024));
+    response
+        .into_reader()
+        .take(maximum_plus_marker as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CloudError::Network(error.to_string()))?;
+    if bytes.len() > maximum_bytes {
+        return Err(CloudError::Decode(
+            "服务器响应超过本地安全大小限制".to_owned(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| CloudError::Decode("服务器响应不是 UTF-8".to_owned()))
 }
 
 // ——— 设备 id 持久化（登出后保留，跨登录复用）———

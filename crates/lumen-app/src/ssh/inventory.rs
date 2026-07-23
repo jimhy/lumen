@@ -361,6 +361,76 @@ impl SshInventory {
         SyncStateDto { groups, profiles }
     }
 
+    /// 应用服务端权威分组值。服务端 revision 才是同步顺序依据；这里保留线缆上的
+    /// 展示时间，不以本机 wall clock 决定胜负。
+    pub(crate) fn apply_synced_group(&mut self, group: SshGroup) -> Result<(), InventoryError> {
+        let mut next = self.clone();
+        if let Some(existing) = next
+            .groups
+            .iter_mut()
+            .find(|existing| existing.id == group.id)
+        {
+            *existing = group;
+        } else {
+            next.groups.push(group);
+        }
+        next.validate_loaded()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// 应用服务端权威服务器值；认证材料不在该类型中，因此本机绑定不受覆盖。
+    pub(crate) fn apply_synced_profile(
+        &mut self,
+        profile: SshProfile,
+    ) -> Result<(), InventoryError> {
+        let mut next = self.clone();
+        if let Some(existing) = next
+            .profiles
+            .iter_mut()
+            .find(|existing| existing.id == profile.id)
+        {
+            *existing = profile;
+        } else {
+            next.profiles.push(profile);
+        }
+        next.validate_loaded()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// 应用服务端分组墓碑。删除分组不删除服务器，也不生成本机 wall-clock 时间。
+    pub(crate) fn apply_synced_group_deletion(&mut self, group_id: &str) {
+        self.groups.retain(|group| group.id != group_id);
+        let append_at = self.profiles_in_group(None).len() as u32;
+        let moved_ids = self
+            .profiles_in_group(Some(group_id))
+            .into_iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        for (offset, profile_id) in moved_ids.into_iter().enumerate() {
+            if let Some(profile) = self
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == profile_id)
+            {
+                profile.group_id = None;
+                profile.sort_order = append_at + offset as u32;
+            }
+        }
+        self.normalize_group_order();
+        self.normalize_profile_order(None);
+    }
+
+    /// 应用服务端服务器墓碑；重复墓碑是幂等 no-op。
+    pub(crate) fn apply_synced_profile_deletion(&mut self, profile_id: &str) {
+        let group_id = self
+            .profile(profile_id)
+            .and_then(|profile| profile.group_id.clone());
+        self.profiles.retain(|profile| profile.id != profile_id);
+        self.normalize_profile_order(group_id.as_deref());
+    }
+
     pub(crate) fn validate_loaded(&mut self) -> Result<(), InventoryError> {
         if self.groups.len() > MAX_GROUPS {
             return Err(InventoryError::TooManyGroups);

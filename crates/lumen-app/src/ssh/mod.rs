@@ -4,11 +4,18 @@
 //! 只应保留在本机的密钥路径、凭据引用分别落盘，避免未来同步代码误把
 //! 秘密字段带出设备。
 
+mod credentials;
 mod inventory;
 mod local;
 mod model;
 mod store;
+mod sync;
 
+#[allow(unused_imports)]
+pub use credentials::{
+    delete_secret, read_secret, write_secret, CredentialError, CredentialReference,
+    CredentialSlot, MAX_SECRET_BYTES,
+};
 #[allow(unused_imports)]
 pub use inventory::{
     InventoryError, SshInventory, MAX_CONNECT_TIMEOUT_SECS, MAX_GROUPS, MAX_GROUP_NAME_CHARS,
@@ -24,4 +31,8 @@ pub use model::{
     SyncGroupDto, SyncProfileDto, SyncStateDto,
 };
 #[allow(unused_imports)]
-pub use store::{SshStore, StoreError};
+pub use store::{SshStore, SshSyncApplyReport, SshSyncRejection, StoreError};
+#[allow(unused_imports)]
+pub use sync::{
+    SshSyncCompleted, SshSyncEvent, SshSyncFailed, SshSyncNotifier, SshSyncSnapshot, SshSyncWorker,
+};

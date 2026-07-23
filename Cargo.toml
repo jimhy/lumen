@@ -88,6 +88,8 @@ trash = "5"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # SSH 本机密码/私钥口令：Windows Credential Manager。
+    "Win32_Security_Credentials",
     # P0 应用锁：DPAPI 保护本机密码校验值。
     "Win32_Security_Cryptography",
     "Win32_System_Threading",

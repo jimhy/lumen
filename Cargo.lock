@@ -2620,6 +2620,7 @@ dependencies = [
  "lumen-protocol",
  "lumen-pty",
  "lumen-renderer",
+ "lumen-ssh",
  "lumen-term",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
