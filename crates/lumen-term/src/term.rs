@@ -86,6 +86,22 @@ impl Terminal {
         &self.inner.title
     }
 
+    /// 窗口标题内容实际变化的单调序号。
+    ///
+    /// 每次 OSC 0/2 把标题改成不同内容时递增；重复设置同一个标题不计数。
+    /// 上层可据此识别标题动画，而不必知道具体 CLI 使用哪组 spinner 字符。
+    pub fn title_revision(&self) -> u64 {
+        self.inner.title_revision
+    }
+
+    /// 终端程序通过 OSC 9;4 上报的任务进度状态。
+    ///
+    /// `0` 表示清除；正常、错误、不确定和暂停等非零状态都表示任务仍在
+    /// 进行。上层只关心是否活动，不依赖具体 CLI 或动画字符。
+    pub fn progress_active(&self) -> bool {
+        self.inner.progress_active
+    }
+
     /// shell 上报的当前工作目录（OSC 9;9，ConEmu/Windows Terminal 约定，
     /// 由 integration.ps1 在每个提示符发射）。尚未上报时为 None；
     /// RIS 全重置后清空，下个提示符会重新上报。
@@ -408,6 +424,10 @@ struct TermInner {
     scroll_top: usize,
     scroll_bottom: usize,
     title: String,
+    /// OSC 0/2 标题内容变化序号。RIS 时保留，保证上层观察值单调。
+    title_revision: u64,
+    /// OSC 9;4 终端任务进度是否活动。
+    progress_active: bool,
     /// shell 上报的当前工作目录（OSC 9;9）。
     cwd: Option<PathBuf>,
     blocks: Vec<Block>,
@@ -463,6 +483,8 @@ impl TermInner {
             scroll_top: 0,
             scroll_bottom: rows - 1,
             title: String::new(),
+            title_revision: 0,
+            progress_active: false,
             cwd: None,
             blocks: Vec::new(),
             next_block_id: 0,
@@ -826,25 +848,44 @@ impl TermInner {
     }
 
     /// 处理 OSC 9 扩展（ConEmu/Windows Terminal 系）。
-    /// 目前只认 `9;9;<path>` cwd 上报，其余子命令（9;4 进度条等）忽略。
+    ///
+    /// - `9;4;<state>[;<progress>]`：任务进度。0 清除，1..=4 均为活动；
+    /// - `9;9;<path>`：当前工作目录。
     fn handle_osc9(&mut self, params: &[&[u8]]) {
-        if params.get(1).copied() != Some(b"9".as_ref()) {
-            return;
-        }
-        // 路径里可能含分号（被 vte 按 ; 切开成多段），重新拼回。
-        let raw: Vec<u8> = params[2..].join(&b';');
-        let Ok(s) = std::str::from_utf8(&raw) else {
-            trace!("OSC 9;9 路径非 UTF-8，忽略");
-            return;
-        };
-        // Windows Terminal 官方脚本带双引号发送（ConEmu 规范引号可选）：
-        // 两端都有才剥除，单边引号视为路径本身的一部分。
-        let path = s
-            .strip_prefix('"')
-            .and_then(|x| x.strip_suffix('"'))
-            .unwrap_or(s);
-        if !path.is_empty() {
-            self.cwd = Some(PathBuf::from(path));
+        match params.get(1).copied() {
+            Some(b"4") => {
+                let Some(state) = params
+                    .get(2)
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .and_then(|s| s.parse::<u8>().ok())
+                else {
+                    trace!("OSC 9;4 状态无效，忽略");
+                    return;
+                };
+                match state {
+                    0 => self.progress_active = false,
+                    1..=4 => self.progress_active = true,
+                    _ => trace!("未知 OSC 9;4 状态: {state}"),
+                }
+            }
+            Some(b"9") => {
+                // 路径里可能含分号（被 vte 按 ; 切开成多段），重新拼回。
+                let raw: Vec<u8> = params[2..].join(&b';');
+                let Ok(s) = std::str::from_utf8(&raw) else {
+                    trace!("OSC 9;9 路径非 UTF-8，忽略");
+                    return;
+                };
+                // Windows Terminal 官方脚本带双引号发送（ConEmu 规范引号可选）：
+                // 两端都有才剥除，单边引号视为路径本身的一部分。
+                let path = s
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(s);
+                if !path.is_empty() {
+                    self.cwd = Some(PathBuf::from(path));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1221,8 +1262,10 @@ impl Perform for TermInner {
                 let (rows, cols) = (self.grid.rows(), self.grid.cols());
                 let limit = self.scrollback_limit;
                 let next_id = self.next_block_id;
+                let title_revision = self.title_revision;
                 *self = TermInner::new(rows, cols, limit);
                 self.next_block_id = next_id;
+                self.title_revision = title_revision;
             }
             _ => trace!("未实现的 ESC: {byte:#04x}"),
         }
@@ -1233,7 +1276,10 @@ impl Perform for TermInner {
         match code {
             b"0" | b"2" => {
                 if let Some(title) = params.get(1).and_then(|p| std::str::from_utf8(p).ok()) {
-                    self.title = title.to_owned();
+                    if self.title != title {
+                        self.title = title.to_owned();
+                        self.title_revision = self.title_revision.saturating_add(1);
+                    }
                 }
             }
             b"8" => self.handle_hyperlink(params),
@@ -1916,6 +1962,66 @@ mod tests {
         let mut alt = term();
         alt.advance(b"\x1b[?1049h\x1b[1;1HX\x1b[2;1HY\x1b[1;1H\x1b[M");
         assert_eq!(alt.grid().scrollback_len(), 0, "备用屏 DL 不保留历史");
+    }
+
+    #[test]
+    fn osc标题变化序号_只统计内容变化且ris后单调() {
+        let mut t = term();
+        assert_eq!(t.title_revision(), 0);
+
+        t.advance(b"\x1b]0;idle\x07");
+        assert_eq!(t.title(), "idle");
+        assert_eq!(t.title_revision(), 1);
+
+        // 动画刷新可能重复写同一帧；内容未变不应制造假活动。
+        t.advance(b"\x1b]2;idle\x1b\\");
+        assert_eq!(t.title_revision(), 1);
+
+        t.advance(b"\x1b]0;spinner-1\x07\x1b]0;spinner-2\x07");
+        assert_eq!(t.title(), "spinner-2");
+        assert_eq!(t.title_revision(), 3);
+
+        // RIS 清标题，但观察序号继续单调，避免上层活动检测倒退。
+        t.advance(b"\x1bc");
+        assert_eq!(t.title(), "");
+        assert_eq!(t.title_revision(), 3);
+        t.advance(b"\x1b]0;idle-again\x07");
+        assert_eq!(t.title_revision(), 4);
+    }
+
+    #[test]
+    fn osc9_4_进度状态_活动与清除() {
+        let mut t = term();
+        assert!(!t.progress_active());
+
+        // Kimi 等 TUI 使用状态 3 表示不确定进度。
+        t.advance(b"\x1b]9;4;3\x07");
+        assert!(t.progress_active());
+
+        // keepalive 重发活动状态不改变语义。
+        t.advance(b"\x1b]9;4;3\x07");
+        assert!(t.progress_active());
+
+        // 清除序列常带一个尾随分号。
+        t.advance(b"\x1b]9;4;0;\x07");
+        assert!(!t.progress_active());
+    }
+
+    #[test]
+    fn osc9_4_其它有效状态与无效状态() {
+        let mut t = term();
+        for state in [b'1', b'2', b'3', b'4'] {
+            t.advance(&[0x1b, b']', b'9', b';', b'4', b';', state, 0x07]);
+            assert!(t.progress_active());
+            t.advance(b"\x1b]9;4;0\x07");
+            assert!(!t.progress_active());
+        }
+
+        t.advance(b"\x1b]9;4;3\x07");
+        t.advance(b"\x1b]9;4;invalid\x07");
+        assert!(t.progress_active(), "无效状态不应清除已有活动状态");
+        t.advance(b"\x1b]9;4;99\x07");
+        assert!(t.progress_active(), "未知状态不应清除已有活动状态");
     }
 
     #[test]

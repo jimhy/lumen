@@ -7,7 +7,6 @@ pub static STRINGS: Strings = Strings {
     sidebar_sessions: "会话",
     menu_rename: "重命名",
     menu_close: "关闭",
-    pane_count_fmt: "{} 格",
     pane_close_tip: "关闭窗格 (Ctrl+Shift+W)",
     pane_restore_tip: "还原窗格 (Ctrl+Shift+Enter)",
     pane_maximize_tip: "最大化窗格 (Ctrl+Shift+Enter)",

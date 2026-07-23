@@ -5880,7 +5880,7 @@ impl ApplicationHandler<PtyWake> for App {
                                 let _ = f.write_all(dump_pty_readable(&bytes).as_bytes());
                             }
                         }
-                        state.tabs[ti].panes[pi].term.advance(&bytes);
+                        state.tabs[ti].panes[pi].advance_terminal(&bytes);
                         // M5.3 part3d 被控端：被控期间转发**控制端订阅会话**的焦点窗格 PTY
                         // 输出给控制端（带双 id；与被控端自身焦点解耦——需求 c/e）。整屏初始
                         // 快照由 pump_remote 的 mirror_src 变化触发 SubscriptionStarted，先于
@@ -7941,8 +7941,6 @@ impl ApplicationHandler<PtyWake> for App {
                             name: t.name.clone(),
                             path: t.path.clone(),
                             active: Some(t.id) == sub,
-                            unseen: t.unseen,
-                            pane_count: t.pane_count as usize,
                             // F7②-remote：被控端传来的前台程序图标位图 → 本地纹理
                             // （ensure_remote_icon_textures 已按内容 hash 建好）；无则回退字形。
                             icon: t
@@ -7963,8 +7961,6 @@ impl ApplicationHandler<PtyWake> for App {
                             name: t.display_name(),
                             path: t.cwd_path(),
                             active: i == state.active_tab,
-                            unseen: t.has_unseen(),
-                            pane_count: t.panes.len(),
                             icon: state.session_icon_for(t.id),
                             busy: t.is_busy(),
                         })

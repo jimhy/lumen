@@ -13,7 +13,6 @@ pub static STRINGS: Strings = Strings {
     sidebar_sessions: "工作階段",
     menu_rename: "重新命名",
     menu_close: "關閉",
-    pane_count_fmt: "{} 格",
     pane_close_tip: "關閉窗格 (Ctrl+Shift+W)",
     pane_restore_tip: "還原窗格 (Ctrl+Shift+Enter)",
     pane_maximize_tip: "最大化窗格 (Ctrl+Shift+Enter)",

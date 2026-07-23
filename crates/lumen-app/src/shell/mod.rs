@@ -41,15 +41,10 @@ pub struct TabItem {
     /// （新会话首个提示符前）为 None，仅画名称行。
     pub path: Option<String>,
     pub active: bool,
-    /// 后台期间 tab 内任意窗格有未读输出（条目右侧小圆点）。
-    pub unseen: bool,
-    /// tab 内窗格数（>1 时条目右侧标「N 格」，F5 批2 视觉打磨）。
-    pub pane_count: usize,
     /// 会话图标纹理（F7②：前台运行程序 exe 图标）；None 时回退自绘
     /// 终端字形（取不到图标/非 Windows）。
     pub icon: Option<egui::TextureId>,
-    /// 会话是否忙（claude 等 TUI 在工作，由其 OSC 0 标题 spinner 判定）：
-    /// 条目右侧画转圈 spinner。
+    /// 会话是否忙（由终端进度或动画帧统一判定）：条目右侧画转圈 spinner。
     pub busy: bool,
 }
 
@@ -2243,24 +2238,8 @@ fn sidebar_ui(
                 } else {
                     draw_session_icon(ui, icon_center, entry.active, pal);
                 }
-                // 右侧为未读点/窗格数/状态指示预留宽度，避免文字压到它们。
-                let right_reserve: f32 = if entry.pane_count > 1 {
-                    if entry.unseen {
-                        40.0
-                    } else {
-                        34.0
-                    }
-                } else if entry.unseen {
-                    16.0
-                } else {
-                    8.0
-                };
-                // 状态指示在最右居中，确保给它留出空间。
-                let right_reserve = if entry.busy {
-                    right_reserve.max(22.0)
-                } else {
-                    right_reserve
-                };
+                // 右侧只保留运行状态指示；未读圆点与窗格数量不再占用会话按钮。
+                let right_reserve = if entry.busy { 22.0 } else { 8.0 };
                 let text_left = rect.left() + ICON_COL;
                 let text_w = (rect.right() - right_reserve - text_left).max(10.0);
                 // 名称 + 路径两行（路径未知时仅名称行），整体垂直居中于行内。
@@ -2313,24 +2292,6 @@ fn sidebar_ui(
                         egui::pos2(rect.right() - 11.0, rect.center().y),
                         6.0,
                         pal.accent,
-                    );
-                }
-                // 未读小圆点（后台有新输出，切换到该 tab 时清除）——贴名称行右端。
-                // 忙指示存在时让位（状态信息更及时）。
-                if entry.unseen && !entry.busy {
-                    let center = egui::pos2(rect.right() - 10.0, rect.top() + 13.0);
-                    ui.painter().circle_filled(center, 3.0, pal.accent);
-                }
-                // 窗格数指示（F5 批2）：多窗格 tab 在条目右上标「N 格」
-                // （有未读点时左移让位）。
-                if entry.pane_count > 1 {
-                    let x = rect.right() - if entry.unseen { 20.0 } else { 8.0 };
-                    ui.painter().text(
-                        egui::pos2(x, rect.top() + 13.0),
-                        egui::Align2::RIGHT_CENTER,
-                        crate::i18n::fmt1(s.pane_count_fmt, entry.pane_count),
-                        egui::FontId::proportional(10.0),
-                        pal.fg_dim,
                     );
                 }
             }

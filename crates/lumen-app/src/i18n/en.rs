@@ -7,7 +7,6 @@ pub static STRINGS: Strings = Strings {
     sidebar_sessions: "Sessions",
     menu_rename: "Rename",
     menu_close: "Close",
-    pane_count_fmt: "{} panes",
     pane_close_tip: "Close pane (Ctrl+Shift+W)",
     pane_restore_tip: "Restore pane (Ctrl+Shift+Enter)",
     pane_maximize_tip: "Maximize pane (Ctrl+Shift+Enter)",

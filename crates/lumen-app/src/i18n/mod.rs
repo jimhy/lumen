@@ -15,9 +15,6 @@
 //! let s = i18n::strings();
 //! ui.label(s.sidebar_sessions);
 //!
-//! // 插值（单参）
-//! let msg = i18n::fmt1(s.pane_count_fmt, 3);
-//!
 //! // 插值（双参）
 //! let msg = i18n::fmt2(s.toast_font_fallback_fmt, "Fira Code", "Consolas");
 //!

@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
@@ -83,11 +83,10 @@ impl Tab {
         &mut self.panes[i]
     }
 
-    /// 会话(tab)是否「忙」：任一窗格的终端标题含 Braille spinner 字符
-    /// （claude code 等 TUI 工作时在 OSC 0 标题里转圈，空闲则无）。供侧栏
-    /// 会话按钮的状态转圈指示（方案 A：标题 spinner = 忙/闲）。
+    /// 会话(tab)是否「忙」：任一窗格通过 OSC 进度、标题动画或连续同步
+    /// 帧动画表达运行状态。判定不依赖 CLI 名称，供侧栏状态指示。
     pub fn is_busy(&self) -> bool {
-        self.panes.iter().any(|p| title_is_busy(p.term.title()))
+        self.panes.iter().any(Session::is_busy)
     }
 
     /// 展示标题（侧栏条目与窗口标题同源此函数）。取值优先级：
@@ -147,6 +146,151 @@ impl Tab {
 /// （队头阻塞，延迟尖峰 10~30ms，需求池 P5）。
 const SESSION_EVENT_CAP: usize = 256;
 
+/// 标题动画相邻帧允许的最大间隔。CLI 的标题 spinner 通常每 80~500ms
+/// 换一帧；放宽到 2s 可兼容低频动画，同时不会把普通偶发改标题长期判忙。
+const TITLE_ANIMATION_MAX_GAP: Duration = Duration::from_secs(2);
+/// 至少连续看到 3 次不同标题才确认为动画，过滤 shell 启动/cd 等单次改标题。
+const TITLE_ANIMATION_CONFIRM_CHANGES: u8 = 3;
+/// 最后一帧后保留忙状态的时长。动画停止即自然回到空闲，无需识别特定结束文案。
+const TITLE_ANIMATION_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 备用屏同步帧的最大连续间隔。OpenTUI 等渲染器的 spinner 通常为
+/// 25~80ms 一帧；500ms 既容纳卡顿，也不会把零散交互重绘串成动画。
+const FRAME_ANIMATION_MAX_GAP: Duration = Duration::from_millis(500);
+/// 至少连续完成 4 个 DEC 2026 同步帧才确认为动画。
+const FRAME_ANIMATION_CONFIRM_FRAMES: u8 = 4;
+/// 同步帧停止后保留忙状态的时长。
+const FRAME_ANIMATION_IDLE_TIMEOUT: Duration = Duration::from_millis(600);
+/// 用户输入后的短时间内，TUI 回显和布局重绘不参与新一轮忙状态确认。
+const FRAME_USER_INPUT_GRACE: Duration = Duration::from_millis(250);
+
+/// 单窗格的 OSC 标题活动检测器。
+///
+/// 部分 AI CLI 会反复发送 OSC 0/2 标题。记录标题内容变化序号与时间，
+/// 就能跨 CLI 统一识别，而不需要维护进程名或 spinner 字符表。
+#[derive(Debug)]
+struct TitleActivity {
+    last_revision: u64,
+    last_change_at: Option<Instant>,
+    consecutive_changes: u8,
+    busy_until: Option<Instant>,
+}
+
+impl TitleActivity {
+    fn new(initial_revision: u64) -> Self {
+        Self {
+            last_revision: initial_revision,
+            last_change_at: None,
+            consecutive_changes: 0,
+            busy_until: None,
+        }
+    }
+
+    fn observe(&mut self, revision: u64, now: Instant) {
+        let changes = revision.saturating_sub(self.last_revision);
+        self.last_revision = revision;
+        if changes == 0 {
+            return;
+        }
+
+        let changes = u8::try_from(changes).unwrap_or(u8::MAX);
+        let continues_animation = self
+            .last_change_at
+            .and_then(|last| now.checked_duration_since(last))
+            .is_some_and(|gap| gap <= TITLE_ANIMATION_MAX_GAP);
+        self.consecutive_changes = if continues_animation {
+            self.consecutive_changes.saturating_add(changes)
+        } else {
+            changes
+        };
+        self.last_change_at = Some(now);
+
+        if self.consecutive_changes >= TITLE_ANIMATION_CONFIRM_CHANGES {
+            self.busy_until = Some(now + TITLE_ANIMATION_IDLE_TIMEOUT);
+        }
+    }
+
+    fn is_busy(&self, title: &str, now: Instant) -> bool {
+        title_has_busy_marker(title) || self.busy_until.is_some_and(|until| now < until)
+    }
+}
+
+/// 备用屏内 DEC 2026 同步帧动画检测器。
+///
+/// OpenTUI 一类程序不会把运行状态写进标题，而是在忙时持续重绘界面
+/// spinner。同步帧结束标记是终端协议层信号，比按输出字节量或进程名判断
+/// 更稳定；仅在备用屏、连续多帧且不紧邻用户输入时确认，避免把普通命令
+/// 输出和键入回显误判为运行状态。
+#[derive(Debug)]
+struct FrameActivity {
+    last_mark: u64,
+    last_frame_at: Option<Instant>,
+    last_user_input_at: Option<Instant>,
+    consecutive_frames: u8,
+    busy_until: Option<Instant>,
+}
+
+impl FrameActivity {
+    fn new(initial_mark: u64) -> Self {
+        Self {
+            last_mark: initial_mark,
+            last_frame_at: None,
+            last_user_input_at: None,
+            consecutive_frames: 0,
+            busy_until: None,
+        }
+    }
+
+    fn observe(&mut self, mark: u64, alt_screen: bool, now: Instant) {
+        let frames = mark.saturating_sub(self.last_mark);
+        self.last_mark = mark;
+
+        if !alt_screen {
+            self.last_frame_at = None;
+            self.consecutive_frames = 0;
+            self.busy_until = None;
+            return;
+        }
+        if frames == 0 {
+            return;
+        }
+
+        let frames = u8::try_from(frames).unwrap_or(u8::MAX);
+        let follows_user_input = self
+            .last_user_input_at
+            .and_then(|input| now.checked_duration_since(input))
+            .is_some_and(|elapsed| elapsed <= FRAME_USER_INPUT_GRACE);
+        if follows_user_input {
+            self.last_frame_at = Some(now);
+            self.consecutive_frames = 0;
+            return;
+        }
+
+        let continues_animation = self
+            .last_frame_at
+            .and_then(|last| now.checked_duration_since(last))
+            .is_some_and(|gap| gap <= FRAME_ANIMATION_MAX_GAP);
+        self.consecutive_frames = if continues_animation {
+            self.consecutive_frames.saturating_add(frames)
+        } else {
+            frames
+        };
+        self.last_frame_at = Some(now);
+
+        if self.consecutive_frames >= FRAME_ANIMATION_CONFIRM_FRAMES {
+            self.busy_until = Some(now + FRAME_ANIMATION_IDLE_TIMEOUT);
+        }
+    }
+
+    fn note_user_input(&mut self, now: Instant) {
+        self.last_user_input_at = Some(now);
+        self.consecutive_frames = 0;
+    }
+
+    fn is_busy(&self, now: Instant) -> bool {
+        self.busy_until.is_some_and(|until| now < until)
+    }
+}
+
 /// 一个终端会话的全部独立状态。
 ///
 /// Drop 即随 `PtySession` 杀掉 shell 子进程（关 tab = 杀进程）；
@@ -199,6 +343,10 @@ pub struct Session {
     pub term_frame_due_since: Option<Instant>,
     /// 后台期间有新输出（tab 未读点；切换到本会话时清除）。
     pub has_unseen_output: bool,
+    /// OSC 0/2 标题动画活动。用于与具体 CLI 无关的运行状态识别。
+    title_activity: TitleActivity,
+    /// 备用屏 DEC 2026 同步帧动画。覆盖不把状态写入标题的 TUI。
+    frame_activity: FrameActivity,
     /// M4.1 批D1：焦点窗格的输入编辑器（`input-editor` feature 门控）。
     /// 挂在窗格生命周期内，模式切换不清缓冲（草稿保全）。
     #[cfg(feature = "input-editor")]
@@ -259,6 +407,8 @@ impl Session {
             cwd,
             &env,
         )?;
+        let title_activity = TitleActivity::new(term.title_revision());
+        let frame_activity = FrameActivity::new(term.esu_mark());
         // per-session 有界通道：主循环持接收端，转发线程持发送端。
         let (tx, rx) = crossbeam_channel::bounded::<PtyEvent>(SESSION_EVENT_CAP);
         std::thread::Builder::new()
@@ -298,6 +448,8 @@ impl Session {
             redraw_abs_at: None,
             term_frame_due_since: None,
             has_unseen_output: false,
+            title_activity,
+            frame_activity,
             #[cfg(feature = "input-editor")]
             editor: Editor::default(),
             #[cfg(feature = "input-editor")]
@@ -328,6 +480,33 @@ impl Session {
         }
         let t = self.term.title();
         (!t.is_empty()).then(|| t.to_owned())
+    }
+
+    /// 消化一批 PTY 输出，并同步观察标题与同步帧是否形成动画。
+    ///
+    /// `Terminal::title_revision` 会统计同一批字节内的多次标题变化，因此即使
+    /// ConPTY 合并了若干动画帧也不会漏判；OSC 9;4 进度由 Terminal
+    /// 直接维护活动状态，DEC 2026 则用 ESU 单调标记识别连续 TUI 帧。
+    pub fn advance_terminal(&mut self, bytes: &[u8]) {
+        self.term.advance(bytes);
+        let now = Instant::now();
+        self.title_activity
+            .observe(self.term.title_revision(), now);
+        self.frame_activity
+            .observe(self.term.esu_mark(), self.term.is_alt_screen(), now);
+    }
+
+    /// 当前窗格是否处于终端协议所表达的运行状态。
+    ///
+    /// 优先采用明确的 OSC 9;4 进度状态；同时保留 OSC 0/2 标题动画和
+    /// DEC 2026 同步帧动画检测，兼容不主动上报任务状态的全屏 TUI。
+    pub fn is_busy(&self) -> bool {
+        let now = Instant::now();
+        self.term.progress_active()
+            || self
+                .title_activity
+                .is_busy(self.term.title(), now)
+            || self.frame_activity.is_busy(now)
     }
 
     /// 复制选中命令块的输出到剪贴板，返回是否复制了内容。
@@ -427,6 +606,7 @@ impl Session {
     /// 返回 `pty.write` 的底层错误（PTY 管道写失败，通常为 ConPTY 进
     /// 程已退出）。
     pub fn write_user_input(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.frame_activity.note_user_input(Instant::now());
         self.pty.write(bytes)
     }
 
@@ -455,9 +635,9 @@ impl Session {
     }
 }
 
-/// 终端标题是否含 Braille 点阵字符（U+2801–U+28FF）——claude code 等
-/// TUI 用它在 OSC 0 标题里画转圈 spinner 表示「正在工作」；据此判会话忙。
-fn title_is_busy(title: &str) -> bool {
+/// 标题是否含可即时识别的 spinner 标记。Braille 是 Claude/Codex 等常见
+/// 首帧格式；其它字符集由 [`TitleActivity`] 的动态变化统一识别。
+fn title_has_busy_marker(title: &str) -> bool {
     title.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
 }
 
@@ -542,6 +722,115 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 标题活动_三次连续变化后判忙并在静默后恢复() {
+        let start = Instant::now();
+        let mut activity = TitleActivity::new(0);
+
+        activity.observe(1, start);
+        assert!(!activity.is_busy("AI CLI", start));
+        activity.observe(2, start + Duration::from_millis(100));
+        assert!(!activity.is_busy("AI CLI", start + Duration::from_millis(100)));
+
+        let confirmed_at = start + Duration::from_millis(200);
+        activity.observe(3, confirmed_at);
+        assert!(activity.is_busy("AI CLI", confirmed_at));
+        assert!(!activity.is_busy(
+            "AI CLI",
+            confirmed_at + TITLE_ANIMATION_IDLE_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn 标题活动_普通零散改名不会误判动画() {
+        let start = Instant::now();
+        let mut activity = TitleActivity::new(0);
+
+        activity.observe(1, start);
+        activity.observe(2, start + TITLE_ANIMATION_MAX_GAP + Duration::from_millis(1));
+        activity.observe(
+            3,
+            start + TITLE_ANIMATION_MAX_GAP + Duration::from_millis(100),
+        );
+        assert!(!activity.is_busy(
+            "PowerShell",
+            start + TITLE_ANIMATION_MAX_GAP + Duration::from_millis(100)
+        ));
+    }
+
+    #[test]
+    fn 标题活动_同批多帧与braille首帧都能即时判忙() {
+        let start = Instant::now();
+        let mut activity = TitleActivity::new(0);
+
+        // ConPTY 可能把三次 OSC 标题更新合在一个读取批次里。
+        activity.observe(3, start);
+        assert!(activity.is_busy("AI CLI", start));
+
+        let idle = TitleActivity::new(0);
+        assert!(idle.is_busy("Claude \u{280B}", start));
+    }
+
+    #[test]
+    fn 同步帧活动_备用屏连续动画判忙并在静默后恢复() {
+        let start = Instant::now();
+        let mut activity = FrameActivity::new(0);
+
+        for mark in 1..FRAME_ANIMATION_CONFIRM_FRAMES as u64 {
+            let now = start + Duration::from_millis(mark * 40);
+            activity.observe(mark, true, now);
+            assert!(!activity.is_busy(now));
+        }
+
+        let confirmed_at =
+            start + Duration::from_millis(FRAME_ANIMATION_CONFIRM_FRAMES as u64 * 40);
+        activity.observe(
+            FRAME_ANIMATION_CONFIRM_FRAMES as u64,
+            true,
+            confirmed_at,
+        );
+        assert!(activity.is_busy(confirmed_at));
+        assert!(!activity.is_busy(
+            confirmed_at + FRAME_ANIMATION_IDLE_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn 同步帧活动_主屏与零散备用屏帧不判忙() {
+        let start = Instant::now();
+        let mut activity = FrameActivity::new(0);
+
+        activity.observe(10, false, start);
+        assert!(!activity.is_busy(start), "主屏帧不参与 TUI 动画检测");
+
+        for mark in 11..15 {
+            let now = start
+                + Duration::from_millis(
+                    (mark - 10) * (FRAME_ANIMATION_MAX_GAP.as_millis() as u64 + 1),
+                );
+            activity.observe(mark, true, now);
+            assert!(!activity.is_busy(now), "超过间隔的零散帧不应累计");
+        }
+    }
+
+    #[test]
+    fn 同步帧活动_用户输入后的回显帧不触发忙状态() {
+        let start = Instant::now();
+        let mut activity = FrameActivity::new(0);
+        activity.note_user_input(start);
+
+        activity.observe(10, true, start + Duration::from_millis(100));
+        assert!(
+            !activity.is_busy(start + Duration::from_millis(100)),
+            "输入宽限期内即使合并多帧也不应误判"
+        );
+
+        let resumed = start + FRAME_USER_INPUT_GRACE + Duration::from_millis(1);
+        activity.observe(11, true, resumed);
+        activity.observe(14, true, resumed + Duration::from_millis(120));
+        assert!(activity.is_busy(resumed + Duration::from_millis(120)));
+    }
 
     #[test]
     fn base64_编码_rfc4648_标准向量() {

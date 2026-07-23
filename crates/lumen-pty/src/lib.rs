@@ -80,6 +80,11 @@ impl PtySession {
         // 终端能力声明：上层实现了 256 色与真彩 SGR。
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // Windows 下声明支持 ConEmu/Windows Terminal 系 OSC 9 扩展。
+        // Lumen 已解析 OSC 9;4（任务进度）与 9;9（当前目录）；采用能力
+        // 变量而非伪造 WT_SESSION，让 TUI 可按协议启用通用进度上报。
+        #[cfg(windows)]
+        cmd.env("ConEmuANSI", "ON");
         // unix locale 兜底：macOS GUI app（open 经 launchd 启动）不继承终端 LANG，
         // 子 shell 无 locale → ls 等把非 ASCII 文件名输出成 '?'（中文乱码）。若继承
         // 环境里无任何 locale 变量，补一个 UTF-8 locale（有则尊重用户设置、不覆盖）。
@@ -251,4 +256,58 @@ fn which_in_path(exe: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
         .unwrap_or(false)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn 子进程收到终端进度能力声明() {
+        let args = vec![
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "$env:ConEmuANSI; Start-Sleep -Seconds 1".to_owned(),
+        ];
+        let (pty, rx) =
+            PtySession::spawn(Some("powershell.exe"), &args, 24, 80, None, &[])
+                .expect("启动 PowerShell PTY");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut replied = false;
+
+        while Instant::now() < deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(timeout) {
+                Ok(PtyEvent::Data(bytes)) => {
+                    output.extend_from_slice(&bytes);
+                    if !replied
+                        && (output.windows(4).any(|w| w == b"\x1b[6n")
+                            || output.windows(3).any(|w| w == b"\x1b[c"))
+                    {
+                        // ConPTY 启动会先查询光标位置与主设备属性；应用正常
+                        // 运行时由 lumen-term 应答。收到查询后回写等价响应。
+                        pty.write(b"\x1b[1;1R\x1b[?62;22c")
+                            .expect("应答 ConPTY 初始化查询");
+                        replied = true;
+                    }
+                    if String::from_utf8_lossy(&output).contains("ON") {
+                        break;
+                    }
+                }
+                Ok(PtyEvent::Exited) => {}
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            String::from_utf8_lossy(&output).contains("ON"),
+            "子进程未收到 ConEmuANSI=ON，实际输出: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }

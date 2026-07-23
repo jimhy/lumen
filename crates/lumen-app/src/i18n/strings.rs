@@ -21,8 +21,6 @@ pub struct Strings {
     pub menu_rename: &'static str,
     /// 右键菜单"关闭"
     pub menu_close: &'static str,
-    /// 窗格数指示，单参 `{}`：格数字
-    pub pane_count_fmt: &'static str,
     // sidebar_settings_btn / sidebar_settings_tip / sidebar_new_session_btn
     // 已于 R8 删除（底部按钮区删除，入口改为头像菜单 + 侧栏标题栏小「＋」）。
     /// 窗格 ✕ tooltip
