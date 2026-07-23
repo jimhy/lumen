@@ -148,6 +148,10 @@ pub struct LayoutSettings {
     /// `#[serde(default)]` 保证旧文件缺字段时补 true（与 Default 一致）。
     #[serde(default = "default_sidebar_visible")]
     pub sidebar_visible: bool,
+    /// 远程设备栏是否可见：仅远程视图生效，true = 显示（默认），false = 隐藏。
+    /// `#[serde(default)]` 保证旧文件缺字段时补 true（与 Default 一致）。
+    #[serde(default = "default_remote_list_visible")]
+    pub remote_list_visible: bool,
     /// 中间文件树栏是否可见（第十九轮持久化）：true = 显示（默认），false = 隐藏。
     ///
     /// 变更来源：顶栏②按钮（`toggle_filetree` 信号）与 Ctrl+B 快捷键
@@ -169,6 +173,11 @@ fn default_sidebar_visible() -> bool {
     true
 }
 
+/// remote_list_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
+fn default_remote_list_visible() -> bool {
+    true
+}
+
 /// filetree_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
 fn default_filetree_visible() -> bool {
     true
@@ -185,6 +194,7 @@ impl Default for LayoutSettings {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             filetree_width: FILETREE_WIDTH_DEFAULT,
             sidebar_visible: true,
+            remote_list_visible: true,
             filetree_visible: true,
             view_mode: false,
         }
@@ -453,6 +463,14 @@ impl Settings {
                     "sidebar_visible",
                     "layout.sidebar_visible",
                     d.sidebar_visible,
+                    path,
+                );
+                // remote_list_visible：旧文件缺字段静默补 true。
+                s.layout.remote_list_visible = lenient_field(
+                    ly,
+                    "remote_list_visible",
+                    "layout.remote_list_visible",
+                    d.remote_list_visible,
                     path,
                 );
                 // filetree_visible（第十九轮）：旧文件缺字段静默补 true。
@@ -746,6 +764,7 @@ mod tests {
                 sidebar_width: 260.0,
                 filetree_width: 320.0,
                 sidebar_visible: true,
+                remote_list_visible: false,
                 filetree_visible: false,
                 view_mode: true,
             },
@@ -1237,5 +1256,58 @@ mod tests {
             "类型非法字段降级为默认值 true"
         );
         assert_eq!(loaded.layout.sidebar_width, 200.0, "好字段应保留");
+    }
+
+    // ── 远程设备栏可见性持久化测试 ────────────────────────────────────────
+
+    #[test]
+    fn 远程设备栏可见性_默认值与旧文件兼容() {
+        assert!(
+            Settings::default().layout.remote_list_visible,
+            "remote_list_visible 默认应为 true"
+        );
+
+        let p = temp_path("remote_list_compat_old");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "view_mode": true, "sidebar_visible": false } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            loaded.layout.remote_list_visible,
+            "旧文件缺 remote_list_visible 字段时应补 true"
+        );
+    }
+
+    #[test]
+    fn 远程设备栏可见性_隐藏态序列化往返() {
+        let p = temp_path("remote_list_roundtrip_hidden");
+        let s = Settings {
+            layout: LayoutSettings {
+                remote_list_visible: false,
+                ..LayoutSettings::default()
+            },
+            ..Settings::default()
+        };
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(!loaded.layout.remote_list_visible);
+    }
+
+    #[test]
+    fn 远程设备栏可见性_字段类型非法降级true() {
+        let p = temp_path("remote_list_lenient");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "remote_list_visible": "yes", "view_mode": true } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(loaded.layout.remote_list_visible);
+        assert!(loaded.layout.view_mode, "其余合法字段应保留");
     }
 }

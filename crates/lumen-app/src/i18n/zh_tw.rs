@@ -224,6 +224,8 @@ pub static STRINGS: Strings = Strings {
     // 頂欄三視圖切換按鈕（問題7）
     topbar_sidebar_show_tip: "顯示工作階段欄",
     topbar_sidebar_hide_tip: "隱藏工作階段欄",
+    toolbar_remote_list_show_tip: "顯示裝置欄",
+    toolbar_remote_list_hide_tip: "隱藏裝置欄",
     topbar_filetree_show_tip: "顯示檔案樹 (Ctrl+B)",
     topbar_filetree_hide_tip: "隱藏檔案樹 (Ctrl+B)",
     topbar_reset_layout_tip: "還原窗格預設大小",

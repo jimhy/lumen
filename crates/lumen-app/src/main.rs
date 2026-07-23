@@ -9621,6 +9621,13 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
+                // 远程设备栏显隐：按钮只在远程视图出现，状态独立持久化。
+                let remote_list_changed = if let Some(v) = shell_out.toggle_remote_list {
+                    state.settings.layout.remote_list_visible = v;
+                    true
+                } else {
+                    false
+                };
                 // 第十九轮：顶栏② 文件树显隐——写入 settings 并触发存盘。
                 // shell/mod.rs 已在 toggle_filetree 信号路径同步更新
                 // ShellState::filetree.visible（两入口共享同一状态源）；
@@ -9678,6 +9685,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_proxy_changed
                     || shell_out.settings_server_url_changed
                     || sidebar_changed
+                    || remote_list_changed
                     || filetree_changed
                     || view_mode_changed;
                 // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。

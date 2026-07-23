@@ -218,6 +218,8 @@ pub static STRINGS: Strings = Strings {
     // 顶栏三视图切换按钮（问题7）
     topbar_sidebar_show_tip: "显示会话栏",
     topbar_sidebar_hide_tip: "隐藏会话栏",
+    toolbar_remote_list_show_tip: "显示设备栏",
+    toolbar_remote_list_hide_tip: "隐藏设备栏",
     topbar_filetree_show_tip: "显示文件树 (Ctrl+B)",
     topbar_filetree_hide_tip: "隐藏文件树 (Ctrl+B)",
     topbar_reset_layout_tip: "恢复窗格默认大小",

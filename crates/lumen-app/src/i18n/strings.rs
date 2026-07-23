@@ -406,6 +406,10 @@ pub struct Strings {
     pub topbar_sidebar_show_tip: &'static str,
     /// 显示/隐藏会话栏 tooltip（隐藏态）
     pub topbar_sidebar_hide_tip: &'static str,
+    /// 显示远程设备栏 tooltip
+    pub toolbar_remote_list_show_tip: &'static str,
+    /// 隐藏远程设备栏 tooltip
+    pub toolbar_remote_list_hide_tip: &'static str,
     /// 显示/隐藏文件树 tooltip（展开态）
     pub topbar_filetree_show_tip: &'static str,
     /// 显示/隐藏文件树 tooltip（隐藏态）

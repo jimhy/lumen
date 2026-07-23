@@ -1,6 +1,7 @@
 //! 应用工具栏（F12 批1，海风哥 2026-07-16 需求）：标题栏之下的
 //! 全宽横条，统一收纳原散落在标题栏上的功能按钮。
 //! **左端**（视图开关组）：
+//! - 远程视图专属：设备栏显隐开关（本地视图不渲染）
 //! - ①侧栏（会话列表）显隐开关（与设置 sidebar_visible 同状态源）
 //! - ②文件树显隐开关（与 Ctrl+B 同状态源）
 //!
@@ -44,6 +45,8 @@ const BTN_GAP: f32 = 4.0;
 /// 一帧工具栏 UI 的产出。
 #[derive(Default)]
 pub struct ToolbarOutput {
+    /// 切换远程设备栏显示/隐藏。None = 未点击，Some(v) = 新可见值。
+    pub toggle_remote_list: Option<bool>,
     /// 切换会话栏显示/隐藏（点击①按钮）。None = 未点击，Some(v) = 新可见值。
     pub toggle_sidebar: Option<bool>,
     /// 切换文件树显示/隐藏（点击②按钮，与 Ctrl+B 同状态源）。None = 未点击，Some(v) = 新可见值。
@@ -56,6 +59,10 @@ pub struct ToolbarOutput {
 
 /// 工具栏按钮的当前状态（打包传入 [`show`]，仿 topbar::ViewState 模式）。
 pub struct ViewState {
+    /// 是否为远程视图；仅为 true 时渲染设备栏按钮。
+    pub remote_view: bool,
+    /// 远程设备栏当前是否可见。
+    pub remote_list_visible: bool,
     /// 会话栏（①）当前是否可见。
     pub sidebar_visible: bool,
     /// 文件树（②）当前是否可见（与 Ctrl+B 同状态源）。
@@ -146,6 +153,23 @@ pub fn show(
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add_space(LEFT_MARGIN);
 
+                    // 远程视图专属：显示/隐藏设备栏。必须位于会话栏按钮左侧；
+                    // 本地视图不分配热区，后续按钮自然左移，不留空位。
+                    if view.remote_view {
+                        let (remote_rect, remote_resp) =
+                            ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
+                        draw_icon_devices(ui, remote_rect, view.remote_list_visible, pal);
+                        let tip = if view.remote_list_visible {
+                            s.toolbar_remote_list_hide_tip
+                        } else {
+                            s.toolbar_remote_list_show_tip
+                        };
+                        if remote_resp.on_hover_text(tip).clicked() {
+                            out.toggle_remote_list = Some(!view.remote_list_visible);
+                        }
+                        ui.add_space(BTN_GAP);
+                    }
+
                     // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
                     {
                         let (sb_rect, sb_resp) =
@@ -186,6 +210,43 @@ pub fn show(
 // ── 图标绘制子函数（自 topbar 迁入；R8.2 精绘规格原样保留）────────────────
 // 视觉盒 ~18×14 逻辑 px 居中于 28×26 热区；线宽 1.2；
 // 颜色常态 fg_dim，hover fg；hover 圆角底 bg_highlight（圆角 4）。
+
+/// 远程设备栏图标：显示器 + 手机，表达「设备列表」且与相邻的会话侧栏
+/// 图标保持明显区分。可见态用 fg，隐藏态用 fg_dim。
+fn draw_icon_devices(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palette) {
+    let painter = ui.painter();
+    if ui.rect_contains_pointer(rect) {
+        painter.rect_filled(rect, 4.0, pal.bg_highlight);
+    }
+    let fg = if visible { pal.fg } else { pal.fg_dim };
+    let stroke = egui::Stroke::new(1.2_f32, fg);
+    let c = rect.center();
+    let ox = (c.x - 9.0 + 0.5).floor() - 0.5;
+    let oy = (c.y - 6.0 + 0.5).floor() - 0.5;
+
+    // 显示器主体与底座。
+    let monitor = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(13.0, 9.0));
+    painter.rect_stroke(monitor, 1.5, stroke, egui::StrokeKind::Middle);
+    let stand_x = ox + 6.5;
+    painter.line_segment(
+        [
+            egui::pos2(stand_x, oy + 9.0),
+            egui::pos2(stand_x, oy + 11.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(stand_x - 3.0, oy + 11.0),
+            egui::pos2(stand_x + 3.0, oy + 11.0),
+        ],
+        stroke,
+    );
+
+    // 右侧手机轮廓。
+    let phone = egui::Rect::from_min_size(egui::pos2(ox + 14.0, oy + 2.0), egui::vec2(4.0, 9.0));
+    painter.rect_stroke(phone, 1.0, stroke, egui::StrokeKind::Middle);
+}
 
 /// ① 侧栏切换图标（codicon layout-sidebar-left 风格）：
 /// 圆角外框 18×14（圆角 2.5）+ 距左 1/3 处竖分隔线；
@@ -374,6 +435,8 @@ mod toolbar_layout_tests {
                 1,
                 &pal,
                 ViewState {
+                    remote_view: false,
+                    remote_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: true,
                 },
@@ -401,6 +464,8 @@ mod toolbar_layout_tests {
                 2,
                 &pal,
                 ViewState {
+                    remote_view: false,
+                    remote_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: false,
                 },
@@ -448,15 +513,55 @@ mod toolbar_layout_tests {
                 MAX_PANES,
                 &pal,
                 ViewState {
+                    remote_view: false,
+                    remote_list_visible: true,
                     sidebar_visible: false,
                     filetree_visible: true,
                 },
             );
             got_default = !out.new_pane
                 && !out.reset_layout
+                && out.toggle_remote_list.is_none()
                 && out.toggle_sidebar.is_none()
                 && out.toggle_filetree.is_none();
         });
         assert!(got_default, "无输入的一帧不应产出任何动作");
+    }
+
+    #[test]
+    fn 工具栏_设备栏按钮仅远程视图渲染() {
+        fn left_line_segments(remote_view: bool) -> usize {
+            let ctx = egui::Context::default();
+            let pal = test_palette();
+            let full = ctx.run_ui(test_input(), |ui| {
+                let _ = show(
+                    ui,
+                    1,
+                    &pal,
+                    ViewState {
+                        remote_view,
+                        remote_list_visible: true,
+                        sidebar_visible: true,
+                        filetree_visible: true,
+                    },
+                );
+            });
+            fn count(s: &egui::epaint::Shape) -> usize {
+                use egui::epaint::Shape;
+                match s {
+                    Shape::LineSegment { points, .. } if points[0].x < 200.0 => 1,
+                    Shape::Vec(v) => v.iter().map(count).sum(),
+                    _ => 0,
+                }
+            }
+            full.shapes.iter().map(|cs| count(&cs.shape)).sum()
+        }
+
+        let local = left_line_segments(false);
+        let remote = left_line_segments(true);
+        assert!(
+            remote >= local + 2,
+            "远程视图应比本地视图多绘制设备栏图标：local={local}, remote={remote}"
+        );
     }
 }

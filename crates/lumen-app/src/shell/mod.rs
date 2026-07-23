@@ -293,6 +293,9 @@ pub struct ShellOutput {
     /// Some(v) = 新可见值，None = 未操作。main 更新
     /// settings.layout.sidebar_visible 并落盘。
     pub toggle_sidebar: Option<bool>,
+    /// 工具栏远程设备栏显隐开关：仅远程视图提供按钮。
+    /// Some(v) = 新可见值，None = 未操作。main 写入设置并落盘。
+    pub toggle_remote_list: Option<bool>,
     /// 工具栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
     pub toggle_filetree: Option<bool>,
     /// 本地/远程视图切换（M5.2）：main 写 settings.layout.view_mode + 存盘。
@@ -498,6 +501,7 @@ pub fn show(
         new_pane: false,
         layout_reset: false,
         toggle_sidebar: None,
+        toggle_remote_list: None,
         toggle_filetree: None,
         toggle_view_mode: None,
         activate_device: None,
@@ -690,6 +694,8 @@ pub fn show(
         input.panes.len(),
         pal,
         toolbar::ViewState {
+            remote_view: app_settings.layout.view_mode,
+            remote_list_visible: app_settings.layout.remote_list_visible,
             sidebar_visible: app_settings.layout.sidebar_visible,
             filetree_visible: st.filetree.visible,
         },
@@ -703,6 +709,9 @@ pub fn show(
     // 问题7：视图开关信号转发（原顶栏路径原样迁入）
     if tbar.toggle_sidebar.is_some() {
         out.toggle_sidebar = tbar.toggle_sidebar;
+    }
+    if tbar.toggle_remote_list.is_some() {
+        out.toggle_remote_list = tbar.toggle_remote_list;
     }
     if let Some(v) = tbar.toggle_filetree {
         // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
@@ -718,7 +727,7 @@ pub fn show(
         egui::Rect::from_x_y_ranges(edge_x - grab..=edge_x + grab, y)
     };
     // 远程设备列表（M5.2）：仅远程 tab 显示，置于会话栏左侧（第三列）。
-    if app_settings.layout.view_mode {
+    if app_settings.layout.view_mode && app_settings.layout.remote_list_visible {
         let rl_resp = egui::Panel::left("lumen_remote_list")
             .default_size(crate::settings::REMOTE_LIST_WIDTH_DEFAULT)
             .size_range(

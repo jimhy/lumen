@@ -220,6 +220,8 @@ pub static STRINGS: Strings = Strings {
     // Topbar view-toggle buttons (issue 7)
     topbar_sidebar_show_tip: "Show session sidebar",
     topbar_sidebar_hide_tip: "Hide session sidebar",
+    toolbar_remote_list_show_tip: "Show device sidebar",
+    toolbar_remote_list_hide_tip: "Hide device sidebar",
     topbar_filetree_show_tip: "Show file tree (Ctrl+B)",
     topbar_filetree_hide_tip: "Hide file tree (Ctrl+B)",
     topbar_reset_layout_tip: "Reset pane sizes",
