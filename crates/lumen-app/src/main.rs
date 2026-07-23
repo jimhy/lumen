@@ -564,6 +564,37 @@ struct ScrollbarGeom {
     scrollback: usize,
 }
 
+/// 「回到底部」按钮要操作的视口所有者。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollToBottomAction {
+    /// Lumen 自己的主屏 scrollback。
+    LocalGrid,
+    /// DECSET 1007 下由备用屏应用自己维护的视口。
+    AlternateApp,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollToBottomTarget {
+    sid: SessionId,
+    rect: egui::Rect,
+    action: ScrollToBottomAction,
+}
+
+fn scroll_to_bottom_action(
+    display_offset: usize,
+    rows: usize,
+    uses_application_alternate_scroll: bool,
+    alternate_scroll_distance_hint: usize,
+) -> Option<ScrollToBottomAction> {
+    if display_offset > rows {
+        Some(ScrollToBottomAction::LocalGrid)
+    } else if uses_application_alternate_scroll && alternate_scroll_distance_hint > rows {
+        Some(ScrollToBottomAction::AlternateApp)
+    } else {
+        None
+    }
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -2555,16 +2586,18 @@ impl AppState {
         }
     }
 
-    /// 「回到底部」浮动按钮的目标矩形（每个上滚超过一整屏的可见窗格各
-    /// 一个）。返回 `(SessionId, 按钮命中区逻辑矩形)`，按钮置于窗格底部
-    /// 居中；焦点窗格扣除 footer 高度，避免压在输入区上。
+    /// 「回到底部」浮动按钮的目标（每个上滚超过一整屏的可见窗格各
+    /// 一个）。按钮置于窗格底部居中；焦点窗格扣除 footer 高度，避免压
+    /// 在输入区上。目标同时记录视口所有者：主屏历史由 Lumen 操作，
+    /// DECSET 1007 备用屏则须向应用发送 End。
     ///
     /// 几何取自上一帧的 `pane_rects_px`（物理像素，连续帧间稳定，滞后
-    /// 一帧无感）；逻辑点 = 物理像素 / `pixels_per_point`。仅当某窗格往
-    /// 上滚动距离 `display_offset` 超过一整屏（`> rows`）才纳入——刚滚一
-    /// 两行不弹按钮，符合「超过 1 屏才提示」的诉求。`&self` 借用整个
-    /// state，故须在 `run_ui` 可变借用 `state.shell_state` 之前调用。
-    fn scroll_to_bottom_overlays(&self) -> Vec<(SessionId, egui::Rect)> {
+    /// 一帧无感）；逻辑点 = 物理像素 / `pixels_per_point`。主屏采用真实
+    /// `display_offset`；备用屏无本地 scrollback，采用成功转发给应用的
+    /// Alternate Scroll 距离估算。二者都超过一整屏（`> rows`）才纳入。
+    /// `&self` 借用整个 state，故须在 `run_ui` 可变借用
+    /// `state.shell_state` 之前调用。
+    fn scroll_to_bottom_overlays(&self) -> Vec<ScrollToBottomTarget> {
         // 按钮逻辑半径与距内容区下沿留白（点）。
         const RADIUS: f32 = 16.0;
         const GAP: f32 = 14.0;
@@ -2586,18 +2619,26 @@ impl AppState {
                 continue;
             };
             let g = pane.term.grid();
-            // display_offset 以行计，0 = 在底部；超过一整屏才显示按钮。
-            if g.display_offset() <= g.rows() {
+            let Some(action) = scroll_to_bottom_action(
+                g.display_offset(),
+                g.rows(),
+                pane.uses_application_alternate_scroll(),
+                pane.alternate_scroll_distance_hint(),
+            ) else {
                 continue;
-            }
+            };
             let footer = if *sid == focus_sid { footer_h_px } else { 0.0 };
             let center_x = (x + w / 2.0) / ppp;
             let bottom = (y + h - footer) / ppp;
             let center = egui::pos2(center_x, bottom - GAP - RADIUS);
-            out.push((
-                *sid,
-                egui::Rect::from_center_size(center, egui::vec2(RADIUS * 2.0, RADIUS * 2.0)),
-            ));
+            out.push(ScrollToBottomTarget {
+                sid: *sid,
+                rect: egui::Rect::from_center_size(
+                    center,
+                    egui::vec2(RADIUS * 2.0, RADIUS * 2.0),
+                ),
+                action,
+            });
         }
         out
     }
@@ -3295,9 +3336,12 @@ impl AppState {
         {
             return false;
         }
-        let buf = input::encode_alternate_scroll(up, notches);
-        if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&buf) {
-            log::error!("备用屏滚轮转方向键写 PTY 失败: {e:#}");
+        let steps = notches.max(1);
+        let buf = input::encode_alternate_scroll(up, steps);
+        let pane = &mut self.tabs[self.active_tab].panes[pane_idx];
+        match pane.write_user_input(&buf) {
+            Ok(()) => pane.note_alternate_scroll_wheel(up, steps),
+            Err(e) => log::error!("备用屏滚轮转方向键写 PTY 失败: {e:#}"),
         }
         self.window.request_redraw();
         true
@@ -6975,6 +7019,12 @@ impl ApplicationHandler<PtyWake> for App {
                 //    守卫 + terminal_focused=false 联合处理，符合设计稿。
 
                 let pressed = event.state == ElementState::Pressed;
+                let plain_end_pressed = pressed
+                    && state.modifiers == ModifiersState::default()
+                    && matches!(
+                        &event.logical_key,
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::End)
+                    );
                 let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
 
                 // —— 文件树 Ctrl+C / Ctrl+V（winit 层直接拦）——
@@ -7383,10 +7433,15 @@ impl ApplicationHandler<PtyWake> for App {
                                 input::encode_key(&event, state.modifiers)
                             };
                             if let Some(bytes) = bytes {
-                                state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
                                 let write_t0 = Instant::now();
-                                if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
-                                    error!("写入 PTY 失败: {e:#}");
+                                let pane = &mut state.tabs[ti].panes[pi];
+                                pane.term.grid_mut().scroll_to_bottom();
+                                match pane.write_user_input(&bytes) {
+                                    Ok(()) if plain_end_pressed => {
+                                        pane.reset_alternate_scroll_distance_hint();
+                                    }
+                                    Ok(()) => {}
+                                    Err(e) => error!("写入 PTY 失败: {e:#}"),
                                 }
                                 state.last_key_at = Some(write_t0);
                                 state.perf_log(format_args!(
@@ -8876,7 +8931,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
                 let scroll_to_bottom_targets = state.scroll_to_bottom_overlays();
-                let mut scroll_to_bottom_req: Option<SessionId> = None;
+                let mut scroll_to_bottom_req: Option<(SessionId, ScrollToBottomAction)> = None;
                 // 终端滚动条目标几何（同样须在借 shell_state 前算好）。
                 // 拖动/点击后把目标绝对 display_offset 记入 scroll_set_req，
                 // 闭包后落到对应 grid。
@@ -8966,13 +9021,18 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     // ── 「回到底部」浮动按钮（窗格上滚超过一整屏时，底部
                     // 居中的圆形向下箭头；点击回到最新输出）──
-                    for (sid, rect) in &scroll_to_bottom_targets {
-                        let resp = egui::Area::new(egui::Id::new(("lumen_scroll_to_bottom", *sid)))
+                    for target in &scroll_to_bottom_targets {
+                        let resp = egui::Area::new(egui::Id::new((
+                            "lumen_scroll_to_bottom",
+                            target.sid,
+                        )))
                             .order(egui::Order::Foreground)
-                            .fixed_pos(rect.min)
+                            .fixed_pos(target.rect.min)
                             .show(ui.ctx(), |ui| {
-                                let (r, resp) =
-                                    ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                                let (r, resp) = ui.allocate_exact_size(
+                                    target.rect.size(),
+                                    egui::Sense::click(),
+                                );
                                 let hovered = resp.hovered();
                                 let p = ui.painter();
                                 let c = r.center();
@@ -9017,7 +9077,7 @@ impl ApplicationHandler<PtyWake> for App {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if resp.inner.clicked() {
-                            scroll_to_bottom_req = Some(*sid);
+                            scroll_to_bottom_req = Some((target.sid, target.action));
                         }
                     }
                     // ── 终端区滚动条（有历史的窗格右缘竖向拖动条）──
@@ -9388,14 +9448,51 @@ impl ApplicationHandler<PtyWake> for App {
                     state.dispatch(ctx_action, ti, pi);
                 }
 
-                // 「回到底部」按钮点击：对应窗格滚回最新输出并请求重绘。
-                if let Some(sid) = scroll_to_bottom_req {
+                // 「回到底部」按钮点击：目标几何来自帧前快照，执行前必须
+                // 重算 action。若期间模式/滚动位置已变化，就丢弃陈旧目标，
+                // 绝不能把备用屏 End 误注入已经退出的 shell。
+                if let Some((sid, requested_action)) = scroll_to_bottom_req {
+                    let mut handled = false;
                     if let Some(p) = state.tabs[state.active_tab]
                         .panes
                         .iter_mut()
                         .find(|p| p.id == sid)
                     {
-                        p.term.grid_mut().scroll_to_bottom();
+                        let g = p.term.grid();
+                        let current_action = scroll_to_bottom_action(
+                            g.display_offset(),
+                            g.rows(),
+                            p.uses_application_alternate_scroll(),
+                            p.alternate_scroll_distance_hint(),
+                        );
+                        if current_action == Some(requested_action) {
+                            match requested_action {
+                                ScrollToBottomAction::LocalGrid => {
+                                    p.term.grid_mut().scroll_to_bottom();
+                                    handled = true;
+                                }
+                                ScrollToBottomAction::AlternateApp => {
+                                    let use_win32 = p.term.win32_input()
+                                        && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
+                                    let bytes = input::encode_plain_end(use_win32);
+                                    match p.write_user_input(&bytes) {
+                                        Ok(()) => {
+                                            p.reset_alternate_scroll_distance_hint();
+                                            handled = true;
+                                        }
+                                        Err(e) => {
+                                            error!("备用屏回到底部 End 写入 PTY 失败: {e:#}");
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            log::debug!(
+                                "丢弃陈旧的回到底部目标 sid={sid} requested={requested_action:?} current={current_action:?}"
+                            );
+                        }
+                    }
+                    if handled {
                         state.window.request_redraw();
                     }
                 }
@@ -11330,7 +11427,8 @@ impl ApplicationHandler<PtyWake> for App {
 mod tests {
     use super::{
         controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, width_worth_persisting, PaneLayout,
+        maximized_overflow, scroll_to_bottom_action, width_worth_persisting, PaneLayout,
+        ScrollToBottomAction,
     };
 
     // ── 本机复制粘贴（local→local，海风哥本轮新增）单测 ───────────────────
@@ -11341,6 +11439,29 @@ mod tests {
         assert!(controller_owns_sub_viewport(1, 0, false));
         assert!(!controller_owns_sub_viewport(0, 0, false));
         assert!(controller_owns_sub_viewport(0, 0, true));
+    }
+
+    #[test]
+    fn 回到底部动作_主屏沿用真实display_offset() {
+        assert_eq!(
+            scroll_to_bottom_action(25, 24, false, 0),
+            Some(ScrollToBottomAction::LocalGrid)
+        );
+        assert_eq!(scroll_to_bottom_action(24, 24, false, 0), None);
+    }
+
+    #[test]
+    fn 回到底部动作_备用屏依赖应用滚动距离估算() {
+        assert_eq!(
+            scroll_to_bottom_action(0, 24, true, 25),
+            Some(ScrollToBottomAction::AlternateApp)
+        );
+        assert_eq!(scroll_to_bottom_action(0, 24, true, 24), None);
+        assert_eq!(
+            scroll_to_bottom_action(0, 24, false, 25),
+            None,
+            "1007 关闭、退出备用屏或开启鼠标上报时不能注入 End"
+        );
     }
 
     #[test]
