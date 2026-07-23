@@ -156,9 +156,9 @@ pub struct SshSyncApplyReport {
 /// 账号隔离的 SSH 库存存储。每次变更会先把库存、本地绑定和同步 journal 写入同一 generation，
 /// 再原子切换 `current.json`，因此读者只会看见一组完整文件。
 ///
-/// `current.json` 的 generation 检查用于尽早发现陈旧实例，但检查与切换之间不是
-/// 跨进程原子 CAS。UI 与同步 worker 必须由单 owner 串行应用状态变更；同步 worker
-/// 只把远端结果发回 owner，不得持有第二个可写 `SshStore`。
+/// 每个 scope 的文件锁把 `current.json` generation 复核与原子切换串行化，陈旧实例
+/// 只能得到 [`StoreError::ConcurrentModification`]。跨 scope 认领固定按 Local →
+/// Account 获取双锁；UI 与同步 worker 仍应由单 owner 串行应用状态变更。
 pub struct SshStore {
     directory: PathBuf,
     server_origin: Option<String>,
@@ -240,9 +240,34 @@ impl SshStore {
         server_origin: &str,
         account_id: &str,
     ) -> Result<Self, StoreError> {
+        Self::load_account_claiming_unclaimed_with_hook(
+            data_root,
+            server_origin,
+            account_id,
+            |_, _| {},
+        )
+    }
+
+    fn load_account_claiming_unclaimed_with_hook(
+        data_root: &Path,
+        server_origin: &str,
+        account_id: &str,
+        after_account_import: impl FnOnce(&Path, &Path),
+    ) -> Result<Self, StoreError> {
         let account_scope =
             StorageScope::account(server_origin, account_id).map_err(StoreError::InvalidScope)?;
+        // 首次 load 负责初始化并验证账号 scope；随后固定按 Local → Account
+        // 获取两个作用域的跨进程锁。所有认领调用都遵循同一顺序，普通 CRUD
+        // 只获取一个作用域锁，因此不会形成反向等待环。
+        let initial_account = Self::load(data_root, account_scope.clone())?;
+        let initial_unclaimed = Self::load(data_root, StorageScope::Local)?;
+        let local_write_lock = acquire_store_write_lock(&initial_unclaimed.directory)?;
+        let account_write_lock = acquire_store_write_lock(&initial_account.directory)?;
+
+        // 两把锁可能在首次 load 后才取得，期间 generation 可以变化。必须在
+        // 持锁后重新加载两边，后续三次提交都以这份锁内快照为 CAS 基线。
         let mut account = Self::load(data_root, account_scope)?;
+        let mut unclaimed = Self::load(data_root, StorageScope::Local)?;
         let canonical_origin = account
             .server_origin
             .clone()
@@ -252,7 +277,6 @@ impl SshStore {
             .clone()
             .ok_or(StoreError::InvalidScope("账号作用域缺少账号 ID"))?;
         let requested_claim = unclaimed_scope_marker(&canonical_origin, &canonical_account);
-        let mut unclaimed = Self::load(data_root, StorageScope::Local)?;
         if unclaimed.inventory.groups().is_empty()
             && unclaimed.inventory.profiles().is_empty()
             && unclaimed.bindings.is_empty()
@@ -278,10 +302,11 @@ impl SshStore {
                 }
                 let mut claimed_sync = unclaimed.sync.clone();
                 claimed_sync.claimed_account_id = Some(requested_claim.clone());
-                unclaimed.commit_state(
+                unclaimed.commit_state_under_lock(
                     unclaimed.inventory.clone(),
                     unclaimed.bindings.clone(),
                     claimed_sync,
+                    &local_write_lock,
                 )?;
             }
         }
@@ -295,13 +320,22 @@ impl SshStore {
                 &SshInventory::default(),
                 &imported_inventory,
             )?;
-            account.commit_state(imported_inventory, imported_bindings, imported_sync)?;
+            account.commit_state_under_lock(
+                imported_inventory,
+                imported_bindings,
+                imported_sync,
+                &account_write_lock,
+            )?;
         }
 
-        unclaimed.commit_state(
+        // 测试钩子位于最危险的 owner 重叠窗口：账号 binding 已提交，但
+        // unclaimed 尚未清空。此时两把锁都必须仍在持有。
+        after_account_import(&unclaimed.directory, &account.directory);
+        unclaimed.commit_state_under_lock(
             SshInventory::default(),
             Vec::new(),
             SyncJournal::default(),
+            &local_write_lock,
         )?;
         Ok(account)
     }
@@ -592,13 +626,25 @@ impl SshStore {
         bindings: Vec<SshLocalBinding>,
         sync: SyncJournal,
     ) -> Result<(), StoreError> {
-        validate_bindings(&inventory, &bindings)?;
-        validate_sync_journal(&sync, self.account_id.as_deref())?;
         // `--multi-instance` 也可能让两个进程同时写同一作用域。必须把
         // generation 复核到 current.json 原子替换的整个窗口串行化；否则
         // 两边都可能通过旧 generation 检查，后写者覆盖前写者，并让刚删除
         // 的旧 Credential Manager target 再次成为 current binding。
-        let _write_lock = acquire_store_write_lock(&self.directory)?;
+        let write_lock = acquire_store_write_lock(&self.directory)?;
+        self.commit_state_under_lock(inventory, bindings, sync, &write_lock)
+    }
+
+    /// 在调用方已经持有当前作用域 `.write.lock` 时提交，避免认领事务
+    /// 对同一文件锁重入。锁引用必须覆盖本函数整个调用。
+    fn commit_state_under_lock(
+        &mut self,
+        inventory: SshInventory,
+        bindings: Vec<SshLocalBinding>,
+        sync: SyncJournal,
+        _write_lock: &std::fs::File,
+    ) -> Result<(), StoreError> {
+        validate_bindings(&inventory, &bindings)?;
+        validate_sync_journal(&sync, self.account_id.as_deref())?;
         match (self.server_origin.as_deref(), self.account_id.as_deref()) {
             (Some(server_origin), Some(account_id)) => {
                 validate_account_scope_file(&self.directory, server_origin, account_id)?;
@@ -1794,7 +1840,9 @@ mod tests {
         // 模拟登出后在 Local 作用域新建另一台服务器。账号缓存已经存在，
         // 再次登录同账号时不应把新 Local 数据误判成崩溃恢复副本。
         let mut local = SshStore::load(&root, StorageScope::Local).unwrap();
-        let local_profile = local.create_profile(draft("local-after-logout", None)).unwrap();
+        let local_profile = local
+            .create_profile(draft("local-after-logout", None))
+            .unwrap();
         drop(local);
         let account =
             SshStore::load_account_claiming_unclaimed(&root, TEST_ORIGIN, &account_id).unwrap();
@@ -1803,6 +1851,89 @@ mod tests {
         let local = SshStore::load(&root, StorageScope::Local).unwrap();
         assert!(local.inventory().profile(&local_profile).is_some());
         assert!(local.sync.claimed_account_id.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 认领事务持有双锁且并发local写不能打断凭据owner转移() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = temporary_root("claim-cross-scope-lock");
+        let account_id = account_id(25);
+        let mut local = SshStore::load(&root, StorageScope::Local).unwrap();
+        let profile_id = local
+            .create_profile(draft("claimed-with-secret", None))
+            .unwrap();
+        let credential_reference = password_ref(&profile_id);
+        local
+            .upsert_binding(SshLocalBinding {
+                profile_id: profile_id.clone(),
+                private_key_path: None,
+                password_credential_ref: Some(credential_reference.clone()),
+                key_passphrase_credential_ref: None,
+            })
+            .unwrap();
+        drop(local);
+
+        // 模拟另一个已登出实例在认领开始前加载了 Local generation，并在
+        // 账号 binding 已提交、Local 尚未清空的最危险窗口尝试删除 profile。
+        let mut stale_local = SshStore::load(&root, StorageScope::Local).unwrap();
+        let stale_profile_id = profile_id.clone();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (attempting_tx, attempting_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            attempting_tx.send(()).unwrap();
+            let result = stale_local.delete_profile(&stale_profile_id);
+            result_tx.send(result).unwrap();
+        });
+
+        let claimed = SshStore::load_account_claiming_unclaimed_with_hook(
+            &root,
+            TEST_ORIGIN,
+            &account_id,
+            |local_directory, account_directory| {
+                start_tx.send(()).unwrap();
+                attempting_rx.recv().unwrap();
+
+                // 钩子执行时双锁仍由认领线程持有；独立 handle 的非阻塞加锁
+                // 必须失败，证明普通 Local writer 没有可插入的 owner 重叠窗口。
+                for directory in [local_directory, account_directory] {
+                    let probe = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(directory.join(".write.lock"))
+                        .unwrap();
+                    assert!(probe.try_lock().is_err());
+                }
+                assert!(matches!(
+                    result_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+            },
+        )
+        .unwrap();
+
+        let writer_result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("认领释放锁后并发 writer 应完成");
+        assert!(matches!(
+            writer_result,
+            Err(StoreError::ConcurrentModification { .. })
+        ));
+        writer.join().unwrap();
+
+        assert_eq!(
+            claimed
+                .binding(&profile_id)
+                .and_then(|binding| binding.password_credential_ref.as_deref()),
+            Some(credential_reference.as_str())
+        );
+        let local = SshStore::load(&root, StorageScope::Local).unwrap();
+        assert!(local.inventory().profile(&profile_id).is_none());
+        assert!(local.binding(&profile_id).is_none());
         let _ = fs::remove_dir_all(root);
     }
 
