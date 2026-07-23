@@ -50,6 +50,9 @@ mod profile;
 mod session;
 mod sessions_store;
 mod settings;
+// P1 SSH：领域库存先独立落地，UI/连接/同步分批接线。
+#[allow(dead_code)]
+mod ssh;
 mod shell;
 mod single_instance;
 // M3.8 批2 Snap Layouts 子类化（仅 Windows）。
@@ -76,7 +79,7 @@ use shell::layout::{DividerKind, PaneLayout};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 // M3.8 自绘标题栏：Windows 平台扩展（无边框阴影 / 圆角）。
 #[cfg(target_os = "windows")]
@@ -549,6 +552,23 @@ fn controller_owns_sub_viewport(tab_index: usize, active_tab: usize, app_locked:
     tab_index != active_tab || app_locked
 }
 
+/// 三种工作模式的全局快捷键。只接受精确的 Ctrl+Shift 组合，避免
+/// Alt/Super 等额外修饰键参与时误切模式。
+fn view_mode_shortcut(
+    modifiers: ModifiersState,
+    physical_key: PhysicalKey,
+) -> Option<settings::ViewMode> {
+    if modifiers != (ModifiersState::CONTROL | ModifiersState::SHIFT) {
+        return None;
+    }
+    match physical_key {
+        PhysicalKey::Code(KeyCode::Digit1) => Some(settings::ViewMode::Local),
+        PhysicalKey::Code(KeyCode::Digit2) => Some(settings::ViewMode::Remote),
+        PhysicalKey::Code(KeyCode::Digit3) => Some(settings::ViewMode::Ssh),
+        _ => None,
+    }
+}
+
 /// 终端区滚动条的逐窗格几何（仅 scrollback 非空、内容区够高的可见
 /// 窗格各一条）。run_ui 闭包内据此绘制轨道/滑块并处理拖动，闭包后把
 /// 目标 `display_offset` 落到对应 grid。几何取自上一帧 `pane_rects_px`
@@ -625,6 +645,12 @@ struct AppState {
     /// 登录档案：None = 未登录。顶栏头像、头像菜单、设置页
     /// Account 三处 UI 同源此字段；登录写盘 / 登出删盘（profile.json）。
     profile: Option<profile::Profile>,
+    /// 当前账号（未登录时为 unclaimed）的 SSH 库存单 owner。UI 与
+    /// 后续同步 worker 的回包都只在主线程串行修改它。
+    ssh_store: Option<ssh::SshStore>,
+    /// 数据目录不可用或库存损坏时的只读空库存，保证 SSH 页面仍可打开
+    /// 并展示明确错误，而不是把损坏文件覆盖成空数据。
+    ssh_empty_inventory: ssh::SshInventory,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     /// 最近一次按键时刻（端到端延迟埋点用，跟随激活会话即可）。
@@ -1115,6 +1141,7 @@ impl AppState {
             .settings
             .clear_sensitive_for_app_lock();
         self.shell_state.remote_ui.reset();
+        self.shell_state.ssh_ui.close_for_app_lock();
         self.lock_ui.clear();
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
@@ -1843,6 +1870,63 @@ impl AppState {
         self.update_window_title();
         self.window.request_redraw();
         true
+    }
+
+    /// 串行施加 SSH 页面动作。`SshStore` 是唯一写 owner；每次 CRUD
+    /// 内部会把库存与本机凭据绑定作为同一 generation 原子提交。
+    fn apply_ssh_ui_actions(&mut self, actions: Vec<shell::ssh_ui::SshUiAction>) {
+        use shell::ssh_ui::SshUiAction;
+
+        for action in actions {
+            if let SshUiAction::ConnectProfile { id } = &action {
+                // 连接层接线前先保留稳定选择；后续由同一动作入口启动
+                // 独立 SSH actor，不会让 UI 直接持有连接对象。
+                self.shell_state.ssh_ui.select_profile(Some(id.clone()));
+                info!("请求连接 SSH 服务器配置 {id}");
+                continue;
+            }
+
+            let Some(store) = self.ssh_store.as_mut() else {
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    "SSH 配置存储不可用，请先处理启动时的存储错误",
+                );
+                continue;
+            };
+
+            let mut created_profile = None;
+            let result = match action {
+                SshUiAction::CreateGroup { name } => store.create_group(&name).map(|_| ()),
+                SshUiAction::RenameGroup { id, name } => store.rename_group(&id, &name),
+                SshUiAction::DeleteGroup { id } => store.delete_group(&id),
+                SshUiAction::CreateProfile { draft } => store.create_profile(draft).map(|id| {
+                    created_profile = Some(id);
+                }),
+                SshUiAction::UpdateProfile { id, draft } => store.update_profile(&id, draft),
+                SshUiAction::DeleteProfile { id } => store.delete_profile(&id),
+                SshUiAction::MoveProfile {
+                    id,
+                    target_group_id,
+                    target_index,
+                } => store.move_profile(&id, target_group_id.as_deref(), target_index),
+                SshUiAction::ConnectProfile { .. } => unreachable!("连接动作已在上方处理"),
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(id) = created_profile {
+                        self.shell_state.ssh_ui.select_profile(Some(id));
+                    }
+                    self.window.request_redraw();
+                }
+                Err(error) => {
+                    error!("SSH 配置变更失败: {error}");
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error.to_string());
+                    self.window.request_redraw();
+                }
+            }
+        }
     }
 
     fn dispatch(
@@ -5685,6 +5769,26 @@ impl App {
         // 「下次重登带空 id → 服务端造幽灵」爆发之前（修「幽灵设备」的廉价治本兜底）。
         cloud::reconcile_device_id(user_profile.as_ref().and_then(|p| p.device_id.as_deref()));
 
+        // SSH 库存按 Lumen 账号隔离；未登录时落 unclaimed。加载失败不
+        // 覆盖原文件，页面退化为空库存并在 UI 就绪后提示。
+        let ssh_scope = user_profile
+            .as_ref()
+            .and_then(|profile| profile.user_id.clone())
+            .map_or(ssh::StorageScope::Local, ssh::StorageScope::Account);
+        let (ssh_store, ssh_store_load_error) = match paths::data_dir() {
+            Some(data_root) => match ssh::SshStore::load(&data_root, ssh_scope) {
+                Ok(store) => (Some(store), None),
+                Err(error) => {
+                    error!("加载 SSH 库存失败（保留原文件）: {error}");
+                    (None, Some(error.to_string()))
+                }
+            },
+            None => (
+                None,
+                Some("无法解析 Lumen 数据目录，SSH 配置本次不可写".to_owned()),
+            ),
+        };
+
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
         shell::theme::apply_style(&egui_ctx, &shell::theme::shell_palette(theme_info));
@@ -5928,6 +6032,8 @@ impl App {
             layout_dirty: false,
             layout_apply_logged: false,
             profile: user_profile,
+            ssh_store,
+            ssh_empty_inventory: ssh::SshInventory::default(),
             modifiers: ModifiersState::default(),
             clipboard,
             last_key_at: None,
@@ -6015,6 +6121,12 @@ impl App {
         // 必须在此显式从 settings 读出。两入口（顶栏②按钮 + Ctrl+B）切换时均同步
         // 写盘（见 shell_out 处理段与 ToggleFiletree 分支），重启即可还原。
         state.shell_state.filetree.visible = state.settings.layout.filetree_visible;
+        if let Some(error) = ssh_store_load_error {
+            state
+                .shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, error);
+        }
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
         if stale_cwd > 0 {
             state.shell_state.toast.push(
@@ -6866,6 +6978,38 @@ impl ApplicationHandler<PtyWake> for App {
                     && state.lock_now()
                 {
                     return;
+                }
+            }
+        }
+
+        // Ctrl+Shift+1/2/3 切换本地/远程/SSH。覆盖层或编辑态打开时
+        // 不抢键；应用锁已在上方优先处理并由下方总闸隔离。
+        if !state.app_lock.is_locked()
+            && !state.shell_state.settings.open
+            && !state.shell_state.login.open
+            && !state.shell_state.history_search.open
+            && !state.shell_state.completion.open
+            && state.shell_state.renaming.is_none()
+            && state.shell_state.pane_renaming.is_none()
+            && !state.shell_state.filetree.dialog_open()
+        {
+            if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+                if key.state == ElementState::Pressed && !key.repeat {
+                    if let Some(next) = view_mode_shortcut(state.modifiers, key.physical_key) {
+                        if state.switch_view_mode(next) {
+                            if let Some(err) = state.settings.save() {
+                                state.shell_state.toast.push(
+                                    shell::toast::ToastKind::Error,
+                                    i18n::fmt1(
+                                        i18n::strings().toast_settings_save_failed_fmt,
+                                        &err,
+                                    ),
+                                );
+                            }
+                            state.window.request_redraw();
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -8920,6 +9064,10 @@ impl ApplicationHandler<PtyWake> for App {
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
                     remote_devices: &state.remote.devices,
+                    ssh_inventory: state
+                        .ssh_store
+                        .as_ref()
+                        .map_or(&state.ssh_empty_inventory, ssh::SshStore::inventory),
                     active_device_id: state.remote.active_device_id.as_deref(),
                     remote_pairing: state.remote_ws.pairing.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
@@ -9449,9 +9597,11 @@ impl ApplicationHandler<PtyWake> for App {
                     Some(UpdateAction::Later) => state.update_dismissed = true,
                     None => {}
                 }
-                let Some(shell_out) = shell_out else {
+                let Some(mut shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
                 };
+                let ssh_actions = std::mem::take(&mut shell_out.ssh_actions);
+                state.apply_ssh_ui_actions(ssh_actions);
                 if shell_out.term_clicked {
                     state.terminal_focused = true;
                 }
@@ -11377,8 +11527,9 @@ impl ApplicationHandler<PtyWake> for App {
 mod tests {
     use super::{
         controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, width_worth_persisting, PaneLayout,
+        maximized_overflow, view_mode_shortcut, width_worth_persisting, PaneLayout,
     };
+    use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
     // ── 本机复制粘贴（local→local，海风哥本轮新增）单测 ───────────────────
     use super::{local_copy_item, unique_copy_name, CopyStats};
@@ -11388,6 +11539,39 @@ mod tests {
         assert!(controller_owns_sub_viewport(1, 0, false));
         assert!(!controller_owns_sub_viewport(0, 0, false));
         assert!(controller_owns_sub_viewport(0, 0, true));
+    }
+
+    #[test]
+    fn 工作模式快捷键_精确匹配_ctrl_shift_数字键() {
+        let modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::Digit1)),
+            Some(crate::settings::ViewMode::Local)
+        );
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::Digit2)),
+            Some(crate::settings::ViewMode::Remote)
+        );
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::Digit3)),
+            Some(crate::settings::ViewMode::Ssh)
+        );
+    }
+
+    #[test]
+    fn 工作模式快捷键_额外修饰键或其他按键不匹配() {
+        let modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            view_mode_shortcut(
+                modifiers | ModifiersState::ALT,
+                PhysicalKey::Code(KeyCode::Digit3)
+            ),
+            None
+        );
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::KeyS)),
+            None
+        );
     }
 
     #[test]

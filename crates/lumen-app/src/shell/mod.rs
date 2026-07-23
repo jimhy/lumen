@@ -16,6 +16,7 @@ pub mod lock_ui;
 pub mod login_ui;
 pub mod remote_ui;
 pub mod settings_ui;
+pub mod ssh_ui;
 pub mod statusbar;
 pub mod theme;
 pub mod toast;
@@ -104,6 +105,8 @@ pub struct ShellState {
     rename_device_focus: bool,
     /// 远程控制配对 UI 跨帧状态（M5.3 part2b：配对码输入缓冲/焦点）。
     pub remote_ui: remote_ui::RemoteUiState,
+    /// SSH 服务器列表、分组、拖放与编辑弹窗的跨帧状态。
+    pub ssh_ui: ssh_ui::SshUiState,
 }
 
 /// 激活 tab 中一个窗格的展示数据（终端工作区分屏用，F5）。
@@ -215,6 +218,8 @@ pub struct ShellInput<'a> {
     pub completion_view: Option<completion_ui::CompletionView<'a>>,
     /// 远程设备列表（M5.2；仅远程 tab 渲染，服务端已按 last_seen 倒序）。
     pub remote_devices: &'a [lumen_protocol::DeviceRecord],
+    /// 当前账号（或未登录作用域）的 SSH 服务器与分组库存。
+    pub ssh_inventory: &'a crate::ssh::SshInventory,
     /// 当前选中的远程设备 id（高亮用）。
     pub active_device_id: Option<&'a str>,
     /// M5.3 远程控制：控制端待配对态（Some = 渲染配对码输入模态）。
@@ -315,6 +320,9 @@ pub struct ShellOutput {
     pub toggle_filetree: Option<bool>,
     /// 本地/远程/SSH 工作模式切换：main 写 settings.layout.view_mode + 存盘。
     pub toggle_view_mode: Option<crate::settings::ViewMode>,
+    /// SSH 服务器列表 UI 的增删改、拖放与连接动作；main 串行施加到
+    /// 单 owner 存储，UI 不直接修改库存。
+    pub ssh_actions: Vec<ssh_ui::SshUiAction>,
     /// 选中了某远程设备（M5.2）：main 记 active_device_id。
     pub activate_device: Option<String>,
     /// 提交远程设备改名（M5.2）：(设备 id, 新名)。
@@ -526,6 +534,7 @@ pub fn show(
         toggle_remote_list: None,
         toggle_filetree: None,
         toggle_view_mode: None,
+        ssh_actions: Vec::new(),
         activate_device: None,
         rename_device: None,
         delete_device: None,
@@ -816,6 +825,48 @@ pub fn show(
             .push(edge_rect(rl_resp.response.rect.max.x, root));
     }
 
+    // SSH 模式使用独立服务器/分组栏，不复用本地会话或远程设备状态。
+    if is_ssh_view {
+        let text = ssh_ui::SshUiText::localized();
+        let mut ssh_out = ssh_ui::SshUiOutput::default();
+        let ssh_resp = egui::Panel::left("lumen_ssh_servers")
+            .default_size(app_settings.layout.sidebar_width)
+            .size_range(crate::settings::SIDEBAR_WIDTH_MIN..=crate::settings::SIDEBAR_WIDTH_MAX)
+            .resizable(true)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg_dark)
+                    .inner_margin(egui::Margin::symmetric(8, 10)),
+            )
+            .show_inside(root, |ui| {
+                ssh_out = ssh_ui::show(
+                    ui,
+                    &mut st.ssh_ui,
+                    ssh_ui::SshUiInput {
+                        inventory: input.ssh_inventory,
+                        text: &text,
+                    },
+                    pal,
+                );
+            });
+        out.ssh_actions = ssh_out.actions;
+        out.sidebar_width = ssh_resp.response.rect.width();
+        {
+            use egui::emath::GuiRounding as _;
+            let ppp = root.pixels_per_point();
+            let rect = ssh_resp.response.rect.round_to_pixels(ppp);
+            root.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0 / ppp, pal.panel_outline),
+                egui::StrokeKind::Inside,
+            );
+        }
+        out.panel_resize_rects
+            .push(edge_rect(ssh_resp.response.rect.max.x, root));
+    }
+
     if app_settings.layout.sidebar_visible && !is_remote_unconnected && !is_ssh_view {
         // 可拖宽（P10）。default_size 只在 egui 无面板记忆（首帧）时生效
         // = 还原持久化宽度；此后宽度由 egui 面板自管，实际值经
@@ -1087,10 +1138,23 @@ pub fn show(
             // SSH 服务器/会话使用独立领域；未选择服务器时不得渲染或
             // 命中后台本地终端。
             if is_ssh_view {
+                let message = st
+                    .ssh_ui
+                    .selected_profile_id()
+                    .and_then(|id| input.ssh_inventory.profile(id))
+                    .map_or_else(
+                        || crate::i18n::strings().ssh_select_server.to_owned(),
+                        |profile| {
+                            format!(
+                                "{}\n{}@{}:{}",
+                                profile.name, profile.username, profile.host, profile.port
+                            )
+                        },
+                    );
                 ui.painter().text(
                     area.center(),
                     egui::Align2::CENTER_CENTER,
-                    crate::i18n::strings().ssh_select_server,
+                    message,
                     egui::FontId::proportional(16.0),
                     pal.fg_dim,
                 );
