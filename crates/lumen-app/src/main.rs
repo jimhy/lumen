@@ -124,6 +124,91 @@ const BG_DRAIN_CAP: usize = 256 * 1024;
 #[derive(Debug)]
 struct PtyWake;
 
+/// 与一个登录账号、一个服务端地址绑定的 SSH 同步会话。
+///
+/// token 与远程心跳/控制共享同一 `Arc`。切换账号时必须先把它原地清空，
+/// 再 drop worker，令仍在途的旧账号任务即使晚一步读 token 也拿不到凭据。
+struct ActiveSshSync {
+    account_id: String,
+    server_url: String,
+    token: Arc<RwLock<String>>,
+    worker: ssh::SshSyncWorker,
+    /// 相同错误在退避重试期间只提示一次；成功回包后清空。
+    last_failure: Option<String>,
+}
+
+fn canonical_ssh_account_id(profile: Option<&profile::Profile>) -> Option<String> {
+    let raw = profile?.user_id.as_deref()?;
+    ssh::StorageScope::Account(raw.to_owned())
+        .canonical_account_id()
+        .ok()
+        .flatten()
+}
+
+fn ssh_sync_identity(
+    profile: Option<&profile::Profile>,
+    server_url: &str,
+) -> Option<(String, String)> {
+    let profile = profile?;
+    profile
+        .token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())?;
+    let account_id = canonical_ssh_account_id(Some(profile))?;
+    let server_url = server_url.trim();
+    (!server_url.is_empty()).then(|| (account_id, server_url.to_owned()))
+}
+
+fn profile_auth_token(profile: Option<&profile::Profile>) -> Option<Arc<RwLock<String>>> {
+    profile?
+        .token
+        .as_ref()
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| Arc::new(RwLock::new(token.clone())))
+}
+
+fn clear_shared_token(token: &Arc<RwLock<String>>) {
+    use zeroize::Zeroize as _;
+
+    match token.write() {
+        Ok(mut value) => value.zeroize(),
+        Err(poisoned) => poisoned.into_inner().zeroize(),
+    }
+}
+
+fn load_ssh_store_for_profile(
+    data_root: &std::path::Path,
+    profile: Option<&profile::Profile>,
+) -> Result<ssh::SshStore, ssh::StoreError> {
+    match canonical_ssh_account_id(profile) {
+        Some(account_id) => ssh::SshStore::load_account_claiming_unclaimed(data_root, &account_id),
+        None => ssh::SshStore::load(data_root, ssh::StorageScope::Local),
+    }
+}
+
+fn should_trigger_ssh_sync_after_local_change(
+    worker_account: Option<&str>,
+    store_account: Option<&str>,
+) -> bool {
+    matches!(
+        (worker_account, store_account),
+        (Some(worker), Some(store)) if worker == store
+    )
+}
+
+fn should_apply_ssh_sync_event(
+    worker_account: Option<&str>,
+    store_account: Option<&str>,
+    event_account: &str,
+) -> bool {
+    should_trigger_ssh_sync_after_local_change(worker_account, store_account)
+        && worker_account == Some(event_account)
+}
+
+fn should_continue_ssh_sync(has_more: bool, pending_mutations: usize) -> bool {
+    has_more || pending_mutations > 0
+}
+
 /// M5.3 part4 本地输入优先仲裁窗口：被控端本地用户在此窗口内有过输入，则丢弃控制端
 /// 转发来的远程输入（本地输入优先，海风哥拍板）。
 const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_millis(800);
@@ -673,6 +758,9 @@ struct AppState {
     /// 当前账号（未登录时为 unclaimed）的 SSH 库存单 owner。UI 与
     /// 后续同步 worker 的回包都只在主线程串行修改它。
     ssh_store: Option<ssh::SshStore>,
+    /// 当前登录账号的 SSH 云同步 worker；未登录、账号/token/服务端
+    /// 地址不完整或库存加载失败时为 None。
+    ssh_sync: Option<ActiveSshSync>,
     /// 数据目录不可用或库存损坏时的只读空库存，保证 SSH 页面仍可打开
     /// 并展示明确错误，而不是把损坏文件覆盖成空数据。
     ssh_empty_inventory: ssh::SshInventory,
@@ -1917,6 +2005,350 @@ impl AppState {
         true
     }
 
+    fn ensure_ssh_sync_worker(&mut self) {
+        let server_url = cloud::server_url();
+        let Some((account_id, server_url)) =
+            ssh_sync_identity(self.profile.as_ref(), &server_url)
+        else {
+            // 地址被清空时只停止同步，不抹掉仍供远程功能使用的当前账号 token。
+            drop(self.ssh_sync.take());
+            return;
+        };
+        let Some(token) = self.auth_token.clone() else {
+            drop(self.ssh_sync.take());
+            return;
+        };
+        let token_is_present = token
+            .read()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !token_is_present {
+            drop(self.ssh_sync.take());
+            return;
+        }
+
+        let Some(store) = self.ssh_store.as_ref() else {
+            drop(self.ssh_sync.take());
+            return;
+        };
+        if !should_trigger_ssh_sync_after_local_change(
+            Some(&account_id),
+            store.account_id(),
+        ) {
+            log::warn!(
+                "拒绝启动 SSH 同步：worker 账号与库存作用域不一致（worker={account_id}）"
+            );
+            drop(self.ssh_sync.take());
+            return;
+        }
+        let Some(snapshot) = store.sync_snapshot() else {
+            drop(self.ssh_sync.take());
+            return;
+        };
+
+        if self.ssh_sync.as_ref().is_some_and(|active| {
+            active.account_id == account_id
+                && active.server_url == server_url
+                && Arc::ptr_eq(&active.token, &token)
+        }) {
+            return;
+        }
+
+        // 防御性处理绕过标准切换入口的状态漂移。地址变化且账号/token
+        // 未变时不能清 token；账号或 token 句柄变化时先清旧句柄再 drop。
+        if let Some(active) = self.ssh_sync.as_ref() {
+            if active.account_id != account_id || !Arc::ptr_eq(&active.token, &token) {
+                clear_shared_token(&active.token);
+            }
+        }
+        drop(self.ssh_sync.take());
+        if token
+            .read()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let proxy = self.proxy.clone();
+        let notifier: ssh::SshSyncNotifier = Arc::new(move || {
+            // 同步数据只留在 worker 自身事件通道；自定义事件仅负责唤醒
+            // winit 主线程，绝不携带账号、配置或错误正文。
+            let _ = proxy.send_event(PtyWake);
+        });
+        match ssh::SshSyncWorker::start_with_notifier(
+            server_url.clone(),
+            token.clone(),
+            snapshot,
+            Some(notifier),
+        ) {
+            Ok(worker) => {
+                info!("SSH 配置同步已启动：account={account_id}");
+                self.ssh_sync = Some(ActiveSshSync {
+                    account_id,
+                    server_url,
+                    token,
+                    worker,
+                    last_failure: None,
+                });
+            }
+            Err(error) => {
+                log::error!("启动 SSH 配置同步线程失败: {error}");
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    format!("SSH 配置同步启动失败: {error}"),
+                );
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn invalidate_account_for_server_url_change(&mut self) {
+        let had_account_state =
+            self.profile.is_some() || self.auth_token.is_some() || self.ssh_sync.is_some();
+        if !had_account_state {
+            return;
+        }
+
+        // token 未携带签发 origin，绝不能把旧地址签发的 bearer token 或
+        // 账号 SSH 快照送往用户刚填写的新地址。先原地抹 token、停掉
+        // 全部账号网络 worker，再删除登录档案并切回 Local 库存。
+        self.stop_account_bound_workers();
+        profile::Profile::delete();
+        self.profile = None;
+        self.reload_ssh_account_context();
+        if let Some(service) = self.clipboard_svc.as_ref() {
+            service.clear();
+        }
+        self.shell_state.toast.push(
+            shell::toast::ToastKind::Warn,
+            "服务器地址已更改，为保护账号数据，请重新登录",
+        );
+        self.window.request_redraw();
+    }
+
+    fn stop_account_bound_workers(&mut self) {
+        // 顺序是安全约束：先原地抹空所有旧 token Arc，再 drop worker。
+        if let Some(active) = self.ssh_sync.as_ref() {
+            clear_shared_token(&active.token);
+        }
+        if let Some(token) = self.auth_token.as_ref() {
+            let already_cleared = self
+                .ssh_sync
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.token, token));
+            if !already_cleared {
+                clear_shared_token(token);
+            }
+        }
+        drop(self.ssh_sync.take());
+        self.remote.stop();
+        self.remote_ws.stop();
+        self.auth_token = None;
+    }
+
+    fn reload_ssh_account_context(&mut self) {
+        // SSH 连接和全部瞬时 UI 都属于旧账号。切换库存前先清掉，
+        // 防止旧 profile id、凭据对话框或 actor 落到新账号页面。
+        self.ssh_runtime = ssh_runtime::SshRuntime::default();
+        self.shell_state.ssh_ui = shell::ssh_ui::SshUiState::default();
+        self.shell_state.ssh_credentials = None;
+        self.ssh_rect_px = None;
+        self.terminal_focused = self.terminal_focus_allowed();
+
+        self.ssh_store = match paths::data_dir() {
+            Some(data_root) => {
+                match load_ssh_store_for_profile(&data_root, self.profile.as_ref()) {
+                    Ok(store) => Some(store),
+                    Err(error) => {
+                        log::error!("切换账号后加载 SSH 库存失败（保留原文件）: {error}");
+                        self.shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error.to_string());
+                        None
+                    }
+                }
+            }
+            None => {
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    "无法解析 Lumen 数据目录，SSH 配置本次不可写",
+                );
+                None
+            }
+        };
+        self.auth_token = profile_auth_token(self.profile.as_ref());
+        self.ensure_ssh_sync_worker();
+        self.window.request_redraw();
+    }
+
+    fn notify_ssh_local_change(&self) {
+        let Some(active) = self.ssh_sync.as_ref() else {
+            return;
+        };
+        let Some(store) = self.ssh_store.as_ref() else {
+            return;
+        };
+        if !should_trigger_ssh_sync_after_local_change(
+            Some(&active.account_id),
+            store.account_id(),
+        ) {
+            return;
+        }
+        if let Some(snapshot) = store.sync_snapshot() {
+            active.worker.update_snapshot_and_trigger(snapshot);
+        }
+    }
+
+    fn show_ssh_sync_failure_once(&mut self, account_id: &str, message: String) {
+        let should_show = self
+            .ssh_sync
+            .as_mut()
+            .filter(|active| active.account_id == account_id)
+            .is_some_and(|active| {
+                if active.last_failure.as_deref() == Some(message.as_str()) {
+                    false
+                } else {
+                    active.last_failure = Some(message.clone());
+                    true
+                }
+            });
+        if should_show {
+            log::warn!("SSH 配置同步失败：account={account_id}, {message}");
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                format!("SSH 配置同步失败: {message}"),
+            );
+            self.window.request_redraw();
+        }
+    }
+
+    fn drain_ssh_sync(&mut self) {
+        let events = self
+            .ssh_sync
+            .as_ref()
+            .map(|active| {
+                std::iter::from_fn(|| active.worker.poll()).collect::<Vec<ssh::SshSyncEvent>>()
+            })
+            .unwrap_or_default();
+
+        for event in events {
+            let event_account = match &event {
+                ssh::SshSyncEvent::Completed(completed) => {
+                    completed.snapshot.account_id().to_owned()
+                }
+                ssh::SshSyncEvent::Failed(failed) => failed.account_id.clone(),
+            };
+            let worker_account = self
+                .ssh_sync
+                .as_ref()
+                .map(|active| active.account_id.as_str());
+            let store_account = self
+                .ssh_store
+                .as_ref()
+                .and_then(ssh::SshStore::account_id);
+            if !should_apply_ssh_sync_event(
+                worker_account,
+                store_account,
+                &event_account,
+            ) {
+                log::warn!(
+                    "丢弃过期 SSH 同步事件：event_account={event_account}, worker_account={worker_account:?}, store_account={store_account:?}"
+                );
+                continue;
+            }
+
+            match event {
+                ssh::SshSyncEvent::Failed(failed) => {
+                    // 失败事件不触碰 SshStore；worker 自身按退避计划重试。
+                    self.show_ssh_sync_failure_once(
+                        &failed.account_id,
+                        format!("{}: {}", failed.error.code(), failed.error.user_message()),
+                    );
+                }
+                ssh::SshSyncEvent::Completed(completed) => {
+                    let applied = {
+                        let Some(store) = self.ssh_store.as_mut() else {
+                            continue;
+                        };
+                        let profiles_before = store
+                            .inventory()
+                            .profiles()
+                            .iter()
+                            .map(|profile| profile.id.clone())
+                            .collect::<Vec<_>>();
+                        match store.apply_sync_completed(completed) {
+                            Ok(report) => {
+                                let removed_profiles = profiles_before
+                                    .into_iter()
+                                    .filter(|id| store.inventory().profile(id).is_none())
+                                    .collect::<Vec<_>>();
+                                let snapshot = store.sync_snapshot();
+                                let pending_mutations = store.pending_sync_mutations();
+                                Ok((report, snapshot, pending_mutations, removed_profiles))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+
+                    let Ok((report, snapshot, pending_mutations, removed_profiles)) = applied
+                    else {
+                        let error = applied.expect_err("上方已匹配错误分支");
+                        self.show_ssh_sync_failure_once(
+                            &event_account,
+                            format!("应用服务端回包失败: {error}"),
+                        );
+                        continue;
+                    };
+
+                    if let Some(active) = self
+                        .ssh_sync
+                        .as_mut()
+                        .filter(|active| active.account_id == event_account)
+                    {
+                        active.last_failure = None;
+                        if let Some(snapshot) = snapshot {
+                            active.worker.update_snapshot(snapshot);
+                            if should_continue_ssh_sync(report.has_more, pending_mutations) {
+                                active.worker.trigger();
+                            }
+                        }
+                    }
+
+                    // 只断开真正被远端删除（或被服务端拒绝并清理）的 profile；
+                    // 远端编辑、移动和删组保留正在运行的 SSH actor。
+                    if !removed_profiles.is_empty() {
+                        let selected_removed = self
+                            .shell_state
+                            .ssh_ui
+                            .selected_profile_id()
+                            .is_some_and(|selected| {
+                                removed_profiles.iter().any(|id| id == selected)
+                            });
+                        for profile_id in &removed_profiles {
+                            self.ssh_runtime.remove_profile(profile_id);
+                        }
+                        if selected_removed {
+                            self.shell_state.ssh_ui.select_profile(None);
+                        }
+                        self.shell_state.ssh_credentials = None;
+                        self.ssh_rect_px = None;
+                        self.terminal_focused = self.terminal_focus_allowed();
+                    }
+                    info!(
+                        "SSH 配置同步完成：ack={} changes={} rejected={} cursor={} deferred={}",
+                        report.acknowledged,
+                        report.applied_changes,
+                        report.rejected.len(),
+                        report.server_cursor,
+                        report.deferred_changes
+                    );
+                    self.window.request_redraw();
+                }
+            }
+        }
+    }
+
     /// 串行施加 SSH 页面动作。`SshStore` 是唯一写 owner；每次 CRUD
     /// 内部会把库存与本机凭据绑定作为同一 generation 原子提交。
     fn apply_ssh_ui_actions(&mut self, actions: Vec<shell::ssh_ui::SshUiAction>) {
@@ -1959,6 +2391,7 @@ impl AppState {
             };
             match result {
                 Ok(()) => {
+                    self.notify_ssh_local_change();
                     if let Some(id) = created_profile {
                         self.shell_state.ssh_ui.select_profile(Some(id));
                     }
@@ -2158,6 +2591,7 @@ impl AppState {
                         .push(shell::toast::ToastKind::Error, error);
                     return;
                 }
+                self.notify_ssh_local_change();
                 if self.ssh_runtime.confirm_unknown_host_key(
                     &profile_id,
                     &algorithm,
@@ -6093,14 +6527,11 @@ impl App {
         // 「下次重登带空 id → 服务端造幽灵」爆发之前（修「幽灵设备」的廉价治本兜底）。
         cloud::reconcile_device_id(user_profile.as_ref().and_then(|p| p.device_id.as_deref()));
 
-        // SSH 库存按 Lumen 账号隔离；未登录时落 unclaimed。加载失败不
-        // 覆盖原文件，页面退化为空库存并在 UI 就绪后提示。
-        let ssh_scope = user_profile
-            .as_ref()
-            .and_then(|profile| profile.user_id.clone())
-            .map_or(ssh::StorageScope::Local, ssh::StorageScope::Account);
+        // SSH 库存按 Lumen 账号隔离；账号首次使用时先以不可逆认领标记
+        // 导入未登录清单。无账号/账号 ID 非规范时仍只读写 Local，绝不
+        // 把一份未确认归属的缓存交给同步 worker。
         let (ssh_store, ssh_store_load_error) = match paths::data_dir() {
-            Some(data_root) => match ssh::SshStore::load(&data_root, ssh_scope) {
+            Some(data_root) => match load_ssh_store_for_profile(&data_root, user_profile.as_ref()) {
                 Ok(store) => (Some(store), None),
                 Err(error) => {
                     error!("加载 SSH 库存失败（保留原文件）: {error}");
@@ -6112,6 +6543,7 @@ impl App {
                 Some("无法解析 Lumen 数据目录，SSH 配置本次不可写".to_owned()),
             ),
         };
+        let initial_auth_token = profile_auth_token(user_profile.as_ref());
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
@@ -6357,6 +6789,7 @@ impl App {
             layout_apply_logged: false,
             profile: user_profile,
             ssh_store,
+            ssh_sync: None,
             ssh_empty_inventory: ssh::SshInventory::default(),
             ssh_runtime: ssh_runtime::SshRuntime::default(),
             ssh_texture: None,
@@ -6383,7 +6816,7 @@ impl App {
             update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
             update_proxy: Arc::new(std::sync::Mutex::new(init_proxy)),
             egui_ctx,
-            auth_token: None,
+            auth_token: initial_auth_token,
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
             mirror_src: None,
@@ -6454,6 +6887,7 @@ impl App {
                 .toast
                 .push(shell::toast::ToastKind::Error, error);
         }
+        state.ensure_ssh_sync_worker();
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
         if stale_cwd > 0 {
             state.shell_state.toast.push(
@@ -6611,6 +7045,7 @@ impl ApplicationHandler<PtyWake> for App {
         // PTY/远程事件，解锁首帧即可与最新终端状态对齐。
         state.drain_lock_crypto();
         state.drain_ssh_runtime();
+        state.drain_ssh_sync();
         // F3：drain 更新消息（发现新版/检查结果/下载完成）。下载完成会拉起
         // 安装器并请求优雅退出——走与 CloseRequested 同路径（落盘 + flush
         // 历史 + exit），让安装器替换 exe。
@@ -7137,6 +7572,9 @@ impl ApplicationHandler<PtyWake> for App {
         if state.ssh_runtime.has_live_connections() {
             state.drain_ssh_runtime();
         }
+        // notifier 正常会用 PtyWake 立即唤醒；这里作为安全帧点非阻塞
+        // drain，覆盖事件循环合并/关闭前的边界，不引入轮询唤醒。
+        state.drain_ssh_sync();
         let ssh_poll_at = state
             .ssh_runtime
             .has_live_connections()
@@ -10938,11 +11376,11 @@ impl ApplicationHandler<PtyWake> for App {
                         *g = state.settings.proxy.effective_url().map(str::to_owned);
                     }
                 }
-                // M5.2：服务端地址改动 → 更新 cloud 全局。注意：运行中的心跳 worker 在 start
-                // 时已一次性捕获旧地址（CloudClient::new(server_url())，循环外不热切），故状态栏
-                // 连接指示要到「下次登录」worker 用新地址重启后才与新地址一致——与设置页
-                // 「改后下次登录生效」提示相符（登录 UI/心跳每次新建 client 时才读新全局）。
+                // 服务端 origin 改动后旧 token 不可复用：先清登录态和账号
+                // worker，再发布新全局地址。重新登录取得新 origin 的 token 后
+                // 才会重新加载账号库存并启动 SSH 同步。
                 if shell_out.settings_server_url_changed {
+                    state.invalidate_account_for_server_url_change();
                     cloud::set_server_url(&state.settings.server_url);
                 }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
@@ -11004,6 +11442,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // —— 登录/登出动作：state.profile 是唯一数据源，更新后
                 // 顶栏头像、头像菜单、设置页 Account 三处下一帧即联动 ——
                 if let Some(p) = shell_out.logged_in {
+                    state.stop_account_bound_workers();
                     // 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
                     p.save();
                     info!("登录成功：{} <{}>", p.display_name, p.email);
@@ -11014,24 +11453,15 @@ impl ApplicationHandler<PtyWake> for App {
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();
                     state.profile = Some(p);
-                    // 新登录态：清共享 token 句柄，下帧据新 token 重建（供心跳续期 + WS 共读）。
-                    state.auth_token = None;
-                    // 关键：停掉仍握着旧 token 句柄的后台线程，下帧据新 token 重启——否则
-                    // 「已登录时点重新登录」（token 被服务端失效的自愈场景）后，心跳/WS 仍用
-                    // 旧死 token 死循环，重登白做、needs_relogin 永不清除。
-                    state.remote.stop();
-                    state.remote_ws.stop();
+                    state.reload_ssh_account_context();
                 }
                 if shell_out.logged_out {
                     // 登出：删 profile.json，三处 UI 即时回未登录态。
+                    state.stop_account_bound_workers();
                     profile::Profile::delete();
                     info!("已登出（profile.json 已删除）");
                     state.profile = None;
-                    state.auth_token = None; // 清共享 token 句柄
-                                             // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
-                    state.remote.stop();
-                    // M5.3：停止远程控制 WS 引擎，清远程会话/配对态。
-                    state.remote_ws.stop();
+                    state.reload_ssh_account_context();
                     // 片6：登出后被控端不可达，清掉系统剪贴板里指向它的虚拟文件，免得粘贴空等失败。
                     if let Some(svc) = state.clipboard_svc.as_ref() {
                         svc.clear();
@@ -12024,8 +12454,11 @@ impl ApplicationHandler<PtyWake> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, view_mode_shortcut, width_worth_persisting, PaneLayout,
+        canonical_ssh_account_id, clear_shared_token, controller_owns_sub_viewport, drain_order,
+        estimate_restored_pane_px, load_icon, maximized_overflow,
+        should_apply_ssh_sync_event, should_continue_ssh_sync,
+        should_trigger_ssh_sync_after_local_change, ssh_sync_identity, view_mode_shortcut,
+        width_worth_persisting, PaneLayout,
     };
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
@@ -12070,6 +12503,95 @@ mod tests {
             view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::KeyS)),
             None
         );
+    }
+
+    #[test]
+    fn ssh同步身份只接受规范账号_非空token和服务端地址() {
+        let mut profile = crate::profile::Profile {
+            user_id: Some("550E8400-E29B-41D4-A716-446655440000".to_owned()),
+            token: Some("jwt-token".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_ssh_account_id(Some(&profile)).as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            ssh_sync_identity(Some(&profile), "https://lumen.example"),
+            Some((
+                "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                "https://lumen.example".to_owned()
+            ))
+        );
+
+        profile.token = Some("   ".to_owned());
+        assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
+        profile.token = Some("jwt-token".to_owned());
+        assert!(ssh_sync_identity(Some(&profile), "   ").is_none());
+        profile.user_id = Some("not-a-canonical-account".to_owned());
+        assert!(canonical_ssh_account_id(Some(&profile)).is_none());
+        assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
+    }
+
+    #[test]
+    fn ssh本地变更只触发同账号worker() {
+        let account = "550e8400-e29b-41d4-a716-446655440000";
+        let other = "550e8400-e29b-41d4-a716-446655440001";
+        assert!(should_trigger_ssh_sync_after_local_change(
+            Some(account),
+            Some(account)
+        ));
+        assert!(!should_trigger_ssh_sync_after_local_change(
+            Some(account),
+            Some(other)
+        ));
+        assert!(!should_trigger_ssh_sync_after_local_change(
+            Some(account),
+            None
+        ));
+        assert!(!should_trigger_ssh_sync_after_local_change(
+            None,
+            Some(account)
+        ));
+    }
+
+    #[test]
+    fn ssh同步事件须同时匹配worker与当前库存账号() {
+        let account = "550e8400-e29b-41d4-a716-446655440000";
+        let stale = "550e8400-e29b-41d4-a716-446655440001";
+        assert!(should_apply_ssh_sync_event(
+            Some(account),
+            Some(account),
+            account
+        ));
+        assert!(!should_apply_ssh_sync_event(
+            Some(account),
+            Some(account),
+            stale
+        ));
+        assert!(!should_apply_ssh_sync_event(
+            Some(account),
+            Some(stale),
+            account
+        ));
+        assert!(!should_apply_ssh_sync_event(Some(account), None, account));
+    }
+
+    #[test]
+    fn ssh同步完成后仅有更多页或待发变更才续触发() {
+        assert!(!should_continue_ssh_sync(false, 0));
+        assert!(should_continue_ssh_sync(true, 0));
+        assert!(should_continue_ssh_sync(false, 1));
+        assert!(should_continue_ssh_sync(true, 1));
+    }
+
+    #[test]
+    fn ssh账号切换会原地清空所有共享token句柄() {
+        let token = std::sync::Arc::new(std::sync::RwLock::new("old-token".to_owned()));
+        let worker_view = token.clone();
+        clear_shared_token(&token);
+        assert!(token.read().unwrap().is_empty());
+        assert!(worker_view.read().unwrap().is_empty());
     }
 
     #[test]
