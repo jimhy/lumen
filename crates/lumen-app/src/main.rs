@@ -789,6 +789,69 @@ fn scroll_to_bottom_action(
     }
 }
 
+fn ssh_file_operation_done_message(operation: lumen_ssh::FileOperation) -> String {
+    match operation {
+        lumen_ssh::FileOperation::WriteText => "SSH 文件已保存".to_owned(),
+        lumen_ssh::FileOperation::CreateDirectory => "SSH 文件夹已创建".to_owned(),
+        lumen_ssh::FileOperation::CreateFile => "SSH 文件已创建".to_owned(),
+        lumen_ssh::FileOperation::Rename => "SSH 项目已重命名".to_owned(),
+        lumen_ssh::FileOperation::Delete => "SSH 项目已永久删除".to_owned(),
+        lumen_ssh::FileOperation::Download => "SSH 文件已下载".to_owned(),
+        lumen_ssh::FileOperation::Upload => "文件已上传到 SSH 服务器".to_owned(),
+    }
+}
+
+fn ssh_file_error_message(
+    operation: ssh_runtime::SshFileAction,
+    error: lumen_ssh::FileError,
+) -> String {
+    let action = match operation {
+        ssh_runtime::SshFileAction::Search => "搜索 SSH 文件",
+        ssh_runtime::SshFileAction::ReadText => "读取 SSH 文件",
+        ssh_runtime::SshFileAction::WriteText => "保存 SSH 文件",
+        ssh_runtime::SshFileAction::OpenLocalCopy => "下载并打开 SSH 文件",
+        ssh_runtime::SshFileAction::CreateDirectory => "新建 SSH 文件夹",
+        ssh_runtime::SshFileAction::CreateFile => "新建 SSH 文件",
+        ssh_runtime::SshFileAction::Delete => "删除 SSH 项目",
+        ssh_runtime::SshFileAction::Download => "下载 SSH 文件",
+        ssh_runtime::SshFileAction::Upload => "上传 SSH 文件",
+    };
+    format!("{action}失败：{error}")
+}
+
+fn remote_edit_error_message(error: lumen_protocol::remote::EditFileError) -> String {
+    use lumen_protocol::remote::EditFileError;
+    match error {
+        EditFileError::InvalidRequest => "远程文件编辑请求无效",
+        EditFileError::NotFound => "远程文件已不存在",
+        EditFileError::PermissionDenied => "没有权限编辑此远程文件",
+        EditFileError::TooLarge => "文件超过内置编辑器的 1 MiB 上限",
+        EditFileError::NotRegular => "只能编辑普通文本文件",
+        EditFileError::Symlink => "为安全起见，内置编辑器不直接编辑符号链接",
+        EditFileError::Busy => "远程文件服务正忙，请稍后重试",
+        EditFileError::ChangedDuringRead => "读取过程中远程文件发生了变化，请重试",
+        EditFileError::LengthMismatch | EditFileError::Integrity => {
+            "远程文件传输校验失败，请重试"
+        }
+        EditFileError::Cancelled => "远程文件编辑操作已取消",
+        EditFileError::StaleSession => "远程控制会话已变化，请重新打开文件",
+        EditFileError::Io => "远程文件读写失败",
+    }
+    .to_owned()
+}
+
+fn remote_parent_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let separator = trimmed.rfind(['/', '\\'])?;
+    if separator == 0
+        || (separator == 2 && trimmed.as_bytes().get(1).copied() == Some(b':'))
+    {
+        Some(&trimmed[..=separator])
+    } else {
+        Some(&trimmed[..separator])
+    }
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -967,6 +1030,13 @@ struct AppState {
     mirror_pane_rects_px: Vec<(session::SessionId, f32, f32, f32, f32)>,
     /// M5.3 part3c-2 #7：粘贴检测到同名、等用户在覆盖模态拍板的待决下载（None = 无待决）。
     pending_paste: Option<PendingPaste>,
+    /// SSH 文件树的内部复制引用。远端路径不会伪装成本机 CF_HDROP；
+    /// 粘贴时才经对应 SSH 会话传输。
+    ssh_file_clipboard: Option<SshClipboardItem>,
+    /// SSH→SSH 跨目录/跨服务器文件粘贴的临时下载后续上传。
+    ssh_paste_chains: HashMap<std::path::PathBuf, SshPasteChain>,
+    /// 已完成 SSH→SSH 下载、正在上传的暂存文件；仅这些路径会在上传结束后删除。
+    ssh_staged_uploads: HashSet<std::path::PathBuf>,
     /// 粘贴完成后待刷新的目标目录 `(is_remote, dir)`：粘贴写文件到目录后，文件树缓存未更新、新
     /// 文件不显示，故传输完成（本机复制 / 下载 / 上传）时刷新该目录。do_file_paste 设、完成点消费。
     paste_refresh: Option<(bool, String)>,
@@ -1621,13 +1691,23 @@ impl AppState {
     /// 增量，保证控制端镜像「快照先于增量」的顺序。
     fn pump_remote(&mut self) {
         if !self.remote_ws.is_running() {
+            self.invalidate_stale_text_editor_source();
+            let edit_events = self.remote_ws.take_edit_events();
+            if !edit_events.is_empty() {
+                self.apply_remote_edit_events(edit_events);
+            }
             return;
         }
         let changed = self.remote_ws.poll();
+        self.invalidate_stale_text_editor_source();
         // 控制端：清理停滞的在途 Fetch（超时删半成品临时文件）。仅在有事件唤醒 pump_remote
         // 时运行（传输中 FileChunk 持续唤醒、足以及时清理）；对端彻底静默时退而依赖会话结束
         // (clear) 与下次启动 (start 清目录) 兜底，临时文件不会无界堆积。
         self.remote_ws.sweep_fetch_stalls();
+        let edit_events = self.remote_ws.take_edit_events();
+        if !edit_events.is_empty() {
+            self.apply_remote_edit_events(edit_events);
+        }
         // H2：会话结束（不再控制）→ 清待决覆盖粘贴，否则覆盖模态会在死会话上复活下载。
         if !self.remote_ws.is_controlling() {
             self.pending_paste = None;
@@ -2028,6 +2108,194 @@ impl AppState {
         }
     }
 
+    fn text_editor_source_is_current(
+        &self,
+        source: &shell::text_editor::TextFileSource,
+    ) -> bool {
+        use shell::text_editor::TextFileSource;
+        match source {
+            TextFileSource::Remote { generation, .. } => {
+                self.remote_ws.is_controlling()
+                    && *generation == self.remote_ws.edit_generation()
+            }
+            TextFileSource::Ssh {
+                runtime_id,
+                session_id,
+                ..
+            } => {
+                *runtime_id == self.ssh_runtime.runtime_id()
+                    && self.ssh_runtime.contains_session(*session_id)
+            }
+        }
+    }
+
+    fn invalidate_stale_text_editor_source(&mut self) {
+        let Some(source) = self.shell_state.text_editor.source().cloned() else {
+            return;
+        };
+        if !self.text_editor_source_is_current(&source) {
+            self.shell_state.text_editor.invalidate_source(
+                &source,
+                i18n::strings().text_editor_source_invalidated,
+            );
+        }
+    }
+
+    fn apply_remote_edit_events(&mut self, events: Vec<remote_ws::EditEvent>) {
+        use shell::text_editor::{SaveFailure, TextFileSource};
+        let current_generation = self.remote_ws.edit_generation();
+        for event in events {
+            match event {
+                remote_ws::EditEvent::Loaded { token, bytes, .. } => {
+                    if matches!(
+                        self.shell_state.text_editor.source(),
+                        Some(TextFileSource::Remote { generation, .. })
+                            if *generation == current_generation
+                    ) {
+                        self.shell_state.text_editor.apply_loaded(token, Ok(bytes));
+                    }
+                }
+                remote_ws::EditEvent::Saved { token, .. } => {
+                    let path = match self.shell_state.text_editor.source() {
+                        Some(TextFileSource::Remote { generation, path })
+                            if *generation == current_generation =>
+                        {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(path) = path {
+                        if self
+                            .shell_state
+                            .text_editor
+                            .apply_saved(token, Ok(()))
+                        {
+                            if let Some(parent) = remote_parent_path(&path) {
+                                self.remote_ws.refresh_remote_path(parent);
+                            }
+                        }
+                    }
+                }
+                remote_ws::EditEvent::Conflict { token, .. } => {
+                    if matches!(
+                        self.shell_state.text_editor.source(),
+                        Some(TextFileSource::Remote { generation, .. })
+                            if *generation == current_generation
+                    ) {
+                        self.shell_state
+                            .text_editor
+                            .apply_saved(token, Err(SaveFailure::Conflict));
+                    }
+                }
+                remote_ws::EditEvent::Error { token, error, .. } => {
+                    let message = remote_edit_error_message(error);
+                    if matches!(
+                        self.shell_state.text_editor.source(),
+                        Some(TextFileSource::Remote { generation, .. })
+                            if *generation == current_generation
+                    ) && !self.shell_state.text_editor.apply_saved(
+                        token,
+                        Err(SaveFailure::Message(message.clone())),
+                    ) {
+                        self.shell_state
+                            .text_editor
+                            .apply_loaded(token, Err(message));
+                    }
+                }
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    fn open_text_editor(&mut self, source: shell::text_editor::TextFileSource) {
+        if !self.text_editor_source_is_current(&source) {
+            self.invalidate_stale_text_editor_source();
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().text_editor_source_invalidated,
+            );
+            self.window.request_redraw();
+            return;
+        }
+        if let Some(request) = self.shell_state.text_editor.request_open(source) {
+            self.start_text_editor_load(request);
+        }
+        self.terminal_focused = false;
+        self.window.request_redraw();
+    }
+
+    fn start_text_editor_load(&mut self, request: shell::text_editor::LoadRequest) {
+        if !self.text_editor_source_is_current(&request.source) {
+            self.shell_state.text_editor.invalidate_source(
+                &request.source,
+                i18n::strings().text_editor_source_invalidated,
+            );
+            return;
+        }
+        let token = request.token;
+        let result = match request.source {
+            shell::text_editor::TextFileSource::Remote { path, .. } => {
+                self.remote_ws.start_edit_fetch(token, path);
+                Ok(())
+            }
+            shell::text_editor::TextFileSource::Ssh {
+                session_id, path, ..
+            } => {
+                self.ssh_runtime.read_text(session_id, token, path)
+            }
+        };
+        if let Err(error) = result {
+            self.shell_state
+                .text_editor
+                .apply_loaded(token, Err(error));
+        }
+    }
+
+    fn start_text_editor_save(&mut self, request: shell::text_editor::SaveRequest) {
+        use shell::text_editor::{SaveFailure, TextFileSource};
+        if !self.text_editor_source_is_current(&request.source) {
+            self.shell_state.text_editor.invalidate_source(
+                &request.source,
+                i18n::strings().text_editor_source_invalidated,
+            );
+            return;
+        }
+        if !self.shell_state.text_editor.mark_saving(&request) {
+            return;
+        }
+        let token = request.token;
+        let result = match request.source {
+            TextFileSource::Remote { path, .. } => {
+                self.remote_ws.start_edit_save(
+                    token,
+                    path,
+                    request.bytes,
+                    lumen_protocol::remote::FileRevision {
+                        len: request.expected_len,
+                        sha256: request.expected_sha256,
+                    },
+                    request.force,
+                );
+                Ok(())
+            }
+            TextFileSource::Ssh {
+                session_id, path, ..
+            } => self.ssh_runtime.write_text(
+                session_id,
+                token,
+                path,
+                request.bytes,
+                request.expected_sha256,
+                request.force,
+            ),
+        };
+        if let Err(error) = result {
+            self.shell_state
+                .text_editor
+                .apply_saved(token, Err(SaveFailure::Message(error)));
+        }
+    }
+
     /// 控制端镜像视图是否生效（控制中 且 处于「远程」视图）：决定键盘是否转发给
     /// 被控端而非本地执行（bug3：切回「本地」视图则本地输入、不转发、不画镜像）。
     fn is_mirror_active(&self) -> bool {
@@ -2046,6 +2314,7 @@ impl AppState {
             || self.shell_state.renaming.is_some()
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.filetree.dialog_open()
+            || self.shell_state.text_editor.is_open()
             || ssh_overlay;
         if overlay {
             return false;
@@ -2227,6 +2496,15 @@ impl AppState {
     }
 
     fn stop_account_bound_workers(&mut self) {
+        if self.shell_state.text_editor.is_open() {
+            self.shell_state.text_editor.close_without_prompt();
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().text_editor_closed_account_change,
+            );
+            self.window.request_redraw();
+        }
+
         // 顺序是安全约束：先原地抹空所有旧 token Arc，再 drop worker。
         if let Some(active) = self.ssh_sync.as_ref() {
             clear_shared_token(&active.token);
@@ -3296,21 +3574,6 @@ impl AppState {
                     self.window.request_redraw();
                 }
             }
-            SshRuntimeAction::ToggleDirectory { session_id, path } => {
-                if self.ssh_runtime.toggle_directory(session_id, &path) {
-                    self.window.request_redraw();
-                }
-            }
-            SshRuntimeAction::RefreshFileTree { session_id } => {
-                if self.ssh_runtime.refresh_file_tree(session_id) {
-                    self.window.request_redraw();
-                }
-            }
-            SshRuntimeAction::ToggleHiddenFiles { session_id } => {
-                if self.ssh_runtime.toggle_hidden_files(session_id) {
-                    self.window.request_redraw();
-                }
-            }
             SshRuntimeAction::Disconnect => {
                 self.ssh_runtime.disconnect_active();
                 self.terminal_focused = false;
@@ -3394,7 +3657,7 @@ impl AppState {
     }
 
     fn drain_ssh_runtime(&mut self) {
-        let outcome = self.ssh_runtime.drain();
+        let mut outcome = self.ssh_runtime.drain();
         for profile_id in &outcome.credential_failures {
             self.ssh_force_credential_prompt.insert(profile_id.clone());
         }
@@ -3419,6 +3682,283 @@ impl AppState {
         {
             self.window.request_redraw();
         }
+        if !outcome.file_events.is_empty() {
+            self.apply_ssh_file_runtime_events(std::mem::take(&mut outcome.file_events));
+        }
+        if !outcome.editor_invalidated_sessions.is_empty() {
+            let runtime_id = self.ssh_runtime.runtime_id();
+            for session_id in outcome.editor_invalidated_sessions {
+                let source = self.shell_state.text_editor.source().cloned();
+                if let Some(
+                    source @ shell::text_editor::TextFileSource::Ssh {
+                        runtime_id: source_runtime,
+                        session_id: source_session,
+                        ..
+                    },
+                ) = source
+                {
+                    if source_runtime == runtime_id && source_session == session_id {
+                        self.shell_state.text_editor.invalidate_source(
+                            &source,
+                            i18n::strings().text_editor_source_invalidated,
+                        );
+                    }
+                }
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    fn apply_ssh_filetree_intent(&mut self, intent: shell::ssh_filetree::SshFileTreeIntent) {
+        use shell::ssh_filetree::SshFileTreeIntent;
+        match intent {
+            SshFileTreeIntent::Select {
+                session_id,
+                path,
+                is_directory,
+            } => {
+                self.ssh_runtime
+                    .select_file(session_id, path, is_directory);
+            }
+            SshFileTreeIntent::ToggleDirectory { session_id, path } => {
+                if self.ssh_runtime.toggle_directory(session_id, &path) {
+                    self.window.request_redraw();
+                }
+            }
+            SshFileTreeIntent::RefreshDirectory { session_id, path } => {
+                if self.ssh_runtime.refresh_directory(session_id, &path) {
+                    self.window.request_redraw();
+                }
+            }
+            SshFileTreeIntent::ChangeDirectory { session_id, path } => {
+                let command = shell::filetree::cd_command_posix(&path);
+                if !command.is_empty() {
+                    match self.ssh_runtime.send_input_to(session_id, command) {
+                        Ok(()) => self.terminal_focused = true,
+                        Err(error) => self
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error),
+                    }
+                }
+            }
+            SshFileTreeIntent::OpenLocalCopy {
+                session_id,
+                path,
+                name,
+                ..
+            } => {
+                if let Err(error) = self.ssh_runtime.open_local_copy(session_id, path, &name) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+            }
+            SshFileTreeIntent::Edit {
+                session_id, path, ..
+            } => {
+                self.open_text_editor(shell::text_editor::TextFileSource::Ssh {
+                    runtime_id: self.ssh_runtime.runtime_id(),
+                    session_id,
+                    path,
+                });
+            }
+            SshFileTreeIntent::Search { session_id, query } => {
+                if let Err(error) = self.ssh_runtime.search_files(session_id, query) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
+            }
+            SshFileTreeIntent::CopyFiles {
+                session_id,
+                path,
+                name,
+                is_directory: _,
+                size,
+            } => {
+                self.ssh_file_clipboard = Some(SshClipboardItem {
+                    session_id,
+                    path,
+                    name,
+                    size,
+                });
+                self.remote_ws.clear_file_clipboard();
+                if let Some(service) = self.clipboard_svc.as_ref() {
+                    service.clear();
+                }
+                if let Some(clipboard) = self.clipboard.as_mut() {
+                    let _ = clipboard.clear();
+                }
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Info,
+                    i18n::fmt1(i18n::strings().remote_copied_fmt, 1),
+                );
+            }
+            SshFileTreeIntent::PasteInto {
+                session_id,
+                directory,
+            } => {
+                self.paste_into_ssh(session_id, directory);
+            }
+            SshFileTreeIntent::CreateEntry { .. } | SshFileTreeIntent::Delete { .. } => {
+                // The shell intercepts these two intents and opens the shared
+                // create/permanent-delete confirmation modal before they reach main.
+            }
+        }
+    }
+
+    fn apply_ssh_file_runtime_events(
+        &mut self,
+        events: Vec<ssh_runtime::SshFileRuntimeEvent>,
+    ) {
+        use shell::text_editor::{SaveFailure, TextFileSource};
+        let runtime_id = self.ssh_runtime.runtime_id();
+        for event in events {
+            match event {
+                ssh_runtime::SshFileRuntimeEvent::TextLoaded {
+                    session_id,
+                    document_token,
+                    bytes,
+                    ..
+                } => {
+                    let source_matches = matches!(
+                        self.shell_state.text_editor.source(),
+                        Some(TextFileSource::Ssh {
+                            runtime_id: source_runtime,
+                            session_id: active,
+                            ..
+                        }) if *source_runtime == runtime_id && *active == session_id
+                    );
+                    if source_matches {
+                        self.shell_state
+                            .text_editor
+                            .apply_loaded(document_token, Ok(bytes));
+                    }
+                }
+                ssh_runtime::SshFileRuntimeEvent::TextSaved {
+                    session_id,
+                    document_token,
+                    ..
+                } => {
+                    let source_matches = matches!(
+                        self.shell_state.text_editor.source(),
+                        Some(TextFileSource::Ssh {
+                            runtime_id: source_runtime,
+                            session_id: active,
+                            ..
+                        }) if *source_runtime == runtime_id && *active == session_id
+                    );
+                    if source_matches {
+                        self.shell_state
+                            .text_editor
+                            .apply_saved(document_token, Ok(()));
+                    }
+                }
+                ssh_runtime::SshFileRuntimeEvent::TextConflict {
+                    session_id,
+                    document_token,
+                } => {
+                    let source_matches = matches!(
+                        self.shell_state.text_editor.source(),
+                        Some(TextFileSource::Ssh {
+                            runtime_id: source_runtime,
+                            session_id: active,
+                            ..
+                        }) if *source_runtime == runtime_id && *active == session_id
+                    );
+                    if source_matches {
+                        self.shell_state
+                            .text_editor
+                            .apply_saved(document_token, Err(SaveFailure::Conflict));
+                    }
+                }
+                ssh_runtime::SshFileRuntimeEvent::LocalCopyReady { local_path, .. } => {
+                    shell::filetree::open_with_default(&local_path);
+                }
+                ssh_runtime::SshFileRuntimeEvent::OperationComplete {
+                    operation,
+                    local_path,
+                    ..
+                } => {
+                    if operation == lumen_ssh::FileOperation::Download {
+                        if let Some(local_path) = local_path {
+                            if let Some(chain) = self.ssh_paste_chains.remove(&local_path) {
+                                match self.ssh_runtime.upload_entry(
+                                    chain.target_session_id,
+                                    local_path.clone(),
+                                    chain.target_directory,
+                                    chain.destination_name,
+                                    false,
+                                ) {
+                                    Ok(()) => {
+                                        self.ssh_staged_uploads.insert(local_path);
+                                    }
+                                    Err(error) => {
+                                        remove_staged_path(&local_path);
+                                        self.shell_state.toast.push(
+                                            shell::toast::ToastKind::Error,
+                                            error,
+                                        );
+                                    }
+                                }
+                            } else if let Some(parent) = local_path.parent() {
+                                self.shell_state.filetree.refresh_dir(parent);
+                            }
+                        }
+                    } else if operation == lumen_ssh::FileOperation::Upload {
+                        if let Some(local_path) = local_path {
+                            if self.ssh_staged_uploads.remove(&local_path) {
+                                remove_staged_path(&local_path);
+                            }
+                        }
+                    }
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Info,
+                        ssh_file_operation_done_message(operation),
+                    );
+                }
+                ssh_runtime::SshFileRuntimeEvent::Error {
+                    session_id,
+                    document_token,
+                    operation,
+                    error,
+                    local_path,
+                } => {
+                    if let Some(local_path) = local_path {
+                        self.ssh_paste_chains.remove(&local_path);
+                        if self.ssh_staged_uploads.remove(&local_path) {
+                            remove_staged_path(&local_path);
+                        }
+                    }
+                    let message = ssh_file_error_message(operation, error);
+                    if let Some(token) = document_token {
+                        let source_matches = matches!(
+                            self.shell_state.text_editor.source(),
+                            Some(TextFileSource::Ssh {
+                                runtime_id: source_runtime,
+                                session_id: active,
+                                ..
+                            }) if *source_runtime == runtime_id && *active == session_id
+                        );
+                        if source_matches
+                            && !self.shell_state.text_editor.apply_saved(
+                                token,
+                                Err(SaveFailure::Message(message.clone())),
+                            )
+                        {
+                            self.shell_state.text_editor.apply_loaded(token, Err(message));
+                        }
+                    } else {
+                        self.shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, message);
+                    }
+                }
+            }
+        }
+        self.window.request_redraw();
     }
 
     fn dispatch(
@@ -3919,6 +4459,7 @@ impl AppState {
         self.shell_state.settings.open
             || self.shell_state.login.open
             || self.shell_state.ssh_credentials.is_some()
+            || self.shell_state.text_editor.is_open()
             || self.ssh_runtime.active_blocks_input()
     }
 
@@ -5642,6 +6183,7 @@ impl AppState {
                 || self.shell_state.renaming.is_some()
                 || self.shell_state.pane_renaming.is_some()
                 || self.shell_state.filetree.dialog_open()
+                || self.shell_state.text_editor.is_open()
                 // 文件树搜索框（egui TextEdit）聚焦时能收 IME，须视作覆盖层、
                 // 把 IME 交还 egui，否则激进路由会把往搜索框打的中文劫持进
                 // 终端 composer（对抗审查 IME 项）。
@@ -5770,6 +6312,7 @@ impl AppState {
             || self.shell_state.renaming.is_some()
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.filetree.dialog_open()
+            || self.shell_state.text_editor.is_open()
         {
             return;
         }
@@ -6626,6 +7169,19 @@ impl AppState {
                     } else {
                         self.remote_ws.start_download(items, dir, true);
                     }
+                } else if let Some(item) = self.ssh_file_clipboard.clone() {
+                    let destination =
+                        std::path::Path::new(&dir).join(safe_staging_file_name(&item.name));
+                    if let Err(error) = self.ssh_runtime.download_file(
+                        item.session_id,
+                        item.path,
+                        destination,
+                        false,
+                    ) {
+                        self.shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error);
+                    }
                 } else {
                     // 本机复制：系统剪贴板文件 → 本地目录。
                     let paths = clipboard_files::paste_files();
@@ -6650,6 +7206,69 @@ impl AppState {
         }
     }
 
+    fn paste_into_ssh(
+        &mut self,
+        target_session_id: ssh_runtime::SshSessionId,
+        target_directory: String,
+    ) {
+        let local_paths = clipboard_files::paste_files();
+        if !local_paths.is_empty() {
+            self.ssh_file_clipboard = None;
+            for path in local_paths {
+                if let Err(error) = self.ssh_runtime.upload_file(
+                    target_session_id,
+                    path,
+                    target_directory.clone(),
+                    false,
+                ) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+            }
+            self.window.request_redraw();
+            return;
+        }
+
+        let Some(item) = self.ssh_file_clipboard.clone() else {
+            return;
+        };
+        let staging_root = std::env::temp_dir().join("lumen_ssh_paste");
+        if let Err(error) = std::fs::create_dir_all(&staging_root) {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                format!("无法创建 SSH 粘贴暂存目录：{error}"),
+            );
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let staging_path = staging_root.join(format!(
+            "{nonce}-{}-{}",
+            item.size,
+            safe_staging_file_name(&item.name)
+        ));
+        self.ssh_paste_chains.insert(
+            staging_path.clone(),
+            SshPasteChain {
+                target_session_id,
+                target_directory,
+                destination_name: item.name.clone(),
+            },
+        );
+        if let Err(error) =
+            self.ssh_runtime
+                .download_file(item.session_id, item.path, staging_path.clone(), false)
+        {
+            self.ssh_paste_chains.remove(&staging_path);
+            self.shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, error);
+        }
+        self.window.request_redraw();
+    }
+
     /// 粘贴传输完成后刷新目标目录（消费 `paste_refresh`）：本地 → 刷新本地树该目录；远程 → 刷新
     /// 远程树该目录。作废其缓存重拉，使刚粘贴进来的文件立即显示。
     fn apply_paste_refresh(&mut self) {
@@ -6669,7 +7288,31 @@ impl AppState {
     /// Lumen 内部剪贴板（下载源）；本地视图 → 复制选中本地项到系统剪贴板（CF_HDROP，与资源管理器
     /// 互通）。无选中则忽略。
     fn filetree_ctrl_c(&mut self) {
-        if self.settings.layout.view_mode.is_remote() {
+        if self.settings.layout.view_mode.is_ssh() {
+            let Some((session_id, path, name, _is_directory, size)) =
+                self.ssh_runtime.active_selected_file()
+            else {
+                return;
+            };
+            self.ssh_file_clipboard = Some(SshClipboardItem {
+                session_id,
+                path,
+                name,
+                size,
+            });
+            self.remote_ws.clear_file_clipboard();
+            if let Some(service) = self.clipboard_svc.as_ref() {
+                service.clear();
+            }
+            if let Some(clipboard) = self.clipboard.as_mut() {
+                let _ = clipboard.clear();
+            }
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Info,
+                i18n::fmt1(i18n::strings().remote_copied_fmt, 1),
+            );
+        } else if self.settings.layout.view_mode.is_remote() {
+            self.ssh_file_clipboard = None;
             // 远程视图：复制选中的被控端项 → Lumen 内部剪贴板（远程路径进不了系统剪贴板，仅供下载）。
             if let Some((path, name, is_dir, size)) = self
                 .remote_ws
@@ -6703,6 +7346,7 @@ impl AppState {
                     .push(shell::toast::ToastKind::Info, msg);
             }
         } else if self.settings.layout.view_mode.is_local() {
+            self.ssh_file_clipboard = None;
             let Some((path, _is_dir)) = self.shell_state.filetree.selected_item() else {
                 return;
             };
@@ -6733,12 +7377,16 @@ impl AppState {
     /// 无文本时连信号都没）。按当前视图定目标目录：远程视图 → 选中目录 / 树根（上传）；本地视图 →
     /// 选中目录 / 树根（下载或本机复制）。无目标目录则忽略。
     fn filetree_ctrl_v(&mut self) {
-        if self.settings.layout.view_mode.is_remote() {
+        if self.settings.layout.view_mode.is_ssh() {
+            if let Some((session_id, directory)) = self.ssh_runtime.active_paste_target() {
+                self.paste_into_ssh(session_id, directory);
+            }
+        } else if self.settings.layout.view_mode.is_remote() {
             // 远程视图：上传到选中的远程目录（或树根）。
-            let dir = self.remote_ws.remote_filetree().and_then(|ft| {
-                ft.selected_dir()
-                    .or_else(|| ft.root_label().map(str::to_owned))
-            });
+            let dir = self
+                .remote_ws
+                .remote_filetree()
+                .and_then(remote_ws::RemoteFileTree::paste_target_dir);
             if let Some(dir) = dir {
                 self.do_file_paste(remote_ws::ClipSide::Remote, dir);
             }
@@ -6880,6 +7528,20 @@ struct PendingPaste {
     local: bool,
 }
 
+#[derive(Clone)]
+struct SshClipboardItem {
+    session_id: ssh_runtime::SshSessionId,
+    path: String,
+    name: String,
+    size: u64,
+}
+
+struct SshPasteChain {
+    target_session_id: ssh_runtime::SshSessionId,
+    target_directory: String,
+    destination_name: String,
+}
+
 /// 把系统剪贴板取出的本地路径转成 `ClipItem`（统一交给本机复制 / 上传编排）。`is_dir` 现读盘
 /// （系统剪贴板只给路径），失败按文件处理。
 fn paths_to_clipitems(paths: &[std::path::PathBuf]) -> Vec<remote_ws::ClipItem> {
@@ -6897,6 +7559,41 @@ fn paths_to_clipitems(paths: &[std::path::PathBuf]) -> Vec<remote_ws::ClipItem> 
             }
         })
         .collect()
+}
+
+fn safe_staging_file_name(name: &str) -> String {
+    let mut result = name
+        .chars()
+        .take(180)
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while result.ends_with(' ') || result.ends_with('.') {
+        result.pop();
+    }
+    if result.is_empty() || result == "." || result == ".." {
+        "remote-file".to_owned()
+    } else {
+        result
+    }
+}
+
+fn remove_staged_path(path: &std::path::Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 在 `dir` 下为 `name` 找一个不冲突的副本名（文件管理器式「X (1)」「X (2)」…）。同目录粘贴
@@ -7667,6 +8364,9 @@ impl App {
             mirror_rect_px: None,
             mirror_pane_rects_px: Vec::new(),
             pending_paste: None,
+            ssh_file_clipboard: None,
+            ssh_paste_chains: HashMap::new(),
+            ssh_staged_uploads: HashSet::new(),
             local_copy_rx: None,
             clip_fetch_rx: None,
             clipboard_svc: None,
@@ -8386,7 +9086,10 @@ impl ApplicationHandler<PtyWake> for App {
                 state.completion_candidates.extend(new_items);
                 sidecar_merged = true;
             }
-            if sidecar_merged && !state.completion_candidates.is_empty() {
+            if sidecar_merged
+                && !state.completion_candidates.is_empty()
+                && !state.shell_state.text_editor.is_open()
+            {
                 // 若弹窗尚未打开（文件路径候选为空、等 sidecar），现在打开。
                 if !state.shell_state.completion.open {
                     state.shell_state.completion.open = true;
@@ -8618,6 +9321,7 @@ impl ApplicationHandler<PtyWake> for App {
             && state.shell_state.renaming.is_none()
             && state.shell_state.pane_renaming.is_none()
             && !state.shell_state.filetree.dialog_open()
+            && !state.shell_state.text_editor.is_open()
         {
             if let WindowEvent::KeyboardInput { event: key, .. } = &event {
                 if key.state == ElementState::Pressed && !key.repeat {
@@ -8841,6 +9545,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && state.filetree_hovered
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
+                    && !state.shell_state.text_editor.is_open()
                 {
                     use winit::keyboard::{KeyCode, PhysicalKey};
                     match event.physical_key {
@@ -8881,7 +9586,8 @@ impl ApplicationHandler<PtyWake> for App {
                     overlay_open: state.shell_state.settings.open
                         || state.shell_state.login.open
                         || state.shell_state.history_search.open
-                        || state.shell_state.completion.open,
+                        || state.shell_state.completion.open
+                        || state.shell_state.text_editor.is_open(),
                     renaming: state.shell_state.renaming.is_some()
                         || state.shell_state.pane_renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
@@ -10458,6 +11164,8 @@ impl ApplicationHandler<PtyWake> for App {
                 #[cfg(not(unix))]
                 let active_cwd = osc_cwd;
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
+                let remote_shell_idle = state.remote_ws.focused_mirror_shell_idle();
+                let ssh_shell_idle = state.ssh_runtime.active_shell_idle();
                 // 背景图参数（P13）：仅当纹理已加载且 settings 启用时传入。
                 // 同时检查 enabled：用户本帧拨动开关关闭后，bg_texture 清空在
                 // apply_background_image（run_ui 之后）才执行；提前在此过滤
@@ -10764,6 +11472,8 @@ impl ApplicationHandler<PtyWake> for App {
                     },
                     cwd: active_cwd.as_deref(),
                     shell_idle,
+                    remote_shell_idle,
+                    ssh_shell_idle,
                     os_dark: state.os_dark,
                     bg_image,
                     // 底部状态栏所需：当前有效输入模式 + 经典直通开关（M4.1 批E）
@@ -10829,6 +11539,7 @@ impl ApplicationHandler<PtyWake> for App {
                     },
                     // part3c-2 #7：文件剪贴板来源侧 + 待决覆盖冲突项数（驱动菜单 / 覆盖模态）。
                     file_clipboard_side: state.remote_ws.file_clipboard().map(|c| c.side),
+                    ssh_file_clipboard_available: state.ssh_file_clipboard.is_some(),
                     overwrite_conflict_count: state
                         .pending_paste
                         .as_ref()
@@ -11354,6 +12065,9 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(action) = shell_out.ssh_runtime_action.take() {
                     state.apply_ssh_runtime_action(action);
                 }
+                for intent in std::mem::take(&mut shell_out.ssh_filetree_intents) {
+                    state.apply_ssh_filetree_intent(intent);
+                }
                 if shell_out.term_clicked {
                     state.terminal_focused = state.terminal_focus_allowed();
                 }
@@ -11499,6 +12213,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
                     && !state.shell_state.completion.open
+                    && !state.shell_state.text_editor.is_open()
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
                     state.terminal_focused = state.terminal_focus_allowed();
@@ -12114,7 +12829,12 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.shell_state.filetree.dialog_open() {
                     state.terminal_focused = false;
                 } else if shell_out.filetree_dialog_closed {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
+                }
+                if state.shell_state.text_editor.is_open() {
+                    state.terminal_focused = false;
+                } else if shell_out.text_editor_closed {
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
                 if shell_out.settings_opened
                     || state.shell_state.settings.open
@@ -12416,9 +13136,18 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(path) = shell_out.remote_fetch_open {
                     state.remote_ws.start_fetch_open(path);
                 }
+                // 右键“编辑”始终进入 Lumen 内置编辑器；双击仍是下载本地副本后
+                // 交给系统默认编辑器，两条保存链路不会混用。
+                if let Some((path, _name, _size)) = shell_out.remote_edit_file {
+                    state.open_text_editor(shell::text_editor::TextFileSource::Remote {
+                        generation: state.remote_ws.edit_generation(),
+                        path,
+                    });
+                }
                 // 复制：本地文件 → **系统剪贴板**（CF_HDROP，与资源管理器及任意应用互通，海风哥
                 // 反馈核心）；远程文件路径在被控端、进不了系统剪贴板 → 存 Lumen 内部（仅供下载到本地）。
                 if let Some((side, path, name, is_dir, size)) = shell_out.file_copy {
+                    state.ssh_file_clipboard = None;
                     log::info!(
                         "[文件剪贴板] 复制: side={side:?} is_dir={is_dir} size={size} path={path}"
                     );
@@ -12573,6 +13302,29 @@ impl ApplicationHandler<PtyWake> for App {
                     state.remote_ws.remote_delete(path, is_dir);
                     state.window.request_redraw();
                 }
+                if let Some((session_id, dir, name, is_dir)) = shell_out.ssh_create {
+                    if let Err(error) = state
+                        .ssh_runtime
+                        .create_entry(session_id, dir, &name, is_dir)
+                    {
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error);
+                    }
+                    state.window.request_redraw();
+                }
+                if let Some((session_id, path, is_dir)) = shell_out.ssh_delete {
+                    if let Err(error) =
+                        state.ssh_runtime.delete_entry(session_id, path, is_dir)
+                    {
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error);
+                    }
+                    state.window.request_redraw();
+                }
                 // 远程菜单「进入文件夹」= 命令行 cd：注入 `cd '<被控端路径>'` 到远程会话
                 // （与本地一致，走 send_input → InputWithId → 被控端 PTY）。未在镜像某个
                 // 远程终端时无处注入 → 提示而非静默无效。控制字符路径被 cd_command_raw 拒。
@@ -12589,6 +13341,12 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                         state.window.request_redraw();
                     }
+                }
+                if let Some(request) = shell_out.text_editor_load {
+                    state.start_text_editor_load(request);
+                }
+                if let Some(request) = shell_out.text_editor_save {
+                    state.start_text_editor_save(request);
                 }
 
                 // —— 窗格矩形（物理像素）变化 → 逐窗格重建离屏 + resize ——

@@ -28,11 +28,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
 use lumen_protocol::remote::{
-    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneOpKind,
-    PaneSnapshot, PaneViewport, PutConflict, PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S,
-    RemoteFrame, RemoteOpErr, RemoteS2C, Role, SessionId, TabId, TabState, FETCH_MAX_LEN,
-    FETCH_WINDOW, FILE_CHUNK, LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
+    DenyReason, DirEntry, EditChunk, EditFileError, EditPath, EndReason, FileRevision, FsErr,
+    PairingFailReason, PaneOpKind, PaneSnapshot, PaneViewport, PutConflict, PutOverwrite, PutStatus,
+    RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr, RemoteS2C, Role, SessionId, TabId,
+    TabState, EDIT_MAX_LEN, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
+    LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 
@@ -90,6 +93,10 @@ const REATTACH_RETRY: Duration = Duration::from_secs(3);
 /// part3c-2 控制端在途 Fetch 的停滞超时：超过这么久没收到新块即判传输中断、清临时文件
 /// （正常传输每收一块刷新计时；仅防对端静默卡死，非总时长上限）。
 const FETCH_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// v3 内置编辑传输的停滞上限。编辑文件最多 1 MiB，30 秒无进展可视为链路失效。
+const EDIT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单端同时处理的编辑读取/保存上限，避免恶意对端借小文件请求制造无界线程或句柄。
+const EDIT_MAX_INFLIGHT: usize = 4;
 /// part3c-2 #7 下载并发文件数上限（递归下载时同时在途的文件 Fetch 数；防一次性起几百个）。
 const DOWNLOAD_MAX_FILES: usize = 4;
 /// part3c-2 #7 下载并发目录列举上限（同时在途的 ListDir 数；防深 / 宽树洪泛被控端线程）。
@@ -370,6 +377,19 @@ pub struct RemoteWs {
     remote_root_sent: Option<String>,
     /// 控制端：请求号分配器（单调递增，跳 0 哨兵；ListDir/Fetch/Put 全局共用）。
     req_seq: u64,
+    /// v3 内置编辑：本进程观察到的远程控制会话代次。每次 SessionStarted/拆会话均推进，
+    /// 所有任务绑定创建时代次，旧会话迟到帧不得作用到新文档。
+    edit_generation: u64,
+    /// 控制端：编辑读取接收任务。
+    inflight_edit_fetch: HashMap<u64, EditFetchJob>,
+    /// 被控端：编辑读取发送任务。
+    inflight_edit_fetch_src: HashMap<u64, EditFetchSrcJob>,
+    /// 控制端：条件保存发送任务。
+    inflight_edit_put_src: HashMap<u64, EditPutSrcJob>,
+    /// 被控端：条件保存落同目录临时文件任务。
+    inflight_edit_put_dst: HashMap<u64, EditPutDstJob>,
+    /// main/shell 待取走的编辑结果。
+    edit_events: Vec<EditEvent>,
     /// 被控端：控制端发来的待处理 ListDir 请求 `(req_id, path, show_hidden)`，main 取走后
     /// 后台读盘（[`Self::spawn_list_dir`]）。
     pending_listdir: Vec<(u64, String, bool)>,
@@ -715,11 +735,16 @@ impl RemoteFileTree {
         let n = self.nodes.get(self.selected?)?;
         Some((n.path.clone(), n.name.clone(), n.is_dir, n.size))
     }
-    /// 选中节点若是目录则返回其 path——Ctrl+V 粘贴（上传）目标用；否则 `None`。
+    /// Ctrl+V 的远程上传目标：选中目录取目录自身，选中文件取其父目录；
+    /// 没有选择时回退当前树根。这样快捷键与本地/SSH 树对文件选择的语义一致。
     #[must_use]
-    pub fn selected_dir(&self) -> Option<String> {
-        let n = self.nodes.get(self.selected?)?;
-        n.is_dir.then(|| n.path.clone())
+    pub fn paste_target_dir(&self) -> Option<String> {
+        let selected = self.selected.and_then(|id| self.nodes.get(id));
+        match selected {
+            Some(node) if node.is_dir => Some(node.path.clone()),
+            Some(node) => Some(parent_remote_dir(&node.path)),
+            None => self.root.clone(),
+        }
     }
 
     /// 树根的不透明路径（工具条标题 + 悬停看全路径）。`None` = 等待 cwd。
@@ -816,6 +841,8 @@ enum SvcReply {
     /// Fetch 源 worker 已结束（文件读完 / 出错 / 被中止）：主线程移除 `inflight_fetch_src`
     /// 该项（worker 自己经 `cmd_tx` 直发 `FileBegin/Chunk/End/Err`，此信号仅用于清理 map）。
     FetchSrcDone { req_id: u64 },
+    /// v3 编辑读取源 worker 已结束。generation 防旧 worker 清掉新会话同号任务。
+    EditFetchSrcDone { req_id: u64, generation: u64 },
     /// 片5 上传：Put 源 worker 正常发完 `PutEnd`：主线程移除 `inflight_put_src`（等被控端
     /// `PutResult` 减 `active_puts`、计统计）。
     PutSrcDone { req_id: u64 },
@@ -1042,6 +1069,130 @@ struct PutMeta {
     name: String,
 }
 
+/// 内置编辑后端交给 shell/main 的一次性结果。Loaded 的 Debug 只展示字节数。
+#[derive(Clone, PartialEq, Eq)]
+pub enum EditEvent {
+    Loaded {
+        token: u64,
+        bytes: Vec<u8>,
+        revision: FileRevision,
+    },
+    Saved {
+        token: u64,
+        revision: FileRevision,
+    },
+    Conflict {
+        token: u64,
+        revision: Option<FileRevision>,
+    },
+    Error {
+        token: u64,
+        revision: Option<FileRevision>,
+        error: EditFileError,
+    },
+}
+
+impl std::fmt::Debug for EditEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loaded {
+                token,
+                bytes,
+                revision,
+            } => formatter
+                .debug_struct("Loaded")
+                .field("token", token)
+                .field("bytes", &bytes.len())
+                .field("revision", revision)
+                .finish(),
+            Self::Saved { token, revision } => formatter
+                .debug_struct("Saved")
+                .field("token", token)
+                .field("revision", revision)
+                .finish(),
+            Self::Conflict { token, revision } => formatter
+                .debug_struct("Conflict")
+                .field("token", token)
+                .field("revision", revision)
+                .finish(),
+            Self::Error {
+                token,
+                revision,
+                error,
+            } => formatter
+                .debug_struct("Error")
+                .field("token", token)
+                .field("revision", revision)
+                .field("error", error)
+                .finish(),
+        }
+    }
+}
+
+/// 控制端接收编辑文件的状态。
+struct EditFetchJob {
+    token: u64,
+    generation: u64,
+    total: Option<u64>,
+    revision: Option<FileRevision>,
+    bytes: Vec<u8>,
+    next_seq: u32,
+    last_at: Instant,
+}
+
+/// 被控端发送编辑文件的 ACK 窗口句柄。
+struct EditFetchSrcJob {
+    token: u64,
+    request_generation: u64,
+    generation: u64,
+    permit_tx: Sender<()>,
+    next_ack_seq: u32,
+    last_at: Instant,
+}
+
+/// 控制端发送待保存字节的状态。块全部 ACK 后才发 End。
+struct EditPutSrcJob {
+    token: u64,
+    generation: u64,
+    bytes: Vec<u8>,
+    expected_revision: FileRevision,
+    new_revision: FileRevision,
+    force: bool,
+    ready: bool,
+    next_send_seq: u32,
+    next_ack_seq: u32,
+    end_sent: bool,
+    last_at: Instant,
+}
+
+/// 被控端条件保存的同目录临时文件状态。
+struct EditPutDstJob {
+    token: u64,
+    request_generation: u64,
+    generation: u64,
+    tmp_path: PathBuf,
+    target: PathBuf,
+    file: Option<std::fs::File>,
+    expected_len: u64,
+    expected_revision: FileRevision,
+    new_revision: FileRevision,
+    force: bool,
+    next_seq: u32,
+    written: u64,
+    last_at: Instant,
+}
+
+struct EditPutBeginRequest {
+    req_id: u64,
+    token: u64,
+    session_generation: u64,
+    path: EditPath,
+    total_len: u64,
+    expected_revision: FileRevision,
+    new_revision: FileRevision,
+    force: bool,
+}
+
 /// 取路径末段作显示名（`C:\Users\hf` → `hf`；盘符根 `C:\` 等无末段时返回整串）。
 fn last_path_segment(path: &str) -> String {
     path.rsplit(['/', '\\'])
@@ -1054,8 +1205,23 @@ fn last_path_segment(path: &str) -> String {
 /// 删除完成后用它刷新被删项所在目录。
 fn parent_remote_dir(path: &str) -> String {
     let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return path.to_owned();
+    }
+    if trimmed.len() == 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+        // 盘符根保留调用方原有分隔符（`C:\` / `C:/`）；`C:` 则仍为 `C:`。
+        return path.to_owned();
+    }
     match trimmed.rfind(['/', '\\']) {
-        Some(i) if i > 0 => trimmed[..i].to_owned(),
+        Some(0) => trimmed[..=0].to_owned(),
+        Some(i)
+            if i == 2
+                && trimmed.as_bytes().get(1) == Some(&b':')
+                && matches!(trimmed.as_bytes()[i], b'/' | b'\\') =>
+        {
+            trimmed[..=i].to_owned()
+        }
+        Some(i) => trimmed[..i].to_owned(),
         _ => trimmed.to_owned(),
     }
 }
@@ -1378,6 +1544,271 @@ fn put_send_worker(
     }
 }
 
+fn edit_revision(bytes: &[u8]) -> FileRevision {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    FileRevision {
+        len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        sha256: hasher.finalize().into(),
+    }
+}
+
+fn random_edit_generation() -> u64 {
+    let mut random = OsRng;
+    loop {
+        let generation = random.next_u64();
+        if generation != 0 {
+            return generation;
+        }
+    }
+}
+
+fn edit_io_error(error: &std::io::Error) -> EditFileError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => EditFileError::NotFound,
+        std::io::ErrorKind::PermissionDenied => EditFileError::PermissionDenied,
+        _ => EditFileError::Io,
+    }
+}
+
+fn checked_edit_path(path: &str) -> Result<PathBuf, EditFileError> {
+    let path = PathBuf::from(path);
+    if path.as_os_str().is_empty()
+        || !path.is_absolute()
+        || path.to_string_lossy().chars().any(char::is_control)
+    {
+        return Err(EditFileError::InvalidRequest);
+    }
+    Ok(path)
+}
+
+fn read_edit_file_once(path: &Path) -> Result<Vec<u8>, EditFileError> {
+    let path_meta = std::fs::symlink_metadata(path).map_err(|error| edit_io_error(&error))?;
+    if path_meta.file_type().is_symlink() {
+        return Err(EditFileError::Symlink);
+    }
+    if !path_meta.is_file() {
+        return Err(EditFileError::NotRegular);
+    }
+    if path_meta.len() > EDIT_MAX_LEN {
+        return Err(EditFileError::TooLarge);
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| edit_io_error(&error))?;
+    let opened_meta = file.metadata().map_err(|error| edit_io_error(&error))?;
+    if !opened_meta.is_file() {
+        return Err(EditFileError::NotRegular);
+    }
+    if opened_meta.len() > EDIT_MAX_LEN {
+        return Err(EditFileError::TooLarge);
+    }
+
+    let capacity = usize::try_from(opened_meta.len()).map_err(|_| EditFileError::TooLarge)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(EDIT_MAX_LEN.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| edit_io_error(&error))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > EDIT_MAX_LEN {
+        return Err(EditFileError::TooLarge);
+    }
+
+    let after = std::fs::symlink_metadata(path).map_err(|error| edit_io_error(&error))?;
+    if after.file_type().is_symlink() {
+        return Err(EditFileError::Symlink);
+    }
+    if !after.is_file() {
+        return Err(EditFileError::NotRegular);
+    }
+    Ok(bytes)
+}
+
+/// 两次读取相同才交付，避免文件在读取期间被原地修改而形成 torn snapshot。
+fn read_edit_snapshot(path: &Path) -> Result<(Vec<u8>, FileRevision), EditFileError> {
+    let first = read_edit_file_once(path)?;
+    let second = match read_edit_file_once(path) {
+        Ok(bytes) => bytes,
+        Err(EditFileError::NotFound | EditFileError::NotRegular | EditFileError::Symlink) => {
+            return Err(EditFileError::ChangedDuringRead);
+        }
+        Err(error) => return Err(error),
+    };
+    if first != second {
+        return Err(EditFileError::ChangedDuringRead);
+    }
+    let revision = edit_revision(&first);
+    Ok((first, revision))
+}
+
+fn current_edit_revision(path: &Path) -> Result<FileRevision, EditFileError> {
+    read_edit_snapshot(path).map(|(_, revision)| revision)
+}
+
+fn create_edit_temp(
+    target: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<(PathBuf, std::fs::File), EditFileError> {
+    let parent = target.parent().ok_or(EditFileError::InvalidRequest)?;
+    let mut random = OsRng;
+    for _ in 0..16 {
+        let name = format!(
+            ".lumen-edit-{:016x}{:016x}.tmp",
+            random.next_u64(),
+            random.next_u64()
+        );
+        let temp = parent.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => {
+                if let Err(error) = file.set_permissions(permissions.clone()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(edit_io_error(&error));
+                }
+                return Ok((temp, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(edit_io_error(&error)),
+        }
+    }
+    Err(EditFileError::Busy)
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_edit_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn atomic_replace_edit_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let temp_wide = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live through the call; optional pointers are null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            temp_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn send_edit_worker_frame(cmd_tx: &Sender<RemoteC2S>, frame: &RemoteFrame) -> bool {
+    frame
+        .to_value()
+        .ok()
+        .is_some_and(|value| cmd_tx.send(RemoteC2S::Relay(value)).is_ok())
+}
+
+fn edit_fetch_src_worker(
+    req_id: u64,
+    document_token: u64,
+    session_generation: u64,
+    path: &Path,
+    cmd_tx: &Sender<RemoteC2S>,
+    permit_rx: &Receiver<()>,
+) {
+    let (bytes, revision) = match read_edit_snapshot(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = send_edit_worker_frame(
+                cmd_tx,
+                &RemoteFrame::EditError {
+                    req_id,
+                    document_token,
+                    session_generation,
+                    revision: None,
+                    error,
+                },
+            );
+            return;
+        }
+    };
+    if !send_edit_worker_frame(
+        cmd_tx,
+        &RemoteFrame::EditFileBegin {
+            req_id,
+            document_token,
+            session_generation,
+            total_len: revision.len,
+            revision,
+        },
+    ) {
+        return;
+    }
+    for (seq, chunk) in bytes.chunks(FILE_CHUNK).enumerate() {
+        if permit_rx.recv().is_err() {
+            return;
+        }
+        let Ok(seq) = u32::try_from(seq) else {
+            return;
+        };
+        if !send_edit_worker_frame(
+            cmd_tx,
+            &RemoteFrame::EditFileChunk {
+                req_id,
+                document_token,
+                session_generation,
+                seq,
+                data: EditChunk::new(chunk.to_vec()),
+            },
+        ) {
+            return;
+        }
+    }
+    // 初始窗口中可能仍有许可；再领满一个窗口，才能确定最后一批块都已逐个 ACK。
+    if !bytes.is_empty() {
+        for _ in 0..FETCH_WINDOW {
+            if permit_rx.recv().is_err() {
+                return;
+            }
+        }
+    }
+    let _ = send_edit_worker_frame(
+        cmd_tx,
+        &RemoteFrame::EditFileEnd {
+            req_id,
+            document_token,
+            session_generation,
+        },
+    );
+}
+
 pub struct MirrorFrame<'a> {
     /// 本帧要渲染的终端（live 镜像或历史窗口 scratch）。
     pub term: &'a Terminal,
@@ -1488,6 +1919,7 @@ impl RemoteWs {
         self.pending_history.clear();
         self.reset_history();
         self.reset_multi_session();
+        self.advance_edit_generation(true);
         // 先 clear（其内排空 svc_rx 丢弃在途回包）再断 svc 通道——否则 svc_rx 已 None
         // 时排空成死代码（与 end_session/Disconnected 路径行为不一致）。
         self.clear_remote_filetree();
@@ -1697,6 +2129,12 @@ impl RemoteWs {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.stop.is_some()
+    }
+
+    /// 当前远程编辑会话身份。每次会话建立、结束、重挂或停止都会变化。
+    #[must_use]
+    pub const fn edit_generation(&self) -> u64 {
+        self.edit_generation
     }
 
     /// 每帧调用：收取后台事件、推进 UI 态。返回是否有更新（请求重绘用）。
@@ -2380,6 +2818,15 @@ impl RemoteWs {
                 SvcReply::FetchSrcDone { req_id } => {
                     self.inflight_fetch_src.remove(&req_id);
                 }
+                SvcReply::EditFetchSrcDone { req_id, generation } => {
+                    if self
+                        .inflight_edit_fetch_src
+                        .get(&req_id)
+                        .is_some_and(|job| job.generation == generation)
+                    {
+                        self.inflight_edit_fetch_src.remove(&req_id);
+                    }
+                }
                 SvcReply::PutSrcDone { req_id } => {
                     self.inflight_put_src.remove(&req_id);
                 }
@@ -2395,6 +2842,1072 @@ impl RemoteWs {
                     self.pump_upload();
                 }
             }
+        }
+    }
+
+    // ── v3 内置文件编辑：有界读取 + revision 条件保存 ────────────────────────
+
+    /// 控制端：读取远程文本文件的精确原始字节。token 由 UI 文档分配且须非零。
+    pub fn start_edit_fetch(&mut self, token: u64, path: String) {
+        if token == 0 {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: None,
+                error: EditFileError::InvalidRequest,
+            });
+            return;
+        }
+        if !self.is_controlling() || self.reattach.is_some() {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: None,
+                error: EditFileError::StaleSession,
+            });
+            return;
+        }
+        if self.edit_generation == 0 {
+            self.edit_generation = random_edit_generation();
+        }
+        let old = self
+            .inflight_edit_fetch
+            .iter()
+            .filter_map(|(&req_id, job)| (job.token == token).then_some(req_id))
+            .collect::<Vec<_>>();
+        for req_id in old {
+            self.cancel_edit_fetch(req_id);
+        }
+        if self.inflight_edit_fetch.len() >= EDIT_MAX_INFLIGHT {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: None,
+                error: EditFileError::Busy,
+            });
+            return;
+        }
+
+        let req_id = self.next_req_id();
+        self.inflight_edit_fetch.insert(
+            req_id,
+            EditFetchJob {
+                token,
+                generation: self.edit_generation,
+                total: None,
+                revision: None,
+                bytes: Vec::new(),
+                next_seq: 0,
+                last_at: Instant::now(),
+            },
+        );
+        self.send_frame(&RemoteFrame::EditFetchReq {
+            req_id,
+            document_token: token,
+            session_generation: self.edit_generation,
+            path: EditPath::new(path),
+        });
+    }
+
+    /// 控制端：保存精确原始字节。非 force 时被控端在 commit 前再次验证 expected_revision。
+    pub fn start_edit_save(
+        &mut self,
+        token: u64,
+        path: String,
+        bytes: Vec<u8>,
+        expected_revision: FileRevision,
+        force: bool,
+    ) {
+        if token == 0
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > EDIT_MAX_LEN
+            || expected_revision.len > EDIT_MAX_LEN
+        {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: Some(expected_revision),
+                error: if token == 0 {
+                    EditFileError::InvalidRequest
+                } else {
+                    EditFileError::TooLarge
+                },
+            });
+            return;
+        }
+        if !self.is_controlling() || self.reattach.is_some() {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: Some(expected_revision),
+                error: EditFileError::StaleSession,
+            });
+            return;
+        }
+        if self.edit_generation == 0 {
+            self.edit_generation = random_edit_generation();
+        }
+        let old = self
+            .inflight_edit_put_src
+            .iter()
+            .filter_map(|(&req_id, job)| (job.token == token).then_some(req_id))
+            .collect::<Vec<_>>();
+        for req_id in old {
+            self.cancel_edit_put_src(req_id);
+        }
+        if self.inflight_edit_put_src.len() >= EDIT_MAX_INFLIGHT {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: Some(expected_revision),
+                error: EditFileError::Busy,
+            });
+            return;
+        }
+
+        let new_revision = edit_revision(&bytes);
+        let req_id = self.next_req_id();
+        self.inflight_edit_put_src.insert(
+            req_id,
+            EditPutSrcJob {
+                token,
+                generation: self.edit_generation,
+                bytes,
+                expected_revision,
+                new_revision,
+                force,
+                ready: false,
+                next_send_seq: 0,
+                next_ack_seq: 0,
+                end_sent: false,
+                last_at: Instant::now(),
+            },
+        );
+        self.send_frame(&RemoteFrame::EditPutBegin {
+            req_id,
+            document_token: token,
+            session_generation: self.edit_generation,
+            path: EditPath::new(path),
+            total_len: new_revision.len,
+            expected_revision,
+            new_revision,
+            force,
+        });
+    }
+
+    /// main/shell 每帧取走编辑后端结果。
+    pub fn take_edit_events(&mut self) -> Vec<EditEvent> {
+        std::mem::take(&mut self.edit_events)
+    }
+
+    fn cancel_edit_fetch(&mut self, req_id: u64) {
+        let Some(job) = self.inflight_edit_fetch.remove(&req_id) else {
+            return;
+        };
+        if job.generation == self.edit_generation {
+            self.send_frame(&RemoteFrame::EditFetchCancel {
+                req_id,
+                document_token: job.token,
+                session_generation: job.generation,
+            });
+        }
+    }
+
+    fn fail_edit_fetch(
+        &mut self,
+        req_id: u64,
+        revision: Option<FileRevision>,
+        error: EditFileError,
+        notify_peer: bool,
+    ) {
+        let Some(job) = self.inflight_edit_fetch.remove(&req_id) else {
+            return;
+        };
+        if job.generation != self.edit_generation {
+            return;
+        }
+        if notify_peer {
+            self.send_frame(&RemoteFrame::EditFetchCancel {
+                req_id,
+                document_token: job.token,
+                session_generation: job.generation,
+            });
+        }
+        self.edit_events.push(EditEvent::Error {
+            token: job.token,
+            revision: revision.or(job.revision),
+            error,
+        });
+    }
+
+    fn edit_fetch_begin(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        total_len: u64,
+        revision: FileRevision,
+    ) {
+        if !self.inflight_edit_fetch.get(&req_id).is_some_and(|job| {
+            job.token == token
+                && job.generation == session_generation
+                && job.generation == self.edit_generation
+        }) {
+            return;
+        }
+        let valid = total_len <= EDIT_MAX_LEN
+            && revision.len == total_len
+            && self.inflight_edit_fetch.get(&req_id).is_some_and(|job| {
+                job.token == token
+                    && job.generation == self.edit_generation
+                    && job.generation == session_generation
+                    && job.total.is_none()
+            });
+        if !valid {
+            self.fail_edit_fetch(
+                req_id,
+                Some(revision),
+                EditFileError::InvalidRequest,
+                true,
+            );
+            return;
+        }
+        let Ok(capacity) = usize::try_from(total_len) else {
+            self.fail_edit_fetch(req_id, Some(revision), EditFileError::TooLarge, true);
+            return;
+        };
+        if let Some(job) = self.inflight_edit_fetch.get_mut(&req_id) {
+            job.total = Some(total_len);
+            job.revision = Some(revision);
+            job.bytes = Vec::with_capacity(capacity);
+            job.next_seq = 0;
+            job.last_at = Instant::now();
+        }
+    }
+
+    fn edit_fetch_chunk(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        seq: u32,
+        data: EditChunk,
+    ) {
+        let bytes = data.into_inner();
+        let error = {
+            let Some(job) = self.inflight_edit_fetch.get_mut(&req_id) else {
+                return;
+            };
+            if job.token != token
+                || job.generation != self.edit_generation
+                || job.generation != session_generation
+            {
+                return;
+            }
+            if let Some(total) = job.total {
+                let next_len = job.bytes.len().saturating_add(bytes.len());
+                if seq != job.next_seq
+                    || bytes.len() > FILE_CHUNK
+                    || u64::try_from(next_len).unwrap_or(u64::MAX) > total
+                    || u64::try_from(next_len).unwrap_or(u64::MAX) > EDIT_MAX_LEN
+                {
+                    Some(EditFileError::LengthMismatch)
+                } else {
+                    job.bytes.extend_from_slice(&bytes);
+                    job.next_seq = job.next_seq.wrapping_add(1);
+                    job.last_at = Instant::now();
+                    None
+                }
+            } else {
+                Some(EditFileError::InvalidRequest)
+            }
+        };
+        if let Some(error) = error {
+            self.fail_edit_fetch(req_id, None, error, true);
+        } else {
+            self.send_frame(&RemoteFrame::EditFileChunkAck {
+                req_id,
+                document_token: token,
+                session_generation,
+                seq,
+            });
+        }
+    }
+
+    fn edit_fetch_end(&mut self, req_id: u64, token: u64, session_generation: u64) {
+        if !self.inflight_edit_fetch.get(&req_id).is_some_and(|job| {
+            job.token == token
+                && job.generation == self.edit_generation
+                && job.generation == session_generation
+        }) {
+            return;
+        }
+        let Some(job) = self.inflight_edit_fetch.remove(&req_id) else {
+            return;
+        };
+        let Some(total) = job.total else {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: job.revision,
+                error: EditFileError::InvalidRequest,
+            });
+            return;
+        };
+        let Some(revision) = job.revision else {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: None,
+                error: EditFileError::InvalidRequest,
+            });
+            return;
+        };
+        if u64::try_from(job.bytes.len()).unwrap_or(u64::MAX) != total {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: Some(revision),
+                error: EditFileError::LengthMismatch,
+            });
+            return;
+        }
+        if edit_revision(&job.bytes) != revision {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: Some(revision),
+                error: EditFileError::Integrity,
+            });
+            return;
+        }
+        self.edit_events.push(EditEvent::Loaded {
+            token,
+            bytes: job.bytes,
+            revision,
+        });
+    }
+
+    fn start_edit_fetch_src(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        path: EditPath,
+    ) {
+        let path = match checked_edit_path(path.as_str()) {
+            Ok(path) => path,
+            Err(error) => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: None,
+                    error,
+                });
+                return;
+            }
+        };
+        if token == 0
+            || session_generation == 0
+            || self.inflight_edit_fetch_src.contains_key(&req_id)
+            || self.inflight_edit_fetch_src.len() >= EDIT_MAX_INFLIGHT
+        {
+            self.send_frame(&RemoteFrame::EditError {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: None,
+                error: if self.inflight_edit_fetch_src.len() >= EDIT_MAX_INFLIGHT {
+                    EditFileError::Busy
+                } else {
+                    EditFileError::InvalidRequest
+                },
+            });
+            return;
+        }
+        let (Some(cmd_tx), Some(svc_tx)) = (self.cmd_tx.clone(), self.svc_tx.clone()) else {
+            self.send_frame(&RemoteFrame::EditError {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: None,
+                error: EditFileError::Io,
+            });
+            return;
+        };
+        let generation = self.edit_generation;
+        let (permit_tx, permit_rx) = std::sync::mpsc::channel();
+        for _ in 0..FETCH_WINDOW {
+            let _ = permit_tx.send(());
+        }
+        self.inflight_edit_fetch_src.insert(
+            req_id,
+            EditFetchSrcJob {
+                token,
+                request_generation: session_generation,
+                generation,
+                permit_tx,
+                next_ack_seq: 0,
+                last_at: Instant::now(),
+            },
+        );
+        thread::spawn(move || {
+            edit_fetch_src_worker(
+                req_id,
+                token,
+                session_generation,
+                &path,
+                &cmd_tx,
+                &permit_rx,
+            );
+            let _ = svc_tx.send(SvcReply::EditFetchSrcDone { req_id, generation });
+        });
+    }
+
+    fn edit_fetch_src_ack(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        seq: u32,
+    ) {
+        let Some(job) = self.inflight_edit_fetch_src.get_mut(&req_id) else {
+            return;
+        };
+        if job.token != token
+            || job.request_generation != session_generation
+            || job.generation != self.edit_generation
+            || seq != job.next_ack_seq
+        {
+            return;
+        }
+        job.next_ack_seq = job.next_ack_seq.wrapping_add(1);
+        job.last_at = Instant::now();
+        let _ = job.permit_tx.send(());
+    }
+
+    fn cancel_edit_fetch_src(&mut self, req_id: u64, token: u64, session_generation: u64) {
+        if self
+            .inflight_edit_fetch_src
+            .get(&req_id)
+            .is_some_and(|job| {
+                job.token == token
+                    && job.request_generation == session_generation
+                    && job.generation == self.edit_generation
+            })
+        {
+            self.inflight_edit_fetch_src.remove(&req_id);
+        }
+    }
+
+    fn cancel_edit_put_src(&mut self, req_id: u64) {
+        let Some(job) = self.inflight_edit_put_src.remove(&req_id) else {
+            return;
+        };
+        if job.generation == self.edit_generation {
+            self.send_frame(&RemoteFrame::EditPutCancel {
+                req_id,
+                document_token: job.token,
+                session_generation: job.generation,
+            });
+        }
+    }
+
+    fn fail_edit_put_src(
+        &mut self,
+        req_id: u64,
+        revision: Option<FileRevision>,
+        error: EditFileError,
+        notify_peer: bool,
+    ) {
+        let Some(job) = self.inflight_edit_put_src.remove(&req_id) else {
+            return;
+        };
+        if job.generation != self.edit_generation {
+            return;
+        }
+        if notify_peer {
+            self.send_frame(&RemoteFrame::EditPutCancel {
+                req_id,
+                document_token: job.token,
+                session_generation: job.generation,
+            });
+        }
+        self.edit_events.push(EditEvent::Error {
+            token: job.token,
+            revision: revision.or(Some(job.expected_revision)),
+            error,
+        });
+    }
+
+    fn edit_put_ready(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        current_revision: FileRevision,
+    ) {
+        let Some(job) = self.inflight_edit_put_src.get(&req_id) else {
+            return;
+        };
+        if job.token != token
+            || job.generation != self.edit_generation
+            || job.generation != session_generation
+        {
+            return;
+        }
+        if job.ready {
+            self.fail_edit_put_src(
+                req_id,
+                Some(current_revision),
+                EditFileError::InvalidRequest,
+                true,
+            );
+            return;
+        }
+        if !job.force && current_revision != job.expected_revision {
+            let token = job.token;
+            self.inflight_edit_put_src.remove(&req_id);
+            self.edit_events.push(EditEvent::Conflict {
+                token,
+                revision: Some(current_revision),
+            });
+            return;
+        }
+        if let Some(job) = self.inflight_edit_put_src.get_mut(&req_id) {
+            job.ready = true;
+            job.last_at = Instant::now();
+        }
+        self.pump_edit_put_src(req_id);
+    }
+
+    fn pump_edit_put_src(&mut self, req_id: u64) {
+        let frames = {
+            let Some(job) = self.inflight_edit_put_src.get_mut(&req_id) else {
+                return;
+            };
+            if !job.ready
+                || job.generation != self.edit_generation
+                || job.end_sent
+            {
+                return;
+            }
+            let chunks = if job.bytes.is_empty() {
+                0
+            } else {
+                (job.bytes.len().saturating_sub(1) / FILE_CHUNK).saturating_add(1)
+            };
+            let Ok(total_chunks) = u32::try_from(chunks) else {
+                return;
+            };
+            let mut frames = Vec::new();
+            while job.next_send_seq < total_chunks
+                && job.next_send_seq.saturating_sub(job.next_ack_seq) < FETCH_WINDOW
+            {
+                let seq = job.next_send_seq;
+                let start = usize::try_from(seq)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(FILE_CHUNK);
+                let end = start.saturating_add(FILE_CHUNK).min(job.bytes.len());
+                if start >= end || end > job.bytes.len() {
+                    break;
+                }
+                frames.push(RemoteFrame::EditPutChunk {
+                    req_id,
+                    document_token: job.token,
+                    session_generation: job.generation,
+                    seq,
+                    data: EditChunk::new(job.bytes[start..end].to_vec()),
+                });
+                job.next_send_seq = job.next_send_seq.wrapping_add(1);
+            }
+            if job.next_send_seq == total_chunks && job.next_ack_seq == total_chunks {
+                frames.push(RemoteFrame::EditPutEnd {
+                    req_id,
+                    document_token: job.token,
+                    session_generation: job.generation,
+                });
+                job.end_sent = true;
+            }
+            if !frames.is_empty() {
+                job.last_at = Instant::now();
+            }
+            frames
+        };
+        for frame in frames {
+            self.send_frame(&frame);
+        }
+    }
+
+    fn edit_put_src_ack(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        seq: u32,
+    ) {
+        let valid = {
+            let Some(job) = self.inflight_edit_put_src.get_mut(&req_id) else {
+                return;
+            };
+            if job.token != token
+                || job.generation != self.edit_generation
+                || job.generation != session_generation
+                || !job.ready
+            {
+                return;
+            }
+            if seq != job.next_ack_seq || seq >= job.next_send_seq {
+                false
+            } else {
+                job.next_ack_seq = job.next_ack_seq.wrapping_add(1);
+                job.last_at = Instant::now();
+                true
+            }
+        };
+        if valid {
+            self.pump_edit_put_src(req_id);
+        } else {
+            self.fail_edit_put_src(req_id, None, EditFileError::InvalidRequest, true);
+        }
+    }
+
+    fn edit_put_conflict(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        current_revision: Option<FileRevision>,
+    ) {
+        if !self.inflight_edit_put_src.get(&req_id).is_some_and(|job| {
+            job.token == token
+                && job.generation == self.edit_generation
+                && job.generation == session_generation
+        }) {
+            return;
+        }
+        let _ = self.inflight_edit_put_src.remove(&req_id);
+        self.edit_events.push(EditEvent::Conflict {
+            token,
+            revision: current_revision,
+        });
+    }
+
+    fn edit_put_result(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        revision: FileRevision,
+    ) {
+        if !self.inflight_edit_put_src.get(&req_id).is_some_and(|job| {
+            job.token == token
+                && job.generation == self.edit_generation
+                && job.generation == session_generation
+        }) {
+            return;
+        }
+        let Some(job) = self.inflight_edit_put_src.remove(&req_id) else {
+            return;
+        };
+        if revision != job.new_revision {
+            self.edit_events.push(EditEvent::Error {
+                token,
+                revision: Some(revision),
+                error: EditFileError::Integrity,
+            });
+        } else {
+            self.edit_events.push(EditEvent::Saved { token, revision });
+        }
+    }
+
+    fn handle_edit_put_begin(&mut self, request: EditPutBeginRequest) {
+        let EditPutBeginRequest {
+            req_id,
+            token,
+            session_generation,
+            path,
+            total_len,
+            expected_revision,
+            new_revision,
+            force,
+        } = request;
+        if token == 0
+            || session_generation == 0
+            || total_len > EDIT_MAX_LEN
+            || expected_revision.len > EDIT_MAX_LEN
+            || new_revision.len != total_len
+            || self.inflight_edit_put_dst.contains_key(&req_id)
+        {
+            self.send_frame(&RemoteFrame::EditError {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: None,
+                error: if total_len > EDIT_MAX_LEN || expected_revision.len > EDIT_MAX_LEN {
+                    EditFileError::TooLarge
+                } else {
+                    EditFileError::InvalidRequest
+                },
+            });
+            return;
+        }
+        if self.inflight_edit_put_dst.len() >= EDIT_MAX_INFLIGHT {
+            self.send_frame(&RemoteFrame::EditError {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: None,
+                error: EditFileError::Busy,
+            });
+            return;
+        }
+        let target = match checked_edit_path(path.as_str()) {
+            Ok(path) => path,
+            Err(error) => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: None,
+                    error,
+                });
+                return;
+            }
+        };
+        let current_revision = match current_edit_revision(&target) {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: None,
+                    error,
+                });
+                return;
+            }
+        };
+        if !force && current_revision != expected_revision {
+            self.send_frame(&RemoteFrame::EditPutConflict {
+                req_id,
+                document_token: token,
+                session_generation,
+                current_revision: Some(current_revision),
+            });
+            return;
+        }
+        let metadata = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: Some(current_revision),
+                    error: EditFileError::Symlink,
+                });
+                return;
+            }
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: Some(current_revision),
+                    error: EditFileError::NotRegular,
+                });
+                return;
+            }
+            Err(error) => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: Some(current_revision),
+                    error: edit_io_error(&error),
+                });
+                return;
+            }
+        };
+        let (tmp_path, file) = match create_edit_temp(&target, metadata.permissions()) {
+            Ok(temp) => temp,
+            Err(error) => {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: Some(current_revision),
+                    error,
+                });
+                return;
+            }
+        };
+        self.inflight_edit_put_dst.insert(
+            req_id,
+            EditPutDstJob {
+                token,
+                request_generation: session_generation,
+                generation: self.edit_generation,
+                tmp_path,
+                target,
+                file: Some(file),
+                expected_len: total_len,
+                expected_revision,
+                new_revision,
+                force,
+                next_seq: 0,
+                written: 0,
+                last_at: Instant::now(),
+            },
+        );
+        self.send_frame(&RemoteFrame::EditPutReady {
+            req_id,
+            document_token: token,
+            session_generation,
+            current_revision,
+        });
+    }
+
+    fn fail_edit_put_dst(&mut self, req_id: u64, error: EditFileError) {
+        let Some(mut job) = self.inflight_edit_put_dst.remove(&req_id) else {
+            return;
+        };
+        job.file = None;
+        let _ = std::fs::remove_file(&job.tmp_path);
+        if job.generation != self.edit_generation {
+            return;
+        }
+        self.send_frame(&RemoteFrame::EditError {
+            req_id,
+            document_token: job.token,
+            session_generation: job.request_generation,
+            revision: current_edit_revision(&job.target).ok(),
+            error,
+        });
+    }
+
+    fn edit_put_dst_chunk(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        seq: u32,
+        data: EditChunk,
+    ) {
+        let bytes = data.into_inner();
+        let error = {
+            let Some(job) = self.inflight_edit_put_dst.get_mut(&req_id) else {
+                return;
+            };
+            if job.token != token
+                || job.request_generation != session_generation
+                || job.generation != self.edit_generation
+            {
+                return;
+            }
+            let next_written = job
+                .written
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            if seq != job.next_seq
+                || bytes.len() > FILE_CHUNK
+                || next_written > job.expected_len
+                || next_written > EDIT_MAX_LEN
+            {
+                Some(EditFileError::LengthMismatch)
+            } else if let Some(file) = job.file.as_mut() {
+                if file.write_all(&bytes).is_err() {
+                    Some(EditFileError::Io)
+                } else {
+                    job.next_seq = job.next_seq.wrapping_add(1);
+                    job.written = next_written;
+                    job.last_at = Instant::now();
+                    None
+                }
+            } else {
+                Some(EditFileError::Io)
+            }
+        };
+        if let Some(error) = error {
+            self.fail_edit_put_dst(req_id, error);
+        } else {
+            self.send_frame(&RemoteFrame::EditPutChunkAck {
+                req_id,
+                document_token: token,
+                session_generation,
+                seq,
+            });
+        }
+    }
+
+    fn edit_put_dst_end(&mut self, req_id: u64, token: u64, session_generation: u64) {
+        if !self
+            .inflight_edit_put_dst
+            .get(&req_id)
+            .is_some_and(|job| {
+                job.token == token
+                    && job.request_generation == session_generation
+                    && job.generation == self.edit_generation
+            })
+        {
+            return;
+        }
+        let Some(mut job) = self.inflight_edit_put_dst.remove(&req_id) else {
+            return;
+        };
+        if job.written != job.expected_len {
+            job.file = None;
+            let _ = std::fs::remove_file(&job.tmp_path);
+            self.send_frame(&RemoteFrame::EditError {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: current_edit_revision(&job.target).ok(),
+                error: EditFileError::LengthMismatch,
+            });
+            return;
+        }
+        let synced = job
+            .file
+            .as_mut()
+            .ok_or(EditFileError::Io)
+            .and_then(|file| {
+                file.flush().map_err(|_| EditFileError::Io)?;
+                file.sync_all().map_err(|_| EditFileError::Io)
+            });
+        job.file = None;
+        if let Err(error) = synced {
+            let _ = std::fs::remove_file(&job.tmp_path);
+            self.send_frame(&RemoteFrame::EditError {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: current_edit_revision(&job.target).ok(),
+                error,
+            });
+            return;
+        }
+        let temp_revision = match read_edit_snapshot(&job.tmp_path) {
+            Ok((_, revision)) if revision == job.new_revision => revision,
+            Ok(_) => {
+                let _ = std::fs::remove_file(&job.tmp_path);
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: current_edit_revision(&job.target).ok(),
+                    error: EditFileError::Integrity,
+                });
+                return;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&job.tmp_path);
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: current_edit_revision(&job.target).ok(),
+                    error,
+                });
+                return;
+            }
+        };
+        let current_revision = match current_edit_revision(&job.target) {
+            Ok(revision) => revision,
+            Err(
+                EditFileError::NotFound
+                | EditFileError::NotRegular
+                | EditFileError::Symlink
+                | EditFileError::TooLarge
+                | EditFileError::ChangedDuringRead,
+            ) => {
+                let _ = std::fs::remove_file(&job.tmp_path);
+                self.send_frame(&RemoteFrame::EditPutConflict {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    current_revision: None,
+                });
+                return;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&job.tmp_path);
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: None,
+                    error,
+                });
+                return;
+            }
+        };
+        if !job.force && current_revision != job.expected_revision {
+            let _ = std::fs::remove_file(&job.tmp_path);
+            self.send_frame(&RemoteFrame::EditPutConflict {
+                req_id,
+                document_token: token,
+                session_generation,
+                current_revision: Some(current_revision),
+            });
+            return;
+        }
+        match atomic_replace_edit_file(&job.tmp_path, &job.target) {
+            Ok(()) => self.send_frame(&RemoteFrame::EditPutResult {
+                req_id,
+                document_token: token,
+                session_generation,
+                revision: temp_revision,
+            }),
+            Err(_) => {
+                let _ = std::fs::remove_file(&job.tmp_path);
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id,
+                    document_token: token,
+                    session_generation,
+                    revision: Some(current_revision),
+                    error: EditFileError::Io,
+                });
+            }
+        }
+    }
+
+    fn cancel_edit_put_dst(&mut self, req_id: u64, token: u64, session_generation: u64) {
+        if !self
+            .inflight_edit_put_dst
+            .get(&req_id)
+            .is_some_and(|job| {
+                job.token == token
+                    && job.request_generation == session_generation
+                    && job.generation == self.edit_generation
+            })
+        {
+            return;
+        }
+        if let Some(mut job) = self.inflight_edit_put_dst.remove(&req_id) {
+            job.file = None;
+            let _ = std::fs::remove_file(job.tmp_path);
+        }
+    }
+
+    fn edit_remote_error(
+        &mut self,
+        req_id: u64,
+        token: u64,
+        session_generation: u64,
+        revision: Option<FileRevision>,
+        error: EditFileError,
+    ) {
+        if self
+            .inflight_edit_fetch
+            .get(&req_id)
+            .is_some_and(|job| {
+                job.token == token
+                    && job.generation == session_generation
+                    && job.generation == self.edit_generation
+            })
+        {
+            self.fail_edit_fetch(req_id, revision, error, false);
+        } else if self
+            .inflight_edit_put_src
+            .get(&req_id)
+            .is_some_and(|job| {
+                job.token == token
+                    && job.generation == session_generation
+                    && job.generation == self.edit_generation
+            })
+        {
+            self.fail_edit_put_src(req_id, revision, error, false);
         }
     }
 
@@ -2792,6 +4305,61 @@ impl RemoteWs {
         for id in stalled {
             log::warn!("Fetch req={id} 停滞超时，中止清理");
             self.fetch_abort(id, FsErr::Io);
+        }
+        let stalled_edit_fetch = self
+            .inflight_edit_fetch
+            .iter()
+            .filter_map(|(&id, job)| {
+                (job.last_at.elapsed() > EDIT_STALL_TIMEOUT).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        for id in stalled_edit_fetch {
+            self.fail_edit_fetch(id, None, EditFileError::Cancelled, true);
+        }
+        let stalled_edit_fetch_src = self
+            .inflight_edit_fetch_src
+            .iter()
+            .filter_map(|(&id, job)| {
+                (job.last_at.elapsed() > EDIT_STALL_TIMEOUT)
+                    .then_some((
+                        id,
+                        job.token,
+                        job.request_generation,
+                        job.generation,
+                    ))
+            })
+            .collect::<Vec<_>>();
+        for (id, token, request_generation, generation) in stalled_edit_fetch_src {
+            self.inflight_edit_fetch_src.remove(&id);
+            if generation == self.edit_generation {
+                self.send_frame(&RemoteFrame::EditError {
+                    req_id: id,
+                    document_token: token,
+                    session_generation: request_generation,
+                    revision: None,
+                    error: EditFileError::Cancelled,
+                });
+            }
+        }
+        let stalled_edit_put_src = self
+            .inflight_edit_put_src
+            .iter()
+            .filter_map(|(&id, job)| {
+                (job.last_at.elapsed() > EDIT_STALL_TIMEOUT).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        for id in stalled_edit_put_src {
+            self.fail_edit_put_src(id, None, EditFileError::Cancelled, true);
+        }
+        let stalled_edit_put_dst = self
+            .inflight_edit_put_dst
+            .iter()
+            .filter_map(|(&id, job)| {
+                (job.last_at.elapsed() > EDIT_STALL_TIMEOUT).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        for id in stalled_edit_put_dst {
+            self.fail_edit_put_dst(id, EditFileError::Cancelled);
         }
     }
 
@@ -3764,6 +5332,36 @@ impl RemoteWs {
         }
     }
 
+    fn advance_edit_generation(&mut self, emit_errors: bool) {
+        let mut pending = HashMap::<u64, Option<FileRevision>>::new();
+        if emit_errors {
+            for job in self.inflight_edit_fetch.values() {
+                pending.entry(job.token).or_insert(job.revision);
+            }
+            for job in self.inflight_edit_put_src.values() {
+                pending
+                    .entry(job.token)
+                    .or_insert(Some(job.expected_revision));
+            }
+        }
+        self.inflight_edit_fetch.clear();
+        self.inflight_edit_fetch_src.clear();
+        self.inflight_edit_put_src.clear();
+        for (_, mut job) in self.inflight_edit_put_dst.drain() {
+            job.file = None;
+            let _ = std::fs::remove_file(job.tmp_path);
+        }
+        self.edit_generation = random_edit_generation();
+        if emit_errors {
+            self.edit_events
+                .extend(pending.into_iter().map(|(token, revision)| EditEvent::Error {
+                    token,
+                    revision,
+                    error: EditFileError::StaleSession,
+                }));
+        }
+    }
+
     /// 清空文件树同步态（会话起止 / 断线；**不**在终端 Resize 时清——resize 不动文件树）。
     fn clear_remote_filetree(&mut self) {
         self.remote_filetree = None;
@@ -4194,6 +5792,14 @@ impl RemoteWs {
     #[must_use]
     pub fn mirror_win32_input(&self) -> bool {
         self.focused_mirror_term().is_some_and(Terminal::win32_input)
+    }
+
+    /// 控制端当前镜像输入目标是否停在 shell 提示符。远程文件树双击目录只在此时
+    /// 注入完整 `cd` 命令，避免覆盖正在前台运行程序的输入。
+    #[must_use]
+    pub fn focused_mirror_shell_idle(&self) -> bool {
+        self.focused_mirror_term()
+            .is_some_and(Terminal::shell_waiting_input)
     }
 
     /// 控制端（part4c）：当前镜像光标 `(row, col)`（跟随态 Some；回看态 None）。IME
@@ -4774,6 +6380,224 @@ impl RemoteWs {
                     self.put_result(req_id, status, err);
                 }
             }
+            // ── v3 内置编辑：独立的有界读取 / 条件保存协议 ─────────────────
+            RemoteFrame::EditFetchReq {
+                req_id,
+                document_token,
+                session_generation,
+                path,
+            } => {
+                if self.is_controlled() {
+                    self.start_edit_fetch_src(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        path,
+                    );
+                }
+            }
+            RemoteFrame::EditFetchCancel {
+                req_id,
+                document_token,
+                session_generation,
+            } => {
+                if self.is_controlled() {
+                    self.cancel_edit_fetch_src(req_id, document_token, session_generation);
+                }
+            }
+            RemoteFrame::EditFileBegin {
+                req_id,
+                document_token,
+                session_generation,
+                total_len,
+                revision,
+            } => {
+                if self.is_controlling() {
+                    self.edit_fetch_begin(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        total_len,
+                        revision,
+                    );
+                }
+            }
+            RemoteFrame::EditFileChunk {
+                req_id,
+                document_token,
+                session_generation,
+                seq,
+                data,
+            } => {
+                if self.is_controlling() {
+                    self.edit_fetch_chunk(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        seq,
+                        data,
+                    );
+                }
+            }
+            RemoteFrame::EditFileChunkAck {
+                req_id,
+                document_token,
+                session_generation,
+                seq,
+            } => {
+                if self.is_controlled() {
+                    self.edit_fetch_src_ack(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        seq,
+                    );
+                }
+            }
+            RemoteFrame::EditFileEnd {
+                req_id,
+                document_token,
+                session_generation,
+            } => {
+                if self.is_controlling() {
+                    self.edit_fetch_end(req_id, document_token, session_generation);
+                }
+            }
+            RemoteFrame::EditPutBegin {
+                req_id,
+                document_token,
+                session_generation,
+                path,
+                total_len,
+                expected_revision,
+                new_revision,
+                force,
+            } => {
+                if self.is_controlled() {
+                    self.handle_edit_put_begin(EditPutBeginRequest {
+                        req_id,
+                        token: document_token,
+                        session_generation,
+                        path,
+                        total_len,
+                        expected_revision,
+                        new_revision,
+                        force,
+                    });
+                }
+            }
+            RemoteFrame::EditPutReady {
+                req_id,
+                document_token,
+                session_generation,
+                current_revision,
+            } => {
+                if self.is_controlling() {
+                    self.edit_put_ready(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        current_revision,
+                    );
+                }
+            }
+            RemoteFrame::EditPutConflict {
+                req_id,
+                document_token,
+                session_generation,
+                current_revision,
+            } => {
+                if self.is_controlling() {
+                    self.edit_put_conflict(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        current_revision,
+                    );
+                }
+            }
+            RemoteFrame::EditPutChunk {
+                req_id,
+                document_token,
+                session_generation,
+                seq,
+                data,
+            } => {
+                if self.is_controlled() {
+                    self.edit_put_dst_chunk(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        seq,
+                        data,
+                    );
+                }
+            }
+            RemoteFrame::EditPutChunkAck {
+                req_id,
+                document_token,
+                session_generation,
+                seq,
+            } => {
+                if self.is_controlling() {
+                    self.edit_put_src_ack(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        seq,
+                    );
+                }
+            }
+            RemoteFrame::EditPutEnd {
+                req_id,
+                document_token,
+                session_generation,
+            } => {
+                if self.is_controlled() {
+                    self.edit_put_dst_end(req_id, document_token, session_generation);
+                }
+            }
+            RemoteFrame::EditPutCancel {
+                req_id,
+                document_token,
+                session_generation,
+            } => {
+                if self.is_controlled() {
+                    self.cancel_edit_put_dst(req_id, document_token, session_generation);
+                }
+            }
+            RemoteFrame::EditPutResult {
+                req_id,
+                document_token,
+                session_generation,
+                revision,
+            } => {
+                if self.is_controlling() {
+                    self.edit_put_result(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        revision,
+                    );
+                }
+            }
+            RemoteFrame::EditError {
+                req_id,
+                document_token,
+                session_generation,
+                revision,
+                error,
+            } => {
+                if self.is_controlling() {
+                    self.edit_remote_error(
+                        req_id,
+                        document_token,
+                        session_generation,
+                        revision,
+                        error,
+                    );
+                }
+            }
             RemoteFrame::MkDir { req_id, dir, name } => {
                 // 仅被控端：建目录（幂等）+ 子树断言。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
@@ -5132,11 +6956,13 @@ impl RemoteWs {
         if sess.role != Role::Controller {
             return false;
         }
+        let target = sess.peer_device_id.clone();
         // 服务端侧会话已拆：P2P 引擎失去信令与对端，一并拆除（重挂成功随新会话重建）。
         self.p2p = None;
         self.p2p_data_active = false;
+        self.advance_edit_generation(true);
         self.reattach = Some(Reattach {
-            target: sess.peer_device_id.clone(),
+            target,
             since: Instant::now(),
             last_try: None,
         });
@@ -5149,6 +6975,7 @@ impl RemoteWs {
     /// 调用方按语境自定（断线清，对端结束保留）。
     fn teardown_session_state(&mut self, reason: EndReason) {
         self.reattach = None;
+        self.advance_edit_generation(true);
         self.mirror = None;
         self.pending_input.clear();
         self.pending_viewport = None;
@@ -5280,6 +7107,7 @@ impl RemoteWs {
                 let peer = peer_name.clone();
                 // 控制端：起一个无 PTY 的镜像 Terminal（被控端会随即发 Resize+快照）。
                 self.reset_history();
+                self.advance_edit_generation(true);
                 self.clear_remote_filetree();
                 self.mirror = (role == Role::Controller)
                     .then(|| Terminal::new(MIRROR_INIT_ROWS, MIRROR_INIT_COLS, MIRROR_SCROLLBACK));
@@ -5549,6 +7377,26 @@ fn sleep_with_stop(total: Duration, stop: &Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recv_relay(rx: &std::sync::mpsc::Receiver<RemoteC2S>) -> RemoteFrame {
+        match rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("应收到一帧 Relay")
+        {
+            RemoteC2S::Relay(value) => RemoteFrame::from_value(&value).expect("合法数据面帧"),
+            other => panic!("预期 Relay，实际 {other:?}"),
+        }
+    }
+
+    fn edit_test_dir(suffix: &str) -> PathBuf {
+        let mut random = OsRng;
+        std::env::temp_dir().join(format!(
+            "lumen_edit_test_{}_{}_{:016x}",
+            std::process::id(),
+            suffix,
+            random.next_u64()
+        ))
+    }
 
     #[test]
     fn ws_url_转换() {
@@ -5970,6 +7818,7 @@ mod tests {
         assert!(ft.visible_rows().is_empty(), "无根无行");
         // 换根：根 id 0、默认展开、整体重置；同根不重置。
         assert!(ft.set_root("/r".into()));
+        assert_eq!(ft.paste_target_dir().as_deref(), Some("/r"), "未选择回退树根");
         assert!(!ft.set_root("/r".into()), "同根不重置");
         let rows = ft.visible_rows();
         assert_eq!(rows.len(), 2, "根 + 临时加载占位（开但未缓存非 pending）");
@@ -6020,6 +7869,18 @@ mod tests {
         assert_eq!(rows[1].name, "sub");
         assert!(matches!(rows[2].kind, RemoteRowKind::File));
         assert!(matches!(rows[3].kind, RemoteRowKind::Overflow(3)));
+        ft.set_selected(rows[2].id);
+        assert_eq!(
+            ft.paste_target_dir().as_deref(),
+            Some("/r"),
+            "选中文件应粘贴到父目录"
+        );
+        ft.set_selected(rows[1].id);
+        assert_eq!(
+            ft.paste_target_dir().as_deref(),
+            Some("/r/sub"),
+            "选中目录应粘贴到目录自身"
+        );
         // 展开 sub（DFS find 可达）：填其 listing，x 在 depth 2 可见。
         let sub_id = rows[1].id;
         ft.set_open(sub_id, true);
@@ -6043,6 +7904,21 @@ mod tests {
         // 折叠 sub（纯本地）：x 不再可见。
         ft.set_open(sub_id, false);
         assert_eq!(ft.visible_rows().len(), 4);
+    }
+
+    #[test]
+    fn 远程父目录保留_posix与_windows根语义() {
+        assert_eq!(parent_remote_dir("/srv/app/file.txt"), "/srv/app");
+        assert_eq!(parent_remote_dir("/file.txt"), "/");
+        assert_eq!(parent_remote_dir("/"), "/");
+        assert_eq!(parent_remote_dir(r"C:\work\file.txt"), r"C:\work");
+        assert_eq!(parent_remote_dir(r"C:\file.txt"), r"C:\");
+        assert_eq!(parent_remote_dir(r"C:\"), r"C:\");
+        assert_eq!(parent_remote_dir("C:/file.txt"), "C:/");
+        assert_eq!(
+            parent_remote_dir(r"\\server\share\file.txt"),
+            r"\\server\share"
+        );
     }
 
     #[test]
@@ -7049,5 +8925,453 @@ mod tests {
         // 断线：来件/会话态清掉。
         ws.apply(WsEvent::Disconnected);
         assert!(ws.incoming.is_none());
+    }
+
+    #[test]
+    fn 内置编辑读取_精确字节与revision校验后才交付() {
+        let mut ws = controlling_ws();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        let bytes = b"\xef\xbb\xbfline1\r\nline2\0".to_vec();
+        let revision = edit_revision(&bytes);
+
+        ws.start_edit_fetch(41, "C:\\remote\\note.txt".to_owned());
+        let (req_id, token, session_generation) = match recv_relay(&rx) {
+            RemoteFrame::EditFetchReq {
+                req_id,
+                document_token,
+                session_generation,
+                path,
+            } => {
+                assert_eq!(path.as_str(), "C:\\remote\\note.txt");
+                (req_id, document_token, session_generation)
+            }
+            frame => panic!("预期 EditFetchReq，实际 {frame:?}"),
+        };
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileBegin {
+                req_id,
+                document_token: token,
+                session_generation,
+                total_len: revision.len,
+                revision,
+            },
+        );
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileChunk {
+                req_id,
+                document_token: token,
+                session_generation,
+                seq: 0,
+                data: EditChunk::new(bytes.clone()),
+            },
+        );
+        assert!(matches!(
+            recv_relay(&rx),
+            RemoteFrame::EditFileChunkAck {
+                req_id: ack_req,
+                document_token: 41,
+                session_generation: ack_generation,
+                seq: 0
+            } if ack_req == req_id && ack_generation == session_generation
+        ));
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileEnd {
+                req_id,
+                document_token: token,
+                session_generation,
+            },
+        );
+        assert_eq!(
+            ws.take_edit_events(),
+            vec![EditEvent::Loaded {
+                token: 41,
+                bytes,
+                revision,
+            }]
+        );
+    }
+
+    #[test]
+    fn 内置编辑读取_长度或hash不符拒绝交付() {
+        let mut ws = controlling_ws();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        ws.start_edit_fetch(42, "/remote/note.txt".to_owned());
+        let (req_id, session_generation) = match recv_relay(&rx) {
+            RemoteFrame::EditFetchReq {
+                req_id,
+                session_generation,
+                ..
+            } => (req_id, session_generation),
+            frame => panic!("预期 EditFetchReq，实际 {frame:?}"),
+        };
+        let revision = edit_revision(b"abcd");
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileBegin {
+                req_id,
+                document_token: 42,
+                session_generation,
+                total_len: 4,
+                revision,
+            },
+        );
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileChunk {
+                req_id,
+                document_token: 42,
+                session_generation,
+                seq: 0,
+                data: EditChunk::new(b"abc".to_vec()),
+            },
+        );
+        let _ = recv_relay(&rx);
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileEnd {
+                req_id,
+                document_token: 42,
+                session_generation,
+            },
+        );
+        assert!(matches!(
+            ws.take_edit_events().as_slice(),
+            [EditEvent::Error {
+                token: 42,
+                revision: Some(r),
+                error: EditFileError::LengthMismatch
+            }] if *r == revision
+        ));
+    }
+
+    #[test]
+    fn 内置编辑保存_api按ack发送并产出saved事件() {
+        let mut ws = controlling_ws();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        let old = edit_revision(b"old");
+        let new_bytes = b"new exact bytes".to_vec();
+        let new_revision = edit_revision(&new_bytes);
+
+        ws.start_edit_save(
+            51,
+            "C:\\remote\\note.txt".to_owned(),
+            new_bytes.clone(),
+            old,
+            false,
+        );
+        let (req_id, session_generation) = match recv_relay(&rx) {
+            RemoteFrame::EditPutBegin {
+                req_id,
+                document_token: 51,
+                session_generation,
+                total_len,
+                expected_revision,
+                new_revision: declared,
+                force: false,
+                ..
+            } => {
+                assert_eq!(total_len, new_revision.len);
+                assert_eq!(expected_revision, old);
+                assert_eq!(declared, new_revision);
+                (req_id, session_generation)
+            }
+            frame => panic!("预期 EditPutBegin，实际 {frame:?}"),
+        };
+        relay(
+            &mut ws,
+            &RemoteFrame::EditPutReady {
+                req_id,
+                document_token: 51,
+                session_generation,
+                current_revision: old,
+            },
+        );
+        let seq = match recv_relay(&rx) {
+            RemoteFrame::EditPutChunk {
+                req_id: chunk_req,
+                document_token: 51,
+                session_generation: chunk_generation,
+                seq,
+                data,
+            } => {
+                assert_eq!(chunk_req, req_id);
+                assert_eq!(chunk_generation, session_generation);
+                assert_eq!(data.as_slice(), new_bytes);
+                seq
+            }
+            frame => panic!("预期 EditPutChunk，实际 {frame:?}"),
+        };
+        relay(
+            &mut ws,
+            &RemoteFrame::EditPutChunkAck {
+                req_id,
+                document_token: 51,
+                session_generation,
+                seq,
+            },
+        );
+        assert!(matches!(
+            recv_relay(&rx),
+            RemoteFrame::EditPutEnd {
+                req_id: end_req,
+                document_token: 51,
+                session_generation: end_generation
+            } if end_req == req_id && end_generation == session_generation
+        ));
+        relay(
+            &mut ws,
+            &RemoteFrame::EditPutResult {
+                req_id,
+                document_token: 51,
+                session_generation,
+                revision: new_revision,
+            },
+        );
+        assert_eq!(
+            ws.take_edit_events(),
+            vec![EditEvent::Saved {
+                token: 51,
+                revision: new_revision,
+            }]
+        );
+    }
+
+    #[test]
+    fn 内置编辑被控端_cas保存成功原子替换已有文件() {
+        let dir = edit_test_dir("cas_success");
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        let target = dir.join("note.txt");
+        std::fs::write(&target, b"old").expect("写旧文件");
+        let old = edit_revision(b"old");
+        let new_bytes = b"new content";
+        let new_revision = edit_revision(new_bytes);
+
+        let mut ws = RemoteWs {
+            session: Some(ActiveSession {
+                peer_device_id: "controller".into(),
+                peer_name: "controller".into(),
+                role: Role::Controlled,
+            }),
+            ..RemoteWs::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        ws.handle_edit_put_begin(EditPutBeginRequest {
+            req_id: 61,
+            token: 9,
+            session_generation: 123,
+            path: EditPath::new(target.display().to_string()),
+            total_len: new_revision.len,
+            expected_revision: old,
+            new_revision,
+            force: false,
+        });
+        assert!(matches!(
+            recv_relay(&rx),
+            RemoteFrame::EditPutReady {
+                req_id: 61,
+                document_token: 9,
+                session_generation: 123,
+                current_revision
+            } if current_revision == old
+        ));
+        let temp = ws
+            .inflight_edit_put_dst
+            .get(&61)
+            .map(|job| job.tmp_path.clone())
+            .expect("临时文件已建立");
+        assert_ne!(temp, target);
+        assert_eq!(std::fs::read(&target).expect("旧目标仍在"), b"old");
+        ws.edit_put_dst_chunk(61, 9, 123, 0, EditChunk::new(new_bytes.to_vec()));
+        assert!(matches!(
+            recv_relay(&rx),
+            RemoteFrame::EditPutChunkAck { req_id: 61, seq: 0, .. }
+        ));
+        ws.edit_put_dst_end(61, 9, 123);
+        assert!(matches!(
+            recv_relay(&rx),
+            RemoteFrame::EditPutResult {
+                req_id: 61,
+                document_token: 9,
+                session_generation: 123,
+                revision
+            } if revision == new_revision
+        ));
+        assert_eq!(std::fs::read(&target).expect("新目标"), new_bytes);
+        assert!(!temp.exists(), "成功后临时路径不再存在");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn 内置编辑被控端_commit前冲突不覆盖并清临时文件() {
+        let dir = edit_test_dir("cas_conflict");
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        let target = dir.join("note.txt");
+        std::fs::write(&target, b"old").expect("写旧文件");
+        let old = edit_revision(b"old");
+        let ours = b"ours";
+        let ours_revision = edit_revision(ours);
+
+        let mut ws = RemoteWs {
+            session: Some(ActiveSession {
+                peer_device_id: "controller".into(),
+                peer_name: "controller".into(),
+                role: Role::Controlled,
+            }),
+            ..RemoteWs::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        ws.handle_edit_put_begin(EditPutBeginRequest {
+            req_id: 62,
+            token: 10,
+            session_generation: 124,
+            path: EditPath::new(target.display().to_string()),
+            total_len: ours_revision.len,
+            expected_revision: old,
+            new_revision: ours_revision,
+            force: false,
+        });
+        let _ = recv_relay(&rx);
+        let temp = ws.inflight_edit_put_dst[&62].tmp_path.clone();
+        ws.edit_put_dst_chunk(62, 10, 124, 0, EditChunk::new(ours.to_vec()));
+        let _ = recv_relay(&rx);
+        std::fs::write(&target, b"external").expect("模拟外部编辑");
+        let external_revision = edit_revision(b"external");
+        ws.edit_put_dst_end(62, 10, 124);
+        assert!(matches!(
+            recv_relay(&rx),
+            RemoteFrame::EditPutConflict {
+                req_id: 62,
+                document_token: 10,
+                session_generation: 124,
+                current_revision: Some(revision)
+            } if revision == external_revision
+        ));
+        assert_eq!(
+            std::fs::read(&target).expect("外部版本保留"),
+            b"external"
+        );
+        assert!(!temp.exists(), "冲突后删除临时文件");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn 内置编辑会话代际丢弃旧请求回包() {
+        let mut ws = controlling_ws();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        ws.start_edit_fetch(71, "/remote/old.txt".to_owned());
+        let (req_id, old_generation) = match recv_relay(&rx) {
+            RemoteFrame::EditFetchReq {
+                req_id,
+                session_generation,
+                ..
+            } => (req_id, session_generation),
+            frame => panic!("预期 EditFetchReq，实际 {frame:?}"),
+        };
+        ws.apply_server(RemoteS2C::SessionStarted {
+            peer_device_id: "new-peer".into(),
+            peer_name: "new".into(),
+            role: Role::Controller,
+        });
+        assert!(matches!(
+            ws.take_edit_events().as_slice(),
+            [EditEvent::Error {
+                token: 71,
+                error: EditFileError::StaleSession,
+                ..
+            }]
+        ));
+        let revision = edit_revision(b"old");
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileBegin {
+                req_id,
+                document_token: 71,
+                session_generation: old_generation,
+                total_len: revision.len,
+                revision,
+            },
+        );
+        relay(
+            &mut ws,
+            &RemoteFrame::EditFileEnd {
+                req_id,
+                document_token: 71,
+                session_generation: old_generation,
+            },
+        );
+        assert!(ws.take_edit_events().is_empty(), "旧代回包不得作用到新会话");
+    }
+
+    #[test]
+    fn 内置编辑推进代际保留已排队终态并结束仍在途请求() {
+        let mut ws = controlling_ws();
+        let completed_revision = edit_revision(b"done");
+        ws.edit_events.push(EditEvent::Saved {
+            token: 70,
+            revision: completed_revision,
+        });
+        ws.start_edit_fetch(71, "/remote/pending.txt".to_owned());
+
+        let before = ws.edit_generation();
+        ws.advance_edit_generation(true);
+        assert_ne!(ws.edit_generation(), before);
+        let events = ws.take_edit_events();
+        assert!(events.contains(&EditEvent::Saved {
+            token: 70,
+            revision: completed_revision,
+        }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EditEvent::Error {
+                token: 71,
+                error: EditFileError::StaleSession,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn 内置编辑停止ws会结束在途请求() {
+        let mut ws = controlling_ws();
+        ws.start_edit_fetch(72, "/remote/pending.txt".to_owned());
+        ws.stop();
+        assert!(matches!(
+            ws.take_edit_events().as_slice(),
+            [EditEvent::Error {
+                token: 72,
+                error: EditFileError::StaleSession,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn 内置编辑超一mib在发送前拒绝() {
+        let mut ws = controlling_ws();
+        ws.start_edit_save(
+            81,
+            "/remote/large.txt".to_owned(),
+            vec![0; usize::try_from(EDIT_MAX_LEN).expect("usize") + 1],
+            edit_revision(b"old"),
+            false,
+        );
+        assert!(matches!(
+            ws.take_edit_events().as_slice(),
+            [EditEvent::Error {
+                token: 81,
+                error: EditFileError::TooLarge,
+                ..
+            }]
+        ));
+        assert!(ws.inflight_edit_put_src.is_empty());
     }
 }

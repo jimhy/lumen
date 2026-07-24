@@ -19,6 +19,7 @@ pub mod settings_ui;
 pub mod ssh_filetree;
 pub mod ssh_ui;
 pub mod statusbar;
+pub mod text_editor;
 pub mod theme;
 pub mod toast;
 pub mod toolbar;
@@ -110,6 +111,8 @@ pub struct ShellState {
     pub ssh_ui: ssh_ui::SshUiState,
     /// SSH 密码/私钥本机安全保存对话框。关闭或锁屏丢弃时会清零明文缓冲。
     pub ssh_credentials: Option<SshCredentialDialog>,
+    /// 远程控制 / SSH 共用的单文档内置文本编辑器。
+    pub text_editor: text_editor::TextEditorState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -282,16 +285,6 @@ pub enum SshRuntimeAction {
     CloseSession {
         session_id: crate::ssh_runtime::SshSessionId,
     },
-    ToggleDirectory {
-        session_id: crate::ssh_runtime::SshSessionId,
-        path: String,
-    },
-    RefreshFileTree {
-        session_id: crate::ssh_runtime::SshSessionId,
-    },
-    ToggleHiddenFiles {
-        session_id: crate::ssh_runtime::SshSessionId,
-    },
     Disconnect,
     TrustHostKey {
         session_id: crate::ssh_runtime::SshSessionId,
@@ -385,6 +378,10 @@ pub struct ShellInput<'a> {
     pub cwd: Option<&'a std::path::Path>,
     /// 焦点窗格 shell 空闲（文件树 cd 注入闸门）。
     pub shell_idle: bool,
+    /// 控制端当前镜像输入目标 shell 空闲（远程文件树 cd 注入闸门）。
+    pub remote_shell_idle: bool,
+    /// 当前激活 SSH 会话 shell 空闲（SSH 文件树 cd 注入闸门）。
+    pub ssh_shell_idle: bool,
     /// 系统当前是否深色模式（P12 Sync with OS：外壳色板与设置页
     /// 「当前主题」展示按它解析生效主题 id）。
     pub os_dark: bool,
@@ -445,6 +442,8 @@ pub struct ShellInput<'a> {
     /// M5.3 part3c-2 #7：文件剪贴板来源侧（None=空）。本地树据此决定是否显示「粘贴到此目录」
     /// （= 剪贴板为 Remote，下载目标）；远程树据此（= 剪贴板为 Local，上传目标）。
     pub file_clipboard_side: Option<crate::remote_ws::ClipSide>,
+    /// SSH 文件树内部剪贴板是否已有远端项目。
+    pub ssh_file_clipboard_available: bool,
     /// M5.3 part3c-2 #7：覆盖弹窗待决的冲突项数（Some = 渲染覆盖确认模态）。
     pub overwrite_conflict_count: Option<usize>,
 }
@@ -532,6 +531,8 @@ pub struct ShellOutput {
     pub ssh_actions: Vec<ssh_ui::SshUiAction>,
     /// SSH 凭据、主机密钥确认与断开动作。
     pub ssh_runtime_action: Option<SshRuntimeAction>,
+    /// SSH 文件树的完整交互意图（选择、目录级刷新、文件操作、搜索与编辑）。
+    pub ssh_filetree_intents: Vec<ssh_filetree::SshFileTreeIntent>,
     /// 选中了某远程设备（M5.2）：main 记 active_device_id。
     pub activate_device: Option<String>,
     /// 提交远程设备改名（M5.2）：(设备 id, 新名)。
@@ -616,6 +617,8 @@ pub struct ShellOutput {
     pub remote_toggle_hidden: Option<bool>,
     /// 控制端远程树：双击文件的被控端路径（main 起 Fetch → 传到本地默认程序打开，#5）。
     pub remote_fetch_open: Option<String>,
+    /// 控制端远程树：右键“编辑”的文件 `(path, name, size)`。
+    pub remote_edit_file: Option<(String, String, u64)>,
     /// 控制端远程树：点了「刷新」图标的目录节点 id（main 重拉该目录最新内容）。
     pub remote_refresh_dir: Option<usize>,
     /// 控制端远程树：本帧单击选中的节点 id（main 设 ft.selected → 高亮 + Ctrl+C 下载源）。
@@ -640,8 +643,19 @@ pub struct ShellOutput {
     pub remote_create: Option<(String, String, bool)>,
     /// 远程文件树：删除确认 (远程 path, 是否目录) → main 调 `remote_ws.remote_delete`。
     pub remote_delete: Option<(String, bool)>,
+    /// SSH 文件树：新建确认 (会话, 目录, 名字, 是否目录)。
+    pub ssh_create:
+        Option<(crate::ssh_runtime::SshSessionId, String, String, bool)>,
+    /// SSH 文件树：永久删除确认 (会话, path, 是否目录)。
+    pub ssh_delete: Option<(crate::ssh_runtime::SshSessionId, String, bool)>,
     /// 远程文件树：菜单「进入文件夹」目标目录（被控端绝对路径）→ main 注入 `cd` 到远程会话。
     pub remote_cd: Option<String>,
+    /// 内置文本编辑器请求读取远端文件。
+    pub text_editor_load: Option<text_editor::LoadRequest>,
+    /// 内置文本编辑器请求条件保存远端文件。
+    pub text_editor_save: Option<text_editor::SaveRequest>,
+    /// 内置文本编辑器本帧已关闭。
+    pub text_editor_closed: bool,
     /// 设置页本帧被打开（main 把终端焦点交给 egui）。
     pub settings_opened: bool,
     /// 设置页本帧被关闭（main 把焦点交还终端，IME 复位链路照旧）。
@@ -746,6 +760,7 @@ pub fn show(
         toggle_view_mode: None,
         ssh_actions: Vec::new(),
         ssh_runtime_action: None,
+        ssh_filetree_intents: Vec::new(),
         activate_device: None,
         rename_device: None,
         delete_device: None,
@@ -781,6 +796,7 @@ pub fn show(
         remote_dir_clicks: Vec::new(),
         remote_toggle_hidden: None,
         remote_fetch_open: None,
+        remote_edit_file: None,
         remote_refresh_dir: None,
         remote_select: None,
         filetree_hovered: false,
@@ -792,7 +808,12 @@ pub fn show(
         filetree_dialog_closed: false,
         remote_create: None,
         remote_delete: None,
+        ssh_create: None,
+        ssh_delete: None,
         remote_cd: None,
+        text_editor_load: None,
+        text_editor_save: None,
+        text_editor_closed: false,
         settings_opened: false,
         settings_closed: false,
         settings_font_changed: false,
@@ -1198,11 +1219,43 @@ pub fn show(
             st.filetree.visible,
             pal,
             app_settings.layout.filetree_width,
+            input.ssh_shell_idle,
+            input.ssh_file_clipboard_available || crate::clipboard_files::has_files(),
         );
         out.filetree_width = ssh_tree.panel_width;
         out.filetree_hovered = ssh_tree.hovered;
-        if let Some(action) = ssh_tree.action.take() {
-            out.ssh_runtime_action = Some(action);
+        for intent in std::mem::take(&mut ssh_tree.intents) {
+            match intent {
+                ssh_filetree::SshFileTreeIntent::CreateEntry {
+                    session_id,
+                    directory,
+                    is_directory,
+                } => st
+                    .filetree
+                    .open_ssh_create(session_id, directory, is_directory),
+                ssh_filetree::SshFileTreeIntent::Delete {
+                    session_id,
+                    path,
+                    name,
+                    is_directory,
+                } => st
+                    .filetree
+                    .open_ssh_delete(session_id, path, name, is_directory),
+                other => out.ssh_filetree_intents.push(other),
+            }
+        }
+        let mut dialog_out = filetree::RemoteFileTreeOutput::default();
+        filetree::remote_dialog_ui(root.ctx(), &mut st.filetree, pal, &mut dialog_out);
+        out.remote_create = dialog_out.remote_create;
+        out.remote_delete = dialog_out.remote_delete;
+        out.ssh_create = dialog_out.ssh_create;
+        out.ssh_delete = dialog_out.ssh_delete;
+        if dialog_out.dialog_closed {
+            out.filetree_dialog_closed = true;
+        }
+        if ssh_tree.busy_hint {
+            st.toast
+                .push(toast::ToastKind::Warn, crate::i18n::strings().shell_busy_cd);
         }
         out.copy_text = ssh_tree.copy_text.take();
         (ssh_tree.panel_width, ssh_tree.panel_rect, None)
@@ -1222,8 +1275,11 @@ pub fn show(
             st.filetree.visible && !is_remote_unconnected,
             pal,
             app_settings.layout.filetree_width,
-            can_paste,
-            controlling,
+            filetree::RemoteFileTreeOptions {
+                shell_idle: input.remote_shell_idle,
+                can_paste,
+                controlling,
+            },
         );
         // 远程菜单的「新建文件夹/文件」「删除」请求 → 开远程对话框（本帧即渲染收集结果）。
         if let Some(dir) = rout.new_dir_req.take() {
@@ -1241,6 +1297,7 @@ pub fn show(
         out.remote_dir_clicks = rout.dir_clicks;
         out.remote_toggle_hidden = rout.toggle_hidden;
         out.remote_fetch_open = rout.fetch_open;
+        out.remote_edit_file = rout.edit_file;
         out.remote_refresh_dir = rout.refresh_dir;
         out.remote_select = rout.select;
         out.filetree_hovered = rout.hovered;
@@ -1253,8 +1310,14 @@ pub fn show(
         out.copy_text = rout.copy_text;
         out.remote_create = rout.remote_create;
         out.remote_delete = rout.remote_delete;
+        out.ssh_create = rout.ssh_create;
+        out.ssh_delete = rout.ssh_delete;
         // 菜单「进入文件夹」→ main 往远程会话注入 cd。
         out.remote_cd = rout.cd_dir;
+        if rout.busy_hint {
+            st.toast
+                .push(toast::ToastKind::Warn, crate::i18n::strings().shell_busy_cd);
+        }
         if rout.dialog_closed {
             out.filetree_dialog_closed = true;
         }
@@ -1263,7 +1326,8 @@ pub fn show(
         // 本地树可粘贴 = 系统剪贴板有文件（资源管理器/Lumen 本地复制 → 本机复制到此目录）
         // 或 Lumen 内部有远程项（远程复制 → 下载到此目录）。粘贴方向在 main 按目标侧分派。
         let can_paste = crate::clipboard_files::has_files()
-            || input.file_clipboard_side == Some(ClipSide::Remote);
+            || input.file_clipboard_side == Some(ClipSide::Remote)
+            || input.ssh_file_clipboard_available;
         let ft = filetree::show(
             root,
             &mut st.filetree,
@@ -1355,7 +1419,7 @@ pub fn show(
     // AltScreen 时 footer 隐藏（ComposerView::hidden），但状态栏仍保持可见以便
     // 用户随时知道当前模式（与 footer 逻辑独立）。
     #[cfg(feature = "input-editor")]
-    if !is_ssh_view {
+    if !is_ssh_view && !st.text_editor.is_open() {
         let sb_resp = egui::Panel::bottom("lumen_statusbar")
             .exact_size(statusbar::HEIGHT)
             .show_separator_line(false)
@@ -1395,6 +1459,16 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
+
+            // 远程/SSH 文件右键“编辑”在中央工作区打开 Lumen 内置编辑器。
+            // PTY 与远程控制连接继续在后台运行，但中央区不再渲染或命中终端。
+            if st.text_editor.is_open() {
+                let editor = text_editor::show(ui, &mut st.text_editor, pal);
+                out.text_editor_load = editor.load;
+                out.text_editor_save = editor.save;
+                out.text_editor_closed = editor.closed;
+                return;
+            }
 
             // SSH 服务器/会话使用独立领域；未选择服务器时不得渲染或
             // 命中后台本地终端。

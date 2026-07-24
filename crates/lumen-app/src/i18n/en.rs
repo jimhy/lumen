@@ -168,6 +168,8 @@ pub static STRINGS: Strings = Strings {
     remote_upload_done_fmt: "Upload done: {0} ok, {1} skipped, {2} errors",
     remote_menu_paste: "Paste into this folder",
     remote_menu_copy: "Copy",
+    filetree_menu_edit: "Edit",
+    filetree_menu_delete_permanent: "Delete permanently",
     remote_overwrite_prompt_fmt: "{} item(s) with the same name exist. What to do?",
     remote_overwrite_overwrite: "Overwrite all",
     remote_overwrite_skip: "Skip existing",
@@ -202,6 +204,32 @@ pub static STRINGS: Strings = Strings {
     filetree_menu_copy_abs: "Copy absolute path",
     filetree_menu_copy_rel: "Copy relative path",
     filetree_menu_delete: "Delete (move to Recycle Bin)",
+    text_editor_saving: "Saving…",
+    text_editor_saved: "Saved",
+    text_editor_unsaved: "Unsaved",
+    text_editor_find_hint: "Find",
+    text_editor_stats_fmt: "{0} lines · {1} bytes",
+    text_editor_remote_changed_title: "The remote file changed",
+    text_editor_remote_changed_body:
+        "Reload the remote file, or overwrite it with your current buffer.",
+    text_editor_keep_editing: "Keep editing",
+    text_editor_reload: "Reload",
+    text_editor_overwrite: "Overwrite",
+    text_editor_unsaved_title: "Unsaved changes",
+    text_editor_unsaved_body: "Your changes have not been saved to the remote file.",
+    text_editor_discard: "Discard changes",
+    text_editor_save_too_large_fmt: "The edited file exceeds the {} MiB save limit.",
+    text_editor_open_too_large_fmt:
+        "This file is larger than the {} MiB editor limit. Double-click it to download and open a local copy.",
+    text_editor_binary_error:
+        "This appears to be a binary file. Double-click it to download and open a local copy.",
+    text_editor_utf8_only_error: "The built-in editor currently supports UTF-8 text files only.",
+    text_editor_mixed_eol_error:
+        "This file uses mixed or legacy line endings. Open a local copy to avoid changing its byte format.",
+    text_editor_source_invalidated:
+        "The remote session changed. Reopen the file before saving it.",
+    text_editor_closed_account_change:
+        "The remote editor was closed because the account changed.",
     // main.rs toasts
     toast_bg_load_failed_fmt: "Background image load failed: {}",
     toast_max_panes_fmt: "Maximum {} panes per session",

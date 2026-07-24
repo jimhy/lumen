@@ -7,6 +7,7 @@
 mod credential;
 mod host_key;
 mod metrics;
+mod sftp;
 mod transport;
 
 pub use credential::{Credential, PrivateKeyCredential, SecretString};
@@ -14,6 +15,10 @@ pub use host_key::{decide_host_key, HostKeyDecision, HostKeyIdentity, HostKeyIde
 pub use metrics::{
     CpuCoreMetrics, DiskIoMetrics, MetricsAccumulator, MetricsError, NetworkMetrics,
     ProcessMetrics, ServerMetrics, ServerMonitorDetails, StorageMetrics, SystemMemoryMetrics,
+};
+pub use sftp::{
+    FileCommand, FileCommandSendError, FileError, FileEvent, FileEventReceiveError, FileOperation,
+    FileVersion, TransferDirection,
 };
 pub use transport::{
     Command, CommandSendError, ConnectionConfig, ConnectionMode, DirectoryEntry,

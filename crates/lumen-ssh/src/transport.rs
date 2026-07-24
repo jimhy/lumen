@@ -17,7 +17,7 @@ use russh::client;
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
-use russh::{Channel, ChannelMsg, Disconnect};
+use russh::{Channel, ChannelMsg, Disconnect, Pty};
 use thiserror::Error;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use tokio::sync::mpsc;
@@ -27,6 +27,9 @@ use zeroize::Zeroizing;
 use crate::credential::{Credential, SecretString};
 use crate::host_key::{decide_host_key, HostKeyDecision, HostKeyIdentity};
 use crate::metrics::{MetricsAccumulator, ServerMetrics, LINUX_METRICS_COMMAND};
+use crate::sftp::{
+    self, FileCommand, FileCommandSendError, FileEvent, FileEventReceiveError, FileLanes,
+};
 
 #[path = "directory.rs"]
 mod directory;
@@ -36,14 +39,42 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMANDS_PER_TICK: usize = 64;
 const MAX_MONITOR_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_PRIVATE_KEY_BYTES: usize = 1024 * 1024;
+const SHELL_DETECT_COMMAND: &[u8] = b"printf '%s' \"$SHELL\"";
+const SHELL_DETECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SHELL_PATH_BYTES: usize = 1024;
+const BASH_CWD_BOOTSTRAP_COMMAND: &[u8] = b"__lumen_cwd_hook(){ local __lumen_status=$?; printf '\\033]9;9;%s\\007' \"$PWD\"; return \"$__lumen_status\"; }; if declare -p PROMPT_COMMAND 2>/dev/null | grep -q '^declare -a'; then case \" ${PROMPT_COMMAND[*]} \" in *' __lumen_cwd_hook '*) :;; *) PROMPT_COMMAND+=(__lumen_cwd_hook);; esac; else case \";${PROMPT_COMMAND-};\" in *';__lumen_cwd_hook;'*) :;; *) PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__lumen_cwd_hook\";; esac; fi; __lumen_cwd_hook\r";
+const ZSH_CWD_BOOTSTRAP_COMMAND: &[u8] = b"autoload -Uz add-zsh-hook; __lumen_cwd_hook(){ local __lumen_status=$?; printf '\\033]9;9;%s\\007' \"$PWD\"; return \"$__lumen_status\"; }; add-zsh-hook precmd __lumen_cwd_hook; __lumen_cwd_hook\r";
+const FISH_CWD_BOOTSTRAP_COMMAND: &[u8] = b"functions -e __lumen_cwd_hook 2>/dev/null; function __lumen_cwd_hook --on-event fish_prompt; set -l __lumen_status $status; printf '\\033]9;9;%s\\007' \"$PWD\"; return $__lumen_status; end; __lumen_cwd_hook\r";
+const RESTORE_PTY_ECHO_COMMAND: &[u8] = b"stty echo\r";
+const PTY_BOOTSTRAP_MODES: [(Pty, u32); 2] = [(Pty::ECHO, 0), (Pty::ECHONL, 0)];
 #[cfg(windows)]
 const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 static CONNECTION_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteShellKind {
+    Bash,
+    Zsh,
+    Fish,
+}
+
 struct DirectoryLanes {
     command_rx: Receiver<Command>,
     event_tx: Sender<Event>,
+}
+
+struct ConnectionLanes {
+    command_rx: Receiver<Command>,
+    event_tx: Sender<Event>,
+    directory: DirectoryLanes,
+    file: FileLanes,
+}
+
+struct ShellLanes {
+    command_rx: Receiver<Command>,
+    directory: DirectoryLanes,
+    file: FileLanes,
 }
 
 pub struct ConnectionConfig {
@@ -497,6 +528,9 @@ pub struct SshConnection {
     event_rx: Receiver<Event>,
     directory_command_tx: Sender<Command>,
     directory_event_rx: Receiver<Event>,
+    file_command_tx: Sender<FileCommand>,
+    file_event_rx: Receiver<FileEvent>,
+    file_progress_event_rx: Receiver<FileEvent>,
     cancelled: Arc<AtomicBool>,
     maximum_input_bytes: usize,
     thread: Option<JoinHandle<()>>,
@@ -511,6 +545,10 @@ impl SshConnection {
         let (event_tx, event_rx) = bounded(queues.event_capacity);
         let (directory_command_tx, directory_command_rx) = bounded(directory::COMMAND_CAPACITY);
         let (directory_event_tx, directory_event_rx) = bounded(directory::EVENT_CAPACITY);
+        let (file_command_tx, file_command_rx) = bounded(sftp::COMMAND_CAPACITY);
+        let (file_event_tx, file_event_rx) = bounded(sftp::EVENT_CAPACITY);
+        let (file_progress_event_tx, file_progress_event_rx) =
+            bounded(sftp::PROGRESS_EVENT_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
         let thread_cancelled = Arc::clone(&cancelled);
         let thread_number = CONNECTION_THREAD_ID.fetch_add(1, Ordering::Relaxed);
@@ -520,10 +558,19 @@ impl SshConnection {
             .spawn(move || {
                 connection_thread(
                     config,
-                    command_rx,
-                    event_tx,
-                    directory_command_rx,
-                    directory_event_tx,
+                    ConnectionLanes {
+                        command_rx,
+                        event_tx,
+                        directory: DirectoryLanes {
+                            command_rx: directory_command_rx,
+                            event_tx: directory_event_tx,
+                        },
+                        file: FileLanes {
+                            command_rx: file_command_rx,
+                            event_tx: file_event_tx,
+                            progress_event_tx: file_progress_event_tx,
+                        },
+                    },
                     thread_cancelled,
                 );
             })
@@ -534,6 +581,9 @@ impl SshConnection {
             event_rx,
             directory_command_tx,
             directory_event_rx,
+            file_command_tx,
+            file_event_rx,
+            file_progress_event_rx,
             cancelled,
             maximum_input_bytes: queues.maximum_input_bytes,
             thread: Some(thread),
@@ -575,6 +625,33 @@ impl SshConnection {
     /// Drains the independent directory result lane without blocking.
     pub fn drain_directory(&self, destination: &mut Vec<Event>) {
         destination.extend(self.directory_event_rx.try_iter());
+    }
+
+    /// Enqueues an SFTP operation without blocking the terminal or caller.
+    pub fn send_file(&self, command: FileCommand) -> Result<(), FileCommandSendError> {
+        sftp::try_send(&self.file_command_tx, command)
+    }
+
+    /// Receives one independent SFTP event without blocking.
+    pub fn try_recv_file(&self) -> Result<FileEvent, FileEventReceiveError> {
+        match self.file_event_rx.try_recv() {
+            Ok(event) => Ok(event),
+            Err(terminal_error) => match self.file_progress_event_rx.try_recv() {
+                Ok(event) => Ok(event),
+                Err(progress_error) => match (terminal_error, progress_error) {
+                    (CrossbeamTryRecvError::Disconnected, CrossbeamTryRecvError::Disconnected) => {
+                        Err(FileEventReceiveError::Closed)
+                    }
+                    _ => Err(FileEventReceiveError::Empty),
+                },
+            },
+        }
+    }
+
+    /// Drains independent SFTP events without touching the terminal event lane.
+    pub fn drain_file(&self, destination: &mut Vec<FileEvent>) {
+        destination.extend(self.file_event_rx.try_iter());
+        destination.extend(self.file_progress_event_rx.try_iter());
     }
 
     #[must_use]
@@ -654,16 +731,9 @@ fn try_send_directory_command(
     })
 }
 
-fn connection_thread(
-    config: ConnectionConfig,
-    command_rx: Receiver<Command>,
-    event_tx: Sender<Event>,
-    directory_command_rx: Receiver<Command>,
-    directory_event_tx: Sender<Event>,
-    cancelled: Arc<AtomicBool>,
-) {
+fn connection_thread(config: ConnectionConfig, lanes: ConnectionLanes, cancelled: Arc<AtomicBool>) {
     let mut sink = EventSink::new(
-        event_tx,
+        lanes.event_tx,
         config.queues.event_capacity,
         config.queues.maximum_pending_event_bytes,
     );
@@ -686,10 +756,10 @@ fn connection_thread(
 
     let result = runtime.block_on(run_connection(
         config,
-        command_rx,
-        DirectoryLanes {
-            command_rx: directory_command_rx,
-            event_tx: directory_event_tx,
+        ShellLanes {
+            command_rx: lanes.command_rx,
+            directory: lanes.directory,
+            file: lanes.file,
         },
         &mut sink,
         Arc::clone(&cancelled),
@@ -718,8 +788,7 @@ fn build_current_thread_runtime() -> Result<Runtime, std::io::Error> {
 
 async fn run_connection(
     mut config: ConnectionConfig,
-    command_rx: Receiver<Command>,
-    directory_lanes: DirectoryLanes,
+    lanes: ShellLanes,
     sink: &mut EventSink,
     cancelled: Arc<AtomicBool>,
 ) -> Result<DisconnectReason, Failure> {
@@ -815,6 +884,13 @@ async fn run_connection(
         return Ok(DisconnectReason::Requested);
     }
 
+    // Query the account's configured shell on an isolated exec channel before
+    // writing any bootstrap text into the interactive PTY. Sending Bash syntax
+    // blindly to fish/csh both prints noise and can corrupt the user's command
+    // line. Detection is optional and tightly bounded: an unknown shell keeps
+    // the terminal usable, only without automatic cwd tracking.
+    let cwd_bootstrap = detect_cwd_bootstrap(&session, &cancelled).await;
+
     let shell_result = unless_cancelled(session.channel_open_session(), &cancelled).await;
     let Some(shell_result) = shell_result else {
         disconnect_quickly(&session).await;
@@ -830,7 +906,7 @@ async fn run_connection(
             config.terminal.rows,
             config.terminal.pixel_width,
             config.terminal.pixel_height,
-            &[],
+            &PTY_BOOTSTRAP_MODES,
         ),
         &cancelled,
     )
@@ -846,22 +922,112 @@ async fn run_connection(
         return Ok(DisconnectReason::HandleDropped);
     };
     shell_request.map_err(|_| Failure::channel("the SSH server rejected the shell request"))?;
+    if let Some(command) = cwd_bootstrap {
+        let bootstrap = unless_cancelled(shell.data_bytes(command.to_vec()), &cancelled).await;
+        let Some(bootstrap) = bootstrap else {
+            disconnect_quickly(&session).await;
+            return Ok(DisconnectReason::HandleDropped);
+        };
+        bootstrap
+            .map_err(|_| Failure::channel("could not initialize SSH current-directory tracking"))?;
+    }
+    let restore_echo = unless_cancelled(
+        shell.data_bytes(RESTORE_PTY_ECHO_COMMAND.to_vec()),
+        &cancelled,
+    )
+    .await;
+    let Some(restore_echo) = restore_echo else {
+        disconnect_quickly(&session).await;
+        return Ok(DisconnectReason::HandleDropped);
+    };
+    restore_echo.map_err(|_| Failure::channel("could not restore SSH terminal echo"))?;
     sink.emit(Event::Connected {
         host_key: trusted_host_key,
     })?;
 
-    let loop_result = drive_shell(
-        &session,
-        &mut shell,
-        command_rx,
-        directory_lanes,
-        sink,
-        cancelled,
-        config.metrics,
-    )
-    .await;
+    let loop_result =
+        drive_shell(&session, &mut shell, lanes, sink, cancelled, config.metrics).await;
     disconnect_quickly(&session).await;
     loop_result
+}
+
+async fn detect_cwd_bootstrap(
+    session: &client::Handle<StrictHostKeyHandler>,
+    cancelled: &Arc<AtomicBool>,
+) -> Option<&'static [u8]> {
+    let opened = unless_cancelled(
+        timeout(SHELL_DETECT_TIMEOUT, session.channel_open_session()),
+        cancelled,
+    )
+    .await?;
+    let channel = match opened {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    let executed = unless_cancelled(
+        timeout(
+            SHELL_DETECT_TIMEOUT,
+            channel.exec(true, SHELL_DETECT_COMMAND),
+        ),
+        cancelled,
+    )
+    .await?;
+    if !matches!(executed, Ok(Ok(()))) {
+        return None;
+    }
+    let collected = unless_cancelled(
+        timeout(SHELL_DETECT_TIMEOUT, collect_shell_path(channel)),
+        cancelled,
+    )
+    .await?;
+    let shell_path = match collected {
+        Ok(Some(shell_path)) => shell_path,
+        Ok(None) | Err(_) => return None,
+    };
+    cwd_bootstrap_for_shell_path(&shell_path)
+}
+
+async fn collect_shell_path(mut channel: Channel<client::Msg>) -> Option<String> {
+    let mut output = Vec::new();
+    let mut exit_status = None;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                if output.len().saturating_add(data.len()) > MAX_SHELL_PATH_BYTES {
+                    return None;
+                }
+                output.extend_from_slice(&data);
+            }
+            ChannelMsg::ExitStatus {
+                exit_status: status,
+            } => exit_status = Some(status),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    if exit_status.is_some_and(|status| status != 0) {
+        return None;
+    }
+    String::from_utf8(output).ok()
+}
+
+fn cwd_bootstrap_for_shell_path(path: &str) -> Option<&'static [u8]> {
+    let executable = path
+        .trim_matches(|character: char| character.is_ascii_whitespace() || character == '\0')
+        .rsplit('/')
+        .next()?
+        .to_ascii_lowercase();
+    let kind = match executable.as_str() {
+        "bash" | "rbash" => RemoteShellKind::Bash,
+        "zsh" => RemoteShellKind::Zsh,
+        "fish" => RemoteShellKind::Fish,
+        _ => return None,
+    };
+    Some(match kind {
+        RemoteShellKind::Bash => BASH_CWD_BOOTSTRAP_COMMAND,
+        RemoteShellKind::Zsh => ZSH_CWD_BOOTSTRAP_COMMAND,
+        RemoteShellKind::Fish => FISH_CWD_BOOTSTRAP_COMMAND,
+    })
 }
 
 const fn opens_interactive_shell(mode: ConnectionMode) -> bool {
@@ -973,6 +1139,8 @@ fn read_private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, Failure> {
 type DynamicAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
 type DirectoryStartFuture<'a> =
     Pin<Box<dyn Future<Output = Result<directory::Opened, (directory::Job, DirectoryError)>> + 'a>>;
+type SftpStartFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<crate::sftp::FileSession, crate::sftp::FileError>> + 'a>>;
 
 async fn authenticate_agent(
     session: &mut client::Handle<StrictHostKeyHandler>,
@@ -1052,12 +1220,16 @@ async fn connect_platform_agent() -> Result<DynamicAgent, Failure> {
 async fn drive_shell(
     session: &client::Handle<StrictHostKeyHandler>,
     shell: &mut Channel<client::Msg>,
-    command_rx: Receiver<Command>,
-    directory_lanes: DirectoryLanes,
+    lanes: ShellLanes,
     sink: &mut EventSink,
     cancelled: Arc<AtomicBool>,
     metrics_config: MetricsConfig,
 ) -> Result<DisconnectReason, Failure> {
+    let ShellLanes {
+        command_rx,
+        directory: directory_lanes,
+        file: file_lanes,
+    } = lanes;
     let mut command_tick = tokio::time::interval(COMMAND_POLL_INTERVAL);
     command_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let (monitor_tx, mut monitor_rx) = mpsc::channel::<MonitorResult>(1);
@@ -1073,6 +1245,9 @@ async fn drive_shell(
     let mut directory_cancellations = HashMap::<u64, Arc<AtomicBool>>::new();
     let mut directory_waiting = VecDeque::<directory::Job>::new();
     let mut directory_start: Option<DirectoryStartFuture<'_>> = None;
+    let mut sftp_start: Option<SftpStartFuture<'_>> = Some(Box::pin(sftp::open(session)));
+    let mut file_lanes = Some(file_lanes);
+    let mut _file_service = None;
 
     loop {
         if directory_start.is_none() {
@@ -1098,6 +1273,19 @@ async fn drive_shell(
         }
 
         tokio::select! {
+            opened = async {
+                sftp_start
+                    .as_mut()
+                    .expect("SFTP start branch is guarded")
+                    .await
+            }, if sftp_start.is_some() => {
+                sftp_start = None;
+                _file_service = Some(sftp::spawn_service(
+                    opened,
+                    file_lanes.take().expect("SFTP lanes are started once"),
+                    Arc::clone(&cancelled),
+                ));
+            }
             started = async {
                 directory_start
                     .as_mut()
@@ -1691,6 +1879,56 @@ mod tests {
         let (interval, maximum_missed_replies) = effective_keepalive(config.mode, config.keepalive);
         assert_eq!(interval, Some(Duration::from_secs(30)));
         assert_eq!(maximum_missed_replies, 3);
+    }
+
+    #[test]
+    fn cwd_bootstrap_is_shell_specific_hidden_and_preserves_bash_prompt_shape() {
+        let bash = std::str::from_utf8(BASH_CWD_BOOTSTRAP_COMMAND).expect("ASCII Bash bootstrap");
+        let zsh = std::str::from_utf8(ZSH_CWD_BOOTSTRAP_COMMAND).expect("ASCII Zsh bootstrap");
+        let fish = std::str::from_utf8(FISH_CWD_BOOTSTRAP_COMMAND).expect("ASCII fish bootstrap");
+        for bootstrap in [bash, zsh, fish] {
+            assert!(bootstrap.contains(r"\033]9;9;%s\007"));
+            assert!(bootstrap.contains("\"$PWD\""));
+            assert!(bootstrap.ends_with('\r'));
+        }
+        assert!(bash.contains("declare -p PROMPT_COMMAND"));
+        assert!(bash.contains("PROMPT_COMMAND+=(__lumen_cwd_hook)"));
+        assert!(bash.contains("return \"$__lumen_status\""));
+        assert!(zsh.contains("add-zsh-hook precmd"));
+        assert!(fish.contains("--on-event fish_prompt"));
+        assert!(!fish.contains("--on-variable PWD"));
+        assert!(fish.contains("return $__lumen_status"));
+        assert_eq!(PTY_BOOTSTRAP_MODES, [(Pty::ECHO, 0), (Pty::ECHONL, 0)]);
+        assert_eq!(RESTORE_PTY_ECHO_COMMAND, b"stty echo\r");
+    }
+
+    #[test]
+    fn fish_cwd_hook_marks_every_prompt_without_wrapping_or_recursing() {
+        let fish = std::str::from_utf8(FISH_CWD_BOOTSTRAP_COMMAND).expect("ASCII fish bootstrap");
+        assert!(fish.contains("function __lumen_cwd_hook --on-event fish_prompt"));
+        assert!(fish.contains("functions -e __lumen_cwd_hook"));
+        assert!(!fish.contains("function fish_prompt"));
+        assert!(!fish.contains("functions -c fish_prompt"));
+        assert_eq!(fish.matches("--on-event fish_prompt").count(), 1);
+    }
+
+    #[test]
+    fn cwd_bootstrap_detection_never_sends_foreign_syntax_to_unknown_shells() {
+        assert_eq!(
+            cwd_bootstrap_for_shell_path("/bin/bash"),
+            Some(BASH_CWD_BOOTSTRAP_COMMAND)
+        );
+        assert_eq!(
+            cwd_bootstrap_for_shell_path(" /usr/local/bin/zsh\r\n"),
+            Some(ZSH_CWD_BOOTSTRAP_COMMAND)
+        );
+        assert_eq!(
+            cwd_bootstrap_for_shell_path("/opt/homebrew/bin/fish"),
+            Some(FISH_CWD_BOOTSTRAP_COMMAND)
+        );
+        assert_eq!(cwd_bootstrap_for_shell_path("/bin/dash"), None);
+        assert_eq!(cwd_bootstrap_for_shell_path("/bin/tcsh"), None);
+        assert_eq!(cwd_bootstrap_for_shell_path(""), None);
     }
 
     #[test]

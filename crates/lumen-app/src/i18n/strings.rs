@@ -334,6 +334,10 @@ pub struct Strings {
     pub remote_menu_paste: &'static str,
     /// part3c-2 #7：远程/本地树右键「复制」菜单
     pub remote_menu_copy: &'static str,
+    /// 远程/SSH 文件右键：在 Lumen 内置文本编辑器中编辑
+    pub filetree_menu_edit: &'static str,
+    /// SSH 删除没有回收站能力，明确提示永久删除
+    pub filetree_menu_delete_permanent: &'static str,
     /// part3c-2 #7：覆盖弹窗标题 / 提示（单参 `{}` = 冲突项数）
     pub remote_overwrite_prompt_fmt: &'static str,
     /// part3c-2 #7：覆盖弹窗「覆盖全部」按钮
@@ -405,6 +409,31 @@ pub struct Strings {
     pub filetree_menu_copy_rel: &'static str,
     /// "删除（移入回收站）"
     pub filetree_menu_delete: &'static str,
+
+    // ── 内置远端文本编辑器 ─────────────────────────────────────────
+    pub text_editor_saving: &'static str,
+    pub text_editor_saved: &'static str,
+    pub text_editor_unsaved: &'static str,
+    pub text_editor_find_hint: &'static str,
+    /// `{0}` 行数，`{1}` UTF-8 缓冲字节数。
+    pub text_editor_stats_fmt: &'static str,
+    pub text_editor_remote_changed_title: &'static str,
+    pub text_editor_remote_changed_body: &'static str,
+    pub text_editor_keep_editing: &'static str,
+    pub text_editor_reload: &'static str,
+    pub text_editor_overwrite: &'static str,
+    pub text_editor_unsaved_title: &'static str,
+    pub text_editor_unsaved_body: &'static str,
+    pub text_editor_discard: &'static str,
+    /// 单参 `{}`：MiB 上限。
+    pub text_editor_save_too_large_fmt: &'static str,
+    /// 单参 `{}`：MiB 上限。
+    pub text_editor_open_too_large_fmt: &'static str,
+    pub text_editor_binary_error: &'static str,
+    pub text_editor_utf8_only_error: &'static str,
+    pub text_editor_mixed_eol_error: &'static str,
+    pub text_editor_source_invalidated: &'static str,
+    pub text_editor_closed_account_change: &'static str,
 
     // ── main.rs toast ────────────────────────────────────────────────
     /// 背景图加载失败 toast，单参 `{}`：错误文本

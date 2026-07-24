@@ -11,7 +11,9 @@ repository.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
 russh.workspace = true
+russh-sftp.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 zeroize.workspace = true

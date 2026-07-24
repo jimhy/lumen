@@ -190,6 +190,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "tim
 # P1 SSH 传输：固定 russh 版本并关闭默认 aws-lc-rs，统一使用 ring；rsa
 # 显式开启以兼容常见 OpenSSH RSA 私钥/agent identity。该组合不依赖系统 OpenSSL。
 russh = { version = "=0.62.4", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "=2.3.0"
 zeroize = "1"
 # QUIC 栈：rustls 0.23 + ring 后端，与 tungstenite 的 rustls-tls-native-roots 同源
 # （Cargo.lock 已有 rustls 0.23 / ring 0.17，不新增加密栈）。default-features = false
