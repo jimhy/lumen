@@ -2130,10 +2130,14 @@ impl AppState {
     }
 
     fn invalidate_stale_text_editor_source(&mut self) {
-        let Some(source) = self.shell_state.text_editor.source().cloned() else {
-            return;
-        };
-        if !self.text_editor_source_is_current(&source) {
+        let stale_sources = self
+            .shell_state
+            .text_editor
+            .sources()
+            .filter(|source| !self.text_editor_source_is_current(source))
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in stale_sources {
             self.shell_state.text_editor.invalidate_source(
                 &source,
                 i18n::strings().text_editor_source_invalidated,
@@ -2148,7 +2152,7 @@ impl AppState {
             match event {
                 remote_ws::EditEvent::Loaded { token, bytes, .. } => {
                     if matches!(
-                        self.shell_state.text_editor.source(),
+                        self.shell_state.text_editor.source_for_token(token),
                         Some(TextFileSource::Remote { generation, .. })
                             if *generation == current_generation
                     ) {
@@ -2156,7 +2160,7 @@ impl AppState {
                     }
                 }
                 remote_ws::EditEvent::Saved { token, .. } => {
-                    let path = match self.shell_state.text_editor.source() {
+                    let path = match self.shell_state.text_editor.source_for_token(token) {
                         Some(TextFileSource::Remote { generation, path })
                             if *generation == current_generation =>
                         {
@@ -2178,7 +2182,7 @@ impl AppState {
                 }
                 remote_ws::EditEvent::Conflict { token, .. } => {
                     if matches!(
-                        self.shell_state.text_editor.source(),
+                        self.shell_state.text_editor.source_for_token(token),
                         Some(TextFileSource::Remote { generation, .. })
                             if *generation == current_generation
                     ) {
@@ -2190,7 +2194,7 @@ impl AppState {
                 remote_ws::EditEvent::Error { token, error, .. } => {
                     let message = remote_edit_error_message(error);
                     if matches!(
-                        self.shell_state.text_editor.source(),
+                        self.shell_state.text_editor.source_for_token(token),
                         Some(TextFileSource::Remote { generation, .. })
                             if *generation == current_generation
                     ) && !self.shell_state.text_editor.apply_saved(
@@ -3688,21 +3692,27 @@ impl AppState {
         if !outcome.editor_invalidated_sessions.is_empty() {
             let runtime_id = self.ssh_runtime.runtime_id();
             for session_id in outcome.editor_invalidated_sessions {
-                let source = self.shell_state.text_editor.source().cloned();
-                if let Some(
-                    source @ shell::text_editor::TextFileSource::Ssh {
-                        runtime_id: source_runtime,
-                        session_id: source_session,
-                        ..
-                    },
-                ) = source
-                {
-                    if source_runtime == runtime_id && source_session == session_id {
-                        self.shell_state.text_editor.invalidate_source(
-                            &source,
-                            i18n::strings().text_editor_source_invalidated,
-                        );
-                    }
+                let sources = self
+                    .shell_state
+                    .text_editor
+                    .sources()
+                    .filter(|source| {
+                        matches!(
+                            source,
+                            shell::text_editor::TextFileSource::Ssh {
+                                runtime_id: source_runtime,
+                                session_id: source_session,
+                                ..
+                            } if *source_runtime == runtime_id && *source_session == session_id
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for source in sources {
+                    self.shell_state.text_editor.invalidate_source(
+                        &source,
+                        i18n::strings().text_editor_source_invalidated,
+                    );
                 }
             }
             self.window.request_redraw();
@@ -3827,12 +3837,14 @@ impl AppState {
                     ..
                 } => {
                     let source_matches = matches!(
-                        self.shell_state.text_editor.source(),
+                        self.shell_state
+                            .text_editor
+                            .source_for_token(document_token),
                         Some(TextFileSource::Ssh {
                             runtime_id: source_runtime,
-                            session_id: active,
+                            session_id: source_session,
                             ..
-                        }) if *source_runtime == runtime_id && *active == session_id
+                        }) if *source_runtime == runtime_id && *source_session == session_id
                     );
                     if source_matches {
                         self.shell_state
@@ -3846,12 +3858,14 @@ impl AppState {
                     ..
                 } => {
                     let source_matches = matches!(
-                        self.shell_state.text_editor.source(),
+                        self.shell_state
+                            .text_editor
+                            .source_for_token(document_token),
                         Some(TextFileSource::Ssh {
                             runtime_id: source_runtime,
-                            session_id: active,
+                            session_id: source_session,
                             ..
-                        }) if *source_runtime == runtime_id && *active == session_id
+                        }) if *source_runtime == runtime_id && *source_session == session_id
                     );
                     if source_matches {
                         self.shell_state
@@ -3864,12 +3878,14 @@ impl AppState {
                     document_token,
                 } => {
                     let source_matches = matches!(
-                        self.shell_state.text_editor.source(),
+                        self.shell_state
+                            .text_editor
+                            .source_for_token(document_token),
                         Some(TextFileSource::Ssh {
                             runtime_id: source_runtime,
-                            session_id: active,
+                            session_id: source_session,
                             ..
-                        }) if *source_runtime == runtime_id && *active == session_id
+                        }) if *source_runtime == runtime_id && *source_session == session_id
                     );
                     if source_matches {
                         self.shell_state
@@ -3938,12 +3954,13 @@ impl AppState {
                     let message = ssh_file_error_message(operation, error);
                     if let Some(token) = document_token {
                         let source_matches = matches!(
-                            self.shell_state.text_editor.source(),
+                            self.shell_state.text_editor.source_for_token(token),
                             Some(TextFileSource::Ssh {
                                 runtime_id: source_runtime,
-                                session_id: active,
+                                session_id: source_session,
                                 ..
-                            }) if *source_runtime == runtime_id && *active == session_id
+                            }) if *source_runtime == runtime_id
+                                && *source_session == session_id
                         );
                         if source_matches
                             && !self.shell_state.text_editor.apply_saved(
@@ -12950,6 +12967,7 @@ impl ApplicationHandler<PtyWake> for App {
                             &actual,
                         )
                     });
+                    state.shell_state.text_editor.invalidate_visual_cache();
                 }
                 if shell_out.settings_theme_changed {
                     // 主题即时生效（P12 画廊点选/槽位变更/Sync 开关
@@ -12980,6 +12998,14 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
+                // SSH 服务器栏显隐：与远程设备栏交互一致，但状态独立持久化。
+                let ssh_server_list_changed =
+                    if let Some(v) = shell_out.toggle_ssh_server_list {
+                        state.settings.layout.ssh_server_list_visible = v;
+                        true
+                    } else {
+                        false
+                    };
                 // 第十九轮：顶栏② 文件树显隐——写入 settings 并触发存盘。
                 // shell/mod.rs 已在 toggle_filetree 信号路径同步更新
                 // ShellState::filetree.visible（两入口共享同一状态源）；
@@ -13007,6 +13033,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_server_url_changed
                     || sidebar_changed
                     || remote_list_changed
+                    || ssh_server_list_changed
                     || filetree_changed
                     || view_mode_changed;
                 // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。

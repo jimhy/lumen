@@ -202,6 +202,10 @@ pub struct LayoutSettings {
     /// `#[serde(default)]` 保证旧文件缺字段时补 true（与 Default 一致）。
     #[serde(default = "default_remote_list_visible")]
     pub remote_list_visible: bool,
+    /// SSH 服务器栏是否可见：仅 SSH 视图生效，true = 显示（默认），false = 隐藏。
+    /// 与 SSH 会话栏的 `sidebar_visible` 独立，隐藏服务器栏不会断开已有连接。
+    #[serde(default = "default_ssh_server_list_visible")]
+    pub ssh_server_list_visible: bool,
     /// 中间文件树栏是否可见（第十九轮持久化）：true = 显示（默认），false = 隐藏。
     ///
     /// 变更来源：顶栏②按钮（`toggle_filetree` 信号）与 Ctrl+B 快捷键
@@ -228,6 +232,11 @@ fn default_remote_list_visible() -> bool {
     true
 }
 
+/// ssh_server_list_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
+fn default_ssh_server_list_visible() -> bool {
+    true
+}
+
 /// filetree_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
 fn default_filetree_visible() -> bool {
     true
@@ -240,6 +249,7 @@ impl Default for LayoutSettings {
             filetree_width: FILETREE_WIDTH_DEFAULT,
             sidebar_visible: true,
             remote_list_visible: true,
+            ssh_server_list_visible: true,
             filetree_visible: true,
             view_mode: ViewMode::Local,
         }
@@ -516,6 +526,14 @@ impl Settings {
                     "remote_list_visible",
                     "layout.remote_list_visible",
                     d.remote_list_visible,
+                    path,
+                );
+                // ssh_server_list_visible：旧文件缺字段静默补 true。
+                s.layout.ssh_server_list_visible = lenient_field(
+                    ly,
+                    "ssh_server_list_visible",
+                    "layout.ssh_server_list_visible",
+                    d.ssh_server_list_visible,
                     path,
                 );
                 // filetree_visible（第十九轮）：旧文件缺字段静默补 true。
@@ -811,6 +829,7 @@ mod tests {
                 filetree_width: 320.0,
                 sidebar_visible: true,
                 remote_list_visible: false,
+                ssh_server_list_visible: false,
                 filetree_visible: false,
                 view_mode: ViewMode::Ssh,
             },
@@ -1359,6 +1378,59 @@ mod tests {
             ViewMode::Remote,
             "旧版 true 应迁移为远程模式"
         );
+    }
+
+    // ── SSH 服务器栏可见性持久化测试 ──────────────────────────────────────
+
+    #[test]
+    fn ssh服务器栏可见性_默认值与旧文件兼容() {
+        assert!(
+            Settings::default().layout.ssh_server_list_visible,
+            "ssh_server_list_visible 默认应为 true"
+        );
+
+        let p = temp_path("ssh_server_list_compat_old");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "view_mode": "ssh", "sidebar_visible": false } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            loaded.layout.ssh_server_list_visible,
+            "旧文件缺 ssh_server_list_visible 字段时应补 true"
+        );
+    }
+
+    #[test]
+    fn ssh服务器栏可见性_隐藏态序列化往返() {
+        let p = temp_path("ssh_server_list_roundtrip_hidden");
+        let s = Settings {
+            layout: LayoutSettings {
+                ssh_server_list_visible: false,
+                ..LayoutSettings::default()
+            },
+            ..Settings::default()
+        };
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(!loaded.layout.ssh_server_list_visible);
+    }
+
+    #[test]
+    fn ssh服务器栏可见性_字段类型非法降级true() {
+        let p = temp_path("ssh_server_list_lenient");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "ssh_server_list_visible": "yes", "view_mode": "ssh" } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(loaded.layout.ssh_server_list_visible);
+        assert_eq!(loaded.layout.view_mode, ViewMode::Ssh);
     }
 
     #[test]

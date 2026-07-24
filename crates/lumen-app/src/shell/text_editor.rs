@@ -4,9 +4,14 @@
 //! 编码/换行约定、未保存确认和 egui 交互。这样远程控制与 SSH 可以
 //! 共用完全相同的编辑体验，同时不会把远端路径误当成本机 `PathBuf`。
 
+use std::collections::HashMap;
+
 use sha2::{Digest as _, Sha256};
 
-use super::theme::Palette;
+use super::{
+    text_editor_language::{CompletionKind, CompletionSet, Language, LanguageCache},
+    theme::Palette,
+};
 
 /// 内置编辑器允许载入的最大文本大小。
 ///
@@ -99,10 +104,15 @@ enum LoadState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PendingDecisionKind {
-    Close,
-    Switch,
-    OverwriteConflict,
+enum CloseScope {
+    Tab,
+    Editor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CloseIntent {
+    scope: CloseScope,
+    token: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +120,23 @@ struct PendingSave {
     token: u64,
     text: String,
     bytes_sha256: [u8; 32],
+}
+
+#[derive(Clone)]
+struct CompletionPopup {
+    token: u64,
+    fingerprint: [u8; 32],
+    set: CompletionSet,
+    selected: usize,
+    caret_rect: egui::Rect,
+}
+
+#[derive(Clone)]
+struct PendingCompletion {
+    token: u64,
+    fingerprint: [u8; 32],
+    replace_chars: std::ops::Range<usize>,
+    insertion: String,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +152,7 @@ struct Document {
     state: LoadState,
     error: Option<String>,
     pending_save: Option<PendingSave>,
+    save_conflict: bool,
     saved_flash_until: Option<std::time::Instant>,
     source_valid: bool,
 }
@@ -143,6 +171,7 @@ impl Document {
             state: LoadState::Loading,
             error: None,
             pending_save: None,
+            save_conflict: false,
             saved_flash_until: None,
             source_valid: true,
         }
@@ -167,79 +196,154 @@ impl Drop for Document {
 /// 跨帧编辑器状态。由 [`super::ShellState`] 持有。
 #[derive(Default)]
 pub struct TextEditorState {
-    document: Option<Document>,
+    documents: Vec<Document>,
+    active_token: Option<u64>,
     next_token: u64,
     focus_editor: bool,
     find_open: bool,
     focus_find: bool,
     find_query: String,
-    pending_source: Option<TextFileSource>,
-    pending_decision: Option<PendingDecisionKind>,
-    post_save_action: Option<PendingDecisionKind>,
+    pending_close: Option<CloseIntent>,
+    post_save_close: Option<CloseIntent>,
+    /// 关闭整个编辑器时，用户已选择“不保存”的文档及其当时正文指纹。
+    ///
+    /// 异步保存另一个标签期间仍允许用户继续操作；若已放弃的标签后来
+    /// 又被修改，指纹会失配，关闭流程必须再次询问，不能静默丢弃新编辑。
+    close_editor_discarded: HashMap<u64, [u8; 32]>,
+    language_caches: HashMap<u64, LanguageCache>,
+    completion: Option<CompletionPopup>,
+    pending_completion: Option<PendingCompletion>,
+    ime_composing: bool,
 }
 
 impl TextEditorState {
     #[must_use]
     pub fn is_open(&self) -> bool {
-        self.document.is_some()
+        !self.documents.is_empty()
     }
 
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        self.document.as_ref().is_some_and(Document::dirty)
+        self.documents.iter().any(Document::dirty)
     }
 
     #[must_use]
-    pub fn source(&self) -> Option<&TextFileSource> {
-        self.document.as_ref().map(|document| &document.source)
+    pub fn source_for_token(&self, token: u64) -> Option<&TextFileSource> {
+        self.document(token).map(|document| &document.source)
     }
 
-    /// 请求打开一个远端文件。当前文档无未保存修改时立即返回读取请求；
-    /// 否则先在编辑器内弹确认，确认丢弃后由 [`show`] 返回读取请求。
+    pub fn sources(&self) -> impl Iterator<Item = &TextFileSource> {
+        self.documents.iter().map(|document| &document.source)
+    }
+
+    /// 字体配置变更后清除已排版的语法高亮 Galley；正文与撤销历史不受影响。
+    pub fn invalidate_visual_cache(&mut self) {
+        self.language_caches.clear();
+        self.completion = None;
+    }
+
+    /// 请求打开一个远端文件。已打开的来源只切换到既有标签；新来源
+    /// 立即建立独立加载标签，不会替换或丢弃其他文档。
     pub fn request_open(&mut self, source: TextFileSource) -> Option<LoadRequest> {
-        if self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.source == source && document.source_valid)
+        if let Some(token) = self
+            .documents
+            .iter()
+            .find(|document| document.source == source && document.source_valid)
+            .map(|document| document.token)
         {
+            self.active_token = Some(token);
             self.focus_editor = true;
+            self.cancel_close_flow();
+            self.dismiss_completion();
             return None;
         }
-        if self.is_dirty()
-            || self
-                .document
-                .as_ref()
-                .is_some_and(|d| d.pending_save.is_some())
-        {
-            self.pending_source = Some(source);
-            self.pending_decision = Some(PendingDecisionKind::Switch);
-            return None;
-        }
+        self.cancel_close_flow();
+        self.dismiss_completion();
         Some(self.begin_load(source))
     }
 
     fn begin_load(&mut self, source: TextFileSource) -> LoadRequest {
         let token = self.allocate_token();
-        self.document = Some(Document::loading(source.clone(), token));
+        self.documents
+            .push(Document::loading(source.clone(), token));
+        self.active_token = Some(token);
         self.find_open = false;
         self.focus_find = false;
         self.find_query.clear();
         self.focus_editor = false;
+        self.dismiss_completion();
         LoadRequest { token, source }
     }
 
     fn allocate_token(&mut self) -> u64 {
-        let token = self.next_token.max(1);
-        self.next_token = token.checked_add(1).unwrap_or(1);
-        token
+        loop {
+            let token = self.next_token.max(1);
+            self.next_token = token.checked_add(1).unwrap_or(1);
+            if self
+                .documents
+                .iter()
+                .all(|document| document.token != token)
+            {
+                return token;
+            }
+        }
     }
 
-    /// 应用异步读取结果。陈旧 token（切换/关闭后的回包）会被静默丢弃。
+    fn document(&self, token: u64) -> Option<&Document> {
+        self.documents
+            .iter()
+            .find(|document| document.token == token)
+    }
+
+    fn document_mut(&mut self, token: u64) -> Option<&mut Document> {
+        self.documents
+            .iter_mut()
+            .find(|document| document.token == token)
+    }
+
+    fn active_document(&self) -> Option<&Document> {
+        self.document(self.active_token?)
+    }
+
+    fn activate(&mut self, token: u64) -> bool {
+        if self.document(token).is_none() {
+            return false;
+        }
+        self.active_token = Some(token);
+        self.focus_editor = true;
+        self.dismiss_completion();
+        true
+    }
+
+    fn activate_adjacent(&mut self, backwards: bool) -> bool {
+        if self.documents.len() < 2 {
+            return false;
+        }
+        let current = self
+            .active_token
+            .and_then(|token| {
+                self.documents
+                    .iter()
+                    .position(|document| document.token == token)
+            })
+            .unwrap_or_default();
+        let next = if backwards {
+            current
+                .checked_sub(1)
+                .unwrap_or(self.documents.len().saturating_sub(1))
+        } else {
+            (current + 1) % self.documents.len()
+        };
+        self.activate(self.documents[next].token)
+    }
+
+    /// 应用异步读取结果。按 token 路由到对应标签；关闭后的陈旧回包
+    /// 会被静默丢弃，后台标签加载完成也不会抢走当前编辑焦点。
     pub fn apply_loaded(&mut self, token: u64, result: Result<Vec<u8>, String>) -> bool {
+        let is_active = self.active_token == Some(token);
         let Some(document) = self
-            .document
-            .as_mut()
-            .filter(|doc| doc.token == token && doc.source_valid)
+            .document_mut(token)
+            .filter(|document| document.source_valid)
         else {
             return false;
         };
@@ -253,19 +357,29 @@ impl TextEditorState {
                 document.utf8_bom = decoded.utf8_bom;
                 document.state = LoadState::Ready;
                 document.error = None;
-                self.focus_editor = true;
+                if is_active {
+                    self.focus_editor = true;
+                }
             }
             Err(error) => {
                 document.state = LoadState::Error;
                 document.error = Some(error);
             }
         }
+        self.language_caches.remove(&token);
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.token == token)
+        {
+            self.dismiss_completion();
+        }
         true
     }
 
     /// 标记保存请求已经交给传输层。若当前文档或 token 已变化则拒绝。
     pub fn mark_saving(&mut self, request: &SaveRequest) -> bool {
-        let Some(document) = self.document.as_mut().filter(|doc| {
+        let Some(document) = self.document_mut(request.token).filter(|doc| {
             doc.token == request.token && doc.source == request.source && doc.source_valid
         }) else {
             return false;
@@ -275,6 +389,7 @@ impl TextEditorState {
             text: document.text.clone(),
             bytes_sha256: sha256(&request.bytes),
         });
+        document.save_conflict = false;
         document.error = None;
         true
     }
@@ -283,9 +398,8 @@ impl TextEditorState {
     /// 的快照作为新基线，之后输入仍保持“未保存”状态。
     pub fn apply_saved(&mut self, token: u64, result: Result<(), SaveFailure>) -> bool {
         let Some(document) = self
-            .document
-            .as_mut()
-            .filter(|doc| doc.token == token && doc.source_valid)
+            .document_mut(token)
+            .filter(|document| document.source_valid)
         else {
             return false;
         };
@@ -296,7 +410,7 @@ impl TextEditorState {
         else {
             return false;
         };
-        match result {
+        let (is_conflict, is_message_error) = match result {
             Ok(()) => {
                 document.saved_text = pending.text;
                 document.expected_sha256 = pending.bytes_sha256;
@@ -310,18 +424,31 @@ impl TextEditorState {
                 )
                 .unwrap_or(u64::MAX);
                 document.error = None;
+                document.save_conflict = false;
                 document.saved_flash_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                (false, false)
             }
             Err(SaveFailure::Conflict) => {
                 document.error = None;
                 document.pending_save = Some(pending);
-                self.pending_decision = Some(PendingDecisionKind::OverwriteConflict);
+                document.save_conflict = true;
+                (true, false)
             }
             Err(SaveFailure::Message(message)) => {
                 document.error = Some(message);
-                self.post_save_action = None;
+                document.save_conflict = false;
+                (false, true)
             }
+        };
+        if is_conflict {
+            self.active_token = Some(token);
+        } else if is_message_error
+            && self
+                .post_save_close
+                .is_some_and(|intent| intent.token == token)
+        {
+            self.pending_close = self.post_save_close.take();
         }
         true
     }
@@ -333,54 +460,163 @@ impl TextEditorState {
         source: &TextFileSource,
         message: impl Into<String>,
     ) -> bool {
-        let Some(document) = self
-            .document
-            .as_mut()
+        let message = message.into();
+        let mut changed = false;
+        for document in self
+            .documents
+            .iter_mut()
             .filter(|document| &document.source == source && document.source_valid)
-        else {
-            return false;
-        };
-        document.source_valid = false;
-        document.pending_save = None;
-        document.saved_flash_until = None;
-        document.error = Some(message.into());
-        if document.state == LoadState::Loading {
-            document.state = LoadState::Error;
+        {
+            document.source_valid = false;
+            document.pending_save = None;
+            document.save_conflict = false;
+            document.saved_flash_until = None;
+            document.error = Some(message.clone());
+            if document.state == LoadState::Loading {
+                document.state = LoadState::Error;
+            }
+            changed = true;
         }
-        if self.pending_decision == Some(PendingDecisionKind::OverwriteConflict) {
-            self.pending_decision = None;
+        if changed {
+            self.dismiss_completion();
         }
-        self.post_save_action = None;
-        true
+        changed
     }
 
     pub fn close_without_prompt(&mut self) {
-        self.document = None;
-        self.pending_source = None;
-        self.pending_decision = None;
-        self.post_save_action = None;
+        self.documents.clear();
+        self.active_token = None;
+        self.pending_close = None;
+        self.post_save_close = None;
+        self.close_editor_discarded.clear();
         self.find_open = false;
         self.focus_find = false;
         self.find_query.clear();
+        self.language_caches.clear();
+        self.dismiss_completion();
     }
 
-    fn request_close(&mut self) -> bool {
-        if self.is_dirty()
+    fn cancel_close_flow(&mut self) {
+        self.pending_close = None;
+        self.post_save_close = None;
+        self.close_editor_discarded.clear();
+    }
+
+    fn dismiss_completion(&mut self) {
+        self.completion = None;
+        self.pending_completion = None;
+        self.ime_composing = false;
+    }
+
+    fn remove_document(&mut self, token: u64) -> bool {
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.token == token)
+        else {
+            return false;
+        };
+        let was_active = self.active_token == Some(token);
+        self.documents.remove(index);
+        self.language_caches.remove(&token);
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.token == token)
             || self
-                .document
+                .pending_completion
                 .as_ref()
-                .is_some_and(|d| d.pending_save.is_some())
+                .is_some_and(|completion| completion.token == token)
         {
-            self.pending_decision = Some(PendingDecisionKind::Close);
-            false
+            self.dismiss_completion();
+        }
+        self.close_editor_discarded.remove(&token);
+        if self.documents.is_empty() {
+            self.active_token = None;
+            self.find_open = false;
+            self.focus_find = false;
+            self.find_query.clear();
+        } else if was_active {
+            let next_index = index.min(self.documents.len() - 1);
+            self.active_token = Some(self.documents[next_index].token);
+            self.focus_editor = true;
+        }
+        true
+    }
+
+    fn needs_close_decision(document: &Document) -> bool {
+        document.dirty() || document.pending_save.is_some()
+    }
+
+    fn request_close_tab(&mut self, token: u64, output: &mut Output) {
+        let Some(document) = self.document(token) else {
+            return;
+        };
+        if Self::needs_close_decision(document) {
+            self.active_token = Some(token);
+            self.pending_close = Some(CloseIntent {
+                scope: CloseScope::Tab,
+                token,
+            });
+            self.post_save_close = None;
+            self.close_editor_discarded.clear();
         } else {
-            self.close_without_prompt();
-            true
+            self.remove_document(token);
+            output.closed = self.documents.is_empty();
         }
     }
 
+    fn request_close_editor(&mut self, output: &mut Output) {
+        self.pending_close = None;
+        self.post_save_close = None;
+        self.close_editor_discarded.clear();
+        self.advance_close_editor(output);
+    }
+
+    fn advance_close_editor(&mut self, output: &mut Output) {
+        let next = self
+            .documents
+            .iter()
+            .find(|document| {
+                let discarded_unchanged = self
+                    .close_editor_discarded
+                    .get(&document.token)
+                    .is_some_and(|fingerprint| *fingerprint == sha256(document.text.as_bytes()));
+                Self::needs_close_decision(document) && !discarded_unchanged
+            })
+            .map(|document| document.token);
+        if let Some(token) = next {
+            self.active_token = Some(token);
+            self.pending_close = Some(CloseIntent {
+                scope: CloseScope::Editor,
+                token,
+            });
+            self.focus_editor = true;
+        } else {
+            self.close_without_prompt();
+            output.closed = true;
+        }
+    }
+
+    fn conflict_token(&self) -> Option<u64> {
+        self.active_document()
+            .filter(|document| document.save_conflict)
+            .map(|document| document.token)
+            .or_else(|| {
+                self.documents
+                    .iter()
+                    .find(|document| document.save_conflict)
+                    .map(|document| document.token)
+            })
+    }
+
     fn build_save_request(&mut self, force: bool) -> Option<SaveRequest> {
-        let document = self.document.as_mut().filter(|doc| {
+        let token = self.active_token?;
+        self.build_save_request_for(token, force)
+    }
+
+    fn build_save_request_for(&mut self, token: u64, force: bool) -> Option<SaveRequest> {
+        let document = self.document_mut(token).filter(|doc| {
             doc.state == LoadState::Ready && doc.pending_save.is_none() && doc.source_valid
         })?;
         if !force && !document.dirty() {
@@ -417,20 +653,49 @@ pub struct Output {
 pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Output {
     let mut output = Output::default();
     finish_deferred_action(state, &mut output);
-    if output.closed || output.load.is_some() {
+    if output.closed {
         return output;
     }
-    let Some(document) = state.document.as_mut() else {
+    if state.active_document().is_none() {
         return output;
-    };
+    }
+
+    let previous_tab_shortcut = egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        egui::Key::Tab,
+    );
+    let next_tab_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Tab);
+    let close_tab_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
+    let previous_tab = ui.input_mut(|input| input.consume_shortcut(&previous_tab_shortcut));
+    let next_tab =
+        !previous_tab && ui.input_mut(|input| input.consume_shortcut(&next_tab_shortcut));
+    let close_tab = ui.input_mut(|input| input.consume_shortcut(&close_tab_shortcut));
+    if state.pending_close.is_none() && state.conflict_token().is_none() {
+        if previous_tab || next_tab {
+            state.activate_adjacent(previous_tab);
+        }
+        if close_tab {
+            if let Some(token) = state.active_token {
+                state.request_close_tab(token, &mut output);
+            }
+        }
+    }
+    if output.closed || !state.is_open() {
+        return output;
+    }
 
     let save_shortcut =
         ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::S));
     let find_shortcut =
         ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F));
-    if find_shortcut && document.state == LoadState::Ready {
+    let active_state = state.active_document().map(|document| document.state);
+    if find_shortcut && active_state == Some(LoadState::Ready) {
         state.find_open = true;
         state.focus_find = true;
+        state.dismiss_completion();
+    }
+    if state.pending_close.is_some() || state.conflict_token().is_some() {
+        state.dismiss_completion();
     }
 
     egui::Frame::new()
@@ -438,36 +703,47 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
         .inner_margin(egui::Margin::same(0))
         .show(ui, |ui| {
             editor_header(ui, state, pal, &mut output);
+            if output.closed || !state.is_open() {
+                return;
+            }
             if state.find_open {
                 find_bar(ui, state, pal);
             }
             ui.separator();
 
-            let Some(document) = state.document.as_mut() else {
+            let Some((token, load_state, source_valid, error, source)) =
+                state.active_document().map(|document| {
+                    (
+                        document.token,
+                        document.state,
+                        document.source_valid,
+                        document.error.clone(),
+                        document.source.clone(),
+                    )
+                })
+            else {
                 return;
             };
-            match document.state {
+            match load_state {
                 LoadState::Loading => {
                     centered_status(ui, crate::i18n::strings().filetree_loading, pal)
                 }
                 LoadState::Error => {
-                    let message = document
-                        .error
+                    let message = error
                         .as_deref()
                         .unwrap_or(crate::i18n::strings().ssh_status_error);
                     centered_error(ui, message, pal);
-                    if document.source_valid {
+                    if source_valid {
                         ui.vertical_centered(|ui| {
                             if ui
                                 .button(crate::i18n::strings().remote_refresh_dir_tip)
                                 .clicked()
                             {
-                                output.load = Some(LoadRequest {
-                                    token: document.token,
-                                    source: document.source.clone(),
-                                });
-                                document.state = LoadState::Loading;
-                                document.error = None;
+                                output.load = Some(LoadRequest { token, source });
+                                if let Some(document) = state.document_mut(token) {
+                                    document.state = LoadState::Loading;
+                                    document.error = None;
+                                }
                             }
                         });
                     }
@@ -478,7 +754,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
             }
         });
 
-    if save_shortcut && output.save.is_none() {
+    if save_shortcut
+        && output.save.is_none()
+        && state.pending_close.is_none()
+        && state.conflict_token().is_none()
+    {
         output.save = state.build_save_request(false);
     }
     decision_modal(ui.ctx(), state, pal, &mut output);
@@ -486,49 +766,55 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
 }
 
 fn finish_deferred_action(state: &mut TextEditorState, output: &mut Output) {
-    let post_save = state.post_save_action;
-    let clean_pending_decision = state.pending_decision.filter(|kind| {
-        matches!(
-            kind,
-            PendingDecisionKind::Close | PendingDecisionKind::Switch
-        ) && state
-            .document
-            .as_ref()
-            .is_some_and(|document| document.pending_save.is_none() && !document.dirty())
-    });
-    let Some(action) = post_save.or(clean_pending_decision) else {
+    let intent = state.post_save_close.or(state.pending_close);
+    let Some(intent) = intent else {
         return;
     };
-    let Some(document) = state.document.as_ref() else {
-        state.post_save_action = None;
-        state.pending_decision = None;
+    let Some(document) = state.document(intent.token) else {
+        if state.post_save_close == Some(intent) {
+            state.post_save_close = None;
+        }
+        if state.pending_close == Some(intent) {
+            state.pending_close = None;
+        }
+        if intent.scope == CloseScope::Editor {
+            state.advance_close_editor(output);
+        }
         return;
     };
-    if document.pending_save.is_some() {
+    if document.pending_save.is_some() || document.save_conflict {
         return;
     }
     if document.dirty() {
-        if post_save.is_some() {
-            state.post_save_action = None;
-            state.pending_decision = Some(action);
+        if state.post_save_close == Some(intent) {
+            state.post_save_close = None;
+            state.pending_close = Some(intent);
         }
         return;
     }
 
-    state.post_save_action = None;
-    state.pending_decision = None;
-    match action {
-        PendingDecisionKind::Close => {
-            state.close_without_prompt();
-            output.closed = true;
-        }
-        PendingDecisionKind::Switch => {
-            if let Some(source) = state.pending_source.take() {
-                output.load = Some(state.begin_load(source));
-            }
-        }
-        PendingDecisionKind::OverwriteConflict => {}
+    if state.post_save_close == Some(intent) {
+        state.post_save_close = None;
     }
+    if state.pending_close == Some(intent) {
+        state.pending_close = None;
+    }
+    match intent.scope {
+        CloseScope::Tab => {
+            state.remove_document(intent.token);
+            output.closed = !state.is_open();
+        }
+        CloseScope::Editor => state.advance_close_editor(output),
+    }
+}
+
+#[derive(Clone)]
+struct TabSnapshot {
+    token: u64,
+    name: String,
+    path: String,
+    dirty: bool,
+    active: bool,
 }
 
 fn editor_header(
@@ -537,37 +823,173 @@ fn editor_header(
     pal: &Palette,
     output: &mut Output,
 ) {
-    let Some(document) = state.document.as_ref() else {
-        return;
+    let tabs = state
+        .documents
+        .iter()
+        .map(|document| TabSnapshot {
+            token: document.token,
+            name: document.source.display_name().to_owned(),
+            path: document.source.path().to_owned(),
+            dirty: document.dirty(),
+            active: state.active_token == Some(document.token),
+        })
+        .collect::<Vec<_>>();
+    let mut activate = None;
+    let mut close_tab = None;
+    let mut close_editor = false;
+    let close_editor_tip = if state.is_dirty() {
+        crate::i18n::strings().text_editor_unsaved_title
+    } else {
+        crate::i18n::strings().menu_close
     };
-    let source = document.source.clone();
-    let dirty = document.dirty();
-    let saving = document.pending_save.is_some();
-    let can_save = document.state == LoadState::Ready && document.source_valid && dirty && !saving;
-    let saved_recent = document
-        .saved_flash_until
-        .is_some_and(|until| until > std::time::Instant::now());
-    let title = format!("{}{}", if dirty { "● " } else { "" }, source.display_name());
-    let path = source.path().to_owned();
-    let source_label = if source.is_ssh() { "SSH" } else { "REMOTE" };
 
     egui::Frame::new()
         .fill(pal.bg_dark)
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .inner_margin(egui::Margin::symmetric(4, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(title).strong().color(pal.fg))
-                    .on_hover_text(path);
+                let tabs_width = (ui.available_width() - 32.0).max(96.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(tabs_width, 30.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("lumen_text_editor_tabs")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for tab in &tabs {
+                                        egui::Frame::new()
+                                            .fill(if tab.active {
+                                                pal.bg_panel
+                                            } else {
+                                                pal.bg_dark
+                                            })
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                if tab.active {
+                                                    pal.panel_outline
+                                                } else {
+                                                    egui::Color32::TRANSPARENT
+                                                },
+                                            ))
+                                            .corner_radius(egui::CornerRadius::same(4))
+                                            .inner_margin(egui::Margin::symmetric(7, 3))
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    let title = if tab.dirty {
+                                                        format!("● {}", tab.name)
+                                                    } else {
+                                                        tab.name.clone()
+                                                    };
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new(title)
+                                                                    .size(11.0)
+                                                                    .color(if tab.active {
+                                                                        pal.fg
+                                                                    } else {
+                                                                        pal.fg_dim
+                                                                    }),
+                                                            )
+                                                            .frame(false),
+                                                        )
+                                                        .on_hover_text(&tab.path)
+                                                        .clicked()
+                                                    {
+                                                        activate = Some(tab.token);
+                                                    }
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                egui::RichText::new("×")
+                                                                    .size(12.0)
+                                                                    .color(pal.fg_dim),
+                                                            )
+                                                            .frame(false),
+                                                        )
+                                                        .on_hover_text(
+                                                            crate::i18n::strings().menu_close,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        close_tab = Some(tab.token);
+                                                    }
+                                                });
+                                            });
+                                    }
+                                });
+                            });
+                    },
+                );
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("×").size(14.0).color(pal.fg_dim))
+                            .frame(false),
+                    )
+                    .on_hover_text(close_editor_tip)
+                    .clicked()
+                {
+                    close_editor = true;
+                }
+            });
+        });
+
+    if let Some(token) = activate {
+        state.activate(token);
+    }
+    if let Some(token) = close_tab {
+        state.request_close_tab(token, output);
+    }
+    if close_editor {
+        state.request_close_editor(output);
+    }
+    if output.closed {
+        return;
+    }
+
+    let Some((source, dirty, saving, can_save, saved_recent)) =
+        state.active_document().map(|document| {
+            (
+                document.source.clone(),
+                document.dirty(),
+                document.pending_save.is_some(),
+                document.state == LoadState::Ready
+                    && document.source_valid
+                    && document.dirty()
+                    && document.pending_save.is_none(),
+                document
+                    .saved_flash_until
+                    .is_some_and(|until| until > std::time::Instant::now()),
+            )
+        })
+    else {
+        return;
+    };
+    let source_label = if source.is_ssh() { "SSH" } else { "REMOTE" };
+    egui::Frame::new()
+        .fill(pal.bg_panel)
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(source_label)
                         .monospace()
                         .size(10.0)
                         .color(pal.accent),
                 );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(source.path())
+                            .monospace()
+                            .size(10.0)
+                            .color(pal.fg_dim),
+                    )
+                    .truncate()
+                    .selectable(true),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(crate::i18n::strings().menu_close).clicked() {
-                        output.closed = state.request_close();
-                    }
                     if ui
                         .add_enabled(can_save, egui::Button::new(crate::i18n::strings().ssh_save))
                         .on_hover_text("Ctrl+S")
@@ -577,12 +999,10 @@ fn editor_header(
                     }
                     let status = if saving {
                         crate::i18n::strings().text_editor_saving
-                    } else if saved_recent {
+                    } else if saved_recent || !dirty {
                         crate::i18n::strings().text_editor_saved
-                    } else if dirty {
-                        crate::i18n::strings().text_editor_unsaved
                     } else {
-                        crate::i18n::strings().text_editor_saved
+                        crate::i18n::strings().text_editor_unsaved
                     };
                     ui.label(egui::RichText::new(status).size(11.0).color(if dirty {
                         pal.fg
@@ -591,23 +1011,12 @@ fn editor_header(
                     }));
                 });
             });
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(source.path())
-                        .monospace()
-                        .size(10.0)
-                        .color(pal.fg_dim),
-                )
-                .truncate()
-                .selectable(true),
-            );
         });
 }
 
 fn find_bar(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
     let matches = state
-        .document
-        .as_ref()
+        .active_document()
         .map_or(0, |document| match_count(&document.text, &state.find_query));
     egui::Frame::new()
         .fill(pal.bg_dark)
@@ -646,41 +1055,144 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
     let available = ui.available_size();
     let status_height = 24.0;
     let editor_height = (available.y - status_height).max(80.0);
-    let Some(document) = state.document.as_mut() else {
+    let focus_editor = std::mem::take(&mut state.focus_editor);
+    let Some(token) = state.active_token else {
         return;
     };
-    let response = egui::Frame::new()
-        .fill(pal.bg_panel)
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.add_sized(
-                [ui.available_width(), editor_height],
+    let editor_id = ui.make_persistent_id(("lumen_text_editor", token));
+    let (explicit_completion, accepted_completion) =
+        prepare_completion_input(ui, state, token, editor_id);
+    let had_completion = state
+        .completion
+        .as_ref()
+        .is_some_and(|completion| completion.token == token);
+    let ime_composing = state.ime_composing;
+
+    struct EditorFrame {
+        response: egui::Response,
+        line_count: usize,
+        bytes: usize,
+        cursor_line: usize,
+        cursor_column: usize,
+        line_ending: LineEnding,
+        utf8_bom: bool,
+        language: Language,
+        error: Option<String>,
+        completion: Option<([u8; 32], CompletionSet, egui::Rect)>,
+    }
+
+    let frame = {
+        let TextEditorState {
+            documents,
+            language_caches,
+            ..
+        } = state;
+        let Some(document) = documents
+            .iter_mut()
+            .find(|document| document.token == token)
+        else {
+            return;
+        };
+        let language = Language::from_path_and_text(document.source.path(), &document.text);
+        let cache = language_caches.entry(token).or_default();
+        let edit_output = egui::Frame::new()
+            .fill(pal.bg_panel)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                let mut layouter =
+                    |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+                        cache.layout(ui, buffer.as_str(), language, pal, wrap_width)
+                    };
                 egui::TextEdit::multiline(&mut document.text)
-                    .id_salt(("lumen_text_editor", document.token))
+                    .id(editor_id)
                     .font(egui::TextStyle::Monospace)
                     .code_editor()
                     .desired_width(f32::INFINITY)
-                    .lock_focus(true),
-            )
-        })
-        .inner;
-    if state.focus_editor {
-        response.request_focus();
-        state.focus_editor = false;
+                    .min_size(egui::vec2(ui.available_width(), editor_height))
+                    .lock_focus(true)
+                    .layouter(&mut layouter)
+                    .show(ui)
+            })
+            .inner;
+
+        let cursor = edit_output.cursor_range.and_then(|range| range.single());
+        let cursor_char = cursor.map_or(0, |cursor| cursor.index);
+        let (cursor_line, cursor_column) = cursor_line_column(&document.text, cursor_char);
+        let should_complete = !ime_composing
+            && !accepted_completion
+            && (explicit_completion || edit_output.response.changed() || had_completion);
+        let completion = if should_complete {
+            cursor.and_then(|cursor| {
+                let local_caret = edit_output.galley.pos_from_cursor(cursor);
+                let caret_rect = local_caret.translate(edit_output.galley_pos.to_vec2());
+                if !caret_rect.intersects(edit_output.text_clip_rect) {
+                    return None;
+                }
+                cache
+                    .completions(&document.text, cursor.index, language, explicit_completion)
+                    .map(|set| (sha256(document.text.as_bytes()), set, caret_rect))
+            })
+        } else {
+            None
+        };
+        EditorFrame {
+            response: edit_output.response.response,
+            line_count: document.text.lines().count().max(1),
+            bytes: document.text.len(),
+            cursor_line,
+            cursor_column,
+            line_ending: document.line_ending,
+            utf8_bom: document.utf8_bom,
+            language,
+            error: document.error.clone(),
+            completion,
+        }
+    };
+
+    if focus_editor {
+        frame.response.request_focus();
+    }
+    if ime_composing || accepted_completion {
+        state.completion = None;
+    } else if explicit_completion || frame.response.changed() || had_completion {
+        state.completion = frame.completion.map(|(fingerprint, set, caret_rect)| {
+            let selected = state
+                .completion
+                .as_ref()
+                .filter(|completion| completion.token == token)
+                .map_or(0, |completion| {
+                    completion.selected.min(set.items.len().saturating_sub(1))
+                });
+            CompletionPopup {
+                token,
+                fingerprint,
+                set,
+                selected,
+                caret_rect,
+            }
+        });
     }
 
-    let line_count = document.text.lines().count().max(1);
-    let bytes = document.text.len();
     egui::Frame::new()
         .fill(pal.bg_dark)
         .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
+                    egui::RichText::new(format!(
+                        "Ln {}, Col {}",
+                        frame.cursor_line, frame.cursor_column
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(pal.fg_dim),
+                );
+                ui.separator();
+                ui.label(
                     egui::RichText::new(crate::i18n::fmt2(
                         crate::i18n::strings().text_editor_stats_fmt,
-                        line_count,
-                        bytes,
+                        frame.line_count,
+                        frame.bytes,
                     ))
                     .monospace()
                     .size(10.0)
@@ -688,27 +1200,318 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new(document.line_ending.label())
+                        egui::RichText::new(frame.language.label())
+                            .monospace()
+                            .size(10.0)
+                            .color(pal.fg_dim),
+                    )
+                    .on_hover_text(crate::i18n::strings().text_editor_completion_hint);
+                    ui.label(
+                        egui::RichText::new(frame.line_ending.label())
                             .monospace()
                             .size(10.0)
                             .color(pal.fg_dim),
                     );
                     ui.label(
-                        egui::RichText::new(if document.utf8_bom {
-                            "UTF-8 BOM"
-                        } else {
-                            "UTF-8"
-                        })
-                        .monospace()
-                        .size(10.0)
-                        .color(pal.fg_dim),
+                        egui::RichText::new(if frame.utf8_bom { "UTF-8 BOM" } else { "UTF-8" })
+                            .monospace()
+                            .size(10.0)
+                            .color(pal.fg_dim),
                     );
                 });
             });
         });
-    if let Some(error) = &document.error {
+    if let Some(error) = &frame.error {
         ui.colored_label(pal.error, error);
     }
+
+    let popup_snapshot = state.completion.clone();
+    if let Some(popup) = popup_snapshot.as_ref() {
+        let popup_output = completion_popup(ui.ctx(), popup, pal);
+        if let Some(selected) = popup_output.hovered {
+            if let Some(current) = state
+                .completion
+                .as_mut()
+                .filter(|completion| completion.token == popup.token)
+            {
+                current.selected = selected;
+            }
+        }
+        if let Some(selected) = popup_output.accepted {
+            queue_completion(state, popup, selected);
+            ui.ctx().request_repaint();
+        } else if popup_output.clicked_outside_editor(frame.response.rect) {
+            state.completion = None;
+        }
+    }
+}
+
+struct CompletionPopupOutput {
+    accepted: Option<usize>,
+    hovered: Option<usize>,
+    rect: egui::Rect,
+    pointer_clicked: bool,
+    pointer_position: Option<egui::Pos2>,
+}
+
+impl CompletionPopupOutput {
+    fn clicked_outside_editor(&self, editor_rect: egui::Rect) -> bool {
+        self.pointer_clicked
+            && self.pointer_position.is_some_and(|position| {
+                !self.rect.contains(position) && !editor_rect.contains(position)
+            })
+    }
+}
+
+fn prepare_completion_input(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+) -> (bool, bool) {
+    update_ime_state(ui, state);
+    if state.ime_composing {
+        state.completion = None;
+        state.pending_completion = None;
+        return (false, false);
+    }
+
+    let explicit_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Space);
+    let explicit = ui.input_mut(|input| input.consume_shortcut(&explicit_shortcut));
+
+    let popup_matches = state
+        .completion
+        .as_ref()
+        .is_some_and(|completion| completion.token == token);
+    if popup_matches {
+        let plain_modifiers = ui.input(|input| input.modifiers == egui::Modifiers::NONE);
+        if plain_modifiers {
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                state.completion = None;
+            } else if ui
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+            {
+                if let Some(completion) = state.completion.as_mut() {
+                    completion.selected = completion
+                        .selected
+                        .checked_sub(1)
+                        .unwrap_or(completion.set.items.len().saturating_sub(1));
+                }
+            } else if ui
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+            {
+                if let Some(completion) = state.completion.as_mut() {
+                    completion.selected =
+                        (completion.selected + 1) % completion.set.items.len().max(1);
+                }
+            } else {
+                let accept_enter = ui
+                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                let accept_tab = !accept_enter
+                    && ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                    });
+                if accept_enter || accept_tab {
+                    if let Some(completion) = state.completion.clone() {
+                        queue_completion(state, &completion, completion.selected);
+                    }
+                }
+            }
+        }
+    }
+
+    let accepted = inject_pending_completion(ui, state, token, editor_id);
+    (explicit, accepted)
+}
+
+fn update_ime_state(ui: &egui::Ui, state: &mut TextEditorState) {
+    let ime_events = ui.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Ime(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    for event in ime_events {
+        match event {
+            egui::ImeEvent::Preedit(text) => state.ime_composing = !text.is_empty(),
+            egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
+                state.ime_composing = false;
+            }
+            egui::ImeEvent::Enabled => {}
+        }
+    }
+}
+
+fn queue_completion(state: &mut TextEditorState, popup: &CompletionPopup, selected: usize) {
+    let Some(item) = popup.set.items.get(selected) else {
+        state.completion = None;
+        return;
+    };
+    state.pending_completion = Some(PendingCompletion {
+        token: popup.token,
+        fingerprint: popup.fingerprint,
+        replace_chars: popup.set.replace_chars.clone(),
+        insertion: item.label.clone(),
+    });
+    state.completion = None;
+}
+
+fn inject_pending_completion(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+) -> bool {
+    let Some(pending) = state.pending_completion.take() else {
+        return false;
+    };
+    let valid = pending.token == token
+        && state.document(token).is_some_and(|document| {
+            pending.fingerprint == sha256(document.text.as_bytes())
+                && pending.replace_chars.end <= document.text.chars().count()
+        });
+    if !valid {
+        return false;
+    }
+
+    let mut edit_state =
+        egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
+    edit_state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(pending.replace_chars.start),
+            egui::text::CCursor::new(pending.replace_chars.end),
+        )));
+    edit_state.store(ui.ctx(), editor_id);
+    ui.memory_mut(|memory| memory.request_focus(editor_id));
+    ui.input_mut(|input| {
+        input.events.push(egui::Event::Paste(pending.insertion));
+    });
+    true
+}
+
+fn completion_popup(
+    ctx: &egui::Context,
+    popup: &CompletionPopup,
+    pal: &Palette,
+) -> CompletionPopupOutput {
+    let width = 320.0;
+    let height = (34.0 + popup.set.items.len() as f32 * 25.0).min(270.0);
+    let content = ctx.content_rect();
+    let mut position = egui::pos2(popup.caret_rect.left(), popup.caret_rect.bottom() + 3.0);
+    if position.y + height > content.bottom() {
+        position.y = popup.caret_rect.top() - height - 3.0;
+    }
+    position.x = position.x.clamp(
+        content.left(),
+        (content.right() - width).max(content.left()),
+    );
+    position.y = position.y.clamp(
+        content.top(),
+        (content.bottom() - height).max(content.top()),
+    );
+
+    let mut accepted = None;
+    let mut hovered = None;
+    let area = egui::Area::new(egui::Id::new(("lumen_text_editor_completion", popup.token)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(position)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(pal.bg_panel)
+                .stroke(egui::Stroke::new(1.0_f32, pal.panel_outline))
+                .corner_radius(egui::CornerRadius::same(5))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 5],
+                    blur: 14,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(100),
+                })
+                .inner_margin(egui::Margin::same(4))
+                .show(ui, |ui| {
+                    ui.set_width(width - 8.0);
+                    ui.label(
+                        egui::RichText::new(crate::i18n::strings().text_editor_completion_hint)
+                            .size(10.0)
+                            .color(pal.fg_dim),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt(("lumen_text_editor_completion_list", popup.token))
+                        .max_height(height - 34.0)
+                        .show(ui, |ui| {
+                            for (index, item) in popup.set.items.iter().enumerate() {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 24.0),
+                                    egui::Sense::click(),
+                                );
+                                if index == popup.selected || response.hovered() {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        egui::CornerRadius::same(3),
+                                        pal.selection,
+                                    );
+                                }
+                                if response.hovered() {
+                                    hovered = Some(index);
+                                }
+                                if response.clicked() {
+                                    accepted = Some(index);
+                                }
+                                let kind = match item.kind {
+                                    CompletionKind::Keyword => {
+                                        crate::i18n::strings().text_editor_completion_keyword
+                                    }
+                                    CompletionKind::Builtin => {
+                                        crate::i18n::strings().text_editor_completion_builtin
+                                    }
+                                    CompletionKind::Document => {
+                                        crate::i18n::strings().text_editor_completion_document
+                                    }
+                                };
+                                ui.painter().text(
+                                    egui::pos2(rect.left() + 6.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &item.label,
+                                    egui::FontId::monospace(12.0),
+                                    pal.fg,
+                                );
+                                ui.painter().text(
+                                    egui::pos2(rect.right() - 6.0, rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    kind,
+                                    egui::FontId::proportional(10.0),
+                                    pal.fg_dim,
+                                );
+                            }
+                        });
+                });
+        });
+    CompletionPopupOutput {
+        accepted,
+        hovered,
+        rect: area.response.rect,
+        pointer_clicked: ctx.input(|input| input.pointer.any_click()),
+        pointer_position: ctx.input(|input| input.pointer.interact_pos()),
+    }
+}
+
+fn cursor_line_column(text: &str, cursor_char: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    for ch in text.chars().take(cursor_char) {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
 }
 
 fn decision_modal(
@@ -717,11 +1520,47 @@ fn decision_modal(
     pal: &Palette,
     output: &mut Output,
 ) {
-    let Some(kind) = state.pending_decision else {
+    #[derive(Clone, Copy)]
+    enum Dialog {
+        Conflict(u64),
+        Close(CloseIntent),
+    }
+    #[derive(Clone, Copy)]
+    enum DialogAction {
+        KeepEditing,
+        Reload,
+        Overwrite,
+        Save,
+        DontSave,
+        Cancel,
+    }
+
+    let dialog = state
+        .conflict_token()
+        .map(Dialog::Conflict)
+        .or_else(|| state.pending_close.map(Dialog::Close));
+    let Some(dialog) = dialog else {
         return;
     };
-    let mut keep = true;
-    egui::Modal::new(egui::Id::new("lumen_text_editor_decision"))
+    let token = match dialog {
+        Dialog::Conflict(token) => token,
+        Dialog::Close(intent) => intent.token,
+    };
+    let Some((name, path, can_save)) = state.document(token).map(|document| {
+        (
+            document.source.display_name().to_owned(),
+            document.source.path().to_owned(),
+            document.state == LoadState::Ready
+                && document.source_valid
+                && document.pending_save.is_none()
+                && document.dirty(),
+        )
+    }) else {
+        state.cancel_close_flow();
+        return;
+    };
+    let mut action = None;
+    egui::Modal::new(egui::Id::new(("lumen_text_editor_decision", token)))
         .backdrop_color(egui::Color32::from_black_alpha(140))
         .frame(
             egui::Frame::new()
@@ -731,37 +1570,30 @@ fn decision_modal(
         )
         .show(ctx, |ui| {
             ui.set_min_width(390.0);
-            match kind {
-                PendingDecisionKind::OverwriteConflict => {
+            match dialog {
+                Dialog::Conflict(_) => {
                     ui.heading(crate::i18n::strings().text_editor_remote_changed_title);
                     ui.add_space(6.0);
                     ui.label(crate::i18n::strings().text_editor_remote_changed_body);
+                    ui.label(
+                        egui::RichText::new(&path)
+                            .monospace()
+                            .small()
+                            .color(pal.fg_dim),
+                    );
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui
                             .button(crate::i18n::strings().text_editor_keep_editing)
                             .clicked()
                         {
-                            if let Some(document) = state.document.as_mut() {
-                                document.pending_save = None;
-                            }
-                            state.post_save_action = None;
-                            keep = false;
+                            action = Some(DialogAction::KeepEditing);
                         }
                         if ui
                             .button(crate::i18n::strings().text_editor_reload)
                             .clicked()
                         {
-                            if let Some(document) = state.document.as_mut() {
-                                document.pending_save = None;
-                                document.state = LoadState::Loading;
-                                output.load = Some(LoadRequest {
-                                    token: document.token,
-                                    source: document.source.clone(),
-                                });
-                            }
-                            state.post_save_action = None;
-                            keep = false;
+                            action = Some(DialogAction::Reload);
                         }
                         if ui
                             .button(
@@ -770,33 +1602,23 @@ fn decision_modal(
                             )
                             .clicked()
                         {
-                            if let Some(document) = state.document.as_mut() {
-                                document.pending_save = None;
-                            }
-                            output.save = state.build_save_request(true);
-                            keep = false;
+                            action = Some(DialogAction::Overwrite);
                         }
                     });
                 }
-                PendingDecisionKind::Close | PendingDecisionKind::Switch => {
+                Dialog::Close(_) => {
                     ui.heading(crate::i18n::strings().text_editor_unsaved_title);
                     ui.add_space(6.0);
                     ui.label(crate::i18n::strings().text_editor_unsaved_body);
+                    ui.label(egui::RichText::new(&name).strong().color(pal.fg));
+                    ui.label(
+                        egui::RichText::new(&path)
+                            .monospace()
+                            .small()
+                            .color(pal.fg_dim),
+                    );
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui
-                            .button(crate::i18n::strings().text_editor_keep_editing)
-                            .clicked()
-                        {
-                            state.pending_source = None;
-                            keep = false;
-                        }
-                        let can_save = state.document.as_ref().is_some_and(|document| {
-                            document.state == LoadState::Ready
-                                && document.source_valid
-                                && document.pending_save.is_none()
-                                && document.dirty()
-                        });
                         if ui
                             .add_enabled(
                                 can_save,
@@ -804,39 +1626,86 @@ fn decision_modal(
                             )
                             .clicked()
                         {
-                            if let Some(save) = state.build_save_request(false) {
-                                state.post_save_action = Some(kind);
-                                output.save = Some(save);
-                                keep = false;
-                            }
+                            action = Some(DialogAction::Save);
                         }
                         if ui
                             .button(
-                                egui::RichText::new(crate::i18n::strings().text_editor_discard)
+                                egui::RichText::new(crate::i18n::strings().text_editor_dont_save)
                                     .color(pal.error),
                             )
+                            .on_hover_text(crate::i18n::strings().text_editor_discard)
                             .clicked()
                         {
-                            match kind {
-                                PendingDecisionKind::Close => {
-                                    state.close_without_prompt();
-                                    output.closed = true;
-                                }
-                                PendingDecisionKind::Switch => {
-                                    if let Some(source) = state.pending_source.take() {
-                                        output.load = Some(state.begin_load(source));
-                                    }
-                                }
-                                PendingDecisionKind::OverwriteConflict => {}
-                            }
-                            keep = false;
+                            action = Some(DialogAction::DontSave);
+                        }
+                        if ui.button(crate::i18n::strings().ssh_cancel).clicked() {
+                            action = Some(DialogAction::Cancel);
                         }
                     });
                 }
             }
         });
-    if !keep {
-        state.pending_decision = None;
+
+    match (dialog, action) {
+        (Dialog::Conflict(token), Some(DialogAction::KeepEditing)) => {
+            if let Some(document) = state.document_mut(token) {
+                document.pending_save = None;
+                document.save_conflict = false;
+            }
+            state.cancel_close_flow();
+        }
+        (Dialog::Conflict(token), Some(DialogAction::Reload)) => {
+            let request = state.document_mut(token).map(|document| {
+                document.pending_save = None;
+                document.save_conflict = false;
+                document.state = LoadState::Loading;
+                document.error = None;
+                LoadRequest {
+                    token,
+                    source: document.source.clone(),
+                }
+            });
+            state.cancel_close_flow();
+            output.load = request;
+        }
+        (Dialog::Conflict(token), Some(DialogAction::Overwrite)) => {
+            if let Some(document) = state.document_mut(token) {
+                document.pending_save = None;
+                document.save_conflict = false;
+            }
+            output.save = state.build_save_request_for(token, true);
+        }
+        (Dialog::Close(intent), Some(DialogAction::Save)) => {
+            if let Some(save) = state.build_save_request_for(intent.token, false) {
+                state.pending_close = None;
+                state.post_save_close = Some(intent);
+                output.save = Some(save);
+            }
+        }
+        (Dialog::Close(intent), Some(DialogAction::DontSave)) => {
+            state.pending_close = None;
+            state.post_save_close = None;
+            match intent.scope {
+                CloseScope::Tab => {
+                    state.remove_document(intent.token);
+                    output.closed = !state.is_open();
+                }
+                CloseScope::Editor => {
+                    if let Some(fingerprint) = state
+                        .document(intent.token)
+                        .map(|document| sha256(document.text.as_bytes()))
+                    {
+                        state
+                            .close_editor_discarded
+                            .insert(intent.token, fingerprint);
+                    }
+                    state.advance_close_editor(output);
+                }
+            }
+        }
+        (Dialog::Close(_), Some(DialogAction::Cancel)) => state.cancel_close_flow(),
+        (_, None) => {}
+        _ => {}
     }
 }
 
@@ -970,24 +1839,39 @@ mod tests {
         assert!(decode_text_file(vec![0xFF]).is_err());
     }
 
+    fn remote(generation: u64, path: &str) -> TextFileSource {
+        TextFileSource::Remote {
+            generation,
+            path: path.to_owned(),
+        }
+    }
+
+    fn ssh(runtime_id: u64, session_id: u64, path: &str) -> TextFileSource {
+        TextFileSource::Ssh {
+            runtime_id,
+            session_id,
+            path: path.to_owned(),
+        }
+    }
+
+    fn open_loaded(state: &mut TextEditorState, source: TextFileSource, text: &str) -> u64 {
+        let request = state.request_open(source).expect("new load request");
+        assert!(state.apply_loaded(request.token, Ok(text.as_bytes().to_vec())));
+        request.token
+    }
+
+    fn edit(state: &mut TextEditorState, token: u64, text: &str) {
+        state.document_mut(token).expect("document").text = text.to_owned();
+    }
+
     #[test]
     fn stale_load_and_save_results_are_ignored() {
         let mut state = TextEditorState::default();
-        let first = state
-            .request_open(TextFileSource::Remote {
-                generation: 1,
-                path: "/tmp/a".to_owned(),
-            })
-            .expect("load");
+        let first = state.request_open(remote(1, "/tmp/a")).expect("load");
         state.close_without_prompt();
         assert!(!state.apply_loaded(first.token, Ok(b"old".to_vec())));
 
-        let second = state
-            .request_open(TextFileSource::Remote {
-                generation: 1,
-                path: "/tmp/b".to_owned(),
-            })
-            .expect("load");
+        let second = state.request_open(remote(1, "/tmp/b")).expect("load");
         assert!(state.apply_loaded(second.token, Ok(b"new".to_vec())));
         assert!(!state.apply_saved(first.token, Ok(())));
     }
@@ -995,66 +1879,89 @@ mod tests {
     #[test]
     fn edit_during_save_remains_dirty_after_success() {
         let mut state = TextEditorState::default();
-        let load = state
-            .request_open(TextFileSource::Ssh {
-                runtime_id: 1,
-                session_id: 7,
-                path: "/tmp/a.txt".to_owned(),
-            })
-            .expect("load");
-        state
-            .apply_loaded(load.token, Ok(b"before".to_vec()))
-            .then_some(())
-            .expect("applied");
-        state.document.as_mut().expect("doc").text = "saved".to_owned();
+        let token = open_loaded(&mut state, ssh(1, 7, "/tmp/a.txt"), "before");
+        edit(&mut state, token, "saved");
         let save = state.build_save_request(false).expect("save");
         assert!(state.mark_saving(&save));
-        state.document.as_mut().expect("doc").text = "typed later".to_owned();
+        edit(&mut state, token, "typed later");
         assert!(state.apply_saved(save.token, Ok(())));
         assert!(state.is_dirty());
-        assert_eq!(state.document.as_ref().expect("doc").saved_text, "saved");
+        assert_eq!(state.document(token).expect("doc").saved_text, "saved");
+        assert_eq!(state.document(token).expect("doc").text, "typed later");
+    }
+
+    #[test]
+    fn opens_multiple_documents_and_reuses_existing_tab() {
+        let mut state = TextEditorState::default();
+        let first_source = remote(2, "/tmp/first.txt");
+        let first = open_loaded(&mut state, first_source.clone(), "one");
+        edit(&mut state, first, "one changed");
+        let second = open_loaded(&mut state, remote(2, "/tmp/second.txt"), "two");
+
+        assert_eq!(state.documents.len(), 2);
+        assert_eq!(state.active_token, Some(second));
+        assert!(state.request_open(first_source).is_none());
+        assert_eq!(state.active_token, Some(first));
+        assert_eq!(state.documents.len(), 2);
+        assert_eq!(state.document(first).expect("first").text, "one changed");
+    }
+
+    #[test]
+    fn background_load_result_does_not_change_active_tab() {
+        let mut state = TextEditorState::default();
+        let first = state
+            .request_open(remote(3, "/tmp/first.txt"))
+            .expect("first load");
+        let second = state
+            .request_open(remote(3, "/tmp/second.txt"))
+            .expect("second load");
+        assert_eq!(state.active_token, Some(second.token));
+
+        assert!(state.apply_loaded(first.token, Ok(b"background".to_vec())));
+        assert_eq!(state.active_token, Some(second.token));
+        assert_eq!(
+            state.document(first.token).expect("first").text,
+            "background"
+        );
+    }
+
+    #[test]
+    fn dirty_state_is_independent_per_tab() {
+        let mut state = TextEditorState::default();
+        let first = open_loaded(&mut state, remote(4, "/tmp/first.txt"), "one");
+        let second = open_loaded(&mut state, remote(4, "/tmp/second.txt"), "two");
+        edit(&mut state, first, "changed");
+
+        assert!(state.document(first).expect("first").dirty());
+        assert!(!state.document(second).expect("second").dirty());
+        assert!(state.is_dirty());
     }
 
     #[test]
     fn same_path_in_a_new_remote_generation_is_a_different_document() {
         let mut state = TextEditorState::default();
         let first = state
-            .request_open(TextFileSource::Remote {
-                generation: 10,
-                path: "/etc/app.conf".to_owned(),
-            })
+            .request_open(remote(10, "/etc/app.conf"))
             .expect("first load");
         assert!(state.apply_loaded(first.token, Ok(b"old peer".to_vec())));
 
         let second = state
-            .request_open(TextFileSource::Remote {
-                generation: 11,
-                path: "/etc/app.conf".to_owned(),
-            })
+            .request_open(remote(11, "/etc/app.conf"))
             .expect("new generation must reload");
         assert_ne!(first.token, second.token);
-        assert_eq!(
-            second.source,
-            TextFileSource::Remote {
-                generation: 11,
-                path: "/etc/app.conf".to_owned(),
-            }
-        );
+        assert_eq!(second.source, remote(11, "/etc/app.conf"));
+        assert_eq!(state.documents.len(), 2);
     }
 
     #[test]
     fn invalidation_finishes_loading_and_saving_without_losing_dirty_buffer() {
         let mut loading = TextEditorState::default();
-        let source = TextFileSource::Ssh {
-            runtime_id: 4,
-            session_id: 7,
-            path: "/tmp/a.txt".to_owned(),
-        };
+        let source = ssh(4, 7, "/tmp/a.txt");
         let load = loading
             .request_open(source.clone())
             .expect("loading request");
         assert!(loading.invalidate_source(&source, "session changed"));
-        let loading_document = loading.document.as_ref().expect("document");
+        let loading_document = loading.document(load.token).expect("document");
         assert_eq!(loading_document.state, LoadState::Error);
         assert!(!loading_document.source_valid);
         assert!(!loading.apply_loaded(load.token, Ok(b"stale".to_vec())));
@@ -1062,11 +1969,11 @@ mod tests {
         let mut saving = TextEditorState::default();
         let load = saving.request_open(source.clone()).expect("load");
         assert!(saving.apply_loaded(load.token, Ok(b"before".to_vec())));
-        saving.document.as_mut().expect("document").text = "after".to_owned();
+        edit(&mut saving, load.token, "after");
         let save = saving.build_save_request(false).expect("save");
         assert!(saving.mark_saving(&save));
         assert!(saving.invalidate_source(&source, "session changed"));
-        let saving_document = saving.document.as_ref().expect("document");
+        let saving_document = saving.document(load.token).expect("document");
         assert_eq!(saving_document.text, "after");
         assert!(saving_document.dirty());
         assert!(saving_document.pending_save.is_none());
@@ -1077,18 +1984,16 @@ mod tests {
     #[test]
     fn save_before_close_waits_for_success_then_closes() {
         let mut state = TextEditorState::default();
-        let source = TextFileSource::Remote {
-            generation: 2,
-            path: "/tmp/a.txt".to_owned(),
-        };
-        let load = state.request_open(source).expect("load");
-        assert!(state.apply_loaded(load.token, Ok(b"before".to_vec())));
-        state.document.as_mut().expect("document").text = "after".to_owned();
+        let token = open_loaded(&mut state, remote(2, "/tmp/a.txt"), "before");
+        edit(&mut state, token, "after");
+        let mut output = Output::default();
+        state.request_close_tab(token, &mut output);
+        let intent = state.pending_close.expect("close decision");
         let save = state.build_save_request(false).expect("save");
-        state.post_save_action = Some(PendingDecisionKind::Close);
+        state.pending_close = None;
+        state.post_save_close = Some(intent);
         assert!(state.mark_saving(&save));
 
-        let mut output = Output::default();
         finish_deferred_action(&mut state, &mut output);
         assert!(!output.closed);
         assert!(state.is_open());
@@ -1100,36 +2005,238 @@ mod tests {
     }
 
     #[test]
-    fn edits_made_during_save_prevent_deferred_switch_from_discarding_them() {
+    fn closing_one_clean_tab_keeps_the_other_document() {
         let mut state = TextEditorState::default();
-        let source = TextFileSource::Ssh {
-            runtime_id: 8,
-            session_id: 9,
-            path: "/tmp/a.txt".to_owned(),
-        };
-        let target = TextFileSource::Ssh {
-            runtime_id: 8,
-            session_id: 9,
-            path: "/tmp/b.txt".to_owned(),
-        };
-        let load = state.request_open(source).expect("load");
-        assert!(state.apply_loaded(load.token, Ok(b"before".to_vec())));
-        state.document.as_mut().expect("document").text = "saved".to_owned();
+        let first = open_loaded(&mut state, ssh(8, 9, "/tmp/a.txt"), "one");
+        let second = open_loaded(&mut state, ssh(8, 9, "/tmp/b.txt"), "two");
+        let mut output = Output::default();
+
+        state.request_close_tab(second, &mut output);
+        assert!(!output.closed);
+        assert_eq!(state.documents.len(), 1);
+        assert_eq!(state.active_token, Some(first));
+        assert_eq!(state.document(first).expect("first").text, "one");
+    }
+
+    #[test]
+    fn edits_during_close_save_return_to_the_close_prompt() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, ssh(8, 9, "/tmp/a.txt"), "before");
+        edit(&mut state, token, "saved");
+        let mut output = Output::default();
+        state.request_close_tab(token, &mut output);
+        let intent = state.pending_close.take().expect("close intent");
         let save = state.build_save_request(false).expect("save");
-        state.pending_source = Some(target);
-        state.post_save_action = Some(PendingDecisionKind::Switch);
+        state.post_save_close = Some(intent);
         assert!(state.mark_saving(&save));
-        state.document.as_mut().expect("document").text = "typed later".to_owned();
+        edit(&mut state, token, "typed later");
 
         assert!(state.apply_saved(save.token, Ok(())));
-        let mut output = Output::default();
         finish_deferred_action(&mut state, &mut output);
-        assert!(output.load.is_none());
-        assert_eq!(state.pending_decision, Some(PendingDecisionKind::Switch));
+        assert_eq!(state.pending_close, Some(intent));
+        assert!(state.post_save_close.is_none());
         assert!(state.is_dirty());
+        assert_eq!(state.document(token).expect("document").text, "typed later");
+    }
+
+    #[test]
+    fn canceling_full_editor_close_preserves_all_dirty_buffers() {
+        let mut state = TextEditorState::default();
+        let first = open_loaded(&mut state, remote(7, "/tmp/a.txt"), "one");
+        let second = open_loaded(&mut state, remote(7, "/tmp/b.txt"), "two");
+        edit(&mut state, first, "one changed");
+        edit(&mut state, second, "two changed");
+        let mut output = Output::default();
+
+        state.request_close_editor(&mut output);
+        let first_intent = state.pending_close.take().expect("first decision");
+        assert_eq!(first_intent.scope, CloseScope::Editor);
+        let fingerprint = sha256(
+            state
+                .document(first_intent.token)
+                .expect("first document")
+                .text
+                .as_bytes(),
+        );
+        state
+            .close_editor_discarded
+            .insert(first_intent.token, fingerprint);
+        state.advance_close_editor(&mut output);
+        assert!(state.pending_close.is_some());
+
+        state.cancel_close_flow();
+        assert_eq!(state.documents.len(), 2);
+        assert_eq!(state.document(first).expect("first").text, "one changed");
+        assert_eq!(state.document(second).expect("second").text, "two changed");
+        assert!(state.document(first).expect("first").dirty());
+        assert!(state.document(second).expect("second").dirty());
+    }
+
+    #[test]
+    fn editing_a_discarded_tab_during_close_save_prompts_again() {
+        let mut state = TextEditorState::default();
+        let first = open_loaded(&mut state, remote(8, "/tmp/a.txt"), "one");
+        let second = open_loaded(&mut state, remote(8, "/tmp/b.txt"), "two");
+        edit(&mut state, first, "one changed");
+        edit(&mut state, second, "two changed");
+        let mut output = Output::default();
+
+        state.request_close_editor(&mut output);
+        let first_intent = state.pending_close.take().expect("first decision");
+        let fingerprint = sha256(
+            state
+                .document(first_intent.token)
+                .expect("first document")
+                .text
+                .as_bytes(),
+        );
+        state
+            .close_editor_discarded
+            .insert(first_intent.token, fingerprint);
+        state.advance_close_editor(&mut output);
+
+        let second_intent = state.pending_close.take().expect("second decision");
+        assert_eq!(second_intent.token, second);
+        let save = state
+            .build_save_request_for(second, false)
+            .expect("save request");
+        state.post_save_close = Some(second_intent);
+        assert!(state.mark_saving(&save));
+
+        edit(&mut state, first, "one changed again");
+        assert!(state.apply_saved(second, Ok(())));
+        finish_deferred_action(&mut state, &mut output);
+
         assert_eq!(
-            state.document.as_ref().expect("document").text,
-            "typed later"
+            state.pending_close,
+            Some(CloseIntent {
+                scope: CloseScope::Editor,
+                token: first,
+            }),
+            "已放弃标签后来又被编辑时必须重新询问"
+        );
+        assert_eq!(state.documents.len(), 2);
+        assert_eq!(
+            state.document(first).expect("first").text,
+            "one changed again"
+        );
+    }
+
+    #[test]
+    fn saving_background_tab_routes_by_token() {
+        let mut state = TextEditorState::default();
+        let first = open_loaded(&mut state, remote(8, "/tmp/a.txt"), "one");
+        let second = open_loaded(&mut state, remote(8, "/tmp/b.txt"), "two");
+        edit(&mut state, first, "one saved");
+        let save = state.build_save_request_for(first, false).expect("save");
+        assert!(state.mark_saving(&save));
+        assert_eq!(state.active_token, Some(second));
+
+        assert!(state.apply_saved(first, Ok(())));
+        assert_eq!(state.active_token, Some(second));
+        assert!(!state.document(first).expect("first").dirty());
+        assert_eq!(
+            state.source_for_token(first),
+            Some(&remote(8, "/tmp/a.txt"))
+        );
+    }
+
+    fn egui_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 500.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accepted_completion_is_one_undoable_text_edit() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(9, "/tmp/main.py"), "pri");
+        state.pending_completion = Some(PendingCompletion {
+            token,
+            fingerprint: sha256(b"pri"),
+            replace_chars: 0..3,
+            insertion: "print".to_owned(),
+        });
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("completion_undo_editor");
+
+        let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
+            assert!(inject_pending_completion(ui, &mut state, token, editor_id));
+            let document = state.document_mut(token).expect("document");
+            let _ = egui::TextEdit::singleline(&mut document.text)
+                .id(editor_id)
+                .show(ui);
+        });
+        assert_eq!(state.document(token).expect("document").text, "print");
+
+        let modifiers = egui::Modifiers::COMMAND;
+        let undo = egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: Some(egui::Key::Z),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut input = egui_input(vec![undo]);
+        input.modifiers = modifiers;
+        let _ = ctx.run_ui(input, |ui| {
+            let document = state.document_mut(token).expect("document");
+            let _ = egui::TextEdit::singleline(&mut document.text)
+                .id(editor_id)
+                .show(ui);
+        });
+        assert_eq!(
+            state.document(token).expect("document").text,
+            "pri",
+            "补全接受必须能被一次 Ctrl+Z 完整撤销"
+        );
+    }
+
+    #[test]
+    fn ime_preedit_does_not_consume_completion_keys() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(9, "/tmp/main.py"), "pri");
+        state.completion = Some(CompletionPopup {
+            token,
+            fingerprint: sha256(b"pri"),
+            set: CompletionSet {
+                replace_chars: 0..3,
+                items: vec![crate::shell::text_editor_language::CompletionItem {
+                    label: "print".to_owned(),
+                    kind: CompletionKind::Builtin,
+                }],
+            },
+            selected: 0,
+            caret_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 14.0)),
+        });
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("中".to_owned())),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("completion_ime_editor");
+        let mut enter_remains = false;
+        let _ = ctx.run_ui(egui_input(events), |ui| {
+            let (_, accepted) = prepare_completion_input(ui, &mut state, token, editor_id);
+            assert!(!accepted);
+            enter_remains = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        });
+        assert!(state.ime_composing);
+        assert!(state.completion.is_none());
+        assert!(
+            enter_remains,
+            "IME 组合期间 Enter 应交给输入法/TextEdit，而不是补全弹层"
         );
     }
 }

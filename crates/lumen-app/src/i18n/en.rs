@@ -208,6 +208,10 @@ pub static STRINGS: Strings = Strings {
     text_editor_saved: "Saved",
     text_editor_unsaved: "Unsaved",
     text_editor_find_hint: "Find",
+    text_editor_completion_hint: "Ctrl+Space to show suggestions",
+    text_editor_completion_keyword: "Keyword",
+    text_editor_completion_builtin: "Built-in",
+    text_editor_completion_document: "Current file",
     text_editor_stats_fmt: "{0} lines · {1} bytes",
     text_editor_remote_changed_title: "The remote file changed",
     text_editor_remote_changed_body:
@@ -217,6 +221,7 @@ pub static STRINGS: Strings = Strings {
     text_editor_overwrite: "Overwrite",
     text_editor_unsaved_title: "Unsaved changes",
     text_editor_unsaved_body: "Your changes have not been saved to the remote file.",
+    text_editor_dont_save: "Don't Save",
     text_editor_discard: "Discard changes",
     text_editor_save_too_large_fmt: "The edited file exceeds the {} MiB save limit.",
     text_editor_open_too_large_fmt:
@@ -291,6 +296,8 @@ pub static STRINGS: Strings = Strings {
     topbar_sidebar_hide_tip: "Hide session sidebar",
     toolbar_remote_list_show_tip: "Show device sidebar",
     toolbar_remote_list_hide_tip: "Hide device sidebar",
+    toolbar_ssh_server_list_show_tip: "Show SSH server sidebar",
+    toolbar_ssh_server_list_hide_tip: "Hide SSH server sidebar",
     topbar_filetree_show_tip: "Show file tree (Ctrl+B)",
     topbar_filetree_hide_tip: "Hide file tree (Ctrl+B)",
     topbar_reset_layout_tip: "Reset pane sizes",

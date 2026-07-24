@@ -415,6 +415,10 @@ pub struct Strings {
     pub text_editor_saved: &'static str,
     pub text_editor_unsaved: &'static str,
     pub text_editor_find_hint: &'static str,
+    pub text_editor_completion_hint: &'static str,
+    pub text_editor_completion_keyword: &'static str,
+    pub text_editor_completion_builtin: &'static str,
+    pub text_editor_completion_document: &'static str,
     /// `{0}` 行数，`{1}` UTF-8 缓冲字节数。
     pub text_editor_stats_fmt: &'static str,
     pub text_editor_remote_changed_title: &'static str,
@@ -424,6 +428,7 @@ pub struct Strings {
     pub text_editor_overwrite: &'static str,
     pub text_editor_unsaved_title: &'static str,
     pub text_editor_unsaved_body: &'static str,
+    pub text_editor_dont_save: &'static str,
     pub text_editor_discard: &'static str,
     /// 单参 `{}`：MiB 上限。
     pub text_editor_save_too_large_fmt: &'static str,
@@ -514,6 +519,10 @@ pub struct Strings {
     pub toolbar_remote_list_show_tip: &'static str,
     /// 隐藏远程设备栏 tooltip
     pub toolbar_remote_list_hide_tip: &'static str,
+    /// 显示 SSH 服务器栏 tooltip
+    pub toolbar_ssh_server_list_show_tip: &'static str,
+    /// 隐藏 SSH 服务器栏 tooltip
+    pub toolbar_ssh_server_list_hide_tip: &'static str,
     /// 显示/隐藏文件树 tooltip（展开态）
     pub topbar_filetree_show_tip: &'static str,
     /// 显示/隐藏文件树 tooltip（隐藏态）

@@ -20,6 +20,7 @@ pub mod ssh_filetree;
 pub mod ssh_ui;
 pub mod statusbar;
 pub mod text_editor;
+mod text_editor_language;
 pub mod theme;
 pub mod toast;
 pub mod toolbar;
@@ -522,6 +523,9 @@ pub struct ShellOutput {
     /// 工具栏远程设备栏显隐开关：仅远程视图提供按钮。
     /// Some(v) = 新可见值，None = 未操作。main 写入设置并落盘。
     pub toggle_remote_list: Option<bool>,
+    /// 工具栏 SSH 服务器栏显隐开关：仅 SSH 视图提供按钮。
+    /// Some(v) = 新可见值，None = 未操作。main 写入设置并落盘。
+    pub toggle_ssh_server_list: Option<bool>,
     /// 工具栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
     pub toggle_filetree: Option<bool>,
     /// 本地/远程/SSH 工作模式切换：main 写 settings.layout.view_mode + 存盘。
@@ -758,6 +762,7 @@ pub fn show(
         layout_reset: false,
         toggle_sidebar: None,
         toggle_remote_list: None,
+        toggle_ssh_server_list: None,
         toggle_filetree: None,
         toggle_view_mode: None,
         ssh_actions: Vec::new(),
@@ -963,9 +968,11 @@ pub fn show(
         pal,
         toolbar::ViewState {
             remote_view: is_remote_view,
+            ssh_view: is_ssh_view,
             session_actions_enabled: !is_ssh_view,
             navigation_actions_enabled: true,
             remote_list_visible: app_settings.layout.remote_list_visible,
+            ssh_server_list_visible: app_settings.layout.ssh_server_list_visible,
             sidebar_visible: app_settings.layout.sidebar_visible,
             filetree_visible: st.filetree.visible,
         },
@@ -982,6 +989,9 @@ pub fn show(
     }
     if tbar.toggle_remote_list.is_some() {
         out.toggle_remote_list = tbar.toggle_remote_list;
+    }
+    if tbar.toggle_ssh_server_list.is_some() {
+        out.toggle_ssh_server_list = tbar.toggle_ssh_server_list;
     }
     if let Some(v) = tbar.toggle_filetree {
         // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
@@ -1062,7 +1072,7 @@ pub fn show(
     }
 
     // SSH 模式使用独立服务器/分组栏，不复用本地会话或远程设备状态。
-    if is_ssh_view {
+    if is_ssh_view && app_settings.layout.ssh_server_list_visible {
         let text = ssh_ui::SshUiText::localized();
         let mut ssh_out = ssh_ui::SshUiOutput::default();
         let ssh_resp = egui::Panel::left("lumen_ssh_servers")
