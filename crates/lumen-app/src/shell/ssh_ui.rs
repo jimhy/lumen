@@ -719,14 +719,142 @@ pub fn show(
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderIcon {
+    NewProfile,
+    NewGroup,
+}
+
+fn header_icon_button(
+    ui: &mut egui::Ui,
+    icon: HeaderIcon,
+    tooltip: &str,
+    pal: &Palette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), egui::Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, 4.0, pal.bg_highlight);
+    }
+
+    let color = if hovered { pal.fg } else { pal.fg_dim };
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    let center = rect.center();
+    match icon {
+        HeaderIcon::NewProfile => {
+            let server = egui::Rect::from_center_size(
+                center + egui::vec2(-2.5, -1.5),
+                egui::vec2(13.0, 14.0),
+            );
+            ui.painter()
+                .rect_stroke(server, 1.5, stroke, egui::StrokeKind::Middle);
+            for y in [server.top() + 4.5, server.top() + 9.5] {
+                ui.painter()
+                    .circle_filled(egui::pos2(server.left() + 3.0, y), 1.0, color);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(server.left() + 5.5, y),
+                        egui::pos2(server.right() - 2.0, y),
+                    ],
+                    egui::Stroke::new(1.0_f32, color),
+                );
+            }
+            paint_plus(ui.painter(), center + egui::vec2(6.0, 5.0), 3.0, color);
+        }
+        HeaderIcon::NewGroup => {
+            let left = center.x - 8.0;
+            let right = center.x + 6.0;
+            let top = center.y - 6.0;
+            let bottom = center.y + 6.0;
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    egui::pos2(left, bottom),
+                    egui::pos2(left, top + 1.5),
+                    egui::pos2(left + 5.0, top + 1.5),
+                    egui::pos2(left + 7.0, top + 4.0),
+                    egui::pos2(right, top + 4.0),
+                    egui::pos2(right, bottom),
+                    egui::pos2(left, bottom),
+                ],
+                stroke,
+            ));
+            paint_plus(ui.painter(), center + egui::vec2(6.0, 4.5), 3.0, color);
+        }
+    }
+
+    response.on_hover_text(tooltip)
+}
+
+fn paint_plus(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
+    let stroke = egui::Stroke::new(1.3_f32, color);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - radius, center.y),
+            egui::pos2(center.x + radius, center.y),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y - radius),
+            egui::pos2(center.x, center.y + radius),
+        ],
+        stroke,
+    );
+}
+
+fn draw_chevron(ui: &mut egui::Ui, collapsed: bool, pal: &Palette) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 20.0), egui::Sense::hover());
+    let color = if response.hovered() {
+        pal.fg
+    } else {
+        pal.fg_dim
+    };
+    let stroke = egui::Stroke::new(1.4_f32, color);
+    let center = rect.center();
+    let points = if collapsed {
+        [
+            center + egui::vec2(-2.0, -4.0),
+            center + egui::vec2(2.0, 0.0),
+            center + egui::vec2(-2.0, 4.0),
+        ]
+    } else {
+        [
+            center + egui::vec2(-4.0, -2.0),
+            center + egui::vec2(0.0, 2.0),
+            center + egui::vec2(4.0, -2.0),
+        ]
+    };
+    ui.painter().line_segment([points[0], points[1]], stroke);
+    ui.painter().line_segment([points[1], points[2]], stroke);
+}
+
+fn overflow_button(ui: &mut egui::Ui, tooltip: &str, pal: &Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, pal.bg_highlight);
+    }
+    let color = if response.hovered() {
+        pal.fg
+    } else {
+        pal.fg_dim
+    };
+    let center = rect.center();
+    for offset in [-4.0, 0.0, 4.0] {
+        ui.painter()
+            .circle_filled(center + egui::vec2(offset, 0.0), 1.25, color);
+    }
+    response.on_hover_text(tooltip)
+}
+
 fn draw_header(ui: &mut egui::Ui, state: &mut SshUiState, text: &SshUiText, pal: &Palette) {
     ui.horizontal(|ui| {
         ui.heading(RichText::new(text.title).size(16.0).color(pal.fg));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if small_button(ui, "+", text.new_profile, pal).clicked() {
+            if header_icon_button(ui, HeaderIcon::NewProfile, text.new_profile, pal).clicked() {
                 state.dialog = Some(Dialog::EditProfile(ProfileForm::create()));
             }
-            if small_button(ui, "▦", text.new_group, pal).clicked() {
+            if header_icon_button(ui, HeaderIcon::NewGroup, text.new_group, pal).clicked() {
                 state.dialog = Some(Dialog::CreateGroup {
                     name: String::new(),
                 });
@@ -748,6 +876,115 @@ fn draw_search(ui: &mut egui::Ui, state: &mut SshUiState, text: &SshUiText, pal:
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupCommand {
+    Rename,
+    Delete,
+}
+
+fn group_action_menu(
+    ui: &mut egui::Ui,
+    text: &SshUiText,
+    pal: &Palette,
+    command: &mut Option<GroupCommand>,
+) {
+    ui.set_min_width(120.0);
+    if ui.button(text.rename_group).clicked() {
+        *command = Some(GroupCommand::Rename);
+        ui.close();
+    }
+    if ui
+        .button(RichText::new(text.delete_group).color(pal.error))
+        .clicked()
+    {
+        *command = Some(GroupCommand::Delete);
+        ui.close();
+    }
+}
+
+fn apply_group_command(command: GroupCommand, group: &SshGroup, state: &mut SshUiState) {
+    state.dialog = Some(match command {
+        GroupCommand::Rename => Dialog::RenameGroup {
+            id: group.id.clone(),
+            name: group.name.clone(),
+        },
+        GroupCommand::Delete => Dialog::DeleteGroup {
+            id: group.id.clone(),
+            name: group.name.clone(),
+        },
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileRowCommand {
+    Connect,
+    Edit,
+    Delete,
+}
+
+fn profile_row_action_labels(text: &SshUiText) -> [&str; 3] {
+    [text.connect, text.edit, text.delete]
+}
+
+fn profile_overflow_menu(
+    ui: &mut egui::Ui,
+    text: &SshUiText,
+    pal: &Palette,
+    command: &mut Option<ProfileRowCommand>,
+) {
+    let [_, edit, delete] = profile_row_action_labels(text);
+    ui.set_min_width(116.0);
+    if ui.button(edit).clicked() {
+        *command = Some(ProfileRowCommand::Edit);
+        ui.close();
+    }
+    if ui.button(RichText::new(delete).color(pal.error)).clicked() {
+        *command = Some(ProfileRowCommand::Delete);
+        ui.close();
+    }
+}
+
+fn profile_context_menu(
+    ui: &mut egui::Ui,
+    text: &SshUiText,
+    pal: &Palette,
+    command: &mut Option<ProfileRowCommand>,
+) {
+    let [connect, _, _] = profile_row_action_labels(text);
+    ui.set_min_width(116.0);
+    if ui.button(connect).clicked() {
+        *command = Some(ProfileRowCommand::Connect);
+        ui.close();
+        return;
+    }
+    ui.separator();
+    profile_overflow_menu(ui, text, pal, command);
+}
+
+fn apply_profile_row_command(
+    command: ProfileRowCommand,
+    profile: &SshProfile,
+    state: &mut SshUiState,
+    out: &mut SshUiOutput,
+) {
+    match command {
+        ProfileRowCommand::Connect => {
+            out.actions.push(SshUiAction::ConnectProfile {
+                id: profile.id.clone(),
+            });
+        }
+        ProfileRowCommand::Edit => {
+            state.dialog = Some(Dialog::EditProfile(ProfileForm::edit(profile)));
+        }
+        ProfileRowCommand::Delete => {
+            state.dialog = Some(Dialog::DeleteProfile {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+            });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_group_section(
     ui: &mut egui::Ui,
@@ -760,21 +997,25 @@ fn draw_group_section(
     out: &mut SshUiOutput,
 ) {
     let collapsed = state.collapsed_groups.contains(&group.id);
+    let mut command = None;
+    let mut overflow_clicked = false;
     let header = draw_group_header(ui, &group.name, collapsed, pal, |ui| {
-        if small_button(ui, "✎", text.rename_group, pal).clicked() {
-            state.dialog = Some(Dialog::RenameGroup {
-                id: group.id.clone(),
-                name: group.name.clone(),
-            });
-        }
-        if small_button(ui, "×", text.delete_group, pal).clicked() {
-            state.dialog = Some(Dialog::DeleteGroup {
-                id: group.id.clone(),
-                name: group.name.clone(),
-            });
-        }
+        let overflow = overflow_button(
+            ui,
+            &format!("{} / {}", text.rename_group, text.delete_group),
+            pal,
+        );
+        overflow_clicked = overflow.clicked();
+        let _ = egui::Popup::menu(&overflow)
+            .align(egui::RectAlign::BOTTOM_END)
+            .width(136.0)
+            .show(|ui| group_action_menu(ui, text, pal, &mut command));
     });
-    if header.clicked() {
+    header.context_menu(|ui| group_action_menu(ui, text, pal, &mut command));
+    if let Some(command) = command {
+        apply_group_command(command, group, state);
+    }
+    if header.clicked_by(egui::PointerButton::Primary) && !overflow_clicked {
         if collapsed {
             state.collapsed_groups.remove(&group.id);
         } else {
@@ -812,7 +1053,7 @@ fn draw_ungrouped_section(
     out: &mut SshUiOutput,
 ) {
     let header = draw_group_header(ui, text.ungrouped, state.ungrouped_collapsed, pal, |_| {});
-    if header.clicked() {
+    if header.clicked_by(egui::PointerButton::Primary) {
         state.ungrouped_collapsed = !state.ungrouped_collapsed;
     }
     register_group_drop_target(state, inventory, &header, None, profiles.len());
@@ -833,30 +1074,30 @@ fn draw_group_header(
     pal: &Palette,
     trailing: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
-    let response = egui::Frame::NONE
-        .fill(pal.bg_panel)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 3))
-        .show(ui, |ui| {
-            ui.set_min_height(ROW_HEIGHT - 2.0);
-            ui.horizontal(|ui| {
-                let arrow = if collapsed { "▸" } else { "▾" };
-                ui.label(RichText::new(arrow).color(pal.fg_dim));
-                ui.label(RichText::new(name).strong().color(pal.fg));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
-            });
-        })
-        .response
-        .interact(egui::Sense::click());
-
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT + 4.0),
+        egui::Sense::click(),
+    );
+    ui.painter().rect_filled(rect, 4.0, pal.bg_panel);
     if response.hovered() {
         ui.painter().rect_stroke(
-            response.rect,
+            rect,
             4.0,
             egui::Stroke::new(1.0_f32, pal.bg_highlight),
             egui::StrokeKind::Inside,
         );
     }
+
+    let content_rect = rect.shrink2(egui::vec2(6.0, 3.0));
+    let mut content_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    content_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+    draw_chevron(&mut content_ui, collapsed, pal);
+    content_ui.label(RichText::new(name).strong().color(pal.fg));
+    content_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
     response
 }
 
@@ -873,63 +1114,95 @@ fn draw_profile_rows(
 ) {
     for (visible_index, profile) in profiles.iter().enumerate() {
         let selected = state.selected_profile_id.as_deref() == Some(&profile.id);
-        let fill = if selected {
-            pal.selection
+        let sense = if state.search.trim().is_empty() {
+            egui::Sense::click_and_drag()
         } else {
-            Color32::TRANSPARENT
+            egui::Sense::click()
         };
-        let row = egui::Frame::NONE
-            .fill(fill)
-            .corner_radius(4.0)
-            .inner_margin(egui::Margin::symmetric(6, 2))
-            .show(ui, |ui| {
-                ui.set_min_height(ROW_HEIGHT);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&profile.name).color(pal.fg));
-                        ui.label(
-                            RichText::new(format!(
-                                "{}@{}:{}",
-                                profile.username, profile.host, profile.port
-                            ))
-                            .small()
-                            .color(pal.fg_dim),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if small_button(ui, "×", text.delete, pal).clicked() {
-                            state.dialog = Some(Dialog::DeleteProfile {
-                                id: profile.id.clone(),
-                                name: profile.name.clone(),
-                            });
-                        }
-                        if small_button(ui, "✎", text.edit, pal).clicked() {
-                            state.dialog = Some(Dialog::EditProfile(ProfileForm::edit(profile)));
-                        }
-                        if small_button(ui, "▶", text.connect, pal).clicked() {
-                            out.actions.push(SshUiAction::ConnectProfile {
-                                id: profile.id.clone(),
-                            });
-                        }
-                    });
-                });
-            })
-            .response
-            .interact(if state.search.trim().is_empty() {
-                egui::Sense::click_and_drag()
+        let row_output = ui.push_id(("ssh_profile_row", &profile.id), |ui| {
+            let (rect, row) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT + 4.0), sense);
+            let fill = if selected {
+                pal.selection
+            } else if row.hovered() {
+                pal.bg_panel
             } else {
-                egui::Sense::click()
-            });
+                Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(rect, 4.0, fill);
 
-        if row.clicked() {
+            let content_rect = rect.shrink2(egui::vec2(6.0, 2.0));
+            let mut content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            content_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+            let mut command = None;
+            let mut action_control_clicked = false;
+            content_ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&profile.name).color(pal.fg));
+                    ui.label(
+                        RichText::new(format!(
+                            "{}@{}:{}",
+                            profile.username, profile.host, profile.port
+                        ))
+                        .small()
+                        .color(pal.fg_dim),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if selected || row.hovered() {
+                        let overflow =
+                            overflow_button(ui, &format!("{} / {}", text.edit, text.delete), pal);
+                        action_control_clicked |= overflow.clicked();
+                        let _ = egui::Popup::menu(&overflow)
+                            .align(egui::RectAlign::BOTTOM_END)
+                            .width(132.0)
+                            .show(|ui| profile_overflow_menu(ui, text, pal, &mut command));
+                        let connect = ui.add(
+                            egui::Button::new(RichText::new(text.connect).small())
+                                .fill(pal.btn_bg)
+                                .corner_radius(3.0),
+                        );
+                        if connect.clicked() {
+                            action_control_clicked = true;
+                            command = Some(ProfileRowCommand::Connect);
+                        }
+                    } else {
+                        // 操作出现/隐藏时保留稳定宽度，避免服务器文本左右跳动。
+                        ui.allocate_space(egui::vec2(92.0, 24.0));
+                    }
+                });
+            });
+            (row, command, action_control_clicked)
+        });
+        let (row, command, action_control_clicked) = row_output.inner;
+
+        let mut context_command = None;
+        row.context_menu(|ui| profile_context_menu(ui, text, pal, &mut context_command));
+        let command = context_command.or(command);
+        if command.is_some()
+            || row.clicked_by(egui::PointerButton::Secondary)
+            || action_control_clicked
+        {
             state.selected_profile_id = Some(profile.id.clone());
         }
-        if row.double_clicked() {
-            out.actions.push(SshUiAction::ConnectProfile {
-                id: profile.id.clone(),
-            });
+        if let Some(command) = command {
+            apply_profile_row_command(command, profile, state, out);
         }
-        if state.search.trim().is_empty() && row.drag_started() {
+
+        if row.clicked_by(egui::PointerButton::Primary) && !action_control_clicked {
+            state.selected_profile_id = Some(profile.id.clone());
+        }
+        if row.double_clicked_by(egui::PointerButton::Primary) && !action_control_clicked {
+            apply_profile_row_command(ProfileRowCommand::Connect, profile, state, out);
+        }
+        if state.search.trim().is_empty()
+            && row.drag_started_by(egui::PointerButton::Primary)
+            && !action_control_clicked
+        {
             state.dragged_profile_id = Some(profile.id.clone());
             state.drop_target = None;
         }
@@ -1565,16 +1838,6 @@ fn empty_row(ui: &mut egui::Ui, message: &str, pal: &Palette) {
     );
 }
 
-fn small_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str, pal: &Palette) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(glyph).color(pal.fg))
-            .fill(Color32::TRANSPARENT)
-            .corner_radius(3.0)
-            .min_size(egui::vec2(24.0, 24.0)),
-    )
-    .on_hover_text(tooltip)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1622,6 +1885,66 @@ mod tests {
             normalized_drop_target(&inventory, source_id, Some(group_id), 2),
             None
         );
+    }
+
+    #[test]
+    fn 服务器行操作使用本地化文案并映射到明确动作() {
+        let text = SshUiText {
+            connect: "Connect",
+            edit: "Edit",
+            delete: "Delete",
+            ..SshUiText::default()
+        };
+        assert_eq!(
+            profile_row_action_labels(&text),
+            ["Connect", "Edit", "Delete"]
+        );
+
+        let inventory = inventory();
+        let profile = inventory.profiles().first().unwrap();
+        let mut state = SshUiState::default();
+        let mut out = SshUiOutput::default();
+
+        apply_profile_row_command(ProfileRowCommand::Connect, profile, &mut state, &mut out);
+        assert!(matches!(
+            out.actions.as_slice(),
+            [SshUiAction::ConnectProfile { id }] if id == &profile.id
+        ));
+
+        apply_profile_row_command(ProfileRowCommand::Edit, profile, &mut state, &mut out);
+        assert!(matches!(
+            state.dialog.as_ref(),
+            Some(Dialog::EditProfile(form))
+                if form.editing_id.as_deref() == Some(profile.id.as_str())
+        ));
+
+        apply_profile_row_command(ProfileRowCommand::Delete, profile, &mut state, &mut out);
+        assert!(matches!(
+            state.dialog.as_ref(),
+            Some(Dialog::DeleteProfile { id, name })
+                if id == &profile.id && name == &profile.name
+        ));
+    }
+
+    #[test]
+    fn 分组菜单复用既有重命名与删除弹窗() {
+        let inventory = inventory();
+        let group = inventory.groups().first().unwrap();
+        let mut state = SshUiState::default();
+
+        apply_group_command(GroupCommand::Rename, group, &mut state);
+        assert!(matches!(
+            state.dialog.as_ref(),
+            Some(Dialog::RenameGroup { id, name })
+                if id == &group.id && name == &group.name
+        ));
+
+        apply_group_command(GroupCommand::Delete, group, &mut state);
+        assert!(matches!(
+            state.dialog.as_ref(),
+            Some(Dialog::DeleteGroup { id, name })
+                if id == &group.id && name == &group.name
+        ));
     }
 
     #[test]

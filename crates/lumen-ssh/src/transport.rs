@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io::Read;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -27,6 +28,10 @@ use crate::credential::{Credential, SecretString};
 use crate::host_key::{decide_host_key, HostKeyDecision, HostKeyIdentity};
 use crate::metrics::{MetricsAccumulator, ServerMetrics, LINUX_METRICS_COMMAND};
 
+#[path = "directory.rs"]
+mod directory;
+pub use directory::{DirectoryEntry, DirectoryEntryKind, DirectoryError};
+
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMANDS_PER_TICK: usize = 64;
 const MAX_MONITOR_OUTPUT_BYTES: usize = 64 * 1024;
@@ -35,6 +40,11 @@ const MAX_PRIVATE_KEY_BYTES: usize = 1024 * 1024;
 const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 static CONNECTION_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+
+struct DirectoryLanes {
+    command_rx: Receiver<Command>,
+    event_tx: Sender<Event>,
+}
 
 pub struct ConnectionConfig {
     pub host: String,
@@ -260,6 +270,20 @@ impl Default for QueueConfig {
 pub enum Command {
     Input(Vec<u8>),
     Resize(TerminalSize),
+    /// List one Linux directory over a separate, read-only exec channel.
+    ///
+    /// Results are received exclusively through
+    /// [`SshConnection::drain_directory`], not the terminal event lane.
+    ListDirectory {
+        token: u64,
+        path: String,
+        show_hidden: bool,
+    },
+    /// Best-effort cancellation. The token is invalidated before the remote
+    /// channel is closed, so any late result is harmless.
+    CancelDirectory {
+        token: u64,
+    },
     Disconnect,
 }
 
@@ -271,6 +295,18 @@ impl fmt::Debug for Command {
                 .field("bytes", &data.len())
                 .finish(),
             Self::Resize(size) => formatter.debug_tuple("Resize").field(size).finish(),
+            Self::ListDirectory {
+                token, show_hidden, ..
+            } => formatter
+                .debug_struct("ListDirectory")
+                .field("token", token)
+                .field("path", &"<redacted>")
+                .field("show_hidden", show_hidden)
+                .finish(),
+            Self::CancelDirectory { token } => formatter
+                .debug_struct("CancelDirectory")
+                .field("token", token)
+                .finish(),
             Self::Disconnect => formatter.write_str("Disconnect"),
         }
     }
@@ -305,6 +341,18 @@ pub enum Event {
     Metrics(ServerMetrics),
     MetricsError {
         message: String,
+    },
+    /// Bounded result from the independent directory event lane.
+    DirectoryListing {
+        token: u64,
+        entries: Vec<DirectoryEntry>,
+        truncated: bool,
+    },
+    /// Non-fatal directory service failure. It never changes the terminal
+    /// connection state.
+    DirectoryError {
+        token: u64,
+        error: DirectoryError,
     },
     Error(EventError),
     Disconnected {
@@ -359,6 +407,21 @@ impl fmt::Debug for Event {
             Self::MetricsError { message } => formatter
                 .debug_struct("MetricsError")
                 .field("message", message)
+                .finish(),
+            Self::DirectoryListing {
+                token,
+                entries,
+                truncated,
+            } => formatter
+                .debug_struct("DirectoryListing")
+                .field("token", token)
+                .field("entries", &entries.len())
+                .field("truncated", truncated)
+                .finish(),
+            Self::DirectoryError { token, error } => formatter
+                .debug_struct("DirectoryError")
+                .field("token", token)
+                .field("error", error)
                 .finish(),
             Self::Error(error) => formatter.debug_tuple("Error").field(error).finish(),
             Self::Disconnected { reason } => formatter
@@ -417,6 +480,8 @@ pub enum CommandSendError {
     InputTooLarge,
     #[error("invalid SSH terminal size")]
     InvalidTerminalSize,
+    #[error("invalid SSH directory request")]
+    InvalidDirectoryRequest,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -430,6 +495,8 @@ pub enum EventReceiveError {
 pub struct SshConnection {
     command_tx: Sender<Command>,
     event_rx: Receiver<Event>,
+    directory_command_tx: Sender<Command>,
+    directory_event_rx: Receiver<Event>,
     cancelled: Arc<AtomicBool>,
     maximum_input_bytes: usize,
     thread: Option<JoinHandle<()>>,
@@ -442,18 +509,31 @@ impl SshConnection {
         let queues = config.queues;
         let (command_tx, command_rx) = bounded(queues.command_capacity);
         let (event_tx, event_rx) = bounded(queues.event_capacity);
+        let (directory_command_tx, directory_command_rx) = bounded(directory::COMMAND_CAPACITY);
+        let (directory_event_tx, directory_event_rx) = bounded(directory::EVENT_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
         let thread_cancelled = Arc::clone(&cancelled);
         let thread_number = CONNECTION_THREAD_ID.fetch_add(1, Ordering::Relaxed);
 
         let thread = thread::Builder::new()
             .name(format!("lumen-ssh-{thread_number}"))
-            .spawn(move || connection_thread(config, command_rx, event_tx, thread_cancelled))
+            .spawn(move || {
+                connection_thread(
+                    config,
+                    command_rx,
+                    event_tx,
+                    directory_command_rx,
+                    directory_event_tx,
+                    thread_cancelled,
+                );
+            })
             .map_err(StartError::Thread)?;
 
         Ok(Self {
             command_tx,
             event_rx,
+            directory_command_tx,
+            directory_event_rx,
             cancelled,
             maximum_input_bytes: queues.maximum_input_bytes,
             thread: Some(thread),
@@ -462,7 +542,12 @@ impl SshConnection {
 
     /// Enqueues a command without blocking the calling thread.
     pub fn send(&self, command: Command) -> Result<(), CommandSendError> {
-        try_send_command(&self.command_tx, command, self.maximum_input_bytes)
+        match command {
+            command @ (Command::ListDirectory { .. } | Command::CancelDirectory { .. }) => {
+                try_send_directory_command(&self.directory_command_tx, command)
+            }
+            command => try_send_command(&self.command_tx, command, self.maximum_input_bytes),
+        }
     }
 
     /// Receives one event without blocking the calling thread.
@@ -475,6 +560,21 @@ impl SshConnection {
 
     pub fn drain(&self, destination: &mut Vec<Event>) {
         destination.extend(self.event_rx.try_iter());
+    }
+
+    /// Receives one directory result without touching the terminal event lane.
+    pub fn try_recv_directory(&self) -> Result<Event, EventReceiveError> {
+        self.directory_event_rx
+            .try_recv()
+            .map_err(|error| match error {
+                CrossbeamTryRecvError::Empty => EventReceiveError::Empty,
+                CrossbeamTryRecvError::Disconnected => EventReceiveError::Closed,
+            })
+    }
+
+    /// Drains the independent directory result lane without blocking.
+    pub fn drain_directory(&self, destination: &mut Vec<Event>) {
+        destination.extend(self.directory_event_rx.try_iter());
     }
 
     #[must_use]
@@ -520,7 +620,33 @@ fn try_send_command(
         Command::Resize(size) if size.validate().is_err() => {
             return Err(CommandSendError::InvalidTerminalSize);
         }
+        Command::ListDirectory { .. } | Command::CancelDirectory { .. } => {
+            return Err(CommandSendError::InvalidDirectoryRequest);
+        }
         _ => {}
+    }
+    sender.try_send(command).map_err(|error| match error {
+        CrossbeamTrySendError::Full(_) => CommandSendError::Full,
+        CrossbeamTrySendError::Disconnected(_) => CommandSendError::Closed,
+    })
+}
+
+fn try_send_directory_command(
+    sender: &Sender<Command>,
+    command: Command,
+) -> Result<(), CommandSendError> {
+    match &command {
+        Command::ListDirectory { token, path, .. } => {
+            directory::validate_request(*token, path)
+                .map_err(|_| CommandSendError::InvalidDirectoryRequest)?;
+        }
+        Command::CancelDirectory { token } if *token == 0 => {
+            return Err(CommandSendError::InvalidDirectoryRequest);
+        }
+        Command::CancelDirectory { .. } => {}
+        Command::Input(_) | Command::Resize(_) | Command::Disconnect => {
+            return Err(CommandSendError::InvalidDirectoryRequest);
+        }
     }
     sender.try_send(command).map_err(|error| match error {
         CrossbeamTrySendError::Full(_) => CommandSendError::Full,
@@ -532,6 +658,8 @@ fn connection_thread(
     config: ConnectionConfig,
     command_rx: Receiver<Command>,
     event_tx: Sender<Event>,
+    directory_command_rx: Receiver<Command>,
+    directory_event_tx: Sender<Event>,
     cancelled: Arc<AtomicBool>,
 ) {
     let mut sink = EventSink::new(
@@ -559,6 +687,10 @@ fn connection_thread(
     let result = runtime.block_on(run_connection(
         config,
         command_rx,
+        DirectoryLanes {
+            command_rx: directory_command_rx,
+            event_tx: directory_event_tx,
+        },
         &mut sink,
         Arc::clone(&cancelled),
     ));
@@ -587,6 +719,7 @@ fn build_current_thread_runtime() -> Result<Runtime, std::io::Error> {
 async fn run_connection(
     mut config: ConnectionConfig,
     command_rx: Receiver<Command>,
+    directory_lanes: DirectoryLanes,
     sink: &mut EventSink,
     cancelled: Arc<AtomicBool>,
 ) -> Result<DisconnectReason, Failure> {
@@ -721,6 +854,7 @@ async fn run_connection(
         &session,
         &mut shell,
         command_rx,
+        directory_lanes,
         sink,
         cancelled,
         config.metrics,
@@ -837,6 +971,8 @@ fn read_private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, Failure> {
 }
 
 type DynamicAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+type DirectoryStartFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<directory::Opened, (directory::Job, DirectoryError)>> + 'a>>;
 
 async fn authenticate_agent(
     session: &mut client::Handle<StrictHostKeyHandler>,
@@ -917,6 +1053,7 @@ async fn drive_shell(
     session: &client::Handle<StrictHostKeyHandler>,
     shell: &mut Channel<client::Msg>,
     command_rx: Receiver<Command>,
+    directory_lanes: DirectoryLanes,
     sink: &mut EventSink,
     cancelled: Arc<AtomicBool>,
     metrics_config: MetricsConfig,
@@ -929,9 +1066,89 @@ async fn drive_shell(
     let mut last_metrics_at = None;
     let mut metrics_accumulator = MetricsAccumulator::new();
     let mut saw_exit_status = false;
+    let (directory_done_tx, mut directory_done_rx) = mpsc::channel::<(
+        u64,
+        Result<directory::Listing, DirectoryError>,
+    )>(directory::MAX_CONCURRENT_REQUESTS);
+    let mut directory_cancellations = HashMap::<u64, Arc<AtomicBool>>::new();
+    let mut directory_waiting = VecDeque::<directory::Job>::new();
+    let mut directory_start: Option<DirectoryStartFuture<'_>> = None;
 
     loop {
+        if directory_start.is_none() {
+            while let Some(job) = directory_waiting.pop_front() {
+                if job.cancelled.load(Ordering::Acquire) {
+                    directory_cancellations.remove(&job.request.token);
+                    emit_directory_event(
+                        &directory_lanes.event_tx,
+                        Event::DirectoryError {
+                            token: job.request.token,
+                            error: DirectoryError::Cancelled,
+                        },
+                    );
+                    continue;
+                }
+                directory_start = Some(Box::pin(directory::open_channel(
+                    session,
+                    job,
+                    Arc::clone(&cancelled),
+                )));
+                break;
+            }
+        }
+
         tokio::select! {
+            started = async {
+                directory_start
+                    .as_mut()
+                    .expect("directory start branch is guarded")
+                    .await
+            }, if directory_start.is_some() => {
+                directory_start = None;
+                match started {
+                    Ok(opened) => {
+                        let token = opened.job.request.token;
+                        let parent = opened.job.request.path;
+                        let request_cancelled = opened.job.cancelled;
+                        let connection_cancelled = Arc::clone(&cancelled);
+                        let sender = directory_done_tx.clone();
+                        tokio::spawn(async move {
+                            let result = directory::collect(
+                                opened.channel,
+                                parent,
+                                request_cancelled,
+                                connection_cancelled,
+                            )
+                            .await;
+                            let _ = sender.send((token, result)).await;
+                        });
+                    }
+                    Err((job, error)) => {
+                        directory_cancellations.remove(&job.request.token);
+                        emit_directory_event(
+                            &directory_lanes.event_tx,
+                            Event::DirectoryError {
+                                token: job.request.token,
+                                error,
+                            },
+                        );
+                    }
+                }
+            }
+            completed = directory_done_rx.recv(), if !directory_cancellations.is_empty() => {
+                if let Some((token, result)) = completed {
+                    directory_cancellations.remove(&token);
+                    let event = match result {
+                        Ok(listing) => Event::DirectoryListing {
+                            token,
+                            entries: listing.entries,
+                            truncated: listing.truncated,
+                        },
+                        Err(error) => Event::DirectoryError { token, error },
+                    };
+                    emit_directory_event(&directory_lanes.event_tx, event);
+                }
+            }
             _ = command_tick.tick() => {
                 sink.flush()?;
                 if cancelled.load(Ordering::Acquire) {
@@ -967,11 +1184,66 @@ async fn drive_shell(
                             resize
                                 .map_err(|_| Failure::channel("could not resize the SSH shell"))?;
                         }
+                        Ok(Command::ListDirectory { .. } | Command::CancelDirectory { .. }) => {
+                            // `SshConnection::send` routes these to the independent lane.
+                        }
                         Ok(Command::Disconnect) => return Ok(DisconnectReason::Requested),
                         Err(CrossbeamTryRecvError::Empty) => break,
                         Err(CrossbeamTryRecvError::Disconnected) => {
                             return Ok(DisconnectReason::HandleDropped);
                         }
+                    }
+                }
+
+                for _ in 0..MAX_COMMANDS_PER_TICK {
+                    match directory_lanes.command_rx.try_recv() {
+                        Ok(Command::ListDirectory {
+                            token,
+                            path,
+                            show_hidden,
+                        }) => {
+                            let request = directory::Request {
+                                token,
+                                path,
+                                show_hidden,
+                            };
+                            let error = if directory::validate_request(token, &request.path).is_err() {
+                                Some(DirectoryError::InvalidRequest)
+                            } else if directory_cancellations.contains_key(&token) {
+                                Some(DirectoryError::DuplicateToken)
+                            } else if directory_cancellations.len()
+                                >= directory::MAX_CONCURRENT_REQUESTS
+                            {
+                                Some(DirectoryError::Busy)
+                            } else {
+                                None
+                            };
+                            if let Some(error) = error {
+                                emit_directory_event(
+                                    &directory_lanes.event_tx,
+                                    Event::DirectoryError { token, error },
+                                );
+                                continue;
+                            }
+
+                            let request_cancelled = Arc::new(AtomicBool::new(false));
+                            directory_cancellations
+                                .insert(token, Arc::clone(&request_cancelled));
+                            directory_waiting.push_back(directory::Job {
+                                request,
+                                cancelled: request_cancelled,
+                            });
+                        }
+                        Ok(Command::CancelDirectory { token }) => {
+                            if let Some(request) = directory_cancellations.get(&token) {
+                                request.store(true, Ordering::Release);
+                            }
+                        }
+                        Ok(Command::Input(_) | Command::Resize(_) | Command::Disconnect) => {
+                            // Defense in depth: terminal commands cannot enter this lane.
+                        }
+                        Err(CrossbeamTryRecvError::Empty) => break,
+                        Err(CrossbeamTryRecvError::Disconnected) => break,
                     }
                 }
 
@@ -1131,6 +1403,13 @@ async fn collect_monitor_output(mut channel: Channel<client::Msg>) -> MonitorRes
         return Err("Linux monitor command failed");
     }
     String::from_utf8(output).map_err(|_| "Linux monitor output was not UTF-8")
+}
+
+/// Directory results deliberately use a separate bounded lane. If its
+/// consumer disappears or stops draining, dropping a result must not affect
+/// terminal data, input, or connection lifetime.
+fn emit_directory_event(sender: &Sender<Event>, event: Event) {
+    let _ = sender.try_send(event);
 }
 
 async fn wait_until_cancelled(cancelled: Arc<AtomicBool>) {
@@ -1520,6 +1799,100 @@ mod tests {
         assert!(!event.contains("server-secret"));
         assert!(command.contains("12"));
         assert!(event.contains("13"));
+    }
+
+    #[test]
+    fn directory_command_and_event_debug_hide_paths_and_contents() {
+        let command = Command::ListDirectory {
+            token: 7,
+            path: "/secret/customer-a".to_owned(),
+            show_hidden: true,
+        };
+        let event = Event::DirectoryListing {
+            token: 7,
+            entries: vec![DirectoryEntry {
+                name: "private.txt".to_owned(),
+                path: "/secret/customer-a/private.txt".to_owned(),
+                kind: DirectoryEntryKind::File,
+                size: 42,
+            }],
+            truncated: false,
+        };
+        let command_debug = format!("{command:?}");
+        let event_debug = format!("{event:?}");
+
+        assert!(command_debug.contains("token"));
+        assert!(command_debug.contains("<redacted>"));
+        assert!(!command_debug.contains("customer-a"));
+        assert!(event_debug.contains("entries"));
+        assert!(!event_debug.contains("private.txt"));
+        assert!(!event_debug.contains("customer-a"));
+    }
+
+    #[test]
+    fn directory_command_lane_is_independently_bounded_and_validated() {
+        let (sender, receiver) = bounded(1);
+        assert_eq!(
+            try_send_directory_command(
+                &sender,
+                Command::ListDirectory {
+                    token: 1,
+                    path: "/srv".to_owned(),
+                    show_hidden: false,
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            try_send_directory_command(
+                &sender,
+                Command::ListDirectory {
+                    token: 2,
+                    path: "/srv/other".to_owned(),
+                    show_hidden: false,
+                },
+            ),
+            Err(CommandSendError::Full)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::ListDirectory { token: 1, .. })
+        ));
+        assert_eq!(
+            try_send_directory_command(
+                &sender,
+                Command::ListDirectory {
+                    token: 3,
+                    path: "relative".to_owned(),
+                    show_hidden: false,
+                },
+            ),
+            Err(CommandSendError::InvalidDirectoryRequest)
+        );
+        assert!(receiver.is_empty());
+    }
+
+    #[test]
+    fn full_directory_result_lane_never_backpressures_terminal_sink() {
+        let (directory_sender, _directory_receiver) = bounded(1);
+        directory_sender
+            .try_send(Event::DirectoryError {
+                token: 1,
+                error: DirectoryError::Busy,
+            })
+            .expect("fill directory lane");
+        emit_directory_event(
+            &directory_sender,
+            Event::DirectoryError {
+                token: 2,
+                error: DirectoryError::Busy,
+            },
+        );
+
+        let (terminal_sender, terminal_receiver) = bounded(1);
+        let mut terminal_sink = EventSink::new(terminal_sender, 1, 1024);
+        assert_eq!(terminal_sink.emit(Event::Data(vec![1, 2, 3])), Ok(()));
+        assert!(matches!(terminal_receiver.try_recv(), Ok(Event::Data(_))));
     }
 
     #[test]

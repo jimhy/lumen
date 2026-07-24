@@ -63,6 +63,8 @@ pub struct ViewState {
     pub remote_view: bool,
     /// 当前工作模式是否允许本地会话/窗格/文件树操作。
     pub session_actions_enabled: bool,
+    /// 当前工作模式是否显示会话栏与文件树显隐开关。
+    pub navigation_actions_enabled: bool,
     /// 远程设备栏当前是否可见。
     pub remote_list_visible: bool,
     /// 会话栏（①）当前是否可见。
@@ -171,7 +173,7 @@ pub fn show(
                         ui.add_space(BTN_GAP);
                     }
 
-                    if view.session_actions_enabled {
+                    if view.navigation_actions_enabled {
                         // ① 显示/隐藏会话栏（codicon layout-sidebar-left 风格）
                         let (sb_rect, sb_resp) =
                             ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
@@ -436,6 +438,7 @@ mod toolbar_layout_tests {
                 ViewState {
                     remote_view: false,
                     session_actions_enabled: true,
+                    navigation_actions_enabled: true,
                     remote_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: true,
@@ -466,6 +469,7 @@ mod toolbar_layout_tests {
                 ViewState {
                     remote_view: false,
                     session_actions_enabled: true,
+                    navigation_actions_enabled: true,
                     remote_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: false,
@@ -516,6 +520,7 @@ mod toolbar_layout_tests {
                 ViewState {
                     remote_view: false,
                     session_actions_enabled: true,
+                    navigation_actions_enabled: true,
                     remote_list_visible: true,
                     sidebar_visible: false,
                     filetree_visible: true,
@@ -543,6 +548,7 @@ mod toolbar_layout_tests {
                     ViewState {
                         remote_view,
                         session_actions_enabled: true,
+                        navigation_actions_enabled: true,
                         remote_list_visible: true,
                         sidebar_visible: true,
                         filetree_visible: true,
@@ -566,5 +572,49 @@ mod toolbar_layout_tests {
             remote >= local + 2,
             "远程视图应比本地视图多绘制设备栏图标：local={local}, remote={remote}"
         );
+    }
+
+    #[test]
+    fn 工具栏_ssh保留导航按钮但不绘制本地窗格操作() {
+        let ctx = egui::Context::default();
+        let pal = test_palette();
+        let full = ctx.run_ui(test_input(), |ui| {
+            let _ = show(
+                ui,
+                2,
+                &pal,
+                ViewState {
+                    remote_view: false,
+                    session_actions_enabled: false,
+                    navigation_actions_enabled: true,
+                    remote_list_visible: false,
+                    sidebar_visible: true,
+                    filetree_visible: true,
+                },
+            );
+        });
+        fn count(s: &egui::epaint::Shape, predicate: &dyn Fn(f32) -> bool) -> usize {
+            use egui::epaint::Shape;
+            match s {
+                Shape::LineSegment { points, .. } if predicate(points[0].x) => 1,
+                Shape::Vec(shapes) => shapes
+                    .iter()
+                    .map(|shape| count(shape, predicate))
+                    .sum(),
+                _ => 0,
+            }
+        }
+        let left = full
+            .shapes
+            .iter()
+            .map(|shape| count(&shape.shape, &|x| x < 200.0))
+            .sum::<usize>();
+        let right = full
+            .shapes
+            .iter()
+            .map(|shape| count(&shape.shape, &|x| x > 1000.0))
+            .sum::<usize>();
+        assert!(left >= 5, "SSH 模式必须保留会话栏与文件树按钮");
+        assert_eq!(right, 0, "SSH 模式不得绘制本地新增/复位窗格按钮");
     }
 }

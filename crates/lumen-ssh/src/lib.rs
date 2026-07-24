@@ -12,11 +12,12 @@ mod transport;
 pub use credential::{Credential, PrivateKeyCredential, SecretString};
 pub use host_key::{decide_host_key, HostKeyDecision, HostKeyIdentity, HostKeyIdentityError};
 pub use metrics::{
-    MetricsAccumulator, MetricsError, NetworkMetrics, ServerMetrics, StorageMetrics,
-    SystemMemoryMetrics,
+    CpuCoreMetrics, DiskIoMetrics, MetricsAccumulator, MetricsError, NetworkMetrics,
+    ProcessMetrics, ServerMetrics, ServerMonitorDetails, StorageMetrics, SystemMemoryMetrics,
 };
 pub use transport::{
-    Command, CommandSendError, ConnectionConfig, ConnectionMode, DisconnectReason, Event,
-    EventError, EventErrorKind, EventReceiveError, KeepaliveConfig, MetricsConfig, QueueConfig,
-    SshConnection, StartError, TerminalSize,
+    Command, CommandSendError, ConnectionConfig, ConnectionMode, DirectoryEntry,
+    DirectoryEntryKind, DirectoryError, DisconnectReason, Event, EventError, EventErrorKind,
+    EventReceiveError, KeepaliveConfig, MetricsConfig, QueueConfig, SshConnection, StartError,
+    TerminalSize,
 };

@@ -499,6 +499,8 @@ pub struct Strings {
     pub topbar_tab_ssh: &'static str,
     /// SSH 模式尚未选择服务器时的占位提示
     pub ssh_select_server: &'static str,
+    /// SSH 会话栏尚无已打开会话
+    pub ssh_no_sessions: &'static str,
     /// SSH 服务器列表与配置表单
     pub ssh_title: &'static str,
     pub ssh_search_hint: &'static str,
@@ -583,6 +585,23 @@ pub struct Strings {
     pub ssh_monitor_network: &'static str,
     pub ssh_monitor_uptime: &'static str,
     pub ssh_monitor_waiting: &'static str,
+    pub ssh_monitor_system: &'static str,
+    pub ssh_monitor_timezone: &'static str,
+    pub ssh_monitor_kernel: &'static str,
+    pub ssh_monitor_used: &'static str,
+    pub ssh_monitor_cached: &'static str,
+    pub ssh_monitor_available: &'static str,
+    pub ssh_monitor_total: &'static str,
+    pub ssh_monitor_upload: &'static str,
+    pub ssh_monitor_download: &'static str,
+    pub ssh_monitor_speed: &'static str,
+    pub ssh_monitor_traffic: &'static str,
+    pub ssh_monitor_filesystem: &'static str,
+    pub ssh_monitor_read: &'static str,
+    pub ssh_monitor_write: &'static str,
+    pub ssh_monitor_processes: &'static str,
+    pub ssh_monitor_command: &'static str,
+    pub ssh_monitor_no_processes: &'static str,
     /// 远程设备列表标题（M5.2）
     pub remote_list_title: &'static str,
     /// 设备在线

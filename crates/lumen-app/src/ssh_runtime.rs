@@ -4,12 +4,13 @@
 //! chooses which profile is active; switching profiles or application modes
 //! never tears down the other background connections.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use lumen_ssh::{
     Command, ConnectionConfig, ConnectionMode, Credential, DisconnectReason, Event, EventErrorKind,
-    HostKeyIdentity, KeepaliveConfig, MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
+    DirectoryEntry, DirectoryEntryKind, DirectoryError, HostKeyIdentity, KeepaliveConfig,
+    MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
 };
 use lumen_term::Terminal;
 
@@ -19,6 +20,7 @@ use crate::ssh::{AuthMethod, HostKeyTrust, SshProfile};
 const DEFAULT_ROWS: usize = 36;
 const DEFAULT_COLUMNS: usize = 120;
 const SSH_SCROLLBACK: usize = 10_000;
+const MONITOR_HISTORY_SAMPLES: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -57,7 +59,7 @@ pub struct MetricsSummary {
     pub uptime: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeView {
     pub profile_id: String,
     pub profile_name: String,
@@ -65,9 +67,52 @@ pub struct RuntimeView {
     pub state: ConnectionState,
     pub detail: Option<String>,
     pub metrics: Option<MetricsSummary>,
+    pub monitor: Option<MonitorView>,
     pub metrics_error: Option<String>,
     pub unknown_host_key: Option<UnknownHostKey>,
     pub changed_host_key: Option<ChangedHostKey>,
+}
+
+/// 系统监控面板使用的结构化快照与短期趋势。原始采样只保存在内存，
+/// 不参与 SSH 配置同步。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorView {
+    pub metrics: ServerMetrics,
+    pub cpu_history: Vec<f32>,
+    pub receive_history: Vec<f64>,
+    pub transmit_history: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshFileTreeRow {
+    pub name: String,
+    pub path: String,
+    pub kind: DirectoryEntryKind,
+    pub size: u64,
+    pub depth: usize,
+    pub expanded: bool,
+    pub loading: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshFileTreeView {
+    pub profile_id: String,
+    pub root: String,
+    pub rows: Vec<SshFileTreeRow>,
+    pub loading: bool,
+    pub show_hidden: bool,
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
+/// SSH 会话栏的一项。仅包含公开连接元数据与状态，不包含终端或凭据。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshSessionView {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub endpoint: String,
+    pub state: ConnectionState,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +167,8 @@ pub struct DrainOutcome {
     pub connected_profiles: Vec<String>,
     /// 当前服务器表单的独立连接测试状态发生变化。
     pub connection_test_changed: bool,
+    /// 任一会话的连接态发生变化；用于刷新 SSH 会话栏中的状态点。
+    pub sessions_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,9 +211,26 @@ struct RuntimeSession {
     state: ConnectionState,
     detail: Option<String>,
     metrics: Option<ServerMetrics>,
+    cpu_history: VecDeque<f32>,
+    receive_history: VecDeque<f64>,
+    transmit_history: VecDeque<f64>,
     metrics_error: Option<String>,
     unknown_host_key: Option<HostKeyIdentity>,
     changed_host_key: Option<(HostKeyIdentity, HostKeyIdentity)>,
+    file_tree_root: String,
+    directory_listings: HashMap<String, DirectoryListing>,
+    open_directories: HashSet<String>,
+    pending_directories: HashMap<u64, String>,
+    latest_directory_request: HashMap<String, u64>,
+    next_directory_token: u64,
+    show_hidden_files: bool,
+    file_tree_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct DirectoryListing {
+    entries: Vec<DirectoryEntry>,
+    truncated: bool,
 }
 
 impl RuntimeSession {
@@ -180,9 +244,20 @@ impl RuntimeSession {
             state: ConnectionState::CredentialRequired,
             detail: None,
             metrics: None,
+            cpu_history: VecDeque::with_capacity(MONITOR_HISTORY_SAMPLES),
+            receive_history: VecDeque::with_capacity(MONITOR_HISTORY_SAMPLES),
+            transmit_history: VecDeque::with_capacity(MONITOR_HISTORY_SAMPLES),
             metrics_error: None,
             unknown_host_key: None,
             changed_host_key: None,
+            file_tree_root: ssh_file_tree_root(profile),
+            directory_listings: HashMap::new(),
+            open_directories: HashSet::new(),
+            pending_directories: HashMap::new(),
+            latest_directory_request: HashMap::new(),
+            next_directory_token: 1,
+            show_hidden_files: false,
+            file_tree_error: None,
         }
     }
 
@@ -210,6 +285,21 @@ impl RuntimeSession {
                 | ConnectionState::HostKeyChanged
         )
     }
+
+    fn reset_file_tree(&mut self, profile: &SshProfile) {
+        for token in self.pending_directories.keys().copied().collect::<Vec<_>>() {
+            if let Some(connection) = &self.connection {
+                let _ = connection.send(Command::CancelDirectory { token });
+            }
+        }
+        self.file_tree_root = ssh_file_tree_root(profile);
+        self.directory_listings.clear();
+        self.open_directories.clear();
+        self.open_directories.insert(self.file_tree_root.clone());
+        self.pending_directories.clear();
+        self.latest_directory_request.clear();
+        self.file_tree_error = None;
+    }
 }
 
 struct ConnectionTestAttempt {
@@ -223,6 +313,7 @@ struct ConnectionTestAttempt {
 #[derive(Default)]
 pub struct SshRuntime {
     sessions: HashMap<String, RuntimeSession>,
+    session_order: Vec<String>,
     active_profile_id: Option<String>,
     connection_test: Option<ConnectionTestAttempt>,
 }
@@ -230,10 +321,11 @@ pub struct SshRuntime {
 impl SshRuntime {
     pub fn select_for_connect(&mut self, profile: &SshProfile) -> ConnectIntent {
         self.active_profile_id = Some(profile.id.clone());
+        self.ensure_session(profile);
         let session = self
             .sessions
-            .entry(profile.id.clone())
-            .or_insert_with(|| RuntimeSession::new(profile));
+            .get_mut(&profile.id)
+            .expect("刚插入的 SSH 会话必须存在");
 
         if session.is_running() {
             return ConnectIntent::AlreadyRunning;
@@ -258,10 +350,11 @@ impl SshRuntime {
 
     pub fn start(&mut self, profile: &SshProfile, credential: Credential) -> Result<(), String> {
         self.active_profile_id = Some(profile.id.clone());
+        self.ensure_session(profile);
         let session = self
             .sessions
-            .entry(profile.id.clone())
-            .or_insert_with(|| RuntimeSession::new(profile));
+            .get_mut(&profile.id)
+            .expect("刚插入的 SSH 会话必须存在");
         session.refresh_metadata(profile);
 
         // Replacing one profile's failed attempt does not affect any other
@@ -270,7 +363,12 @@ impl SshRuntime {
         session.unknown_host_key = None;
         session.changed_host_key = None;
         session.detail = None;
+        session.metrics = None;
         session.metrics_error = None;
+        session.cpu_history.clear();
+        session.receive_history.clear();
+        session.transmit_history.clear();
+        session.reset_file_tree(profile);
 
         let (rows, columns) = {
             let grid = session.terminal.grid();
@@ -416,12 +514,128 @@ impl SshRuntime {
     }
 
     pub fn remove_profile(&mut self, profile_id: &str) {
+        self.close_session(profile_id);
+    }
+
+    /// 激活一个已打开的 SSH 会话；不会重连或改变其他后台连接。
+    pub fn activate_session(&mut self, profile_id: &str) -> bool {
+        if !self.sessions.contains_key(profile_id) {
+            return false;
+        }
+        self.active_profile_id = Some(profile_id.to_owned());
+        true
+    }
+
+    /// 关闭会话但保留服务器配置。若关闭当前会话，选择相邻会话。
+    pub fn close_session(&mut self, profile_id: &str) -> bool {
+        let Some(index) = self
+            .session_order
+            .iter()
+            .position(|existing| existing == profile_id)
+        else {
+            return false;
+        };
         // Dropping the handle signals cancellation to the profile's dedicated
         // actor. Other profile sessions remain untouched.
         self.sessions.remove(profile_id);
+        self.session_order.remove(index);
         if self.active_profile_id.as_deref() == Some(profile_id) {
-            self.active_profile_id = None;
+            self.active_profile_id = self
+                .session_order
+                .get(index.min(self.session_order.len().saturating_sub(1)))
+                .cloned();
         }
+        true
+    }
+
+    #[must_use]
+    pub fn session_views(&self) -> Vec<SshSessionView> {
+        self.session_order
+            .iter()
+            .filter_map(|profile_id| {
+                let session = self.sessions.get(profile_id)?;
+                Some(SshSessionView {
+                    profile_id: profile_id.clone(),
+                    profile_name: session.profile_name.clone(),
+                    endpoint: session.endpoint.clone(),
+                    state: session.state.clone(),
+                    active: self.active_profile_id.as_ref() == Some(profile_id),
+                })
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn active_file_tree_view(&self) -> Option<SshFileTreeView> {
+        let profile_id = self.active_profile_id.as_ref()?;
+        let session = self.sessions.get(profile_id)?;
+        let mut rows = Vec::new();
+        append_file_tree_rows(session, &session.file_tree_root, 0, &mut rows);
+        let truncated = session
+            .directory_listings
+            .iter()
+            .any(|(path, listing)| {
+                session.open_directories.contains(path) && listing.truncated
+            });
+        Some(SshFileTreeView {
+            profile_id: profile_id.clone(),
+            root: session.file_tree_root.clone(),
+            rows,
+            loading: !session.pending_directories.is_empty(),
+            show_hidden: session.show_hidden_files,
+            truncated,
+            error: session.file_tree_error.clone(),
+        })
+    }
+
+    /// 展开或折叠一个来自当前树快照的目录。展示字符串不会被当作路径使用：
+    /// 只有 runtime 缓存中仍存在的精确目录路径才会执行请求。
+    pub fn toggle_directory(&mut self, profile_id: &str, path: &str) -> bool {
+        let Some(session) = self.sessions.get_mut(profile_id) else {
+            return false;
+        };
+        if !known_directory(session, path) {
+            return false;
+        }
+        if session.open_directories.remove(path) {
+            return true;
+        }
+        session.open_directories.insert(path.to_owned());
+        if !session.directory_listings.contains_key(path)
+            && !session.latest_directory_request.contains_key(path)
+        {
+            request_directory(session, path);
+        }
+        true
+    }
+
+    pub fn refresh_file_tree(&mut self, profile_id: &str) -> bool {
+        let Some(session) = self.sessions.get_mut(profile_id) else {
+            return false;
+        };
+        cancel_directory_requests(session);
+        session.directory_listings.clear();
+        session.open_directories.clear();
+        session.open_directories.insert(session.file_tree_root.clone());
+        session.file_tree_error = None;
+        let root = session.file_tree_root.clone();
+        let _ = request_directory(session, &root);
+        true
+    }
+
+    pub fn toggle_hidden_files(&mut self, profile_id: &str) -> bool {
+        let Some(session) = self.sessions.get_mut(profile_id) else {
+            return false;
+        };
+        session.show_hidden_files = !session.show_hidden_files;
+        cancel_directory_requests(session);
+        session.directory_listings.clear();
+        session.open_directories.clear();
+        session.open_directories.insert(session.file_tree_root.clone());
+        session.file_tree_error = None;
+        let root = session.file_tree_root.clone();
+        let _ = request_directory(session, &root);
+        true
     }
 
     pub fn send_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
@@ -501,15 +715,22 @@ impl SshRuntime {
             let before_unknown = session.unknown_host_key.clone();
             let before_changed = session.changed_host_key.clone();
             let mut terminal_changed = false;
+            let mut directory_changed = false;
             let mut events = Vec::new();
+            let mut directory_events = Vec::new();
             if let Some(connection) = &session.connection {
                 connection.drain(&mut events);
+                connection.drain_directory(&mut directory_events);
             }
             for event in events {
                 let credential_failed = event_is_saved_credential_failure(&event);
                 let connected = matches!(&event, Event::Connected { .. });
                 let changed = apply_event(session, event);
                 terminal_changed |= changed;
+                if connected {
+                    let root = session.file_tree_root.clone();
+                    directory_changed |= request_directory(session, &root);
+                }
                 if credential_failed
                     && !outcome
                         .credential_failures
@@ -533,6 +754,11 @@ impl SshRuntime {
                     reply_to_terminal_queries(session);
                 }
             }
+            for event in directory_events {
+                directory_changed |= apply_directory_event(session, event);
+            }
+
+            outcome.sessions_changed |= before_state != session.state;
 
             if active_id.as_deref() == Some(profile_id.as_str()) {
                 outcome.active_terminal_changed |= terminal_changed;
@@ -541,7 +767,8 @@ impl SshRuntime {
                     || before_metrics != session.metrics
                     || before_metrics_error != session.metrics_error
                     || before_unknown != session.unknown_host_key
-                    || before_changed != session.changed_host_key;
+                    || before_changed != session.changed_host_key
+                    || directory_changed;
                 outcome.active_became_connected |= before_state != ConnectionState::Connected
                     && session.state == ConnectionState::Connected;
             }
@@ -618,6 +845,12 @@ impl SshRuntime {
             state: session.state.clone(),
             detail: session.detail.clone(),
             metrics: session.metrics.as_ref().map(format_metrics),
+            monitor: session.metrics.as_ref().map(|metrics| MonitorView {
+                metrics: metrics.clone(),
+                cpu_history: session.cpu_history.iter().copied().collect(),
+                receive_history: session.receive_history.iter().copied().collect(),
+                transmit_history: session.transmit_history.iter().copied().collect(),
+            }),
             metrics_error: session.metrics_error.clone(),
             unknown_host_key: session
                 .unknown_host_key
@@ -694,6 +927,202 @@ impl SshRuntime {
         let profile_id = self.active_profile_id.as_ref()?.clone();
         self.sessions.get_mut(&profile_id)
     }
+
+    fn ensure_session(&mut self, profile: &SshProfile) {
+        if self.sessions.contains_key(&profile.id) {
+            return;
+        }
+        self.session_order.push(profile.id.clone());
+        self.sessions
+            .insert(profile.id.clone(), RuntimeSession::new(profile));
+    }
+}
+
+fn ssh_file_tree_root(profile: &SshProfile) -> String {
+    let candidate = profile.initial_directory.as_deref().unwrap_or("").trim();
+    if candidate.starts_with('/')
+        && candidate.len() <= 4096
+        && !candidate.chars().any(char::is_control)
+    {
+        let trimmed = candidate.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/".to_owned()
+        } else {
+            trimmed.to_owned()
+        }
+    } else {
+        "/".to_owned()
+    }
+}
+
+fn known_directory(session: &RuntimeSession, path: &str) -> bool {
+    path == session.file_tree_root
+        || session.directory_listings.values().any(|listing| {
+            listing.entries.iter().any(|entry| {
+                entry.path == path && entry.kind == DirectoryEntryKind::Directory
+            })
+        })
+}
+
+fn append_file_tree_rows(
+    session: &RuntimeSession,
+    parent: &str,
+    depth: usize,
+    rows: &mut Vec<SshFileTreeRow>,
+) {
+    let Some(listing) = session.directory_listings.get(parent) else {
+        return;
+    };
+    for entry in &listing.entries {
+        let expanded = entry.kind == DirectoryEntryKind::Directory
+            && session.open_directories.contains(&entry.path);
+        rows.push(SshFileTreeRow {
+            name: entry.name.clone(),
+            path: entry.path.clone(),
+            kind: entry.kind,
+            size: entry.size,
+            depth,
+            expanded,
+            loading: session.latest_directory_request.contains_key(&entry.path),
+        });
+        if expanded {
+            append_file_tree_rows(session, &entry.path, depth.saturating_add(1), rows);
+        }
+    }
+}
+
+fn request_directory(session: &mut RuntimeSession, path: &str) -> bool {
+    if session.state != ConnectionState::Connected
+        || session.latest_directory_request.contains_key(path)
+    {
+        return false;
+    }
+    let Some(connection) = &session.connection else {
+        return false;
+    };
+    let token = session.next_directory_token;
+    let Some(next_token) = token.checked_add(1) else {
+        session.file_tree_error = Some("SSH directory request counter exhausted".to_owned());
+        return false;
+    };
+    match connection.send(Command::ListDirectory {
+        token,
+        path: path.to_owned(),
+        show_hidden: session.show_hidden_files,
+    }) {
+        Ok(()) => {
+            session.next_directory_token = next_token;
+            session.pending_directories.insert(token, path.to_owned());
+            session
+                .latest_directory_request
+                .insert(path.to_owned(), token);
+            session.file_tree_error = None;
+            true
+        }
+        Err(error) => {
+            session.file_tree_error = Some(error.to_string());
+            false
+        }
+    }
+}
+
+fn cancel_directory_requests(session: &mut RuntimeSession) {
+    if let Some(connection) = &session.connection {
+        for token in session.pending_directories.keys().copied() {
+            let _ = connection.send(Command::CancelDirectory { token });
+        }
+    }
+    session.pending_directories.clear();
+    session.latest_directory_request.clear();
+}
+
+fn apply_directory_event(session: &mut RuntimeSession, event: Event) -> bool {
+    match event {
+        Event::DirectoryListing {
+            token,
+            mut entries,
+            truncated,
+        } => {
+            let Some(path) = session.pending_directories.remove(&token) else {
+                return false;
+            };
+            if session.latest_directory_request.get(&path).copied() != Some(token) {
+                return false;
+            }
+            session.latest_directory_request.remove(&path);
+            entries.retain(|entry| directory_entry_belongs_to(&path, entry));
+            entries.sort_by(|left, right| {
+                directory_kind_order(left.kind)
+                    .cmp(&directory_kind_order(right.kind))
+                    .then_with(|| {
+                        left.name
+                            .to_ascii_lowercase()
+                            .cmp(&right.name.to_ascii_lowercase())
+                    })
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            session
+                .directory_listings
+                .insert(path, DirectoryListing { entries, truncated });
+            session.file_tree_error = None;
+            true
+        }
+        Event::DirectoryError { token, error } => {
+            let Some(path) = session.pending_directories.remove(&token) else {
+                return false;
+            };
+            if session.latest_directory_request.get(&path).copied() != Some(token) {
+                return false;
+            }
+            session.latest_directory_request.remove(&path);
+            if error != DirectoryError::Cancelled {
+                session.file_tree_error = Some(directory_error_message(error).to_owned());
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn directory_entry_belongs_to(parent: &str, entry: &DirectoryEntry) -> bool {
+    if entry.name.is_empty()
+        || entry.name == "."
+        || entry.name == ".."
+        || entry.name.contains('/')
+        || entry.name.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let expected = if parent == "/" {
+        format!("/{}", entry.name)
+    } else {
+        format!("{parent}/{}", entry.name)
+    };
+    entry.path == expected
+}
+
+const fn directory_kind_order(kind: DirectoryEntryKind) -> u8 {
+    match kind {
+        DirectoryEntryKind::Directory => 0,
+        DirectoryEntryKind::File => 1,
+        DirectoryEntryKind::Symlink => 2,
+        DirectoryEntryKind::Other => 3,
+    }
+}
+
+const fn directory_error_message(error: DirectoryError) -> &'static str {
+    match error {
+        DirectoryError::InvalidRequest => "The remote directory path is invalid",
+        DirectoryError::DuplicateToken => "The directory request is stale",
+        DirectoryError::Busy => "Too many directory requests are running",
+        DirectoryError::OpenFailed => "Could not open the remote directory service",
+        DirectoryError::ExecFailed => "The server does not support directory browsing",
+        DirectoryError::TimedOut => "The remote directory request timed out",
+        DirectoryError::OutputTooLarge => "The remote directory contains too much data",
+        DirectoryError::MalformedOutput => "The server returned an invalid directory listing",
+        DirectoryError::CommandFailed => "The remote directory could not be read",
+        DirectoryError::Cancelled => "The remote directory request was cancelled",
+    }
 }
 
 fn connection_config(profile: &SshProfile, credential: Credential) -> ConnectionConfig {
@@ -765,7 +1194,9 @@ fn apply_connection_test_event(attempt: &mut ConnectionTestAttempt, event: Event
         | Event::ExitStatus(_)
         | Event::ExitSignal { .. }
         | Event::Metrics(_)
-        | Event::MetricsError { .. } => {
+        | Event::MetricsError { .. }
+        | Event::DirectoryListing { .. }
+        | Event::DirectoryError { .. } => {
             attempt.state = ConnectionTestState::Error {
                 message: "SSH connection test received an unexpected shell event".to_owned(),
             };
@@ -836,6 +1267,18 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
             false
         }
         Event::Metrics(metrics) => {
+            push_monitor_history(
+                &mut session.cpu_history,
+                metrics.cpu_usage_percent.unwrap_or(0.0),
+            );
+            push_monitor_history_f64(
+                &mut session.receive_history,
+                metrics.network.receive_bytes_per_second.unwrap_or(0.0),
+            );
+            push_monitor_history_f64(
+                &mut session.transmit_history,
+                metrics.network.transmit_bytes_per_second.unwrap_or(0.0),
+            );
             session.metrics = Some(metrics);
             session.metrics_error = None;
             false
@@ -846,12 +1289,18 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
             session.metrics_error = Some(message);
             false
         }
+        Event::DirectoryListing { .. } | Event::DirectoryError { .. } => {
+            // Directory events are drained from their independent lane and
+            // handled by `apply_directory_event`.
+            false
+        }
         Event::Error(error) => {
             session.state = ConnectionState::Error;
             session.detail = Some(error.message);
             false
         }
         Event::Disconnected { reason } => {
+            cancel_directory_requests(session);
             session.connection.take();
             if !matches!(
                 session.state,
@@ -867,6 +1316,28 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
             false
         }
     }
+}
+
+fn push_monitor_history(history: &mut VecDeque<f32>, value: f32) {
+    if history.len() == MONITOR_HISTORY_SAMPLES {
+        history.pop_front();
+    }
+    history.push_back(if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    });
+}
+
+fn push_monitor_history_f64(history: &mut VecDeque<f64>, value: f64) {
+    if history.len() == MONITOR_HISTORY_SAMPLES {
+        history.pop_front();
+    }
+    history.push_back(if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    });
 }
 
 fn reply_to_terminal_queries(session: &mut RuntimeSession) {
@@ -1240,6 +1711,7 @@ mod tests {
                 transmit_bytes_per_second: Some(2.0 * 1024.0 * 1024.0),
             },
             uptime_seconds: 183_900.0,
+            details: None,
         });
         assert_eq!(summary.cpu, "12.5%");
         assert!(summary.memory.contains("25.0%"));
@@ -1263,6 +1735,148 @@ mod tests {
             runtime.active_profile_id.as_deref(),
             Some(second.id.as_str())
         );
+    }
+
+    #[test]
+    fn session_bar_keeps_open_order_and_switches_without_closing_background_sessions() {
+        let first = profile(AuthMethod::Password);
+        let mut second = first.clone();
+        second.id = "ssh_abcdef0123456789abcdef0123456789".to_owned();
+        second.name = "prod".to_owned();
+
+        let mut runtime = SshRuntime::default();
+        assert_eq!(runtime.select_for_connect(&first), ConnectIntent::Password);
+        assert_eq!(runtime.select_for_connect(&second), ConnectIntent::Password);
+        assert!(runtime.activate_session(&first.id));
+
+        let sessions = runtime.session_views();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].profile_id, first.id);
+        assert!(sessions[0].active);
+        assert_eq!(sessions[1].profile_id, second.id);
+        assert!(!sessions[1].active);
+        assert_eq!(runtime.sessions.len(), 2);
+    }
+
+    #[test]
+    fn closing_active_session_selects_an_adjacent_session_and_keeps_profiles_external() {
+        let first = profile(AuthMethod::Agent);
+        let mut second = first.clone();
+        second.id = "ssh_abcdef0123456789abcdef0123456789".to_owned();
+        second.name = "prod".to_owned();
+        let mut third = first.clone();
+        third.id = "ssh_fedcba9876543210fedcba9876543210".to_owned();
+        third.name = "stage".to_owned();
+
+        let mut runtime = SshRuntime::default();
+        runtime.select_for_connect(&first);
+        runtime.select_for_connect(&second);
+        runtime.select_for_connect(&third);
+        assert!(runtime.activate_session(&second.id));
+        assert!(runtime.close_session(&second.id));
+
+        assert_eq!(
+            runtime.active_profile_id.as_deref(),
+            Some(third.id.as_str())
+        );
+        assert_eq!(
+            runtime
+                .session_views()
+                .iter()
+                .map(|session| session.profile_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str(), third.id.as_str()]
+        );
+        assert!(!runtime.close_session(&second.id));
+    }
+
+    #[test]
+    fn ssh_file_tree_root_keeps_linux_separators_and_rejects_windows_paths() {
+        let mut p = profile(AuthMethod::Agent);
+        p.initial_directory = Some("/home/alice/projects/".to_owned());
+        assert_eq!(ssh_file_tree_root(&p), "/home/alice/projects");
+
+        p.initial_directory = Some(r"C:\Users\alice".to_owned());
+        assert_eq!(
+            ssh_file_tree_root(&p),
+            "/",
+            "Windows 客户端不得把本机路径语义带入 Linux SSH 文件树"
+        );
+        p.initial_directory = None;
+        assert_eq!(ssh_file_tree_root(&p), "/");
+    }
+
+    #[test]
+    fn directory_tree_drops_stale_replies_and_only_accepts_exact_children() {
+        let p = profile(AuthMethod::Agent);
+        let mut session = RuntimeSession::new(&p);
+        session.open_directories.insert("/".to_owned());
+        session.pending_directories.insert(10, "/".to_owned());
+        session.pending_directories.insert(11, "/".to_owned());
+        session.latest_directory_request.insert("/".to_owned(), 11);
+
+        assert!(!apply_directory_event(
+            &mut session,
+            Event::DirectoryListing {
+                token: 10,
+                entries: vec![DirectoryEntry {
+                    name: "stale".to_owned(),
+                    path: "/stale".to_owned(),
+                    kind: DirectoryEntryKind::Directory,
+                    size: 0,
+                }],
+                truncated: false,
+            }
+        ));
+        assert!(!session.directory_listings.contains_key("/"));
+
+        assert!(apply_directory_event(
+            &mut session,
+            Event::DirectoryListing {
+                token: 11,
+                entries: vec![
+                    DirectoryEntry {
+                        name: "etc".to_owned(),
+                        path: "/etc".to_owned(),
+                        kind: DirectoryEntryKind::Directory,
+                        size: 0,
+                    },
+                    DirectoryEntry {
+                        name: "escape".to_owned(),
+                        path: "/tmp/escape".to_owned(),
+                        kind: DirectoryEntryKind::File,
+                        size: 1,
+                    },
+                ],
+                truncated: false,
+            }
+        ));
+        let listing = session.directory_listings.get("/").expect("root listing");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, "/etc");
+    }
+
+    #[test]
+    fn disconnect_clears_directory_requests_without_affecting_terminal_error_semantics() {
+        let p = profile(AuthMethod::Agent);
+        let mut session = RuntimeSession::new(&p);
+        session.state = ConnectionState::Connected;
+        session
+            .pending_directories
+            .insert(7, "/home/alice".to_owned());
+        session
+            .latest_directory_request
+            .insert("/home/alice".to_owned(), 7);
+
+        assert!(!apply_event(
+            &mut session,
+            Event::Disconnected {
+                reason: DisconnectReason::Requested,
+            }
+        ));
+        assert!(session.pending_directories.is_empty());
+        assert!(session.latest_directory_request.is_empty());
+        assert_eq!(session.state, ConnectionState::Disconnected);
     }
 
     #[test]

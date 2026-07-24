@@ -3139,6 +3139,44 @@ impl AppState {
                     );
                 }
             }
+            SshRuntimeAction::ActivateSession { profile_id } => {
+                if self.ssh_runtime.activate_session(&profile_id) {
+                    self.shell_state
+                        .ssh_ui
+                        .select_profile(Some(profile_id));
+                    self.terminal_focused = self.ssh_runtime.active_accepts_input();
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::CloseSession { profile_id } => {
+                if self.ssh_runtime.close_session(&profile_id) {
+                    let active_profile_id = self
+                        .ssh_runtime
+                        .active_view()
+                        .map(|view| view.profile_id.clone());
+                    self.shell_state
+                        .ssh_ui
+                        .select_profile(active_profile_id);
+                    self.terminal_focused = self.ssh_runtime.active_accepts_input();
+                    self.ssh_rect_px = None;
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::ToggleDirectory { profile_id, path } => {
+                if self.ssh_runtime.toggle_directory(&profile_id, &path) {
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::RefreshFileTree { profile_id } => {
+                if self.ssh_runtime.refresh_file_tree(&profile_id) {
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::ToggleHiddenFiles { profile_id } => {
+                if self.ssh_runtime.toggle_hidden_files(&profile_id) {
+                    self.window.request_redraw();
+                }
+            }
             SshRuntimeAction::Disconnect => {
                 self.ssh_runtime.disconnect_active();
                 self.terminal_focused = false;
@@ -3230,6 +3268,7 @@ impl AppState {
             && self.settings.layout.view_mode.is_ssh()
             && (outcome.active_terminal_changed
                 || outcome.active_status_changed
+                || outcome.sessions_changed
                 || outcome.connection_test_changed)
         {
             self.window.request_redraw();
@@ -10544,6 +10583,8 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 let ssh_runtime_view = state.ssh_runtime.active_view();
+                let ssh_session_views = state.ssh_runtime.session_views();
+                let ssh_file_tree_view = state.ssh_runtime.active_file_tree_view();
                 let ssh_connection_test_view = state.ssh_runtime.connection_test_view();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
@@ -10621,6 +10662,8 @@ impl ApplicationHandler<PtyWake> for App {
                         .as_ref()
                         .map_or(&state.ssh_empty_inventory, ssh::SshStore::inventory),
                     ssh_runtime: ssh_runtime_view.as_ref(),
+                    ssh_sessions: &ssh_session_views,
+                    ssh_file_tree: ssh_file_tree_view.as_ref(),
                     ssh_connection_test: ssh_connection_test_view.as_ref(),
                     ssh_terminal_tex: state.ssh_texture,
                     active_device_id: state.remote.active_device_id.as_deref(),
