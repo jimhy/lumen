@@ -121,7 +121,6 @@ pub struct SshFileTreeView {
     pub root: String,
     pub rows: Vec<SshFileTreeRow>,
     pub loading: bool,
-    pub show_hidden: bool,
     pub truncated: bool,
     pub error: Option<String>,
     pub search_query: Option<String>,
@@ -383,7 +382,6 @@ struct RuntimeSession {
     pending_directories: HashMap<u64, String>,
     latest_directory_request: HashMap<String, u64>,
     next_directory_token: u64,
-    show_hidden_files: bool,
     file_tree_error: Option<String>,
     selected_file: Option<(String, bool)>,
     next_file_token: u64,
@@ -458,7 +456,6 @@ impl RuntimeSession {
             pending_directories: HashMap::new(),
             latest_directory_request: HashMap::new(),
             next_directory_token: 1,
-            show_hidden_files: false,
             file_tree_error: None,
             selected_file: None,
             next_file_token: 1,
@@ -920,7 +917,6 @@ impl SshRuntime {
             root: session.file_tree_root.clone(),
             rows,
             loading: !session.pending_directories.is_empty(),
-            show_hidden: session.show_hidden_files,
             truncated,
             error: session.file_tree_error.clone(),
             search_query: session.search_query.clone(),
@@ -944,6 +940,14 @@ impl SshRuntime {
             return false;
         }
         session.selected_file = Some((path, is_directory));
+        true
+    }
+
+    pub fn clear_file_selection(&mut self, session_id: SshSessionId) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        session.selected_file = None;
         true
     }
 
@@ -1921,11 +1925,7 @@ fn request_directory(session: &mut RuntimeSession, path: &str) -> bool {
         session.file_tree_error = Some("SSH directory request counter exhausted".to_owned());
         return false;
     };
-    match connection.send(Command::ListDirectory {
-        token,
-        path: path.to_owned(),
-        show_hidden: session.show_hidden_files,
-    }) {
+    match connection.send(list_directory_command(token, path)) {
         Ok(()) => {
             session.next_directory_token = next_token;
             session.pending_directories.insert(token, path.to_owned());
@@ -1939,6 +1939,16 @@ fn request_directory(session: &mut RuntimeSession, path: &str) -> bool {
             session.file_tree_error = Some(error.to_string());
             false
         }
+    }
+}
+
+fn list_directory_command(token: u64, path: &str) -> Command {
+    Command::ListDirectory {
+        token,
+        path: path.to_owned(),
+        // SSH 模式始终展示 Linux dot 文件/目录，不保留可变开关，避免树、
+        // 刷新和 cwd 重载在不同请求间产生不一致结果。
+        show_hidden: true,
     }
 }
 
@@ -3060,27 +3070,7 @@ mod tests {
             .sessions
             .get_mut(&first_session_id)
             .expect("first session")
-            .show_hidden_files = true;
-        runtime
-            .sessions
-            .get_mut(&first_session_id)
-            .expect("first session")
             .state = ConnectionState::Connected;
-        assert!(
-            runtime
-                .sessions
-                .get(&first_session_id)
-                .expect("first session")
-                .show_hidden_files
-        );
-        assert!(
-            !runtime
-                .sessions
-                .get(&second_session_id)
-                .expect("second session")
-                .show_hidden_files,
-            "同一服务器的文件树状态必须按会话隔离"
-        );
         assert_eq!(
             runtime
                 .sessions
@@ -3098,6 +3088,45 @@ mod tests {
         assert_eq!(views[1].display_name, "dev · 2");
         assert_eq!(views[0].session_id, first_session_id);
         assert_eq!(views[1].session_id, second_session_id);
+    }
+
+    #[test]
+    fn ssh_directory_requests_always_include_hidden_entries() {
+        match list_directory_command(42, "/srv/project") {
+            Command::ListDirectory {
+                token,
+                path,
+                show_hidden,
+            } => {
+                assert_eq!(token, 42);
+                assert_eq!(path, "/srv/project");
+                assert!(show_hidden, "SSH 目录请求必须始终包含 Linux dot 项");
+            }
+            _ => panic!("应生成 SSH ListDirectory 请求"),
+        }
+    }
+
+    #[test]
+    fn clearing_file_tree_selection_is_session_scoped() {
+        let p = profile(AuthMethod::Password);
+        let mut runtime = SshRuntime::default();
+        let (session_id, _) = runtime.select_for_connect(&p);
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .expect("session")
+            .selected_file = Some(("/home/alice/.ssh".to_owned(), true));
+
+        assert!(runtime.clear_file_selection(session_id));
+        assert!(
+            runtime
+                .sessions
+                .get(&session_id)
+                .expect("session")
+                .selected_file
+                .is_none()
+        );
+        assert!(!runtime.clear_file_selection(u64::MAX));
     }
 
     #[test]

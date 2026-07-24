@@ -820,127 +820,56 @@ pub(crate) fn shared_filetree_root_label(
     full_path.map_or(response.clone(), |path| response.on_hover_text(path))
 }
 
-/// 远程和 SSH 扁平快照共用的行描述。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SharedTreeRowKind {
-    Directory { open: bool },
-    File,
-}
-
-pub(crate) struct SharedTreeRow<'a> {
-    pub id: egui::Id,
-    pub depth: usize,
-    pub name: &'a str,
-    pub path: &'a str,
-    pub kind: SharedTreeRowKind,
-    pub selected: bool,
-    pub loading: bool,
-}
-
-/// 共用行渲染后的稳定交互句柄。
-pub(crate) struct SharedTreeRowResponse {
-    pub row: egui::Response,
-    pub triangle: Option<egui::Response>,
-    pub refresh: Option<egui::Response>,
-}
-
-/// 按本地 `egui_ltreeview` 的尺寸规格绘制一行远端树。
+/// `egui_ltreeview` 文件节点的统一标签。
 ///
-/// 这里统一行高、12px 层级缩进、9px closer、18px 行内刷新预留、
-/// 选择/悬停底色和长文件名截断。调用方只解释点击意图，不再自行画行。
-pub(crate) fn shared_tree_row(
+/// 本地、远程和 SSH 都必须通过这个入口绘制文件名，确保三种模式使用
+/// 相同的原生树布局、截断和选择态前景色；不要在调用方用绝对矩形仿画。
+pub(crate) fn shared_ltree_leaf_label(ui: &mut egui::Ui, name: &str) {
+    ui.add(
+        egui::Label::new(egui::RichText::new(name))
+            .selectable(false)
+            .truncate(),
+    );
+}
+
+/// `egui_ltreeview` 目录节点的统一标签（含本地树同款 18px 行内刷新位）。
+///
+/// 返回 `true` 表示刷新按钮被点击。`refresh_id` 必须由调用方按
+/// “树种类 + 稳定节点 id”构造，避免三种树之间或拖动浮层内重复命中。
+pub(crate) fn shared_ltree_dir_label(
     ui: &mut egui::Ui,
-    row_data: SharedTreeRow<'_>,
-    pal: &theme::Palette,
-) -> SharedTreeRowResponse {
-    let SharedTreeRow {
-        id,
-        depth,
-        name,
-        path,
-        kind,
-        selected,
-        loading,
-    } = row_data;
-    let row_height = ui.spacing().interact_size.y;
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), row_height),
-        egui::Sense::hover(),
+    name: &str,
+    refresh_id: egui::Id,
+    fg_dim: egui::Color32,
+) -> bool {
+    // 名字右侧常驻预留 16+2px；刷新图标出现时文本截断点不跳动。
+    ui.spacing_mut().item_spacing.x = 2.0;
+    ui.set_max_width((ui.available_width() - 18.0).max(0.0));
+    shared_ltree_leaf_label(ui, name);
+
+    // ltreeview 拖动时会在 Tooltip 层再次绘制标签；浮层不注册同 id
+    // 的刷新命中区，避免 debug 重复 id 与点击串扰。
+    if ui.layer_id().order == egui::Order::Tooltip {
+        return false;
+    }
+    let (refresh_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let response = ui.interact(refresh_rect, refresh_id, egui::Sense::click());
+    let band = egui::Rect::from_x_y_ranges(
+        ui.clip_rect().left()..=refresh_rect.right(),
+        ui.max_rect().y_range(),
     );
-    let row = ui.interact(rect, id.with("row"), egui::Sense::click_and_drag());
-    if selected {
-        ui.painter()
-            .rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
-    } else if row.hovered() {
-        ui.painter()
-            .rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    let hovered = response.hovered()
+        || ui
+            .ctx()
+            .pointer_hover_pos()
+            .is_some_and(|position| band.contains(position));
+    if !hovered {
+        return false;
     }
-
-    #[allow(clippy::cast_precision_loss)]
-    let mut x = rect.left() + depth as f32 * 12.0;
-    let mut triangle = None;
-    let mut refresh = None;
-    let is_directory = matches!(kind, SharedTreeRowKind::Directory { .. });
-    if let SharedTreeRowKind::Directory { open } = kind {
-        let triangle_rect = egui::Rect::from_center_size(
-            egui::pos2(x + 4.5, rect.center().y),
-            egui::vec2(9.0, 16.0),
-        );
-        let response = ui.interact(triangle_rect, id.with("triangle"), egui::Sense::click());
-        paint_tri(
-            ui.painter(),
-            triangle_rect,
-            open,
-            if row.hovered() || response.hovered() {
-                pal.fg
-            } else {
-                pal.fg_dim
-            },
-        );
-        triangle = Some(response);
-    }
-    // ltreeview 会为叶节点保留同宽 closer 槽，目录和文件名由此对齐。
-    x += 11.0;
-
-    let right_reserved = if is_directory || loading { 20.0 } else { 3.0 };
-    let text_rect = egui::Rect::from_min_max(
-        egui::pos2(x, rect.top()),
-        egui::pos2((rect.right() - right_reserved).max(x), rect.bottom()),
-    );
-    ui.put(
-        text_rect,
-        egui::Label::new(egui::RichText::new(name).color(pal.fg))
-            .truncate()
-            .selectable(false),
-    );
-
-    if loading {
-        let spinner_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - 8.0, rect.center().y),
-            egui::vec2(14.0, 14.0),
-        );
-        ui.put(spinner_rect, egui::Spinner::new().size(12.0));
-    } else if is_directory {
-        let refresh_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - 8.0, rect.center().y),
-            egui::vec2(16.0, 16.0),
-        );
-        let response = ui.interact(refresh_rect, id.with("refresh"), egui::Sense::click());
-        if row.hovered()
-            || triangle.as_ref().is_some_and(egui::Response::hovered)
-            || response.hovered()
-        {
-            paint_refresh_small(ui.painter(), refresh_rect, pal.fg_dim);
-        }
-        refresh = Some(response);
-    }
-
-    let row = row.on_hover_text(path);
-    SharedTreeRowResponse {
-        row,
-        triangle,
-        refresh,
-    }
+    paint_refresh_small(ui.painter(), refresh_rect, fg_dim);
+    response
+        .on_hover_text(crate::i18n::strings().remote_refresh_dir_tip)
+        .clicked()
 }
 
 /// 本地搜索结果与远端搜索结果共用的扁平行。
@@ -1386,11 +1315,11 @@ fn tree_ui(
 /// `SetSelected`，不会误激活。上游修复后真实 Activate 优先，合成
 /// 路径自动让位（不会双重激活）——届时下方「上游 bug 复现」单测会
 /// 失败提醒移除本函数。
-fn merge_double_click_activation(
-    activated: Vec<usize>,
+pub(crate) fn merge_double_click_activation<T>(
+    activated: Vec<T>,
     double_clicked: bool,
-    selected_now: Option<Vec<usize>>,
-) -> Vec<usize> {
+    selected_now: Option<Vec<T>>,
+) -> Vec<T> {
     if !activated.is_empty() || !double_clicked {
         return activated;
     }
@@ -1748,11 +1677,7 @@ fn add_node(
             builder.node(
                 NodeBuilder::leaf(id)
                     .label_ui(move |ui| {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&name))
-                                .selectable(false)
-                                .truncate(),
-                        );
+                        shared_ltree_leaf_label(ui, &name);
                     })
                     .context_menu(move |ui| file_context_menu(ui, &path, menu)),
             );
@@ -1808,53 +1733,13 @@ fn add_node(
                     .drop_allowed(false)
                     // R8.2：用 label_ui + truncate() 确保目录名带省略号截断。
                     .label_ui(move |ui| {
-                        // P15：行内刷新图标常驻预留 16+2px（名字截断点前移），
-                        // 悬停出图标时名字不跳动；名字→图标间距 2.0 与远程树行同款。
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.set_max_width((ui.available_width() - 18.0).max(0.0));
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&name))
-                                .selectable(false)
-                                .truncate(),
-                        );
-                        // P15 行内刷新（照抄远程树 #6 样式/语义）：悬停目录行时名字
-                        // 右侧出现小刷新图标，点击只重拉该目录（refresh_dir 链路，
-                        // 展开状态不丢）。ltreeview 拖动时会把本行再画进 Order::Tooltip
-                        // 的拖动浮层（label 闭包同帧跑第二遍）——浮层内跳过，防止
-                        // 同 id 命中区重复注册（点击判定错乱 + debug 重复 id 警告）。
-                        if ui.layer_id().order == egui::Order::Tooltip {
-                            return;
-                        }
-                        let (rf_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        // 显式稳定 id（同远程树范式）：ltreeview 的行 Response 不外露，
-                        // 命中区后注册居上层，点击被图标独占、不连带触发行选中。
-                        let rf_resp = ui.interact(
-                            rf_rect,
+                        if shared_ltree_dir_label(
+                            ui,
+                            &name,
                             egui::Id::new(("lumen_local_rf", id)),
-                            egui::Sense::click(),
-                        );
-                        // 悬停判定：指针落在「行横带」（可视区左缘→图标右缘 ×
-                        // 本行高）——覆盖三角/名字/图标区，与远程树
-                        // 「row/tri/rf 任一 hovered」观感一致（行 Response 拿不到，
-                        // 用指针位置对带判定）。
-                        let band = egui::Rect::from_x_y_ranges(
-                            ui.clip_rect().left()..=rf_rect.right(),
-                            ui.max_rect().y_range(),
-                        );
-                        let hovered = rf_resp.hovered()
-                            || ui
-                                .ctx()
-                                .pointer_hover_pos()
-                                .is_some_and(|p| band.contains(p));
-                        if hovered {
-                            paint_refresh_small(ui.painter(), rf_rect, fg_dim);
-                            if rf_resp
-                                .on_hover_text(crate::i18n::strings().remote_refresh_dir_tip)
-                                .clicked()
-                            {
-                                *menu.borrow_mut() = Some(MenuAction::RefreshDir(rf_path.clone()));
-                            }
+                            fg_dim,
+                        ) {
+                            *menu.borrow_mut() = Some(MenuAction::RefreshDir(rf_path.clone()));
                         }
                     })
                     .context_menu(move |ui| {
@@ -2352,6 +2237,8 @@ pub struct RemoteFileTreeOutput {
     pub refresh_dir: Option<usize>,
     /// 本帧单击选中的节点 id（main 设 ft.selected → 渲染高亮 + Ctrl+C 复制源）。
     pub select: Option<usize>,
+    /// 点击树空白处清空选择（与本地 ltreeview 行为一致）。
+    pub clear_select: bool,
     /// 菜单「新建文件夹」请求：在此远程目录下新建（shell 据此开远程新建对话框）。
     pub new_dir_req: Option<String>,
     /// 菜单「新建文件」请求：在此远程目录下新建。
@@ -2469,6 +2356,18 @@ enum RemoteMenuAction {
     Delete(String, String, bool),
     /// 复制路径文本到系统剪贴板（绝对/相对已在树侧算好）。
     CopyText(String),
+    /// 行内刷新：只重拉这个目录。
+    Refresh(usize),
+}
+
+/// 远程树直接交给 `egui_ltreeview` 的稳定节点 id。
+///
+/// 真实节点沿用 `RemoteFileTree` 的 usize id；占位行用本帧行号隔离，
+/// 且不可选择/激活，不会进入业务动作。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RemoteTreeNodeId {
+    Entry(usize),
+    Placeholder(usize),
 }
 
 fn guarded_remote_cd(path: String, shell_idle: bool) -> RemoteMenuAction {
@@ -2476,6 +2375,54 @@ fn guarded_remote_cd(path: String, shell_idle: bool) -> RemoteMenuAction {
         RemoteMenuAction::Cd(path)
     } else {
         RemoteMenuAction::BusyCd
+    }
+}
+
+fn remote_tree_menu_action(
+    action: SharedTreeMenuAction,
+    path: &str,
+    name: &str,
+    size: u64,
+    is_directory: bool,
+    root: Option<&str>,
+    shell_idle: bool,
+) -> Option<RemoteMenuAction> {
+    let parent = path
+        .rsplit_once(['/', '\\'])
+        .map_or_else(|| path.to_owned(), |(parent, _)| parent.to_owned());
+    let target_dir = if is_directory {
+        path.to_owned()
+    } else {
+        parent
+    };
+    match action {
+        SharedTreeMenuAction::EnterDirectory => {
+            Some(guarded_remote_cd(path.to_owned(), shell_idle))
+        }
+        SharedTreeMenuAction::Edit => Some(RemoteMenuAction::Edit(
+            path.to_owned(),
+            name.to_owned(),
+            size,
+        )),
+        SharedTreeMenuAction::CopyFiles => Some(RemoteMenuAction::Copy(
+            path.to_owned(),
+            name.to_owned(),
+            is_directory,
+            size,
+        )),
+        SharedTreeMenuAction::Paste => Some(RemoteMenuAction::Paste(target_dir)),
+        SharedTreeMenuAction::NewFile => Some(RemoteMenuAction::NewFile(target_dir)),
+        SharedTreeMenuAction::NewDirectory => Some(RemoteMenuAction::NewDir(target_dir)),
+        SharedTreeMenuAction::CopyAbsolutePath => Some(RemoteMenuAction::CopyText(path.to_owned())),
+        SharedTreeMenuAction::CopyRelativePath => {
+            Some(RemoteMenuAction::CopyText(rel_remote_path(path, root)))
+        }
+        SharedTreeMenuAction::Delete => Some(RemoteMenuAction::Delete(
+            path.to_owned(),
+            name.to_owned(),
+            is_directory,
+        )),
+        SharedTreeMenuAction::Reveal => None,
     }
 }
 
@@ -2501,12 +2448,8 @@ fn remote_panel_ui(
     } else {
         s.remote_not_connected
     };
-    // 右键菜单经 RefCell 收口，循环后写入 out（与本地树 MenuAction 同款；context_menu 闭包里直接
-    // 借 &mut out 会导致菜单不触发）。**提到工具条前**：根目录标签也要挂右键菜单（粘贴到树根 =
-    // 上传到被控端 cwd，修复「右键根目录无『粘贴』、看似不能上传」）。
-    let menu: RefCell<Option<RemoteMenuAction>> = RefCell::new(None);
-    // 工具条：树根名（basename，悬停看全路径）。根目录菜单也走
-    // shared_tree_context_menu，与远程/SSH 行菜单保持同序。
+    // 工具条只展示根名；与本地树一致，根目录的完整右键菜单挂在下方
+    // ltreeview 根节点上，避免同一目录出现两套不同的命中区。
     ui.horizontal(|ui| {
         let label = root_label.map_or_else(
             || placeholder.to_string(),
@@ -2517,51 +2460,7 @@ fn remote_panel_ui(
                     .to_string()
             },
         );
-        let root_resp = shared_filetree_root_label(ui, &label, root_label, pal);
-        if let Some(root) = root_label {
-            let root = root.to_string();
-            let root_name = label.clone();
-            egui::Popup::context_menu(&root_resp).show(|ui| {
-                if let Some(action) = shared_tree_context_menu(
-                    ui,
-                    SharedTreeMenuSpec {
-                        is_directory: true,
-                        is_root: true,
-                        can_paste,
-                        can_reveal: false,
-                        can_edit: false,
-                        can_delete: false,
-                        permanent_delete: false,
-                    },
-                ) {
-                    *menu.borrow_mut() = match action {
-                        SharedTreeMenuAction::EnterDirectory => {
-                            Some(guarded_remote_cd(root.clone(), shell_idle))
-                        }
-                        SharedTreeMenuAction::CopyFiles => Some(RemoteMenuAction::Copy(
-                            root.clone(),
-                            root_name.clone(),
-                            true,
-                            0,
-                        )),
-                        SharedTreeMenuAction::Paste => Some(RemoteMenuAction::Paste(root.clone())),
-                        SharedTreeMenuAction::NewFile => {
-                            Some(RemoteMenuAction::NewFile(root.clone()))
-                        }
-                        SharedTreeMenuAction::NewDirectory => {
-                            Some(RemoteMenuAction::NewDir(root.clone()))
-                        }
-                        SharedTreeMenuAction::CopyAbsolutePath => {
-                            Some(RemoteMenuAction::CopyText(root.clone()))
-                        }
-                        SharedTreeMenuAction::Edit
-                        | SharedTreeMenuAction::Reveal
-                        | SharedTreeMenuAction::CopyRelativePath
-                        | SharedTreeMenuAction::Delete => None,
-                    };
-                }
-            });
-        }
+        shared_filetree_root_label(ui, &label, root_label, pal);
     });
     // 树未到：占位，不画树（绝不回落本机树）。
     let Some(ft) = ft.filter(|f| f.root_label().is_some()) else {
@@ -2585,142 +2484,234 @@ fn remote_panel_ui(
         out.toggle_hidden = Some(show_hidden);
     }
     ui.add_space(2.0);
-    // （menu RefCell 已在工具条前声明，供根目录 + 行内右键共用。）
+    let rows = ft.visible_rows();
+    let menu: RefCell<Option<RemoteMenuAction>> = RefCell::new(None);
+    let context_selected: RefCell<Option<usize>> = RefCell::new(None);
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.spacing_mut().button_padding.x = 0.0;
-            for row in ft.visible_rows() {
-                let placeholder = match row.kind {
-                    RemoteRowKind::Loading => Some(s.filetree_loading.to_owned()),
-                    RemoteRowKind::Unreadable => Some(s.filetree_unreadable.to_owned()),
-                    RemoteRowKind::Overflow(count) => {
-                        Some(crate::i18n::fmt1(s.filetree_overflow_fmt, count))
-                    }
-                    RemoteRowKind::Dir { .. } | RemoteRowKind::File => None,
-                };
-                if let Some(text) = placeholder {
-                    shared_tree_placeholder_row(ui, row.depth as usize, &text, pal);
-                    continue;
+            let tree_id = ui.make_persistent_id("lumen_remote_file_tree");
+            let mut tree_state =
+                TreeViewState::<RemoteTreeNodeId>::load(ui, tree_id).unwrap_or_default();
+            tree_state.set_selected(
+                ft.selected()
+                    .map(RemoteTreeNodeId::Entry)
+                    .into_iter()
+                    .collect(),
+            );
+            let mut directory_openness = Vec::new();
+            for row in &rows {
+                if let RemoteRowKind::Dir { open } = &row.kind {
+                    let id = RemoteTreeNodeId::Entry(row.id);
+                    tree_state.set_openness(id, *open);
+                    directory_openness.push((row.id, *open));
                 }
+            }
 
-                let kind = match row.kind {
-                    RemoteRowKind::Dir { open } => SharedTreeRowKind::Directory { open },
-                    RemoteRowKind::File => SharedTreeRowKind::File,
+            let (response, actions) = TreeView::new(tree_id)
+                .allow_multi_selection(false)
+                .allow_drag_and_drop(false)
+                .show_state(ui, &mut tree_state, |builder| {
+                    // RemoteFileTree 提供 DFS 可见行；按 depth 还原成 ltreeview
+                    // 的 open_dir/close_dir 层级，行本身完全交给原生组件布局。
+                    let mut directory_depth = 0usize;
+                    for (index, row) in rows.iter().enumerate() {
+                        let target_depth = row.depth as usize;
+                        while directory_depth > target_depth {
+                            builder.close_dir();
+                            directory_depth -= 1;
+                        }
+
+                        match &row.kind {
+                            RemoteRowKind::Dir { open } => {
+                                let id = RemoteTreeNodeId::Entry(row.id);
+                                let label = row.name.clone();
+                                let menu_path = row.path.clone();
+                                let menu_name = row.name.clone();
+                                let menu_size = row.size;
+                                let menu_root = root_owned.clone();
+                                let menu_cell = &menu;
+                                let context_selected_cell = &context_selected;
+                                let refresh_cell = &menu;
+                                let row_id = row.id;
+                                builder.node(
+                                    NodeBuilder::dir(id)
+                                        .activatable(true)
+                                        .default_open(*open)
+                                        .drop_allowed(false)
+                                        .label_ui(move |ui| {
+                                            if shared_ltree_dir_label(
+                                                ui,
+                                                &label,
+                                                egui::Id::new(("lumen_remote_rf", row_id)),
+                                                pal.fg_dim,
+                                            ) {
+                                                *refresh_cell.borrow_mut() =
+                                                    Some(RemoteMenuAction::Refresh(row_id));
+                                            }
+                                        })
+                                        .context_menu(move |ui| {
+                                            *context_selected_cell.borrow_mut() = Some(row_id);
+                                            let Some(action) = shared_tree_context_menu(
+                                                ui,
+                                                SharedTreeMenuSpec {
+                                                    is_directory: true,
+                                                    is_root: row_id == 0,
+                                                    can_paste,
+                                                    can_reveal: false,
+                                                    can_edit: false,
+                                                    can_delete: true,
+                                                    permanent_delete: false,
+                                                },
+                                            ) else {
+                                                return;
+                                            };
+                                            *menu_cell.borrow_mut() = remote_tree_menu_action(
+                                                action,
+                                                &menu_path,
+                                                &menu_name,
+                                                menu_size,
+                                                true,
+                                                menu_root.as_deref(),
+                                                shell_idle,
+                                            );
+                                        }),
+                                );
+                                directory_depth += 1;
+                            }
+                            RemoteRowKind::File => {
+                                let id = RemoteTreeNodeId::Entry(row.id);
+                                let label = row.name.clone();
+                                let menu_path = row.path.clone();
+                                let menu_name = row.name.clone();
+                                let menu_size = row.size;
+                                let menu_root = root_owned.clone();
+                                let menu_cell = &menu;
+                                let context_selected_cell = &context_selected;
+                                let row_id = row.id;
+                                builder.node(
+                                    NodeBuilder::leaf(id)
+                                        .label_ui(move |ui| {
+                                            shared_ltree_leaf_label(ui, &label);
+                                        })
+                                        .context_menu(move |ui| {
+                                            *context_selected_cell.borrow_mut() = Some(row_id);
+                                            let Some(action) = shared_tree_context_menu(
+                                                ui,
+                                                SharedTreeMenuSpec {
+                                                    is_directory: false,
+                                                    is_root: false,
+                                                    can_paste,
+                                                    can_reveal: false,
+                                                    can_edit: true,
+                                                    can_delete: true,
+                                                    permanent_delete: false,
+                                                },
+                                            ) else {
+                                                return;
+                                            };
+                                            *menu_cell.borrow_mut() = remote_tree_menu_action(
+                                                action,
+                                                &menu_path,
+                                                &menu_name,
+                                                menu_size,
+                                                false,
+                                                menu_root.as_deref(),
+                                                shell_idle,
+                                            );
+                                        }),
+                                );
+                            }
+                            RemoteRowKind::Loading
+                            | RemoteRowKind::Unreadable
+                            | RemoteRowKind::Overflow(_) => {
+                                let text = match &row.kind {
+                                    RemoteRowKind::Loading => s.filetree_loading.to_owned(),
+                                    RemoteRowKind::Unreadable => s.filetree_unreadable.to_owned(),
+                                    RemoteRowKind::Overflow(count) => {
+                                        crate::i18n::fmt1(s.filetree_overflow_fmt, *count)
+                                    }
+                                    RemoteRowKind::Dir { .. } | RemoteRowKind::File => {
+                                        unreachable!("real node handled above")
+                                    }
+                                };
+                                builder.node(
+                                    NodeBuilder::leaf(RemoteTreeNodeId::Placeholder(index))
+                                        .activatable(false)
+                                        .label(
+                                            egui::RichText::new(text)
+                                                .size(11.0)
+                                                .color(pal.fg_dim)
+                                                .italics(),
+                                        ),
+                                );
+                            }
+                        }
+                    }
+                    while directory_depth > 0 {
+                        builder.close_dir();
+                        directory_depth -= 1;
+                    }
+                });
+
+            let mut activated = Vec::new();
+            let mut selected_now = None;
+            for action in actions {
+                match action {
+                    Action::Activate(action) => activated.extend(action.selected),
+                    Action::SetSelected(selected) => selected_now = Some(selected),
+                    Action::Move(_)
+                    | Action::Drag(_)
+                    | Action::DragExternal(_)
+                    | Action::MoveExternal(_) => {}
+                }
+            }
+            if let Some(id) = selected_now
+                .as_ref()
+                .and_then(|selected| selected.last())
+                .and_then(|id| match id {
+                    RemoteTreeNodeId::Entry(id) => Some(*id),
+                    RemoteTreeNodeId::Placeholder(_) => None,
+                })
+            {
+                out.select = Some(id);
+                out.clear_select = false;
+            } else if selected_now.as_ref().is_some_and(Vec::is_empty) {
+                out.clear_select = true;
+            }
+            for id in
+                merge_double_click_activation(activated, response.double_clicked(), selected_now)
+            {
+                let RemoteTreeNodeId::Entry(id) = id else {
+                    continue;
+                };
+                let Some(row) = rows.iter().find(|row| row.id == id) else {
+                    continue;
+                };
+                out.select = Some(id);
+                out.clear_select = false;
+                match &row.kind {
+                    RemoteRowKind::Dir { .. } => {
+                        *menu.borrow_mut() = Some(guarded_remote_cd(row.path.clone(), shell_idle));
+                    }
+                    RemoteRowKind::File => out.fetch_open = Some(row.path.clone()),
                     RemoteRowKind::Loading
                     | RemoteRowKind::Unreadable
-                    | RemoteRowKind::Overflow(_) => unreachable!("placeholder handled above"),
-                };
-                let response = shared_tree_row(
-                    ui,
-                    SharedTreeRow {
-                        id: egui::Id::new(("lumen_remote_tree_row", row.id)),
-                        depth: row.depth as usize,
-                        name: &row.name,
-                        path: &row.path,
-                        kind,
-                        selected: ft.selected() == Some(row.id),
-                        loading: false,
-                    },
-                    pal,
-                );
-                if response
-                    .refresh
-                    .as_ref()
-                    .is_some_and(egui::Response::clicked)
-                {
-                    out.refresh_dir = Some(row.id);
-                } else if response
-                    .triangle
-                    .as_ref()
-                    .is_some_and(egui::Response::clicked)
-                {
-                    out.dir_clicks.push(row.id);
-                } else if response.row.double_clicked() {
-                    // 与本地 ltreeview 一致：双击既激活也把该项设为当前选择，
-                    // 随后的 Ctrl+C/V 不得继续作用于旧选择。
-                    out.select = Some(row.id);
-                    match row.kind {
-                        RemoteRowKind::Dir { .. } => {
-                            *menu.borrow_mut() =
-                                Some(guarded_remote_cd(row.path.clone(), shell_idle));
-                        }
-                        RemoteRowKind::File => out.fetch_open = Some(row.path.clone()),
-                        RemoteRowKind::Loading
-                        | RemoteRowKind::Unreadable
-                        | RemoteRowKind::Overflow(_) => {}
-                    }
-                } else if response.row.clicked() || response.row.secondary_clicked() {
-                    out.select = Some(row.id);
+                    | RemoteRowKind::Overflow(_) => {}
                 }
-
-                let is_directory = matches!(row.kind, RemoteRowKind::Dir { .. });
-                let is_root = row.id == 0;
-                egui::Popup::context_menu(&response.row).show(|ui| {
-                    let Some(action) = shared_tree_context_menu(
-                        ui,
-                        SharedTreeMenuSpec {
-                            is_directory,
-                            is_root,
-                            can_paste,
-                            can_reveal: false,
-                            can_edit: !is_directory,
-                            can_delete: true,
-                            permanent_delete: false,
-                        },
-                    ) else {
-                        return;
-                    };
-                    let parent = row
-                        .path
-                        .rsplit_once(['/', '\\'])
-                        .map_or_else(|| row.path.clone(), |(path, _)| path.to_owned());
-                    let target_dir = if is_directory {
-                        row.path.clone()
-                    } else {
-                        parent
-                    };
-                    *menu.borrow_mut() = match action {
-                        SharedTreeMenuAction::EnterDirectory => {
-                            Some(guarded_remote_cd(row.path.clone(), shell_idle))
-                        }
-                        SharedTreeMenuAction::Edit => Some(RemoteMenuAction::Edit(
-                            row.path.clone(),
-                            row.name.clone(),
-                            row.size,
-                        )),
-                        SharedTreeMenuAction::CopyFiles => Some(RemoteMenuAction::Copy(
-                            row.path.clone(),
-                            row.name.clone(),
-                            is_directory,
-                            row.size,
-                        )),
-                        SharedTreeMenuAction::Paste => {
-                            Some(RemoteMenuAction::Paste(row.path.clone()))
-                        }
-                        SharedTreeMenuAction::NewFile => {
-                            Some(RemoteMenuAction::NewFile(target_dir))
-                        }
-                        SharedTreeMenuAction::NewDirectory => {
-                            Some(RemoteMenuAction::NewDir(target_dir))
-                        }
-                        SharedTreeMenuAction::CopyAbsolutePath => {
-                            Some(RemoteMenuAction::CopyText(row.path.clone()))
-                        }
-                        SharedTreeMenuAction::CopyRelativePath => Some(RemoteMenuAction::CopyText(
-                            rel_remote_path(&row.path, root_owned.as_deref()),
-                        )),
-                        SharedTreeMenuAction::Delete => Some(RemoteMenuAction::Delete(
-                            row.path.clone(),
-                            row.name.clone(),
-                            is_directory,
-                        )),
-                        SharedTreeMenuAction::Reveal => None,
-                    };
-                });
             }
+            for (id, backend_open) in directory_openness {
+                let node_id = RemoteTreeNodeId::Entry(id);
+                if tree_state.is_open(&node_id).unwrap_or(backend_open) != backend_open {
+                    out.dir_clicks.push(id);
+                }
+            }
+            tree_state.store(ui, tree_id);
         });
+    if let Some(id) = context_selected.into_inner() {
+        out.select = Some(id);
+        out.clear_select = false;
+    }
     // 循环结束后写入 out（避免 context_menu 闭包里嵌套借 &mut out）。
     match menu.into_inner() {
         Some(RemoteMenuAction::Copy(path, name, is_dir, size)) => {
@@ -2738,6 +2729,7 @@ fn remote_panel_ui(
             out.delete_req = Some((path, name, is_dir));
         }
         Some(RemoteMenuAction::CopyText(t)) => out.copy_text = Some(t),
+        Some(RemoteMenuAction::Refresh(id)) => out.refresh_dir = Some(id),
         None => {}
     }
 }
@@ -2941,26 +2933,6 @@ pub(crate) fn remote_dialog_ui(
     } else {
         st.remote_dialog = Some(dialog);
     }
-}
-
-/// 远程树目录三角（painter 画，避免 `▾`/`▸` 字形缺失渲染成 tofu）：`open`=朝下、否则朝右。
-fn paint_tri(painter: &egui::Painter, rect: egui::Rect, open: bool, color: egui::Color32) {
-    let c = rect.center();
-    let r = 3.5_f32;
-    let pts = if open {
-        vec![
-            egui::pos2(c.x - r, c.y - r * 0.5),
-            egui::pos2(c.x + r, c.y - r * 0.5),
-            egui::pos2(c.x, c.y + r * 0.8),
-        ]
-    } else {
-        vec![
-            egui::pos2(c.x - r * 0.5, c.y - r),
-            egui::pos2(c.x - r * 0.5, c.y + r),
-            egui::pos2(c.x + r * 0.8, c.y),
-        ]
-    };
-    painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
 /// 目录行悬停时的小刷新图标（painter 画约 280° 圆弧 + 箭头）。
@@ -3335,6 +3307,39 @@ mod tests {
             action: Action::Delete,
             enabled: true,
         }));
+    }
+
+    #[test]
+    fn remote_paste_targets_a_selected_files_parent_and_a_directory_itself() {
+        let file_action = remote_tree_menu_action(
+            SharedTreeMenuAction::Paste,
+            r"C:\work\main.rs",
+            "main.rs",
+            12,
+            false,
+            Some(r"C:\work"),
+            true,
+        )
+        .expect("paste is supported");
+        let RemoteMenuAction::Paste(file_target) = file_action else {
+            panic!("paste must produce a paste action");
+        };
+        assert_eq!(file_target, r"C:\work");
+
+        let directory_action = remote_tree_menu_action(
+            SharedTreeMenuAction::Paste,
+            r"C:\work\src",
+            "src",
+            0,
+            true,
+            Some(r"C:\work"),
+            true,
+        )
+        .expect("paste is supported");
+        let RemoteMenuAction::Paste(directory_target) = directory_action else {
+            panic!("paste must produce a paste action");
+        };
+        assert_eq!(directory_target, r"C:\work\src");
     }
 
     /// 造一棵唯一的临时目录树根（同款于 main.rs 的 lc_tmp；不引 tempfile）。
@@ -3776,7 +3781,7 @@ mod tests {
             vec![5]
         );
         // 双击但本帧无点选（点了 closer 三角/空白处）：不激活。
-        assert!(merge_double_click_activation(Vec::new(), true, None).is_empty());
+        assert!(merge_double_click_activation(Vec::<usize>::new(), true, None).is_empty());
         // 非双击且无 Activate：不激活。
         assert!(merge_double_click_activation(Vec::new(), false, Some(vec![5])).is_empty());
     }

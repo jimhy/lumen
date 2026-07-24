@@ -4,16 +4,18 @@
 //! [`super::filetree`]. SSH paths remain opaque UTF-8 strings with `/`
 //! separators and are never converted to a Windows `PathBuf`.
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use egui::RichText;
+use egui_ltreeview::{Action, NodeBuilder, TreeView, TreeViewBuilder, TreeViewState};
 use lumen_ssh::DirectoryEntryKind;
 
 use super::filetree::{
-    shared_filetree_panel, shared_filetree_root_label, shared_filetree_search_button,
-    shared_tree_context_menu, shared_tree_placeholder_row, shared_tree_row,
-    shared_tree_search_result_row, SharedTreeMenuAction, SharedTreeMenuSpec, SharedTreeRow,
-    SharedTreeRowKind,
+    merge_double_click_activation, shared_filetree_panel, shared_filetree_root_label,
+    shared_filetree_search_button, shared_ltree_dir_label, shared_ltree_leaf_label,
+    shared_tree_context_menu, shared_tree_placeholder_row, shared_tree_search_result_row,
+    SharedTreeMenuAction, SharedTreeMenuSpec,
 };
 use super::theme::Palette;
 
@@ -30,6 +32,9 @@ pub enum SshFileTreeIntent {
         session_id: crate::ssh_runtime::SshSessionId,
         path: String,
         is_directory: bool,
+    },
+    ClearSelection {
+        session_id: crate::ssh_runtime::SshSessionId,
     },
     ToggleDirectory {
         session_id: crate::ssh_runtime::SshSessionId,
@@ -108,10 +113,46 @@ struct EntryView<'a> {
     name: &'a str,
     kind: DirectoryEntryKind,
     size: u64,
+    is_root: bool,
+}
+
+#[derive(Clone)]
+struct OwnedEntry {
+    path: String,
+    name: String,
+    kind: DirectoryEntryKind,
+    size: u64,
     depth: usize,
     expanded: bool,
     loading: bool,
     is_root: bool,
+}
+
+impl OwnedEntry {
+    fn as_view(&self) -> EntryView<'_> {
+        EntryView {
+            path: &self.path,
+            name: &self.name,
+            kind: self.kind,
+            size: self.size,
+            is_root: self.is_root,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DeferredTreeOutput {
+    refresh: Option<String>,
+    menu: Option<(SharedTreeMenuAction, OwnedEntry)>,
+    context_selection: Option<OwnedEntry>,
+}
+
+struct LtreeBuildCtx<'a> {
+    entries: &'a [OwnedEntry],
+    tree: &'a crate::ssh_runtime::SshFileTreeView,
+    pal: &'a Palette,
+    permissions: TreePermissions,
+    deferred: &'a RefCell<DeferredTreeOutput>,
 }
 
 #[derive(Clone, Copy)]
@@ -182,27 +223,9 @@ fn draw_contents(
             let title = tree.map_or(strings.filetree_root_placeholder, |tree| {
                 linux_basename(&tree.root)
             });
-            let root_response =
-                shared_filetree_root_label(ui, title, tree.map(|tree| tree.root.as_str()), pal);
-            if let Some(tree) = tree {
-                show_context_menu(
-                    &root_response,
-                    EntryView {
-                        path: &tree.root,
-                        name: title,
-                        kind: DirectoryEntryKind::Directory,
-                        size: 0,
-                        depth: 0,
-                        expanded: true,
-                        loading: tree.loading,
-                        is_root: true,
-                    },
-                    tree,
-                    permissions.shell_idle,
-                    permissions.can_paste,
-                    output,
-                );
-            }
+            // 与本地目录树一致：标题只显示根名；根目录右键菜单挂在
+            // 下方原生 TreeView 的根节点上。
+            shared_filetree_root_label(ui, title, tree.map(|tree| tree.root.as_str()), pal);
         });
     });
 
@@ -286,6 +309,8 @@ fn draw_contents(
     }
     if let Some(selected_path) = selected_path {
         ui.data_mut(|data| data.insert_temp(selected_id, selected_path));
+    } else {
+        ui.data_mut(|data| data.remove::<String>(selected_id));
     }
     ui.data_mut(|data| data.insert_temp(search_id, search));
 }
@@ -299,83 +324,208 @@ fn draw_tree(
     output: &mut Output,
 ) {
     let strings = crate::i18n::strings();
-    let root_open_id = ui.make_persistent_id((
-        "ssh_filetree_root_open",
-        tree.session_id,
-        tree.root.as_str(),
-    ));
-    let mut root_open = ui
-        .data(|data| data.get_temp::<bool>(root_open_id))
-        .unwrap_or(true);
+    let state_id =
+        ui.make_persistent_id(("lumen_ssh_file_tree", tree.session_id, tree.root.as_str()));
+    let mut state = TreeViewState::<String>::load(ui, state_id).unwrap_or_default();
+    let root_entry = OwnedEntry {
+        path: tree.root.clone(),
+        name: linux_basename(&tree.root).to_owned(),
+        kind: DirectoryEntryKind::Directory,
+        size: 0,
+        depth: 0,
+        expanded: true,
+        loading: tree.rows.is_empty() && tree.loading,
+        is_root: true,
+    };
+    let entries = tree
+        .rows
+        .iter()
+        .map(|row| OwnedEntry {
+            path: row.path.clone(),
+            name: row.name.clone(),
+            kind: row.kind,
+            size: row.size,
+            depth: row.depth,
+            expanded: row.expanded,
+            loading: row.loading,
+            is_root: false,
+        })
+        .collect::<Vec<_>>();
+
+    // SSH runtime owns the directory cache/open state. Seed ltreeview from that
+    // snapshot before drawing, then turn any closer changes back into runtime
+    // intents after drawing.
+    for entry in &entries {
+        if entry.kind == DirectoryEntryKind::Directory {
+            state.set_openness(entry.path.clone(), entry.expanded);
+        }
+    }
+    if let Some(path) = selected_path.as_ref() {
+        state.set_one_selected(path.clone());
+    }
+
+    let deferred = RefCell::new(DeferredTreeOutput::default());
     egui::ScrollArea::both()
         .id_salt(("ssh_filetree_scroll", tree.session_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.spacing_mut().button_padding.x = 0.0;
+            let (response, actions) = TreeView::new(state_id)
+                .allow_multi_selection(false)
+                .allow_drag_and_drop(false)
+                .show_state(ui, &mut state, |builder| {
+                    let root_open =
+                        add_ltree_entry(builder, &root_entry, tree, pal, permissions, &deferred);
+                    if root_open {
+                        if root_entry.loading {
+                            add_ltree_placeholder(
+                                builder,
+                                "\0ssh:root-loading".to_owned(),
+                                strings.filetree_loading,
+                                pal,
+                            );
+                        }
+                        let mut next = 0;
+                        let build = LtreeBuildCtx {
+                            entries: &entries,
+                            tree,
+                            pal,
+                            permissions,
+                            deferred: &deferred,
+                        };
+                        add_ltree_rows(builder, &mut next, 0, &build);
+                        if tree.truncated {
+                            add_ltree_placeholder(
+                                builder,
+                                "\0ssh:truncated".to_owned(),
+                                strings.filetree_truncated,
+                                pal,
+                            );
+                        }
+                        if let Some(error) = &tree.error {
+                            add_ltree_error_placeholder(
+                                builder,
+                                "\0ssh:error".to_owned(),
+                                strings.filetree_unreadable,
+                                error,
+                                pal,
+                            );
+                        }
+                    }
+                    builder.close_dir();
+                });
 
-            let root_name = linux_basename(&tree.root);
-            if draw_entry(
-                ui,
-                tree,
-                EntryView {
-                    path: &tree.root,
-                    name: root_name,
-                    kind: DirectoryEntryKind::Directory,
-                    size: 0,
-                    depth: 0,
-                    expanded: root_open,
-                    loading: tree.rows.is_empty() && tree.loading,
-                    is_root: true,
-                },
-                pal,
-                permissions,
-                selected_path,
-                output,
-            ) {
-                root_open = !root_open;
+            let mut activated = Vec::new();
+            let mut selected_now = None;
+            for action in actions {
+                match action {
+                    Action::Activate(action) => activated.extend(action.selected),
+                    Action::SetSelected(selected) => selected_now = Some(selected),
+                    Action::Move(_)
+                    | Action::Drag(_)
+                    | Action::DragExternal(_)
+                    | Action::MoveExternal(_) => {}
+                }
             }
-            if root_open {
-                for row in &tree.rows {
-                    let _ = draw_entry(
-                        ui,
-                        tree,
-                        EntryView {
-                            path: &row.path,
-                            name: &row.name,
-                            kind: row.kind,
-                            size: row.size,
-                            depth: row.depth.saturating_add(1),
-                            expanded: row.expanded,
-                            loading: row.loading,
-                            is_root: false,
-                        },
-                        pal,
-                        permissions,
+
+            let selected_for_activation = selected_now.clone();
+            if let Some(selected) = selected_now {
+                if let Some(entry) = selected
+                    .last()
+                    .and_then(|id| entry_for_path(&root_entry, &entries, id))
+                {
+                    if selected_path.as_deref() != Some(entry.path.as_str()) {
+                        select_entry(
+                            tree.session_id,
+                            &entry.path,
+                            entry.kind == DirectoryEntryKind::Directory,
+                            selected_path,
+                            output,
+                        );
+                    }
+                } else if selected.is_empty() && selected_path.take().is_some() {
+                    output.intents.push(SshFileTreeIntent::ClearSelection {
+                        session_id: tree.session_id,
+                    });
+                }
+            }
+
+            for id in merge_double_click_activation(
+                activated,
+                response.double_clicked(),
+                selected_for_activation,
+            ) {
+                let Some(entry) = entry_for_path(&root_entry, &entries, &id) else {
+                    continue;
+                };
+                if selected_path.as_deref() != Some(entry.path.as_str()) {
+                    select_entry(
+                        tree.session_id,
+                        &entry.path,
+                        entry.kind == DirectoryEntryKind::Directory,
                         selected_path,
                         output,
                     );
                 }
-            }
-            if root_open {
-                if tree.truncated {
-                    shared_tree_placeholder_row(ui, 1, strings.filetree_truncated, pal);
-                }
-                if let Some(error) = &tree.error {
-                    let response = ui.add(
-                        egui::Label::new(
-                            RichText::new(strings.filetree_unreadable)
-                                .size(11.0)
-                                .color(pal.fg_dim)
-                                .italics(),
-                        )
-                        .wrap(),
+                if entry.kind == DirectoryEntryKind::Directory {
+                    queue_change_directory(
+                        output,
+                        tree.session_id,
+                        &entry.path,
+                        permissions.shell_idle,
                     );
-                    response.on_hover_text(error);
+                } else {
+                    output.intents.push(SshFileTreeIntent::OpenLocalCopy {
+                        session_id: tree.session_id,
+                        path: entry.path.clone(),
+                        name: entry.name.clone(),
+                        size: entry.size,
+                    });
                 }
             }
         });
-    ui.data_mut(|data| data.insert_temp(root_open_id, root_open));
+
+    for entry in &entries {
+        if entry.kind != DirectoryEntryKind::Directory {
+            continue;
+        }
+        let open = state.is_open(&entry.path).unwrap_or(entry.expanded);
+        if open != entry.expanded {
+            output.intents.push(SshFileTreeIntent::ToggleDirectory {
+                session_id: tree.session_id,
+                path: entry.path.clone(),
+            });
+        }
+    }
+    state.store(ui, state_id);
+
+    let deferred = deferred.into_inner();
+    if let Some(entry) = deferred.context_selection {
+        let is_directory = entry.kind == DirectoryEntryKind::Directory;
+        if selected_path.as_deref() != Some(entry.path.as_str()) {
+            select_entry(
+                tree.session_id,
+                &entry.path,
+                is_directory,
+                selected_path,
+                output,
+            );
+        }
+    }
+    if let Some(path) = deferred.refresh {
+        output.intents.push(SshFileTreeIntent::RefreshDirectory {
+            session_id: tree.session_id,
+            path,
+        });
+    }
+    if let Some((action, entry)) = deferred.menu {
+        apply_menu_action(
+            action,
+            entry.as_view(),
+            tree,
+            permissions.shell_idle,
+            output,
+        );
+    }
 }
 
 fn draw_search_results(
@@ -471,9 +621,6 @@ fn draw_search_results(
                         name: &row.name,
                         kind: row.kind,
                         size: row.size,
-                        depth: 0,
-                        expanded: row.expanded,
-                        loading: row.loading,
                         is_root: false,
                     },
                     tree,
@@ -488,99 +635,173 @@ fn draw_search_results(
         });
 }
 
-fn draw_entry(
-    ui: &mut egui::Ui,
+fn add_ltree_rows(
+    builder: &mut TreeViewBuilder<'_, String>,
+    next: &mut usize,
+    depth: usize,
+    build: &LtreeBuildCtx<'_>,
+) {
+    while let Some(entry) = build.entries.get(*next) {
+        if entry.depth < depth {
+            return;
+        }
+        if entry.depth > depth {
+            // A malformed snapshot must not escape its missing parent. Runtime
+            // snapshots are normally contiguous, so this is only a defensive skip.
+            *next += 1;
+            continue;
+        }
+
+        let entry_index = *next;
+        *next += 1;
+        let open = add_ltree_entry(
+            builder,
+            entry,
+            build.tree,
+            build.pal,
+            build.permissions,
+            build.deferred,
+        );
+        if entry.kind != DirectoryEntryKind::Directory {
+            continue;
+        }
+
+        if open {
+            if entry.loading || !entry.expanded {
+                add_ltree_placeholder(
+                    builder,
+                    format!("\0ssh:loading:{entry_index}:{}", entry.path),
+                    crate::i18n::strings().filetree_loading,
+                    build.pal,
+                );
+            }
+            add_ltree_rows(builder, next, depth.saturating_add(1), build);
+        } else {
+            while build
+                .entries
+                .get(*next)
+                .is_some_and(|child| child.depth > depth)
+            {
+                *next += 1;
+            }
+        }
+        builder.close_dir();
+    }
+}
+
+fn add_ltree_entry(
+    builder: &mut TreeViewBuilder<'_, String>,
+    entry: &OwnedEntry,
     tree: &crate::ssh_runtime::SshFileTreeView,
-    entry: EntryView<'_>,
     pal: &Palette,
     permissions: TreePermissions,
-    selected_path: &mut Option<String>,
-    output: &mut Output,
+    deferred: &RefCell<DeferredTreeOutput>,
 ) -> bool {
     let is_directory = entry.kind == DirectoryEntryKind::Directory;
-    let response = shared_tree_row(
-        ui,
-        SharedTreeRow {
-            id: egui::Id::new(("ssh_filetree_row", tree.session_id, entry.path)),
-            depth: entry.depth,
-            name: entry.name,
-            path: entry.path,
-            kind: if is_directory {
-                SharedTreeRowKind::Directory {
-                    open: entry.expanded,
-                }
-            } else {
-                SharedTreeRowKind::File
-            },
-            selected: selected_path.as_deref() == Some(entry.path),
-            loading: entry.loading,
-        },
-        pal,
-    );
-
-    if response
-        .refresh
-        .as_ref()
-        .is_some_and(egui::Response::clicked)
-    {
-        output.intents.push(SshFileTreeIntent::RefreshDirectory {
-            session_id: tree.session_id,
-            path: entry.path.to_owned(),
-        });
-    } else if response
-        .triangle
-        .as_ref()
-        .is_some_and(egui::Response::clicked)
-    {
-        output.intents.push(SshFileTreeIntent::ToggleDirectory {
-            session_id: tree.session_id,
-            path: entry.path.to_owned(),
-        });
-        show_context_menu(
-            &response.row,
-            entry,
-            tree,
-            permissions.shell_idle,
-            permissions.can_paste,
-            output,
+    let id = entry.path.clone();
+    let label = entry.name.clone();
+    let menu_entry = entry.clone();
+    let menu = deferred;
+    let menu_spec = SharedTreeMenuSpec {
+        is_directory,
+        is_root: entry.is_root,
+        can_paste: permissions.can_paste,
+        can_reveal: false,
+        can_edit: !is_directory,
+        can_delete: true,
+        permanent_delete: true,
+    };
+    if !is_directory {
+        builder.node(
+            NodeBuilder::leaf(id)
+                .label_ui(move |ui| shared_ltree_leaf_label(ui, &label))
+                .context_menu(move |ui| {
+                    menu.borrow_mut().context_selection = Some(menu_entry.clone());
+                    if let Some(action) = shared_tree_context_menu(ui, menu_spec) {
+                        menu.borrow_mut().menu = Some((action, menu_entry.clone()));
+                    }
+                }),
         );
-        return true;
-    } else if response.row.double_clicked() {
-        select_entry(
-            tree.session_id,
-            entry.path,
-            is_directory,
-            selected_path,
-            output,
-        );
-        if is_directory {
-            queue_change_directory(output, tree.session_id, entry.path, permissions.shell_idle);
-        } else {
-            output.intents.push(SshFileTreeIntent::OpenLocalCopy {
-                session_id: tree.session_id,
-                path: entry.path.to_owned(),
-                name: entry.name.to_owned(),
-                size: entry.size,
-            });
-        }
-    } else if response.row.clicked() || response.row.secondary_clicked() {
-        select_entry(
-            tree.session_id,
-            entry.path,
-            is_directory,
-            selected_path,
-            output,
-        );
+        return false;
     }
-    show_context_menu(
-        &response.row,
-        entry,
-        tree,
-        permissions.shell_idle,
-        permissions.can_paste,
-        output,
+
+    let refresh_path = entry.path.clone();
+    let refresh_id = egui::Id::new(("lumen_ssh_rf", tree.session_id, entry.path.as_str()));
+    let refresh = deferred;
+    let fg_dim = pal.fg_dim;
+    builder.node(
+        NodeBuilder::dir(id)
+            .activatable(true)
+            .default_open(entry.is_root)
+            .drop_allowed(false)
+            .label_ui(move |ui| {
+                if shared_ltree_dir_label(ui, &label, refresh_id, fg_dim) {
+                    refresh.borrow_mut().refresh = Some(refresh_path.clone());
+                }
+            })
+            .context_menu(move |ui| {
+                menu.borrow_mut().context_selection = Some(menu_entry.clone());
+                if let Some(action) = shared_tree_context_menu(ui, menu_spec) {
+                    menu.borrow_mut().menu = Some((action, menu_entry.clone()));
+                }
+            }),
+    )
+}
+
+fn add_ltree_placeholder(
+    builder: &mut TreeViewBuilder<'_, String>,
+    id: String,
+    text: &str,
+    pal: &Palette,
+) {
+    builder.node(
+        NodeBuilder::leaf(id).activatable(false).label(
+            egui::RichText::new(text)
+                .size(11.0)
+                .color(pal.fg_dim)
+                .italics(),
+        ),
     );
-    false
+}
+
+fn add_ltree_error_placeholder(
+    builder: &mut TreeViewBuilder<'_, String>,
+    id: String,
+    text: &str,
+    error: &str,
+    pal: &Palette,
+) {
+    let text = text.to_owned();
+    let error = error.to_owned();
+    let fg_dim = pal.fg_dim;
+    builder.node(
+        NodeBuilder::leaf(id)
+            .activatable(false)
+            .label_ui(move |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&text)
+                            .size(11.0)
+                            .color(fg_dim)
+                            .italics(),
+                    )
+                    .selectable(false),
+                )
+                .on_hover_text(&error);
+            }),
+    );
+}
+
+fn entry_for_path<'a>(
+    root: &'a OwnedEntry,
+    entries: &'a [OwnedEntry],
+    path: &str,
+) -> Option<&'a OwnedEntry> {
+    if path == root.path {
+        Some(root)
+    } else {
+        entries.iter().find(|entry| entry.path == path)
+    }
 }
 
 fn select_entry(
@@ -661,7 +882,7 @@ fn apply_menu_action(
         SharedTreeMenuAction::Paste => {
             output.intents.push(SshFileTreeIntent::PasteInto {
                 session_id,
-                directory: entry.path.to_owned(),
+                directory: target_directory.to_owned(),
             });
         }
         SharedTreeMenuAction::NewFile | SharedTreeMenuAction::NewDirectory => {
@@ -728,6 +949,23 @@ fn relative_linux_path(path: &str, root: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_tree() -> crate::ssh_runtime::SshFileTreeView {
+        crate::ssh_runtime::SshFileTreeView {
+            session_id: 7,
+            profile_id: "ssh_test".to_owned(),
+            root: "/srv/app".to_owned(),
+            rows: Vec::new(),
+            loading: false,
+            truncated: false,
+            error: None,
+            search_query: None,
+            search_rows: Vec::new(),
+            search_loading: false,
+            search_truncated: false,
+            search_error: None,
+        }
+    }
+
     #[test]
     fn linux_paths_stay_opaque_and_relative_to_the_tree_root() {
         assert_eq!(
@@ -746,9 +984,6 @@ mod tests {
             name: "main.rs",
             kind: DirectoryEntryKind::File,
             size: 12,
-            depth: 0,
-            expanded: false,
-            loading: false,
             is_root: false,
         };
         let directory = EntryView {
@@ -756,9 +991,6 @@ mod tests {
             name: "app",
             kind: DirectoryEntryKind::Directory,
             size: 0,
-            depth: 0,
-            expanded: true,
-            loading: false,
             is_root: false,
         };
         assert_eq!(linux_parent(file.path), Some("/srv/app"));
@@ -787,6 +1019,27 @@ mod tests {
             vec![SshFileTreeIntent::ChangeDirectory {
                 session_id: 7,
                 path: "/srv/app".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn paste_on_a_file_targets_its_parent_directory() {
+        let tree = test_tree();
+        let file = EntryView {
+            path: "/srv/app/.env",
+            name: ".env",
+            kind: DirectoryEntryKind::File,
+            size: 12,
+            is_root: false,
+        };
+        let mut output = Output::default();
+        apply_menu_action(SharedTreeMenuAction::Paste, file, &tree, true, &mut output);
+        assert_eq!(
+            output.intents,
+            vec![SshFileTreeIntent::PasteInto {
+                session_id: 7,
+                directory: "/srv/app".to_owned(),
             }]
         );
     }

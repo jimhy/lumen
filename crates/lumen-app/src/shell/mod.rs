@@ -623,6 +623,8 @@ pub struct ShellOutput {
     pub remote_refresh_dir: Option<usize>,
     /// 控制端远程树：本帧单击选中的节点 id（main 设 ft.selected → 高亮 + Ctrl+C 下载源）。
     pub remote_select: Option<usize>,
+    /// 控制端远程树：点击空白处清空选择。
+    pub remote_clear_select: bool,
     /// 本帧鼠标是否在文件树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键门控）。
     pub filetree_hovered: bool,
     /// part3c-2 #7：复制文件 / 文件夹到剪贴板 (来源侧, path, name, is_dir)。
@@ -799,6 +801,7 @@ pub fn show(
         remote_edit_file: None,
         remote_refresh_dir: None,
         remote_select: None,
+        remote_clear_select: false,
         filetree_hovered: false,
         file_copy: None,
         file_paste: None,
@@ -1300,6 +1303,7 @@ pub fn show(
         out.remote_edit_file = rout.edit_file;
         out.remote_refresh_dir = rout.refresh_dir;
         out.remote_select = rout.select;
+        out.remote_clear_select = rout.clear_select;
         out.filetree_hovered = rout.hovered;
         // 复制远程项 → 剪贴板 Remote 侧（下载源）；粘贴到远程目录 → Remote 目标（上传，片5）。
         out.file_copy = rout

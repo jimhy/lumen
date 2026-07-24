@@ -3720,6 +3720,9 @@ impl AppState {
                 self.ssh_runtime
                     .select_file(session_id, path, is_directory);
             }
+            SshFileTreeIntent::ClearSelection { session_id } => {
+                self.ssh_runtime.clear_file_selection(session_id);
+            }
             SshFileTreeIntent::ToggleDirectory { session_id, path } => {
                 if self.ssh_runtime.toggle_directory(session_id, &path) {
                     self.window.request_redraw();
@@ -13128,6 +13131,9 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if let Some(id) = shell_out.remote_select {
                     state.remote_ws.set_remote_selected(id);
+                }
+                if shell_out.remote_clear_select {
+                    state.remote_ws.clear_remote_selected();
                 }
                 if let Some(show) = shell_out.remote_toggle_hidden {
                     state.remote_ws.set_remote_show_hidden(show);

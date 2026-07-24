@@ -729,6 +729,9 @@ impl RemoteFileTree {
     fn set_selected(&mut self, id: usize) {
         self.selected = Some(id);
     }
+    fn clear_selected(&mut self) {
+        self.selected = None;
+    }
     /// 选中节点的 `(path, name, is_dir)`——Ctrl+C 复制为下载源用；占位 / 越界返回 `None`。
     #[must_use]
     pub fn selected_item(&self) -> Option<(String, String, bool, u64)> {
@@ -2536,6 +2539,13 @@ impl RemoteWs {
     pub fn set_remote_selected(&mut self, id: usize) {
         if let Some(ft) = self.remote_filetree.as_mut() {
             ft.set_selected(id);
+        }
+    }
+
+    /// 控制端：点击远程树空白处后清空选择，Ctrl+C/V 回退到无选中语义。
+    pub fn clear_remote_selected(&mut self) {
+        if let Some(ft) = self.remote_filetree.as_mut() {
+            ft.clear_selected();
         }
     }
 
@@ -7880,6 +7890,13 @@ mod tests {
             ft.paste_target_dir().as_deref(),
             Some("/r/sub"),
             "选中目录应粘贴到目录自身"
+        );
+        ft.clear_selected();
+        assert_eq!(ft.selected(), None, "点击空白处应清空远程树选择");
+        assert_eq!(
+            ft.paste_target_dir().as_deref(),
+            Some("/r"),
+            "清空选择后粘贴目标应回退树根"
         );
         // 展开 sub（DFS find 可达）：填其 listing，x 在 depth 2 可见。
         let sub_id = rows[1].id;
