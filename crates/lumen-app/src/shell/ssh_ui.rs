@@ -7,6 +7,7 @@
 use std::{
     collections::HashSet,
     fmt,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -58,6 +59,13 @@ pub struct SshUiText {
     pub auth_agent: &'static str,
     pub password_required_hint: &'static str,
     pub password_saved_hint: &'static str,
+    pub private_key_file: &'static str,
+    pub choose_private_key: &'static str,
+    pub key_passphrase: &'static str,
+    pub credentials_local_only: &'static str,
+    pub private_key_required_hint: &'static str,
+    pub private_key_saved_hint: &'static str,
+    pub private_key_invalid_hint: &'static str,
     pub group: &'static str,
     pub initial_directory: &'static str,
     pub connect_timeout: &'static str,
@@ -115,6 +123,14 @@ impl Default for SshUiText {
             auth_agent: "SSH Agent",
             password_required_hint: "密码只安全保存在当前设备，不会同步。",
             password_saved_hint: "留空则沿用当前设备已保存的密码。",
+            private_key_file: "私钥文件",
+            choose_private_key: "选择文件…",
+            key_passphrase: "私钥口令（可选）",
+            credentials_local_only:
+                "密码和私钥口令将安全保存在本机，私钥文件路径仅保留在本机；均不会同步。",
+            private_key_required_hint: "请选择本机私钥文件；文件和路径不会上传或同步。",
+            private_key_saved_hint: "选择新文件可替换本机私钥；不选择则沿用当前设备的绑定。",
+            private_key_invalid_hint: "所选私钥文件不存在，请重新选择。",
             group: "分组",
             initial_directory: "初始目录",
             connect_timeout: "连接超时",
@@ -176,6 +192,13 @@ impl SshUiText {
             auth_agent: strings.ssh_auth_agent,
             password_required_hint: strings.ssh_password_required_hint,
             password_saved_hint: strings.ssh_password_saved_hint,
+            private_key_file: strings.ssh_private_key_file,
+            choose_private_key: strings.ssh_choose_private_key,
+            key_passphrase: strings.ssh_key_passphrase,
+            credentials_local_only: strings.ssh_credentials_memory_only,
+            private_key_required_hint: strings.ssh_private_key_required_hint,
+            private_key_saved_hint: strings.ssh_private_key_saved_hint,
+            private_key_invalid_hint: strings.ssh_private_key_invalid_hint,
             group: strings.ssh_group,
             initial_directory: strings.ssh_initial_directory,
             connect_timeout: strings.ssh_connect_timeout,
@@ -226,6 +249,8 @@ pub struct SshProfileSubmission {
     editing_id: Option<ProfileId>,
     draft: NewSshProfile,
     password: String,
+    private_key_path: Option<PathBuf>,
+    key_passphrase: String,
     intent: ProfileSubmitIntent,
 }
 
@@ -264,6 +289,14 @@ impl SshProfileSubmission {
         std::mem::take(&mut self.password)
     }
 
+    pub(crate) fn take_private_key_path(&mut self) -> Option<PathBuf> {
+        self.private_key_path.take()
+    }
+
+    pub(crate) fn take_key_passphrase(&mut self) -> String {
+        std::mem::take(&mut self.key_passphrase)
+    }
+
     pub(crate) const fn intent(&self) -> ProfileSubmitIntent {
         self.intent
     }
@@ -282,6 +315,8 @@ impl fmt::Debug for SshProfileSubmission {
             .field("editing_id", &self.editing_id)
             .field("draft", &self.draft)
             .field("password", &"<redacted>")
+            .field("private_key_path", &"<redacted>")
+            .field("key_passphrase", &"<redacted>")
             .field("intent", &self.intent)
             .finish()
     }
@@ -291,6 +326,7 @@ impl Drop for SshProfileSubmission {
     fn drop(&mut self) {
         use zeroize::Zeroize as _;
         self.password.zeroize();
+        self.key_passphrase.zeroize();
     }
 }
 
@@ -318,7 +354,7 @@ pub enum SshUiAction {
     ConnectProfile {
         id: ProfileId,
     },
-    SubmitProfile(SshProfileSubmission),
+    SubmitProfile(Box<SshProfileSubmission>),
     CancelConnectionTest {
         form_id: u64,
     },
@@ -335,7 +371,7 @@ enum Dialog {
     CreateGroup { name: String },
     RenameGroup { id: GroupId, name: String },
     DeleteGroup { id: GroupId, name: String },
-    EditProfile(ProfileForm),
+    EditProfile(Box<ProfileForm>),
     DeleteProfile { id: ProfileId, name: String },
 }
 
@@ -350,6 +386,9 @@ struct ProfileForm {
     username: String,
     auth_method: AuthMethod,
     password: String,
+    private_key_path: Option<PathBuf>,
+    key_passphrase: String,
+    can_reuse_saved_private_key: bool,
     group_id: Option<GroupId>,
     initial_directory: String,
     connect_timeout_secs: u32,
@@ -383,6 +422,12 @@ impl fmt::Debug for ProfileForm {
             .field("username", &self.username)
             .field("auth_method", &self.auth_method)
             .field("password", &"<redacted>")
+            .field("private_key_path", &"<redacted>")
+            .field("key_passphrase", &"<redacted>")
+            .field(
+                "can_reuse_saved_private_key",
+                &self.can_reuse_saved_private_key,
+            )
             .field("group_id", &self.group_id)
             .field("initial_directory", &self.initial_directory)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
@@ -398,6 +443,7 @@ impl Drop for ProfileForm {
     fn drop(&mut self) {
         use zeroize::Zeroize as _;
         self.password.zeroize();
+        self.key_passphrase.zeroize();
     }
 }
 
@@ -426,6 +472,8 @@ impl ProfileForm {
     }
 
     fn from_draft(editing_id: Option<ProfileId>, draft: NewSshProfile) -> Self {
+        let can_reuse_saved_private_key =
+            editing_id.is_some() && draft.auth_method == AuthMethod::PrivateKey;
         Self {
             form_id: next_profile_form_id(),
             connection_revision: 0,
@@ -437,6 +485,9 @@ impl ProfileForm {
             username: draft.username,
             auth_method: draft.auth_method,
             password: String::new(),
+            private_key_path: None,
+            key_passphrase: String::new(),
+            can_reuse_saved_private_key,
             group_id: draft.group_id,
             initial_directory: draft.initial_directory.unwrap_or_default(),
             connect_timeout_secs: draft.connect_timeout_secs,
@@ -458,9 +509,14 @@ impl ProfileForm {
                 .group_id
                 .as_deref()
                 .is_none_or(|id| inventory.group(id).is_some())
-            && (self.auth_method != AuthMethod::Password
-                || self.editing_id.is_some()
-                || !self.password.is_empty())
+            && match self.auth_method {
+                AuthMethod::Password => self.editing_id.is_some() || !self.password.is_empty(),
+                AuthMethod::PrivateKey => match self.private_key_path.as_deref() {
+                    Some(path) => valid_private_key_path(path),
+                    None => self.can_reuse_saved_private_key,
+                },
+                AuthMethod::Agent => true,
+            }
     }
 
     fn to_draft(&self) -> NewSshProfile {
@@ -492,6 +548,8 @@ impl ProfileForm {
             // 测试期间表单保持打开，因此只在这条一次性消息中创建一份
             // 受 Drop 保护的副本；原缓冲仍由 ProfileForm 负责清零。
             password: self.password.clone(),
+            private_key_path: self.private_key_path.clone(),
+            key_passphrase: self.key_passphrase.clone(),
             intent: ProfileSubmitIntent::TestConnection,
         }
     }
@@ -504,6 +562,8 @@ impl ProfileForm {
             editing_id: self.editing_id.clone(),
             draft: self.to_draft(),
             password: std::mem::take(&mut self.password),
+            private_key_path: self.private_key_path.take(),
+            key_passphrase: std::mem::take(&mut self.key_passphrase),
             intent: ProfileSubmitIntent::Save,
         }
     }
@@ -520,7 +580,7 @@ impl ProfileForm {
         &mut self,
         previous_fields: &ConnectionFields,
         previous_auth: AuthMethod,
-        password_changed: bool,
+        credential_changed: bool,
     ) {
         let endpoint_changed = self.host != previous_fields.host
             || self.port != previous_fields.port
@@ -530,7 +590,10 @@ impl ProfileForm {
             self.trusted_host_key = None;
             self.host_key_verified_for_current_endpoint = false;
         }
-        if endpoint_changed || auth_changed || password_changed {
+        if endpoint_changed || auth_changed {
+            self.can_reuse_saved_private_key = false;
+        }
+        if endpoint_changed || auth_changed || credential_changed {
             self.bump_connection_revision();
         }
     }
@@ -548,6 +611,10 @@ impl ProfileForm {
     fn bump_connection_revision(&mut self) {
         self.connection_revision = self.connection_revision.saturating_add(1);
     }
+}
+
+fn valid_private_key_path(path: &Path) -> bool {
+    path.is_absolute() && path.is_file()
 }
 
 fn next_profile_form_id() -> u64 {
@@ -850,7 +917,7 @@ fn draw_header(ui: &mut egui::Ui, state: &mut SshUiState, text: &SshUiText, pal:
         ui.heading(RichText::new(text.title).size(16.0).color(pal.fg));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if header_icon_button(ui, HeaderIcon::NewProfile, text.new_profile, pal).clicked() {
-                state.dialog = Some(Dialog::EditProfile(ProfileForm::create()));
+                state.dialog = Some(Dialog::EditProfile(Box::new(ProfileForm::create())));
             }
             if header_icon_button(ui, HeaderIcon::NewGroup, text.new_group, pal).clicked() {
                 state.dialog = Some(Dialog::CreateGroup {
@@ -964,7 +1031,7 @@ fn apply_profile_row_command(
             });
         }
         ProfileRowCommand::Edit => {
-            state.dialog = Some(Dialog::EditProfile(ProfileForm::edit(profile)));
+            state.dialog = Some(Dialog::EditProfile(Box::new(ProfileForm::edit(profile))));
         }
         ProfileRowCommand::Delete => {
             state.dialog = Some(Dialog::DeleteProfile {
@@ -1475,7 +1542,7 @@ fn profile_editor(
 ) -> bool {
     let previous_connection_fields = form.connection_fields();
     let previous_auth_method = form.auth_method;
-    let mut password_changed = false;
+    let mut credential_changed = false;
     egui::Grid::new("ssh_profile_form_grid")
         .num_columns(2)
         .spacing([12.0, 8.0])
@@ -1510,12 +1577,20 @@ fn profile_editor(
                 use zeroize::Zeroize as _;
                 form.password.zeroize();
             }
+            if previous_auth_method != form.auth_method {
+                credential_changed = true;
+                if form.auth_method != AuthMethod::PrivateKey {
+                    use zeroize::Zeroize as _;
+                    form.private_key_path = None;
+                    form.key_passphrase.zeroize();
+                }
+            }
             ui.end_row();
 
             if form.auth_method == AuthMethod::Password {
                 ui.label(input.text.auth_password);
                 ui.vertical(|ui| {
-                    password_changed |= secure_password_edit(
+                    credential_changed |= secure_password_edit(
                         ui,
                         "ssh_profile_password",
                         egui::TextEdit::singleline(&mut form.password)
@@ -1533,6 +1608,71 @@ fn profile_editor(
                     ui.label(RichText::new(hint).small().color(pal.fg_dim));
                 });
                 ui.end_row();
+            }
+
+            if form.auth_method == AuthMethod::PrivateKey {
+                ui.label(input.text.private_key_file);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let path_text = form
+                            .private_key_path
+                            .as_ref()
+                            .map_or_else(|| "—".to_owned(), |path| path.display().to_string());
+                        let path_label = ui.add_sized(
+                            [220.0, 24.0],
+                            egui::Label::new(RichText::new(&path_text).small().color(pal.fg_dim))
+                                .truncate()
+                                .sense(egui::Sense::hover()),
+                        );
+                        if path_label.hovered() && form.private_key_path.is_some() {
+                            path_label.on_hover_text(path_text);
+                        }
+                        if ui.button(input.text.choose_private_key).clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_title(input.text.choose_private_key)
+                                .pick_file()
+                            {
+                                credential_changed |= form.private_key_path.as_ref() != Some(&path);
+                                form.private_key_path = Some(path);
+                            }
+                        }
+                    });
+
+                    let (hint, color) = match form.private_key_path.as_deref() {
+                        Some(path) if !valid_private_key_path(path) => {
+                            (input.text.private_key_invalid_hint, pal.error)
+                        }
+                        Some(_) => (input.text.credentials_local_only, pal.fg_dim),
+                        None if form.can_reuse_saved_private_key => {
+                            (input.text.private_key_saved_hint, pal.fg_dim)
+                        }
+                        None => (input.text.private_key_required_hint, pal.warn),
+                    };
+                    ui.label(RichText::new(hint).small().color(color));
+                });
+                ui.end_row();
+
+                if form.private_key_path.is_some() {
+                    ui.label(input.text.key_passphrase);
+                    ui.vertical(|ui| {
+                        credential_changed |= secure_password_edit(
+                            ui,
+                            "ssh_profile_key_passphrase",
+                            egui::TextEdit::singleline(&mut form.key_passphrase)
+                                .password(true)
+                                .desired_width(260.0)
+                                .text_color(pal.fg)
+                                .background_color(pal.extreme_bg),
+                        )
+                        .changed();
+                        ui.label(
+                            RichText::new(input.text.credentials_local_only)
+                                .small()
+                                .color(pal.fg_dim),
+                        );
+                    });
+                    ui.end_row();
+                }
             }
 
             ui.label(input.text.group);
@@ -1589,7 +1729,7 @@ fn profile_editor(
     form.reconcile_connection_field_changes(
         &previous_connection_fields,
         previous_auth_method,
-        password_changed,
+        credential_changed,
     );
     draw_connection_test_status(ui, form, &input, pal, out);
 
@@ -1624,7 +1764,7 @@ fn profile_editor(
                 form_id: form.form_id,
             });
             out.actions
-                .push(SshUiAction::SubmitProfile(form.test_submission()));
+                .push(SshUiAction::SubmitProfile(Box::new(form.test_submission())));
         }
         let button_text = if form.editing_id.is_some() {
             input.text.save
@@ -1639,7 +1779,7 @@ fn profile_editor(
                 form_id: form.form_id,
             });
             out.actions
-                .push(SshUiAction::SubmitProfile(form.save_submission()));
+                .push(SshUiAction::SubmitProfile(Box::new(form.save_submission())));
             keep_open = false;
         }
     });
@@ -1709,7 +1849,7 @@ fn draw_connection_test_status(
                     form_id: form.form_id,
                 });
                 out.actions
-                    .push(SshUiAction::SubmitProfile(form.test_submission()));
+                    .push(SshUiAction::SubmitProfile(Box::new(form.test_submission())));
             }
         }
         crate::ssh_runtime::ConnectionTestState::HostKeyChanged {
@@ -2002,6 +2142,82 @@ mod tests {
         assert_eq!(draft.username, "alice");
         assert!(!format!("{draft:?}").contains("local-only-secret"));
         assert!(!format!("{form:?}").contains("local-only-secret"));
+    }
+
+    #[test]
+    fn 新建私钥认证必须先选择存在的本机文件且秘密不进入同步草稿() {
+        let inventory = SshInventory::default();
+        let mut form = ProfileForm::create();
+        form.name = "key-server".to_owned();
+        form.host = "server.example.test".to_owned();
+        form.username = "alice".to_owned();
+        form.auth_method = AuthMethod::PrivateKey;
+
+        assert!(!form.valid(&inventory));
+        form.private_key_path = Some(PathBuf::from("relative-id_ed25519"));
+        assert!(!form.valid(&inventory), "相对路径不得通过表单校验");
+        form.private_key_path = Some(std::env::temp_dir());
+        assert!(!form.valid(&inventory), "目录不得被当作私钥文件");
+
+        let key_path = std::env::temp_dir().join(format!(
+            "lumen-ssh-form-key-{}-{}",
+            std::process::id(),
+            next_profile_form_id()
+        ));
+        std::fs::write(&key_path, b"test-key").expect("创建临时私钥");
+        form.private_key_path = Some(key_path.clone());
+        form.key_passphrase = "local-key-passphrase".to_owned();
+        assert!(form.valid(&inventory));
+
+        let draft = form.to_draft();
+        assert_eq!(draft.auth_method, AuthMethod::PrivateKey);
+        assert!(!format!("{draft:?}").contains(&key_path.display().to_string()));
+        assert!(!format!("{draft:?}").contains("local-key-passphrase"));
+        assert!(!format!("{form:?}").contains(&key_path.display().to_string()));
+        assert!(!format!("{form:?}").contains("local-key-passphrase"));
+
+        let mut submission = form.test_submission();
+        assert_eq!(
+            submission.take_private_key_path().as_deref(),
+            Some(key_path.as_path())
+        );
+        assert_eq!(submission.take_key_passphrase(), "local-key-passphrase");
+        assert_eq!(form.private_key_path.as_deref(), Some(key_path.as_path()));
+        assert_eq!(form.key_passphrase, "local-key-passphrase");
+        let _ = std::fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn 编辑私钥仅在目标和认证方式未变化时允许沿用本机绑定() {
+        let inventory = inventory();
+        let mut profile = inventory.profiles().first().unwrap().clone();
+        profile.auth_method = AuthMethod::PrivateKey;
+        let mut form = ProfileForm::edit(&profile);
+        assert!(form.can_reuse_saved_private_key);
+        assert!(form.valid(&inventory));
+        form.private_key_path = Some(std::env::temp_dir());
+        assert!(
+            !form.valid(&inventory),
+            "显式选择了无效路径时不得静默回退旧绑定"
+        );
+        form.private_key_path = None;
+
+        let previous_fields = form.connection_fields();
+        let previous_auth = form.auth_method;
+        form.host = "other.example.test".to_owned();
+        form.reconcile_connection_field_changes(&previous_fields, previous_auth, false);
+        assert!(!form.can_reuse_saved_private_key);
+        assert!(!form.valid(&inventory));
+
+        let mut password_profile = profile;
+        password_profile.auth_method = AuthMethod::Password;
+        let mut switched = ProfileForm::edit(&password_profile);
+        let previous_fields = switched.connection_fields();
+        let previous_auth = switched.auth_method;
+        switched.auth_method = AuthMethod::PrivateKey;
+        switched.reconcile_connection_field_changes(&previous_fields, previous_auth, false);
+        assert!(!switched.can_reuse_saved_private_key);
+        assert!(!switched.valid(&inventory));
     }
 
     #[test]

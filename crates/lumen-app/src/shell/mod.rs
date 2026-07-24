@@ -216,6 +216,30 @@ impl SshCredentialSubmission {
         }
     }
 
+    /// 为已经落盘并取得稳定 profile id 的私钥认证配置构造一次性提交。
+    ///
+    /// 私钥路径只会进入本机 binding；口令由调用方写入系统凭据库。二者
+    /// 都不会进入可同步的 SSH profile。
+    pub(crate) fn from_private_key(
+        profile_id: String,
+        host: String,
+        port: u16,
+        username: String,
+        private_key_path: std::path::PathBuf,
+        key_passphrase: String,
+    ) -> Self {
+        Self {
+            profile_id,
+            expected_host: host,
+            expected_port: port,
+            expected_username: username,
+            kind: SshCredentialKind::PrivateKey,
+            password: String::new(),
+            private_key_path: Some(private_key_path),
+            key_passphrase,
+        }
+    }
+
     pub(crate) fn profile_id(&self) -> &str {
         &self.profile_id
     }
@@ -4579,6 +4603,32 @@ mod tests {
         assert!(submission.key_passphrase().is_empty());
         assert_eq!(submission.take_password(), "one-shot-secret");
         assert!(submission.password().is_empty());
+    }
+
+    #[test]
+    fn ssh私钥提交安全构造器只设置本机私钥字段() {
+        let key_path = std::path::PathBuf::from(r"C:\Users\alice\.ssh\id_ed25519");
+        let mut submission = SshCredentialSubmission::from_private_key(
+            "ssh_0123456789abcdef0123456789abcdef".to_owned(),
+            "server.example.test".to_owned(),
+            2222,
+            "alice".to_owned(),
+            key_path.clone(),
+            "one-shot-passphrase".to_owned(),
+        );
+        assert!(submission.matches_target(
+            "ssh_0123456789abcdef0123456789abcdef",
+            "server.example.test",
+            2222,
+            "alice",
+            SshCredentialKind::PrivateKey,
+        ));
+        assert!(submission.kind() == SshCredentialKind::PrivateKey);
+        assert!(submission.password().is_empty());
+        assert_eq!(submission.private_key_path(), Some(key_path.as_path()));
+        assert_eq!(submission.key_passphrase(), "one-shot-passphrase");
+        assert_eq!(submission.take_private_key_path(), Some(key_path));
+        assert_eq!(submission.take_key_passphrase(), "one-shot-passphrase");
     }
 
     /// 两格左右布局的整格矩形（含标题栏）。

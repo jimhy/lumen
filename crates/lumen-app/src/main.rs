@@ -758,6 +758,33 @@ fn ssh_profile_matches_test_target(saved: &ssh::SshProfile, test: &ssh::SshProfi
         && saved.auth_method == test.auth_method
 }
 
+fn ssh_private_key_submission_is_valid(
+    draft: &ssh::NewSshProfile,
+    saved_profile: Option<&ssh::SshProfile>,
+    saved_binding: Option<&ssh::SshLocalBinding>,
+    selected_path: Option<&std::path::Path>,
+) -> bool {
+    if draft.auth_method != ssh::AuthMethod::PrivateKey {
+        return true;
+    }
+    if let Some(path) = selected_path {
+        return path.is_absolute() && path.is_file();
+    }
+    saved_profile.is_some_and(|profile| {
+        profile.host == draft.host
+            && profile.port == draft.port
+            && profile.username == draft.username
+            && profile.auth_method == ssh::AuthMethod::PrivateKey
+            && saved_binding.is_some_and(|binding| {
+                binding.profile_id == profile.id
+                    && binding
+                        .private_key_path
+                        .as_deref()
+                        .is_some_and(|path| path.is_absolute() && path.is_file())
+            })
+    })
+}
+
 /// 「回到底部」按钮要操作的视口所有者。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollToBottomAction {
@@ -2777,7 +2804,7 @@ impl AppState {
                     continue;
                 }
                 SshUiAction::SubmitProfile(submission) => {
-                    self.apply_ssh_profile_submission(submission);
+                    self.apply_ssh_profile_submission(*submission);
                     continue;
                 }
                 SshUiAction::CancelConnectionTest { form_id } => {
@@ -2863,6 +2890,36 @@ impl AppState {
         let editing_id = submission.take_editing_id();
         let draft = submission.take_draft();
         let mut password = zeroize::Zeroizing::new(submission.take_password());
+        let private_key_path = submission.take_private_key_path();
+        let mut key_passphrase =
+            zeroize::Zeroizing::new(submission.take_key_passphrase());
+
+        // UI 会禁用无效提交，但主线程必须在任何 inventory mutation 前再次
+        // 复核本机私钥。编辑且 endpoint/auth 均未变化时允许沿用现有绑定；
+        // 新建、切换认证方式或修改 endpoint 都必须显式选择文件。
+        let private_key_submission_is_valid = {
+            let store = self.ssh_store.as_ref();
+            let saved_profile = editing_id.as_deref().and_then(|profile_id| {
+                store.and_then(|store| store.inventory().profile(profile_id))
+            });
+            let saved_binding = editing_id
+                .as_deref()
+                .and_then(|profile_id| store.and_then(|store| store.binding(profile_id)));
+            ssh_private_key_submission_is_valid(
+                &draft,
+                saved_profile,
+                saved_binding,
+                private_key_path.as_deref(),
+            )
+        };
+        if !private_key_submission_is_valid {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "请选择当前设备上存在的 SSH 私钥文件后再保存",
+            );
+            self.window.request_redraw();
+            return;
+        }
 
         let saved = (|| -> Result<(String, Option<ssh::SshLocalBinding>), String> {
             let store = self
@@ -2916,8 +2973,8 @@ impl AppState {
         };
 
         let mut credential_save_failed = false;
-        if !password.is_empty() {
-            if profile.auth_method == ssh::AuthMethod::Password {
+        match profile.auth_method {
+            ssh::AuthMethod::Password if !password.is_empty() => {
                 let credential_submission = shell::SshCredentialSubmission::from_password(
                     profile.id.clone(),
                     profile.host.clone(),
@@ -2931,9 +2988,33 @@ impl AppState {
                 {
                     credential_save_failed = true;
                 }
-            } else {
-                log::warn!("忽略认证方式已变化的 SSH 密码表单缓冲");
             }
+            ssh::AuthMethod::PrivateKey => {
+                if let Some(path) = private_key_path {
+                    let credential_submission =
+                        shell::SshCredentialSubmission::from_private_key(
+                            profile.id.clone(),
+                            profile.host.clone(),
+                            profile.port,
+                            profile.username.clone(),
+                            path,
+                            std::mem::take(&mut *key_passphrase),
+                        );
+                    if self
+                        .save_ssh_credential_submission(&profile, credential_submission)
+                        .is_err()
+                    {
+                        credential_save_failed = true;
+                    }
+                }
+            }
+            ssh::AuthMethod::Password
+            | ssh::AuthMethod::Agent
+                if !password.is_empty() || !key_passphrase.is_empty() =>
+            {
+                log::warn!("忽略认证方式已变化的 SSH 表单凭据缓冲");
+            }
+            ssh::AuthMethod::Password | ssh::AuthMethod::Agent => {}
         }
 
         let current_binding = self
@@ -2947,9 +3028,14 @@ impl AppState {
             .ssh_ui
             .select_profile(Some(profile_id.clone()));
         if credential_save_failed {
+            let message = if profile.auth_method == ssh::AuthMethod::PrivateKey {
+                "SSH 服务器已保存，但无法安全绑定本机私钥"
+            } else {
+                "SSH 服务器已保存，但密码无法安全写入本机凭据存储"
+            };
             self.shell_state.toast.push(
                 shell::toast::ToastKind::Error,
-                "SSH 服务器已保存，但密码无法安全写入本机凭据存储",
+                message,
             );
         }
         self.window.request_redraw();
@@ -2961,6 +3047,9 @@ impl AppState {
         let editing_id = submission.take_editing_id();
         let draft = submission.take_draft();
         let mut password = zeroize::Zeroizing::new(submission.take_password());
+        let private_key_path = submission.take_private_key_path();
+        let mut key_passphrase =
+            zeroize::Zeroizing::new(submission.take_key_passphrase());
         let profile = ssh_test_profile(form_id, &draft);
 
         let saved_credential = || -> Option<lumen_ssh::Credential> {
@@ -2976,13 +3065,23 @@ impl AppState {
             ssh::AuthMethod::Password if !password.is_empty() => Some(
                 lumen_ssh::Credential::password(std::mem::take(&mut *password)),
             ),
-            ssh::AuthMethod::Password | ssh::AuthMethod::PrivateKey => saved_credential(),
+            ssh::AuthMethod::PrivateKey => match private_key_path {
+                Some(path) if path.is_absolute() && path.is_file() => {
+                    let passphrase = (!key_passphrase.is_empty()).then(|| {
+                        lumen_ssh::SecretString::new(std::mem::take(&mut *key_passphrase))
+                    });
+                    Some(lumen_ssh::Credential::private_key(path, passphrase))
+                }
+                Some(_) => None,
+                None => saved_credential(),
+            },
+            ssh::AuthMethod::Password => saved_credential(),
             ssh::AuthMethod::Agent => Some(lumen_ssh::Credential::agent()),
         };
         let Some(credential) = credential else {
             let message = match profile.auth_method {
                 ssh::AuthMethod::Password => "请输入密码，或先保存本机密码后再测试连接",
-                ssh::AuthMethod::PrivateKey => "请先保存服务器并绑定本机私钥，再测试连接",
+                ssh::AuthMethod::PrivateKey => "请选择当前设备上存在的 SSH 私钥文件",
                 ssh::AuthMethod::Agent => unreachable!("SSH Agent 不需要本机表单凭据"),
             };
             self.ssh_runtime
@@ -14177,7 +14276,8 @@ mod tests {
         estimate_restored_pane_px, load_icon, maximized_overflow, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
         should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
-        ssh_host_key_confirmation_is_current, ssh_sync_identity, ssh_test_profile,
+        ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
+        ssh_sync_identity, ssh_test_profile,
         view_mode_shortcut, width_worth_persisting, PaneLayout, ScrollToBottomAction,
     };
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -14249,6 +14349,67 @@ mod tests {
             "回归样例必须能碰撞旧展示字符串"
         );
         assert!(!ssh_profile_matches_test_target(&saved, &colliding));
+    }
+
+    #[test]
+    fn ssh私钥表单提交在写库存前严格校验本机文件与复用目标() {
+        let mut draft = crate::ssh::NewSshProfile {
+            name: "key-server".to_owned(),
+            host: "server.example.test".to_owned(),
+            username: "alice".to_owned(),
+            auth_method: crate::ssh::AuthMethod::PrivateKey,
+            ..Default::default()
+        };
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft, None, None, None
+        ));
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft,
+            None,
+            None,
+            Some(std::path::Path::new("relative-key")),
+        ));
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft,
+            None,
+            None,
+            Some(std::env::temp_dir().as_path()),
+        ));
+
+        let key_path = std::env::temp_dir().join(format!(
+            "lumen-main-key-validation-{}",
+            std::process::id()
+        ));
+        std::fs::write(&key_path, b"test-key").expect("创建临时私钥");
+        assert!(ssh_private_key_submission_is_valid(
+            &draft,
+            None,
+            None,
+            Some(&key_path),
+        ));
+
+        let saved = ssh_test_profile(73, &draft);
+        let binding = crate::ssh::SshLocalBinding {
+            profile_id: saved.id.clone(),
+            private_key_path: Some(key_path.clone()),
+            password_credential_ref: None,
+            key_passphrase_credential_ref: None,
+        };
+        assert!(ssh_private_key_submission_is_valid(
+            &draft,
+            Some(&saved),
+            Some(&binding),
+            None,
+        ));
+
+        draft.host = "other.example.test".to_owned();
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft,
+            Some(&saved),
+            Some(&binding),
+            None,
+        ));
+        let _ = std::fs::remove_file(key_path);
     }
 
     #[test]
