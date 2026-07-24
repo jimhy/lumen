@@ -467,6 +467,28 @@ impl Language {
         }
     }
 
+    const fn snippets(self) -> &'static [(&'static str, &'static str, &'static str)] {
+        match self {
+            Self::Rust => &[
+                ("println!(…)", "println", "println!(\"|\")"),
+                ("Some(…)", "some", "Some(|)"),
+            ],
+            Self::Python => &[
+                ("print(…)", "print", "print(|)"),
+                ("len(…)", "len", "len(|)"),
+            ],
+            Self::JavaScript | Self::TypeScript => &[
+                ("console.log(…)", "console", "console.log(|)"),
+                ("JSON.stringify(…)", "json", "JSON.stringify(|)"),
+            ],
+            Self::Go => &[("fmt.Println(…)", "fmt", "fmt.Println(|)")],
+            Self::Java | Self::CLike => {
+                &[("System.out.println(…)", "system", "System.out.println(|)")]
+            }
+            _ => &[],
+        }
+    }
+
     const fn line_comment(self) -> Option<&'static str> {
         match self {
             Self::Json => Some("//"),
@@ -912,11 +934,15 @@ fn is_identifier_continue(language: Language, ch: char) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CompletionItem {
     pub label: String,
+    pub filter_text: String,
+    pub insertion: String,
+    pub cursor_offset: Option<usize>,
     pub kind: CompletionKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompletionKind {
+    Snippet,
     Keyword,
     Builtin,
     Document,
@@ -1021,20 +1047,21 @@ fn completions_from_candidates(
     let prefix = &text[start_byte..cursor_byte];
     let prefix_chars = prefix.chars().count();
     let start = cursor_char.saturating_sub(prefix_chars);
-    if (!explicit && prefix.chars().count() < 2)
-        || prefix.chars().next().is_some_and(char::is_numeric)
-    {
+    if (!explicit && prefix_chars < 1) || prefix.chars().next().is_some_and(char::is_numeric) {
         return None;
     }
     let prefix_lower = prefix.to_lowercase();
     let mut ranked: Vec<(u8, &CompletionItem)> = candidates
         .iter()
         .filter_map(|candidate| {
-            if candidate.label == prefix {
+            if !explicit && prefix_chars == 1 && candidate.kind == CompletionKind::Document {
                 return None;
             }
-            let lower = candidate.label.to_lowercase();
-            let score = if candidate.label.starts_with(prefix) {
+            if candidate.filter_text == prefix && candidate.insertion == prefix {
+                return None;
+            }
+            let lower = candidate.filter_text.to_lowercase();
+            let score = if candidate.filter_text.starts_with(prefix) {
                 0
             } else if lower.starts_with(&prefix_lower) {
                 1
@@ -1049,6 +1076,9 @@ fn completions_from_candidates(
     ranked.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
+            .then_with(|| {
+                completion_kind_rank(left.1.kind).cmp(&completion_kind_rank(right.1.kind))
+            })
             .then_with(|| left.1.label.len().cmp(&right.1.label.len()))
             .then_with(|| {
                 left.1
@@ -1069,20 +1099,64 @@ fn completions_from_candidates(
 }
 
 fn completion_candidates(text: &str, language: Language) -> Vec<CompletionItem> {
-    let mut candidates = BTreeMap::<String, CompletionKind>::new();
+    let mut candidates = BTreeMap::<String, CompletionItem>::new();
+    for (label, filter_text, template) in language.snippets() {
+        let marker_byte = template.find('|');
+        let insertion = marker_byte.map_or_else(
+            || (*template).to_owned(),
+            |marker| {
+                let mut insertion = (*template).to_owned();
+                insertion.remove(marker);
+                insertion
+            },
+        );
+        let cursor_offset = marker_byte.map(|marker| template[..marker].chars().count());
+        candidates.insert(
+            (*label).to_owned(),
+            CompletionItem {
+                label: (*label).to_owned(),
+                filter_text: (*filter_text).to_owned(),
+                insertion,
+                cursor_offset,
+                kind: CompletionKind::Snippet,
+            },
+        );
+    }
     for keyword in language.keywords() {
-        candidates.insert((*keyword).to_owned(), CompletionKind::Keyword);
+        candidates
+            .entry((*keyword).to_owned())
+            .or_insert_with(|| plain_completion(keyword, CompletionKind::Keyword));
     }
     for builtin in language.builtins() {
-        candidates.insert((*builtin).to_owned(), CompletionKind::Builtin);
+        candidates
+            .entry((*builtin).to_owned())
+            .or_insert_with(|| plain_completion(builtin, CompletionKind::Builtin));
     }
     for word in identifiers(text, language) {
-        candidates.entry(word).or_insert(CompletionKind::Document);
+        candidates
+            .entry(word.clone())
+            .or_insert_with(|| plain_completion(&word, CompletionKind::Document));
     }
-    candidates
-        .into_iter()
-        .map(|(label, kind)| CompletionItem { label, kind })
-        .collect()
+    candidates.into_values().collect()
+}
+
+fn plain_completion(label: &str, kind: CompletionKind) -> CompletionItem {
+    CompletionItem {
+        label: label.to_owned(),
+        filter_text: label.to_owned(),
+        insertion: label.to_owned(),
+        cursor_offset: None,
+        kind,
+    }
+}
+
+const fn completion_kind_rank(kind: CompletionKind) -> u8 {
+    match kind {
+        CompletionKind::Snippet => 0,
+        CompletionKind::Builtin => 1,
+        CompletionKind::Keyword => 2,
+        CompletionKind::Document => 3,
+    }
 }
 
 fn char_to_byte(text: &str, char_index: usize) -> usize {
@@ -1111,7 +1185,7 @@ fn identifiers(text: &str, language: Language) -> Vec<String> {
 }
 
 fn add_identifier(words: &mut BTreeMap<String, usize>, word: &str) {
-    if word.chars().count() >= 3 {
+    if word.chars().count() >= 2 {
         *words.entry(word.to_owned()).or_default() += 1;
     }
 }
@@ -1164,11 +1238,49 @@ mod tests {
     }
 
     #[test]
+    fn one_character_completion_is_visible_but_document_noise_waits() {
+        let text = "privateValue\np";
+        let candidates = completion_candidates(text, Language::Python);
+        let set = completions_from_candidates(
+            text,
+            text.chars().count(),
+            Language::Python,
+            false,
+            &candidates,
+        )
+        .expect("one-character suggestions");
+        assert!(set.items.iter().any(|item| item.label == "print(…)"));
+        assert!(
+            set.items
+                .iter()
+                .all(|item| item.kind != CompletionKind::Document),
+            "输入一个字符时只显示高价值语言候选"
+        );
+    }
+
+    #[test]
+    fn snippet_keeps_display_text_insertion_and_cursor_separate() {
+        let candidates = completion_candidates("pri", Language::Python);
+        let set = completions_from_candidates("pri", 3, Language::Python, false, &candidates)
+            .expect("snippet suggestions");
+        let snippet = set
+            .items
+            .iter()
+            .find(|item| item.label == "print(…)")
+            .expect("print snippet");
+        assert_eq!(snippet.insertion, "print()");
+        assert_eq!(snippet.cursor_offset, Some(6));
+    }
+
+    #[test]
     fn identifier_rules_do_not_swallow_code_operators() {
         let text = "foo-bar";
         let cursor = text.chars().count();
         let candidates = vec![CompletionItem {
             label: "barValue".to_owned(),
+            filter_text: "barValue".to_owned(),
+            insertion: "barValue".to_owned(),
+            cursor_offset: None,
             kind: CompletionKind::Document,
         }];
         let set =

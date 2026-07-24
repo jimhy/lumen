@@ -19,6 +19,12 @@ use super::{
 /// 的单个 `String` 后卡住 UI。双击文件仍可走下载后本机打开流程。
 pub const MAX_TEXT_FILE_BYTES: usize = 1024 * 1024;
 
+// 含 egui 垂直布局在相邻控件之间追加的 8px item spacing。
+const EDITOR_STATUS_HEIGHT: f32 = 32.0;
+const EDITOR_ERROR_HEIGHT: f32 = 30.0;
+const EDITOR_INNER_MARGIN_X: f32 = 10.0;
+const EDITOR_INNER_MARGIN_Y: f32 = 8.0;
+
 /// 编辑器所指向的远端文件。路径始终是不透明的远端 UTF-8 字符串。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TextFileSource {
@@ -137,6 +143,18 @@ struct PendingCompletion {
     fingerprint: [u8; 32],
     replace_chars: std::ops::Range<usize>,
     insertion: String,
+    post_selection: Option<std::ops::Range<usize>>,
+}
+
+struct InjectedEditorEdit {
+    post_selection: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SmartNewlineEdit {
+    replace_chars: std::ops::Range<usize>,
+    insertion: String,
+    cursor_after: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -845,7 +863,14 @@ fn editor_header(
 
     egui::Frame::new()
         .fill(pal.bg_dark)
-        .inner_margin(egui::Margin::symmetric(4, 3))
+        // 原顶部 3px 调整为 -2px，即 Tab 行整体上移 5px；
+        // 底部同步补偿到 8px，保持标题栏总高度和下方布局不变。
+        .inner_margin(egui::Margin {
+            left: 4,
+            right: 4,
+            top: -2,
+            bottom: 8,
+        })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let tabs_width = (ui.available_width() - 32.0).max(96.0);
@@ -1053,15 +1078,28 @@ fn find_bar(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
 
 fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
     let available = ui.available_size();
-    let status_height = 24.0;
-    let editor_height = (available.y - status_height).max(80.0);
+    let error_height = if state
+        .active_document()
+        .and_then(|document| document.error.as_ref())
+        .is_some()
+    {
+        EDITOR_ERROR_HEIGHT
+    } else {
+        0.0
+    };
+    let editor_height = (available.y - EDITOR_STATUS_HEIGHT - error_height).max(0.0);
     let focus_editor = std::mem::take(&mut state.focus_editor);
     let Some(token) = state.active_token else {
         return;
     };
     let editor_id = ui.make_persistent_id(("lumen_text_editor", token));
-    let (explicit_completion, accepted_completion) =
-        prepare_completion_input(ui, state, token, editor_id);
+    let input_language = state
+        .active_document()
+        .map(|document| Language::from_path_and_text(document.source.path(), &document.text))
+        .unwrap_or(Language::PlainText);
+    let (explicit_completion, injected_edit, suppress_completion) =
+        prepare_completion_input(ui, state, token, editor_id, input_language);
+    let editor_edit_applied = injected_edit.is_some();
     let had_completion = state
         .completion
         .as_ref()
@@ -1079,6 +1117,8 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         language: Language,
         error: Option<String>,
         completion: Option<([u8; 32], CompletionSet, egui::Rect)>,
+        viewport_rect: egui::Rect,
+        viewport_clicked: bool,
     }
 
     let frame = {
@@ -1095,10 +1135,37 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         };
         let language = Language::from_path_and_text(document.source.path(), &document.text);
         let cache = language_caches.entry(token).or_default();
-        let edit_output = egui::Frame::new()
-            .fill(pal.bg_panel)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
+        // 先固定分配编辑器视口，再让正文只在内部滚动。TextEdit 的
+        // min_size.y 在 egui 0.34 不会约束高度，不能依赖正文控件自行撑开。
+        let (editor_rect, editor_response) = ui.allocate_exact_size(
+            egui::vec2(available.x.max(0.0), editor_height),
+            egui::Sense::click(),
+        );
+        ui.painter().rect_filled(editor_rect, 0.0, pal.bg_panel);
+        let inset_x = EDITOR_INNER_MARGIN_X.min(editor_rect.width().max(0.0) * 0.5);
+        let inset_y = EDITOR_INNER_MARGIN_Y.min(editor_rect.height().max(0.0) * 0.5);
+        let viewport_rect = editor_rect.shrink2(egui::vec2(inset_x, inset_y));
+        let mut editor_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(viewport_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let row_height = editor_ui
+            .text_style_height(&egui::TextStyle::Monospace)
+            .max(1.0);
+        // TextEdit 默认上下各 2px 内边距；扣除后向下取整，避免空文档
+        // 也因为一行的舍入误差常驻垂直滚动条。
+        let desired_rows = ((viewport_rect.height() - 4.0).max(row_height) / row_height)
+            .floor()
+            .max(1.0) as usize;
+        let scroll_output = egui::ScrollArea::both()
+            .id_salt(("lumen_text_editor_scroll", token))
+            .auto_shrink([false, false])
+            .max_width(viewport_rect.width())
+            .max_height(viewport_rect.height())
+            .min_scrolled_width(viewport_rect.width())
+            .min_scrolled_height(viewport_rect.height())
+            .show(&mut editor_ui, |ui| {
                 let mut layouter =
                     |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
                         cache.layout(ui, buffer.as_str(), language, pal, wrap_width)
@@ -1108,24 +1175,41 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
                     .font(egui::TextStyle::Monospace)
                     .code_editor()
                     .desired_width(f32::INFINITY)
-                    .min_size(egui::vec2(ui.available_width(), editor_height))
+                    .desired_rows(desired_rows)
+                    .min_size(egui::vec2(viewport_rect.width(), 0.0))
                     .lock_focus(true)
                     .layouter(&mut layouter)
                     .show(ui)
-            })
-            .inner;
+            });
+        let mut edit_output = scroll_output.inner;
+        let visible_text_rect = scroll_output.inner_rect.intersect(viewport_rect);
+        if edit_output.response.changed() {
+            if let Some(post_selection) = injected_edit
+                .as_ref()
+                .and_then(|injected| injected.post_selection.clone())
+            {
+                let selection = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(post_selection.start),
+                    egui::text::CCursor::new(post_selection.end),
+                );
+                edit_output.state.cursor.set_char_range(Some(selection));
+                edit_output.state.clone().store(ui.ctx(), editor_id);
+                edit_output.cursor_range = Some(selection);
+            }
+        }
 
         let cursor = edit_output.cursor_range.and_then(|range| range.single());
         let cursor_char = cursor.map_or(0, |cursor| cursor.index);
         let (cursor_line, cursor_column) = cursor_line_column(&document.text, cursor_char);
         let should_complete = !ime_composing
-            && !accepted_completion
+            && !suppress_completion
+            && !editor_edit_applied
             && (explicit_completion || edit_output.response.changed() || had_completion);
         let completion = if should_complete {
             cursor.and_then(|cursor| {
                 let local_caret = edit_output.galley.pos_from_cursor(cursor);
                 let caret_rect = local_caret.translate(edit_output.galley_pos.to_vec2());
-                if !caret_rect.intersects(edit_output.text_clip_rect) {
+                if !caret_rect.intersects(visible_text_rect) {
                     return None;
                 }
                 cache
@@ -1146,13 +1230,15 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
             language,
             error: document.error.clone(),
             completion,
+            viewport_rect,
+            viewport_clicked: editor_response.clicked(),
         }
     };
 
-    if focus_editor {
+    if focus_editor || frame.viewport_clicked {
         frame.response.request_focus();
     }
-    if ime_composing || accepted_completion {
+    if ime_composing || suppress_completion || editor_edit_applied {
         state.completion = None;
     } else if explicit_completion || frame.response.changed() || had_completion {
         state.completion = frame.completion.map(|(fingerprint, set, caret_rect)| {
@@ -1240,7 +1326,7 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         if let Some(selected) = popup_output.accepted {
             queue_completion(state, popup, selected);
             ui.ctx().request_repaint();
-        } else if popup_output.clicked_outside_editor(frame.response.rect) {
+        } else if popup_output.clicked_outside_editor(frame.viewport_rect) {
             state.completion = None;
         }
     }
@@ -1268,12 +1354,13 @@ fn prepare_completion_input(
     state: &mut TextEditorState,
     token: u64,
     editor_id: egui::Id,
-) -> (bool, bool) {
-    update_ime_state(ui, state);
-    if state.ime_composing {
+    language: Language,
+) -> (bool, Option<InjectedEditorEdit>, bool) {
+    let ime_frame = update_ime_state(ui, state);
+    if ime_frame.composing || ime_frame.had_event {
         state.completion = None;
         state.pending_completion = None;
-        return (false, false);
+        return (false, None, true);
     }
 
     let explicit_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Space);
@@ -1320,11 +1407,20 @@ fn prepare_completion_input(
         }
     }
 
-    let accepted = inject_pending_completion(ui, state, token, editor_id);
-    (explicit, accepted)
+    let mut injected = inject_pending_completion(ui, state, token, editor_id);
+    if injected.is_none() && queue_smart_newline(ui, state, token, editor_id, language) {
+        injected = inject_pending_completion(ui, state, token, editor_id);
+    }
+    (explicit, injected, false)
 }
 
-fn update_ime_state(ui: &egui::Ui, state: &mut TextEditorState) {
+#[derive(Clone, Copy)]
+struct ImeFrame {
+    composing: bool,
+    had_event: bool,
+}
+
+fn update_ime_state(ui: &egui::Ui, state: &mut TextEditorState) -> ImeFrame {
     let ime_events = ui.input(|input| {
         input
             .events
@@ -1335,6 +1431,7 @@ fn update_ime_state(ui: &egui::Ui, state: &mut TextEditorState) {
             })
             .collect::<Vec<_>>()
     });
+    let had_event = !ime_events.is_empty();
     for event in ime_events {
         match event {
             egui::ImeEvent::Preedit(text) => state.ime_composing = !text.is_empty(),
@@ -1344,6 +1441,10 @@ fn update_ime_state(ui: &egui::Ui, state: &mut TextEditorState) {
             egui::ImeEvent::Enabled => {}
         }
     }
+    ImeFrame {
+        composing: state.ime_composing,
+        had_event,
+    }
 }
 
 fn queue_completion(state: &mut TextEditorState, popup: &CompletionPopup, selected: usize) {
@@ -1351,11 +1452,16 @@ fn queue_completion(state: &mut TextEditorState, popup: &CompletionPopup, select
         state.completion = None;
         return;
     };
+    let post_selection = item.cursor_offset.map(|offset| {
+        let cursor = popup.set.replace_chars.start + offset;
+        cursor..cursor
+    });
     state.pending_completion = Some(PendingCompletion {
         token: popup.token,
         fingerprint: popup.fingerprint,
         replace_chars: popup.set.replace_chars.clone(),
-        insertion: item.label.clone(),
+        insertion: item.insertion.clone(),
+        post_selection,
     });
     state.completion = None;
 }
@@ -1365,17 +1471,15 @@ fn inject_pending_completion(
     state: &mut TextEditorState,
     token: u64,
     editor_id: egui::Id,
-) -> bool {
-    let Some(pending) = state.pending_completion.take() else {
-        return false;
-    };
+) -> Option<InjectedEditorEdit> {
+    let pending = state.pending_completion.take()?;
     let valid = pending.token == token
         && state.document(token).is_some_and(|document| {
             pending.fingerprint == sha256(document.text.as_bytes())
                 && pending.replace_chars.end <= document.text.chars().count()
         });
     if !valid {
-        return false;
+        return None;
     }
 
     let mut edit_state =
@@ -1391,7 +1495,262 @@ fn inject_pending_completion(
     ui.input_mut(|input| {
         input.events.push(egui::Event::Paste(pending.insertion));
     });
+    Some(InjectedEditorEdit {
+        post_selection: pending.post_selection,
+    })
+}
+
+fn queue_smart_newline(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+    language: Language,
+) -> bool {
+    if !ui.memory(|memory| memory.has_focus(editor_id)) || !has_plain_enter(ui) {
+        return false;
+    }
+    let Some(cursor_range) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+        .and_then(|edit_state| edit_state.cursor.char_range())
+    else {
+        return false;
+    };
+    let replace_chars = cursor_range.as_sorted_char_range();
+    if !replace_chars.is_empty() {
+        return false;
+    }
+    let Some((fingerprint, plan)) = state.document(token).and_then(|document| {
+        smart_newline_edit(&document.text, replace_chars, language)
+            .map(|plan| (sha256(document.text.as_bytes()), plan))
+    }) else {
+        return false;
+    };
+    if !consume_plain_enter(ui) {
+        return false;
+    }
+    state.pending_completion = Some(PendingCompletion {
+        token,
+        fingerprint,
+        replace_chars: plan.replace_chars,
+        insertion: plan.insertion,
+        post_selection: Some(plan.cursor_after..plan.cursor_after),
+    });
+    state.completion = None;
     true
+}
+
+fn has_plain_enter(ui: &egui::Ui) -> bool {
+    ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if *modifiers == egui::Modifiers::NONE
+            )
+        })
+    })
+}
+
+fn consume_plain_enter(ui: &mut egui::Ui) -> bool {
+    ui.input_mut(|input| {
+        let mut consumed = false;
+        input.events.retain(|event| {
+            let matches = !consumed
+                && matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if *modifiers == egui::Modifiers::NONE
+                );
+            consumed |= matches;
+            !matches
+        });
+        consumed
+    })
+}
+
+fn smart_newline_edit(
+    text: &str,
+    replace_chars: std::ops::Range<usize>,
+    language: Language,
+) -> Option<SmartNewlineEdit> {
+    let char_count = text.chars().count();
+    if !replace_chars.is_empty() || replace_chars.end > char_count {
+        return None;
+    }
+    let cursor_byte = byte_index_from_char_index(text, replace_chars.start);
+    let line_start_byte = text[..cursor_byte].rfind('\n').map_or(0, |index| index + 1);
+    let line_start_char = text[..line_start_byte].chars().count();
+    let line_before_cursor = &text[line_start_byte..cursor_byte];
+    let suffix = &text[cursor_byte..];
+    let base_indent: String = line_before_cursor
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .collect();
+    let indent_unit = detected_indent_unit(text, &base_indent, language);
+    let immediate_next = suffix.chars().next();
+
+    // 光标位于只有缩进的闭合符前：保留当前内层空行，同时把闭合符
+    // 回退一级。整次变化仍通过一条 Paste 事件进入撤销栈。
+    if line_before_cursor
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t'))
+        && immediate_next.is_some_and(is_closer)
+    {
+        let outer_indent = remove_one_indent(&base_indent, &indent_unit);
+        let insertion = format!("{base_indent}\n{outer_indent}");
+        return Some(SmartNewlineEdit {
+            replace_chars: line_start_char..replace_chars.end,
+            cursor_after: line_start_char + base_indent.chars().count(),
+            insertion,
+        });
+    }
+
+    let code_tail = last_code_char(line_before_cursor, language);
+    let opens_block = code_tail.is_some_and(|tail| {
+        matches!(tail, '{' | '[' | '(')
+            || (tail == ':'
+                && matches!(language, Language::Python | Language::Json | Language::Yaml))
+    });
+    let inner_indent = if opens_block {
+        format!("{base_indent}{indent_unit}")
+    } else {
+        base_indent.clone()
+    };
+
+    if code_tail
+        .and_then(matching_closer)
+        .is_some_and(|closer| immediate_next == Some(closer))
+    {
+        let insertion = format!("\n{inner_indent}\n{base_indent}");
+        let cursor_after = replace_chars.start + 1 + inner_indent.chars().count();
+        Some(SmartNewlineEdit {
+            replace_chars,
+            insertion,
+            cursor_after,
+        })
+    } else {
+        let insertion = format!("\n{inner_indent}");
+        let cursor_after = replace_chars.start + insertion.chars().count();
+        Some(SmartNewlineEdit {
+            replace_chars,
+            insertion,
+            cursor_after,
+        })
+    }
+}
+
+fn byte_index_from_char_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+fn detected_indent_unit(text: &str, base_indent: &str, language: Language) -> String {
+    if base_indent.ends_with('\t') {
+        return "\t".to_owned();
+    }
+    let detected_spaces = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let spaces = line.chars().take_while(|ch| *ch == ' ').count();
+            (spaces > 0 && spaces <= 8).then_some(spaces)
+        })
+        .min();
+    let default_spaces = if matches!(
+        language,
+        Language::Json
+            | Language::Yaml
+            | Language::Toml
+            | Language::Html
+            | Language::Xml
+            | Language::Css
+    ) {
+        2
+    } else {
+        4
+    };
+    " ".repeat(detected_spaces.unwrap_or(default_spaces))
+}
+
+fn remove_one_indent(indent: &str, unit: &str) -> String {
+    if let Some(outer) = indent.strip_suffix(unit) {
+        return outer.to_owned();
+    }
+    if let Some(outer) = indent.strip_suffix('\t') {
+        return outer.to_owned();
+    }
+    let trailing_spaces = indent.chars().rev().take_while(|ch| *ch == ' ').count();
+    let remove = trailing_spaces.min(unit.chars().count().max(1));
+    indent
+        .chars()
+        .take(indent.chars().count().saturating_sub(remove))
+        .collect()
+}
+
+fn matching_closer(opener: char) -> Option<char> {
+    match opener {
+        '{' => Some('}'),
+        '[' => Some(']'),
+        '(' => Some(')'),
+        _ => None,
+    }
+}
+
+fn is_closer(ch: char) -> bool {
+    matches!(ch, '}' | ']' | ')')
+}
+
+fn last_code_char(line: &str, language: Language) -> Option<char> {
+    let line_comment = match language {
+        Language::Python
+        | Language::Shell
+        | Language::PowerShell
+        | Language::Yaml
+        | Language::Toml
+        | Language::Dockerfile => Some("#"),
+        Language::Sql => Some("--"),
+        Language::Rust
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Go
+        | Language::Java
+        | Language::CLike
+        | Language::Json => Some("//"),
+        _ => None,
+    };
+    let mut quote = None;
+    let mut escaped = false;
+    let mut last = None;
+    for (byte, ch) in line.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if line_comment.is_some_and(|marker| line[byte..].starts_with(marker)) {
+            break;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+        } else if !ch.is_whitespace() {
+            last = Some(ch);
+        }
+    }
+    last
 }
 
 fn completion_popup(
@@ -1434,11 +1793,25 @@ fn completion_popup(
                 .inner_margin(egui::Margin::same(4))
                 .show(ui, |ui| {
                     ui.set_width(width - 8.0);
-                    ui.label(
-                        egui::RichText::new(crate::i18n::strings().text_editor_completion_hint)
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                crate::i18n::strings().text_editor_completion_title,
+                            )
+                            .strong()
                             .size(10.0)
-                            .color(pal.fg_dim),
-                    );
+                            .color(pal.fg),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    crate::i18n::strings().text_editor_completion_keys,
+                                )
+                                .size(9.0)
+                                .color(pal.fg_dim),
+                            );
+                        });
+                    });
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt(("lumen_text_editor_completion_list", popup.token))
@@ -1456,6 +1829,16 @@ fn completion_popup(
                                         pal.selection,
                                     );
                                 }
+                                if index == popup.selected {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_max(
+                                            rect.min,
+                                            egui::pos2(rect.left() + 3.0, rect.bottom()),
+                                        ),
+                                        egui::CornerRadius::same(2),
+                                        pal.accent,
+                                    );
+                                }
                                 if response.hovered() {
                                     hovered = Some(index);
                                 }
@@ -1463,6 +1846,9 @@ fn completion_popup(
                                     accepted = Some(index);
                                 }
                                 let kind = match item.kind {
+                                    CompletionKind::Snippet => {
+                                        crate::i18n::strings().text_editor_completion_snippet
+                                    }
                                     CompletionKind::Keyword => {
                                         crate::i18n::strings().text_editor_completion_keyword
                                     }
@@ -2161,12 +2547,13 @@ mod tests {
             fingerprint: sha256(b"pri"),
             replace_chars: 0..3,
             insertion: "print".to_owned(),
+            post_selection: None,
         });
         let ctx = egui::Context::default();
         let editor_id = egui::Id::new("completion_undo_editor");
 
         let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
-            assert!(inject_pending_completion(ui, &mut state, token, editor_id));
+            assert!(inject_pending_completion(ui, &mut state, token, editor_id).is_some());
             let document = state.document_mut(token).expect("document");
             let _ = egui::TextEdit::singleline(&mut document.text)
                 .id(editor_id)
@@ -2198,6 +2585,52 @@ mod tests {
     }
 
     #[test]
+    fn snippet_completion_places_cursor_at_placeholder() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(9, "/tmp/main.py"), "pri");
+        let popup = CompletionPopup {
+            token,
+            fingerprint: sha256(b"pri"),
+            set: CompletionSet {
+                replace_chars: 0..3,
+                items: vec![crate::shell::text_editor_language::CompletionItem {
+                    label: "print(…)".to_owned(),
+                    filter_text: "print".to_owned(),
+                    insertion: "print()".to_owned(),
+                    cursor_offset: Some(6),
+                    kind: CompletionKind::Snippet,
+                }],
+            },
+            selected: 0,
+            caret_rect: egui::Rect::NOTHING,
+        };
+        queue_completion(&mut state, &popup, 0);
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("snippet_cursor_editor");
+        let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
+            let injected = inject_pending_completion(ui, &mut state, token, editor_id)
+                .expect("snippet injection");
+            let document = state.document_mut(token).expect("document");
+            let mut output = egui::TextEdit::singleline(&mut document.text)
+                .id(editor_id)
+                .show(ui);
+            let post = injected.post_selection.expect("snippet cursor");
+            let cursor = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(post.start),
+                egui::text::CCursor::new(post.end),
+            );
+            output.state.cursor.set_char_range(Some(cursor));
+            output.state.store(ui.ctx(), editor_id);
+        });
+        assert_eq!(state.document(token).expect("document").text, "print()");
+        let cursor = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|edit_state| edit_state.cursor.char_range())
+            .and_then(|range| range.single())
+            .expect("snippet cursor");
+        assert_eq!(cursor.index, 6);
+    }
+
+    #[test]
     fn ime_preedit_does_not_consume_completion_keys() {
         let mut state = TextEditorState::default();
         let token = open_loaded(&mut state, remote(9, "/tmp/main.py"), "pri");
@@ -2208,6 +2641,9 @@ mod tests {
                 replace_chars: 0..3,
                 items: vec![crate::shell::text_editor_language::CompletionItem {
                     label: "print".to_owned(),
+                    filter_text: "print".to_owned(),
+                    insertion: "print".to_owned(),
+                    cursor_offset: None,
                     kind: CompletionKind::Builtin,
                 }],
             },
@@ -2228,8 +2664,10 @@ mod tests {
         let editor_id = egui::Id::new("completion_ime_editor");
         let mut enter_remains = false;
         let _ = ctx.run_ui(egui_input(events), |ui| {
-            let (_, accepted) = prepare_completion_input(ui, &mut state, token, editor_id);
-            assert!(!accepted);
+            let (_, accepted, suppressed) =
+                prepare_completion_input(ui, &mut state, token, editor_id, Language::Python);
+            assert!(accepted.is_none());
+            assert!(suppressed);
             enter_remains = ui.input(|input| input.key_pressed(egui::Key::Enter));
         });
         assert!(state.ime_composing);
@@ -2238,5 +2676,182 @@ mod tests {
             enter_remains,
             "IME 组合期间 Enter 应交给输入法/TextEdit，而不是补全弹层"
         );
+    }
+
+    #[test]
+    fn ime_commit_frame_does_not_consume_enter_for_auto_indent() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(9, "/tmp/main.py"), "if ready:");
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Commit("中".to_owned())),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("indent_ime_commit_editor");
+        let mut enter_remains = false;
+        let _ = ctx.run_ui(egui_input(events), |ui| {
+            ui.memory_mut(|memory| memory.request_focus(editor_id));
+            let (_, injected, suppressed) =
+                prepare_completion_input(ui, &mut state, token, editor_id, Language::Python);
+            assert!(injected.is_none());
+            assert!(suppressed);
+            enter_remains = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        });
+        assert!(enter_remains);
+    }
+
+    #[test]
+    fn smart_newline_inherits_indent_and_expands_matching_pair() {
+        let inherited = smart_newline_edit("    value", 9..9, Language::Python).expect("plan");
+        assert_eq!(inherited.insertion, "\n    ");
+        assert_eq!(inherited.cursor_after, 14);
+
+        let pair = smart_newline_edit("if ready {\n    {}", 16..16, Language::Rust).expect("plan");
+        assert_eq!(pair.insertion, "\n        \n    ");
+        assert_eq!(pair.cursor_after, 25);
+
+        let tabs = smart_newline_edit("\tif ready:", 10..10, Language::Python).expect("plan");
+        assert_eq!(tabs.insertion, "\n\t\t");
+    }
+
+    #[test]
+    fn smart_newline_dedents_closer_and_ignores_comment_or_string_openers() {
+        let closer =
+            smart_newline_edit("fn main() {\n    }", 16..16, Language::Rust).expect("plan");
+        assert_eq!(closer.replace_chars, 12..16);
+        assert_eq!(closer.insertion, "    \n");
+        assert_eq!(closer.cursor_after, 16);
+
+        let comment = smart_newline_edit("// {", 4..4, Language::Rust).expect("plan");
+        assert_eq!(comment.insertion, "\n");
+        let string = smart_newline_edit("print(\"{\")", 10..10, Language::Python).expect("plan");
+        assert_eq!(string.insertion, "\n");
+    }
+
+    #[test]
+    fn smart_newline_is_one_undoable_text_edit_and_places_cursor() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(10, "/tmp/main.py"), "if ready:");
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("smart_newline_undo_editor");
+        let original_len = "if ready:".chars().count();
+
+        let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
+            let document = state.document_mut(token).expect("document");
+            let mut output = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+            let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(original_len));
+            output.state.cursor.set_char_range(Some(cursor));
+            output.state.store(ui.ctx(), editor_id);
+            ui.memory_mut(|memory| memory.request_focus(editor_id));
+        });
+
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run_ui(egui_input(vec![enter]), |ui| {
+            let (_, injected, suppressed) =
+                prepare_completion_input(ui, &mut state, token, editor_id, Language::Python);
+            assert!(!suppressed);
+            let injected = injected.expect("smart newline injection");
+            let document = state.document_mut(token).expect("document");
+            let mut output = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+            if let Some(post_selection) = injected.post_selection {
+                let cursor = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(post_selection.start),
+                    egui::text::CCursor::new(post_selection.end),
+                );
+                output.state.cursor.set_char_range(Some(cursor));
+                output.state.store(ui.ctx(), editor_id);
+            }
+        });
+        assert_eq!(
+            state.document(token).expect("document").text,
+            "if ready:\n    "
+        );
+        let cursor = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|edit_state| edit_state.cursor.char_range())
+            .and_then(|range| range.single())
+            .expect("post cursor");
+        assert_eq!(cursor.index, 14);
+
+        let modifiers = egui::Modifiers::COMMAND;
+        let undo = egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: Some(egui::Key::Z),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut input = egui_input(vec![undo]);
+        input.modifiers = modifiers;
+        let _ = ctx.run_ui(input, |ui| {
+            let document = state.document_mut(token).expect("document");
+            let _ = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+        });
+        assert_eq!(
+            state.document(token).expect("document").text,
+            "if ready:",
+            "自动缩进必须能被一次 Ctrl+Z 完整撤销"
+        );
+    }
+
+    #[test]
+    fn editor_viewport_height_does_not_follow_document_length() {
+        fn rendered_extent(text: &str, with_error: bool) -> (f32, f32) {
+            let mut state = TextEditorState::default();
+            let token = open_loaded(&mut state, remote(11, "/tmp/layout.rs"), text);
+            if with_error {
+                state.document_mut(token).expect("document").error = Some("save failed".to_owned());
+            }
+            let ctx = egui::Context::default();
+            let mut consumed_height = 0.0;
+            let mut used_width = 0.0;
+            let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
+                let start_y = ui.cursor().min.y;
+                editor_body(ui, &mut state, &crate::shell::theme::DARK);
+                consumed_height = ui.cursor().min.y - start_y;
+                used_width = ui.min_rect().width();
+            });
+            (consumed_height, used_width)
+        }
+
+        let short = rendered_extent("", false);
+        let many_lines = (0..400)
+            .map(|index| format!("let value_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long = rendered_extent(&many_lines, false);
+        let wide = rendered_extent(&"x".repeat(20_000), false);
+        let error = rendered_extent("dirty", true);
+
+        assert!(
+            (short.0 - long.0).abs() < 1.0 && (short.0 - wide.0).abs() < 1.0,
+            "编辑器外框高度必须由内容区决定：short={short:?}, long={long:?}, wide={wide:?}"
+        );
+        assert!(
+            (short.1 - wide.1).abs() < 1.0,
+            "超长单行不得把编辑区撑宽：short={short:?}, wide={wide:?}"
+        );
+        assert!(short.0 <= 500.0, "编辑器不得把根内容区撑高：{short:?}");
+        assert!(error.0 <= 500.0, "错误提示也不得把内容区撑高：{error:?}");
     }
 }
