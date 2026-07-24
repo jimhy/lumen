@@ -266,6 +266,7 @@ pub static STRINGS: Strings = Strings {
     topbar_tab_ssh: "SSH",
     ssh_select_server: "请选择 SSH 服务器",
     ssh_no_sessions: "暂无 SSH 会话",
+    ssh_new_session: "新建 SSH 会话",
     ssh_title: "SSH 服务器",
     ssh_search_hint: "搜索服务器",
     ssh_new_profile: "新建服务器",

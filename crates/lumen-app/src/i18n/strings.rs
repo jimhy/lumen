@@ -501,6 +501,8 @@ pub struct Strings {
     pub ssh_select_server: &'static str,
     /// SSH 会话栏尚无已打开会话
     pub ssh_no_sessions: &'static str,
+    /// SSH 会话栏新增一个独立 Shell
+    pub ssh_new_session: &'static str,
     /// SSH 服务器列表与配置表单
     pub ssh_title: &'static str,
     pub ssh_search_hint: &'static str,

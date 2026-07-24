@@ -721,6 +721,16 @@ fn ssh_profile_draft(
     }
 }
 
+fn ssh_host_key_confirmation_is_current(
+    current: Option<&ssh::HostKeyTrust>,
+    algorithm: &str,
+    fingerprint: &str,
+) -> bool {
+    current.is_none_or(|trusted| {
+        trusted.algorithm == algorithm && trusted.fingerprint == fingerprint
+    })
+}
+
 fn ssh_test_profile(form_id: u64, draft: &ssh::NewSshProfile) -> ssh::SshProfile {
     ssh::SshProfile {
         id: format!("ssh_{form_id:032x}"),
@@ -1351,9 +1361,9 @@ impl AppState {
         // 表单测试不是已建立的工作会话；锁屏关闭表单时一并丢弃其
         // 一次性 probe 与凭据副本。正式 SSH actor 仍继续后台运行。
         self.ssh_runtime.cancel_any_connection_test();
-        // Dropping the one-shot dialog zeroizes password/passphrase buffers.
-        // The SSH actors themselves intentionally continue in the background.
-        self.shell_state.ssh_credentials = None;
+        // 丢弃一次性对话框会清零秘密，并关闭它尚未认证的会话；已经建立
+        // 的 SSH actor 与远程控制会话仍继续在后台运行。
+        self.discard_ssh_credential_dialog();
         self.lock_ui.clear();
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
@@ -2054,9 +2064,9 @@ impl AppState {
         self.release_held_report_buttons();
         self.settings.layout.view_mode = next;
         if !next.is_ssh() {
-            // A credential prompt is one-shot local state, not a connection.
-            // Switching away drops and zeroizes it; established actors remain.
-            self.shell_state.ssh_credentials = None;
+            // 切走时丢弃并清零一次性凭据，同时关闭对应的待认证会话；
+            // 已建立的 actor 保持后台运行。
+            self.discard_ssh_credential_dialog();
         }
 
         self.terminal_focused = self.terminal_focus_allowed();
@@ -2239,10 +2249,10 @@ impl AppState {
     fn reload_ssh_account_context(&mut self) {
         // SSH 连接和全部瞬时 UI 都属于旧账号。切换库存前先清掉，
         // 防止旧 profile id、凭据对话框或 actor 落到新账号页面。
+        self.discard_ssh_credential_dialog();
         self.ssh_runtime = ssh_runtime::SshRuntime::default();
         self.ssh_force_credential_prompt.clear();
         self.shell_state.ssh_ui = shell::ssh_ui::SshUiState::default();
-        self.shell_state.ssh_credentials = None;
         self.ssh_rect_px = None;
         self.terminal_focused = self.terminal_focus_allowed();
 
@@ -2445,13 +2455,13 @@ impl AppState {
                                 removed_profiles.iter().any(|id| id == selected)
                             });
                         for profile_id in &removed_profiles {
+                            self.discard_ssh_credential_dialog_for_profile(profile_id);
                             self.ssh_runtime.remove_profile(profile_id);
                             self.ssh_force_credential_prompt.remove(profile_id);
                         }
                         if selected_removed {
                             self.shell_state.ssh_ui.select_profile(None);
                         }
-                        self.shell_state.ssh_credentials = None;
                         self.ssh_rect_px = None;
                         self.terminal_focused = self.terminal_focus_allowed();
                     }
@@ -2533,10 +2543,10 @@ impl AppState {
                 Ok(()) => {
                     self.notify_ssh_local_change();
                     if let Some((id, binding)) = deleted_profile {
+                        self.discard_ssh_credential_dialog_for_profile(&id);
                         self.ssh_runtime.remove_profile(&id);
                         self.ssh_force_credential_prompt.remove(&id);
                         self.delete_obsolete_ssh_secrets(binding.as_ref(), None);
-                        self.shell_state.ssh_credentials = None;
                         self.ssh_rect_px = None;
                         self.terminal_focused = false;
                     }
@@ -2756,11 +2766,16 @@ impl AppState {
 
     fn open_ssh_credential_dialog(
         &mut self,
+        session_id: ssh_runtime::SshSessionId,
         profile: &ssh::SshProfile,
         kind: shell::SshCredentialKind,
     ) {
+        // 凭据弹窗是全局单槽；新请求覆盖旧请求前必须关闭旧的待认证
+        // 会话，不能在会话栏留下永远无法继续的空 Shell。
+        self.discard_ssh_credential_dialog();
         self.terminal_focused = false;
         self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
+            session_id,
             profile.id.clone(),
             profile.name.clone(),
             profile.host.clone(),
@@ -2768,6 +2783,39 @@ impl AppState {
             profile.username.clone(),
             kind,
         ));
+    }
+
+    fn discard_ssh_credential_dialog(&mut self) {
+        if let Some(dialog) = self.shell_state.ssh_credentials.take() {
+            self.ssh_runtime.close_session(dialog.session_id());
+        }
+    }
+
+    fn discard_ssh_credential_dialog_for_profile(&mut self, profile_id: &str) {
+        let matches = self
+            .shell_state
+            .ssh_credentials
+            .as_ref()
+            .is_some_and(|dialog| dialog.profile_id() == profile_id);
+        if matches {
+            self.discard_ssh_credential_dialog();
+        }
+    }
+
+    fn clear_ssh_credential_dialog_for_session(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+    ) -> bool {
+        let matches = self
+            .shell_state
+            .ssh_credentials
+            .as_ref()
+            .is_some_and(|dialog| dialog.session_id() == session_id);
+        if matches {
+            // 会话由调用方关闭；这里只清零并丢弃它的弹窗秘密。
+            self.shell_state.ssh_credentials.take();
+        }
+        matches
     }
 
     /// 从当前作用域的 local binding 与 Credential Manager 重新组装一次性
@@ -2852,24 +2900,66 @@ impl AppState {
             return;
         };
 
+        let (session_id, intent) = self.ssh_runtime.select_for_connect(&profile);
+        self.apply_ssh_connect_intent(session_id, &profile, intent);
+        self.window.request_redraw();
+    }
+
+    fn continue_ssh_profile_connect(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+        profile_id: &str,
+    ) {
+        let profile = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.inventory().profile(profile_id))
+            .cloned();
+        let Some(profile) = profile else {
+            self.ssh_runtime.close_session(session_id);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器配置不存在或存储不可用",
+            );
+            return;
+        };
+        let Some(intent) = self.ssh_runtime.connect_intent(session_id, &profile) else {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 会话已关闭，请重新连接",
+            );
+            return;
+        };
+        self.apply_ssh_connect_intent(session_id, &profile, intent);
+        self.window.request_redraw();
+    }
+
+    fn apply_ssh_connect_intent(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+        profile: &ssh::SshProfile,
+        intent: ssh_runtime::ConnectIntent,
+    ) {
         use ssh_runtime::ConnectIntent;
-        match self.ssh_runtime.select_for_connect(&profile) {
+        match intent {
             ConnectIntent::AlreadyRunning => {
                 self.terminal_focused = self.terminal_focus_allowed();
             }
             ConnectIntent::Password => {
                 if self.ssh_force_credential_prompt.contains(&profile.id) {
                     self.open_ssh_credential_dialog(
-                        &profile,
+                        session_id,
+                        profile,
                         shell::SshCredentialKind::Password,
                     );
                 } else {
-                    match self.load_saved_ssh_credential(&profile) {
+                    match self.load_saved_ssh_credential(profile) {
                         Ok(Some(credential)) => {
-                            self.start_ssh_connection(&profile, credential);
+                            self.start_ssh_connection(session_id, profile, credential);
                         }
                         Ok(None) => self.open_ssh_credential_dialog(
-                            &profile,
+                            session_id,
+                            profile,
                             shell::SshCredentialKind::Password,
                         ),
                         Err(()) => {
@@ -2880,7 +2970,8 @@ impl AppState {
                                 "本机 SSH 凭据不可用，请重新输入",
                             );
                             self.open_ssh_credential_dialog(
-                                &profile,
+                                session_id,
+                                profile,
                                 shell::SshCredentialKind::Password,
                             );
                         }
@@ -2890,16 +2981,18 @@ impl AppState {
             ConnectIntent::PrivateKey => {
                 if self.ssh_force_credential_prompt.contains(&profile.id) {
                     self.open_ssh_credential_dialog(
-                        &profile,
+                        session_id,
+                        profile,
                         shell::SshCredentialKind::PrivateKey,
                     );
                 } else {
-                    match self.load_saved_ssh_credential(&profile) {
+                    match self.load_saved_ssh_credential(profile) {
                         Ok(Some(credential)) => {
-                            self.start_ssh_connection(&profile, credential);
+                            self.start_ssh_connection(session_id, profile, credential);
                         }
                         Ok(None) => self.open_ssh_credential_dialog(
-                            &profile,
+                            session_id,
+                            profile,
                             shell::SshCredentialKind::PrivateKey,
                         ),
                         Err(()) => {
@@ -2910,7 +3003,8 @@ impl AppState {
                                 "本机 SSH 凭据不可用，请重新输入",
                             );
                             self.open_ssh_credential_dialog(
-                                &profile,
+                                session_id,
+                                profile,
                                 shell::SshCredentialKind::PrivateKey,
                             );
                         }
@@ -2918,21 +3012,21 @@ impl AppState {
                 }
             }
             ConnectIntent::Agent => {
-                self.start_ssh_connection(&profile, lumen_ssh::Credential::agent());
+                self.start_ssh_connection(session_id, profile, lumen_ssh::Credential::agent());
             }
             ConnectIntent::AwaitingHostKey | ConnectIntent::HostKeyChanged => {
                 self.terminal_focused = false;
             }
         }
-        self.window.request_redraw();
     }
 
     fn start_ssh_connection(
         &mut self,
+        session_id: ssh_runtime::SshSessionId,
         profile: &ssh::SshProfile,
         credential: lumen_ssh::Credential,
     ) {
-        match self.ssh_runtime.start(profile, credential) {
+        match self.ssh_runtime.start(session_id, profile, credential) {
             Ok(()) => {
                 self.terminal_focused = false;
                 self.window.request_redraw();
@@ -3114,7 +3208,16 @@ impl AppState {
     fn apply_ssh_runtime_action(&mut self, action: shell::SshRuntimeAction) {
         use shell::SshRuntimeAction;
         match action {
-            SshRuntimeAction::ConnectWithCredential(submission) => {
+            SshRuntimeAction::NewSession { profile_id } => {
+                self.shell_state
+                    .ssh_ui
+                    .select_profile(Some(profile_id.clone()));
+                self.begin_ssh_profile_connect(&profile_id);
+            }
+            SshRuntimeAction::ConnectWithCredential {
+                session_id,
+                submission,
+            } => {
                 let profile_id = submission.profile_id().to_owned();
                 let profile = self
                     .ssh_store
@@ -3122,58 +3225,89 @@ impl AppState {
                     .and_then(|store| store.inventory().profile(&profile_id))
                     .cloned();
                 let Some(profile) = profile else {
+                    self.ssh_runtime.close_session(session_id);
                     self.shell_state.toast.push(
                         shell::toast::ToastKind::Error,
                         "SSH 服务器配置已不存在",
                     );
                     return;
                 };
+                if !self
+                    .ssh_runtime
+                    .accepts_credential_for(session_id, &profile)
+                {
+                    self.ssh_runtime.close_session(session_id);
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 凭据请求已过期，请重新连接",
+                    );
+                    return;
+                }
                 if let Ok(credential) =
                     self.save_ssh_credential_submission(&profile, submission)
                 {
-                    self.start_ssh_connection(&profile, credential);
+                    self.start_ssh_connection(session_id, &profile, credential);
                 } else {
                     self.shell_state.toast.push(
                         shell::toast::ToastKind::Error,
                         "无法安全保存 SSH 本机凭据，请重新选择或输入",
                     );
+                    let kind = match profile.auth_method {
+                        ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
+                        ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
+                        ssh::AuthMethod::Agent => {
+                            self.ssh_runtime.close_session(session_id);
+                            return;
+                        }
+                    };
+                    self.open_ssh_credential_dialog(session_id, &profile, kind);
                 }
             }
-            SshRuntimeAction::ActivateSession { profile_id } => {
-                if self.ssh_runtime.activate_session(&profile_id) {
-                    self.shell_state
-                        .ssh_ui
-                        .select_profile(Some(profile_id));
-                    self.terminal_focused = self.ssh_runtime.active_accepts_input();
-                    self.window.request_redraw();
-                }
-            }
-            SshRuntimeAction::CloseSession { profile_id } => {
-                if self.ssh_runtime.close_session(&profile_id) {
+            SshRuntimeAction::ActivateSession { session_id } => {
+                if self.ssh_runtime.activate_session(session_id) {
                     let active_profile_id = self
                         .ssh_runtime
                         .active_view()
                         .map(|view| view.profile_id.clone());
-                    self.shell_state
-                        .ssh_ui
-                        .select_profile(active_profile_id);
+                    if let Some(active_profile_id) = active_profile_id {
+                        self.shell_state
+                            .ssh_ui
+                            .select_profile(Some(active_profile_id));
+                    }
+                    self.terminal_focused = self.ssh_runtime.active_accepts_input();
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::CloseSession { session_id } => {
+                let cleared_dialog =
+                    self.clear_ssh_credential_dialog_for_session(session_id);
+                if self.ssh_runtime.close_session(session_id) || cleared_dialog {
+                    let active_profile_id = self
+                        .ssh_runtime
+                        .active_view()
+                        .map(|view| view.profile_id.clone());
+                    if let Some(active_profile_id) = active_profile_id {
+                        self.shell_state
+                            .ssh_ui
+                            .select_profile(Some(active_profile_id));
+                    }
                     self.terminal_focused = self.ssh_runtime.active_accepts_input();
                     self.ssh_rect_px = None;
                     self.window.request_redraw();
                 }
             }
-            SshRuntimeAction::ToggleDirectory { profile_id, path } => {
-                if self.ssh_runtime.toggle_directory(&profile_id, &path) {
+            SshRuntimeAction::ToggleDirectory { session_id, path } => {
+                if self.ssh_runtime.toggle_directory(session_id, &path) {
                     self.window.request_redraw();
                 }
             }
-            SshRuntimeAction::RefreshFileTree { profile_id } => {
-                if self.ssh_runtime.refresh_file_tree(&profile_id) {
+            SshRuntimeAction::RefreshFileTree { session_id } => {
+                if self.ssh_runtime.refresh_file_tree(session_id) {
                     self.window.request_redraw();
                 }
             }
-            SshRuntimeAction::ToggleHiddenFiles { profile_id } => {
-                if self.ssh_runtime.toggle_hidden_files(&profile_id) {
+            SshRuntimeAction::ToggleHiddenFiles { session_id } => {
+                if self.ssh_runtime.toggle_hidden_files(session_id) {
                     self.window.request_redraw();
                 }
             }
@@ -3182,12 +3316,13 @@ impl AppState {
                 self.terminal_focused = false;
                 self.window.request_redraw();
             }
-            SshRuntimeAction::DismissHostKey { profile_id } => {
-                self.ssh_runtime.dismiss_unknown_host_key(&profile_id);
+            SshRuntimeAction::DismissHostKey { session_id } => {
+                self.ssh_runtime.dismiss_unknown_host_key(session_id);
                 self.terminal_focused = false;
                 self.window.request_redraw();
             }
             SshRuntimeAction::TrustHostKey {
+                session_id,
                 profile_id,
                 algorithm,
                 fingerprint,
@@ -3198,10 +3333,21 @@ impl AppState {
                     .and_then(|store| store.inventory().profile(&profile_id))
                     .cloned();
                 let exact_pending = current_profile.as_ref().is_some_and(|profile| {
-                    self.ssh_runtime
-                        .unknown_host_key_matches(profile, &algorithm, &fingerprint)
+                    let trust_is_current = ssh_host_key_confirmation_is_current(
+                        profile.trusted_host_key.as_ref(),
+                        &algorithm,
+                        &fingerprint,
+                    );
+                    trust_is_current
+                        && self.ssh_runtime.unknown_host_key_matches(
+                            session_id,
+                            profile,
+                            &algorithm,
+                            &fingerprint,
+                        )
                 });
                 if !exact_pending {
+                    self.ssh_runtime.dismiss_unknown_host_key(session_id);
                     self.shell_state.toast.push(
                         shell::toast::ToastKind::Error,
                         "SSH 主机密钥确认已过期，请重新连接",
@@ -3235,13 +3381,13 @@ impl AppState {
                 }
                 self.notify_ssh_local_change();
                 if self.ssh_runtime.confirm_unknown_host_key(
-                    &profile_id,
+                    session_id,
                     &algorithm,
                     &fingerprint,
                 ) {
                     // Never cache/reuse the credential that reached the first
                     // host-key probe. Password/private-key modes prompt again.
-                    self.begin_ssh_profile_connect(&profile_id);
+                    self.continue_ssh_profile_connect(session_id, &profile_id);
                 }
             }
         }
@@ -13240,8 +13386,8 @@ mod tests {
         estimate_restored_pane_px, load_icon, maximized_overflow, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
         should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
-        ssh_sync_identity, ssh_test_profile, view_mode_shortcut, width_worth_persisting,
-        PaneLayout, ScrollToBottomAction,
+        ssh_host_key_confirmation_is_current, ssh_sync_identity, ssh_test_profile,
+        view_mode_shortcut, width_worth_persisting, PaneLayout, ScrollToBottomAction,
     };
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
@@ -13312,6 +13458,34 @@ mod tests {
             "回归样例必须能碰撞旧展示字符串"
         );
         assert!(!ssh_profile_matches_test_target(&saved, &colliding));
+    }
+
+    #[test]
+    fn ssh主机密钥并发确认不能覆盖已信任的不同指纹() {
+        let trusted = crate::ssh::HostKeyTrust {
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint: "SHA256:first".to_owned(),
+        };
+        assert!(ssh_host_key_confirmation_is_current(
+            None,
+            "ssh-ed25519",
+            "SHA256:first",
+        ));
+        assert!(ssh_host_key_confirmation_is_current(
+            Some(&trusted),
+            "ssh-ed25519",
+            "SHA256:first",
+        ));
+        assert!(!ssh_host_key_confirmation_is_current(
+            Some(&trusted),
+            "ssh-ed25519",
+            "SHA256:second",
+        ));
+        assert!(!ssh_host_key_confirmation_is_current(
+            Some(&trusted),
+            "rsa-sha2-512",
+            "SHA256:first",
+        ));
     }
 
     #[test]

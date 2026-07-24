@@ -18,6 +18,7 @@ use crate::ssh::{
 };
 
 const ROW_HEIGHT: f32 = 30.0;
+const PROFILE_ROW_HEIGHT: f32 = 40.0;
 const SECTION_GAP: f32 = 8.0;
 static NEXT_PROFILE_FORM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -36,7 +37,6 @@ pub struct SshUiText {
     pub no_search_results: &'static str,
     pub edit: &'static str,
     pub delete: &'static str,
-    pub connect: &'static str,
     pub rename_group: &'static str,
     pub delete_group: &'static str,
     pub create_group_title: &'static str,
@@ -94,7 +94,6 @@ impl Default for SshUiText {
             no_search_results: "没有匹配的服务器",
             edit: "编辑",
             delete: "删除",
-            connect: "连接",
             rename_group: "重命名",
             delete_group: "删除组",
             create_group_title: "新建 SSH 分组",
@@ -156,7 +155,6 @@ impl SshUiText {
             no_search_results: strings.ssh_no_search_results,
             edit: strings.ssh_edit,
             delete: strings.ssh_delete,
-            connect: strings.ssh_connect,
             rename_group: strings.ssh_rename_group,
             delete_group: strings.ssh_delete_group,
             create_group_title: strings.ssh_create_group_title,
@@ -922,8 +920,8 @@ enum ProfileRowCommand {
     Delete,
 }
 
-fn profile_row_action_labels(text: &SshUiText) -> [&str; 3] {
-    [text.connect, text.edit, text.delete]
+fn profile_row_action_labels(text: &SshUiText) -> [&str; 2] {
+    [text.edit, text.delete]
 }
 
 fn profile_overflow_menu(
@@ -932,7 +930,7 @@ fn profile_overflow_menu(
     pal: &Palette,
     command: &mut Option<ProfileRowCommand>,
 ) {
-    let [_, edit, delete] = profile_row_action_labels(text);
+    let [edit, delete] = profile_row_action_labels(text);
     ui.set_min_width(116.0);
     if ui.button(edit).clicked() {
         *command = Some(ProfileRowCommand::Edit);
@@ -950,14 +948,6 @@ fn profile_context_menu(
     pal: &Palette,
     command: &mut Option<ProfileRowCommand>,
 ) {
-    let [connect, _, _] = profile_row_action_labels(text);
-    ui.set_min_width(116.0);
-    if ui.button(connect).clicked() {
-        *command = Some(ProfileRowCommand::Connect);
-        ui.close();
-        return;
-    }
-    ui.separator();
     profile_overflow_menu(ui, text, pal, command);
 }
 
@@ -1121,7 +1111,7 @@ fn draw_profile_rows(
         };
         let row_output = ui.push_id(("ssh_profile_row", &profile.id), |ui| {
             let (rect, row) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT + 4.0), sense);
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), PROFILE_ROW_HEIGHT), sense);
             let fill = if selected {
                 pal.selection
             } else if row.hovered() {
@@ -1131,51 +1121,68 @@ fn draw_profile_rows(
             };
             ui.painter().rect_filled(rect, 4.0, fill);
 
-            let content_rect = rect.shrink2(egui::vec2(6.0, 2.0));
-            let mut content_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(content_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            // 操作区固定只保留一个矢量省略号按钮，避免悬停时文本左右跳动。
+            // 两行文本各自限制在剩余宽度内，窄侧栏中也不会被控件覆盖。
+            let content_rect = rect.shrink2(egui::vec2(6.0, 3.0));
+            let action_width = 28.0;
+            let action_rect = egui::Rect::from_min_max(
+                egui::pos2(content_rect.right() - action_width, content_rect.top()),
+                content_rect.right_bottom(),
             );
-            content_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+            let text_rect = egui::Rect::from_min_max(
+                content_rect.left_top(),
+                egui::pos2(action_rect.left() - 4.0, content_rect.bottom()),
+            );
+
+            let mut text_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(text_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            text_ui.set_clip_rect(text_rect.intersect(ui.clip_rect()));
+            text_ui.spacing_mut().item_spacing.y = 0.0;
+            let name = text_ui.add(
+                egui::Label::new(RichText::new(&profile.name).color(pal.fg))
+                    .truncate()
+                    .sense(egui::Sense::hover()),
+            );
+            if name.hovered() {
+                name.on_hover_text(&profile.name);
+            }
+            let endpoint = format!("{}@{}:{}", profile.username, profile.host, profile.port);
+            let endpoint_label = text_ui.add(
+                egui::Label::new(RichText::new(&endpoint).small().color(pal.fg_dim))
+                    .truncate()
+                    .sense(egui::Sense::hover()),
+            );
+            if endpoint_label.hovered() {
+                endpoint_label.on_hover_text(endpoint);
+            }
+
             let mut command = None;
             let mut action_control_clicked = false;
-            content_ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&profile.name).color(pal.fg));
-                    ui.label(
-                        RichText::new(format!(
-                            "{}@{}:{}",
-                            profile.username, profile.host, profile.port
-                        ))
-                        .small()
-                        .color(pal.fg_dim),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if selected || row.hovered() {
-                        let overflow =
-                            overflow_button(ui, &format!("{} / {}", text.edit, text.delete), pal);
-                        action_control_clicked |= overflow.clicked();
-                        let _ = egui::Popup::menu(&overflow)
-                            .align(egui::RectAlign::BOTTOM_END)
-                            .width(132.0)
-                            .show(|ui| profile_overflow_menu(ui, text, pal, &mut command));
-                        let connect = ui.add(
-                            egui::Button::new(RichText::new(text.connect).small())
-                                .fill(pal.btn_bg)
-                                .corner_radius(3.0),
-                        );
-                        if connect.clicked() {
-                            action_control_clicked = true;
-                            command = Some(ProfileRowCommand::Connect);
-                        }
-                    } else {
-                        // 操作出现/隐藏时保留稳定宽度，避免服务器文本左右跳动。
-                        ui.allocate_space(egui::vec2(92.0, 24.0));
-                    }
-                });
-            });
+            if selected || row.hovered() {
+                let button_rect = egui::Rect::from_center_size(
+                    action_rect.center(),
+                    egui::vec2(action_width, 24.0),
+                );
+                let mut action_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(button_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                action_ui.set_clip_rect(button_rect.intersect(ui.clip_rect()));
+                let overflow = overflow_button(
+                    &mut action_ui,
+                    &format!("{} / {}", text.edit, text.delete),
+                    pal,
+                );
+                action_control_clicked |= overflow.clicked();
+                let _ = egui::Popup::menu(&overflow)
+                    .align(egui::RectAlign::BOTTOM_END)
+                    .width(132.0)
+                    .show(|ui| profile_overflow_menu(ui, text, pal, &mut command));
+            }
             (row, command, action_control_clicked)
         });
         let (row, command, action_control_clicked) = row_output.inner;
@@ -1890,15 +1897,11 @@ mod tests {
     #[test]
     fn 服务器行操作使用本地化文案并映射到明确动作() {
         let text = SshUiText {
-            connect: "Connect",
             edit: "Edit",
             delete: "Delete",
             ..SshUiText::default()
         };
-        assert_eq!(
-            profile_row_action_labels(&text),
-            ["Connect", "Edit", "Delete"]
-        );
+        assert_eq!(profile_row_action_labels(&text), ["Edit", "Delete"]);
 
         let inventory = inventory();
         let profile = inventory.profiles().first().unwrap();

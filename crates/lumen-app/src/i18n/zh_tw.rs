@@ -273,6 +273,7 @@ pub static STRINGS: Strings = Strings {
     topbar_tab_ssh: "SSH",
     ssh_select_server: "請選擇 SSH 伺服器",
     ssh_no_sessions: "暫無 SSH 會話",
+    ssh_new_session: "新增 SSH 工作階段",
     ssh_title: "SSH 伺服器",
     ssh_search_hint: "搜尋伺服器",
     ssh_new_profile: "新增伺服器",

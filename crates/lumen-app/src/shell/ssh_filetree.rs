@@ -38,15 +38,13 @@ pub fn show(
     let mut output = Output::default();
     let panel = egui::Panel::left("lumen_ssh_filetree")
         .default_size(width)
-        .size_range(
-            crate::settings::FILETREE_WIDTH_MIN..=crate::settings::FILETREE_WIDTH_MAX,
-        )
+        .size_range(crate::settings::FILETREE_WIDTH_MIN..=crate::settings::FILETREE_WIDTH_MAX)
         .resizable(true)
         .show_separator_line(false)
         .frame(
             egui::Frame::new()
                 .fill(pal.filetree_fill)
-                .inner_margin(egui::Margin::symmetric(7, 9)),
+                .inner_margin(egui::Margin::symmetric(6, 8)),
         )
         .show_inside(root, |ui| {
             draw_contents(ui, tree, pal, &mut output);
@@ -64,123 +62,112 @@ fn draw_contents(
     output: &mut Output,
 ) {
     let strings = crate::i18n::strings();
-    let (header_rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
-    let mut header_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(header_rect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    header_ui.label(
-        RichText::new(strings.filetree_root_placeholder)
-            .size(12.0)
-            .color(pal.fg_dim),
-    );
-    header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let refresh = toolbar_icon_button(
-            ui,
-            ToolbarIcon::Refresh,
-            false,
-            strings.remote_refresh_dir_tip,
-            pal,
-        );
-        if refresh.clicked() {
+    // 与本地文件树使用同一套工具条规格：6px 面板横边距、24px
+    // 图标热区、12px 根目录名。SSH 保留「刷新 / 显示隐藏项」两个
+    // 远端专属动作，但不再另画一行完整路径，避免内容区起点错位。
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let refresh = toolbar_icon_button(
+                ui,
+                ToolbarIcon::Refresh,
+                false,
+                strings.remote_refresh_dir_tip,
+                pal,
+            );
+            if refresh.clicked() {
+                if let Some(tree) = tree {
+                    output.action = Some(SshRuntimeAction::RefreshFileTree {
+                        session_id: tree.session_id,
+                    });
+                }
+            }
+            let show_hidden = tree.is_some_and(|tree| tree.show_hidden);
+            let hidden = toolbar_icon_button(
+                ui,
+                ToolbarIcon::Hidden,
+                show_hidden,
+                strings.remote_show_hidden,
+                pal,
+            );
+            if hidden.clicked() {
+                if let Some(tree) = tree {
+                    output.action = Some(SshRuntimeAction::ToggleHiddenFiles {
+                        session_id: tree.session_id,
+                    });
+                }
+            }
+
+            let title = tree.map_or(strings.filetree_root_placeholder, |tree| {
+                linux_basename(&tree.root)
+            });
+            let root_response = ui.add(
+                egui::Label::new(RichText::new(title).size(12.0).color(pal.fg))
+                    .truncate()
+                    .selectable(false),
+            );
             if let Some(tree) = tree {
-                output.action = Some(SshRuntimeAction::RefreshFileTree {
-                    profile_id: tree.profile_id.clone(),
+                root_response.on_hover_text(&tree.root).context_menu(|ui| {
+                    if ui.button(strings.filetree_menu_copy_abs).clicked() {
+                        output.copy_text = Some(tree.root.clone());
+                        ui.close();
+                    }
                 });
             }
-        }
-        let show_hidden = tree.is_some_and(|tree| tree.show_hidden);
-        let hidden = toolbar_icon_button(
-            ui,
-            ToolbarIcon::Hidden,
-            show_hidden,
-            strings.remote_show_hidden,
-            pal,
-        );
-        if hidden.clicked() {
-            if let Some(tree) = tree {
-                output.action = Some(SshRuntimeAction::ToggleHiddenFiles {
-                    profile_id: tree.profile_id.clone(),
-                });
-            }
-        }
+        });
     });
 
     let Some(tree) = tree else {
-        ui.add_space(16.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new(strings.filetree_waiting_cwd)
-                    .small()
-                    .color(pal.fg_dim),
-            );
-        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(strings.filetree_waiting_cwd)
+                .size(11.0)
+                .color(pal.fg_dim),
+        );
         return;
     };
 
-    let root_response = ui.add(
-        egui::Label::new(
-            RichText::new(&tree.root)
-                .monospace()
-                .small()
-                .color(pal.fg),
-        )
-        .truncate(),
-    );
-    root_response
-        .on_hover_text(&tree.root)
-        .context_menu(|ui| {
-            if ui.button(strings.filetree_menu_copy_abs).clicked() {
-                output.copy_text = Some(tree.root.clone());
-                ui.close();
-            }
-        });
-    ui.add_space(4.0);
-    ui.separator();
-    ui.add_space(3.0);
-
-    egui::ScrollArea::vertical()
-        .id_salt(("ssh_filetree_scroll", tree.profile_id.as_str()))
+    ui.add_space(2.0);
+    let selected_id = ui.make_persistent_id(("ssh_filetree_selected", tree.session_id));
+    let mut selected_path = ui.data(|data| data.get_temp::<String>(selected_id));
+    egui::ScrollArea::both()
+        .id_salt(("ssh_filetree_scroll", tree.session_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // 同本地/远程文件树：三角与名字仅留 2px，取消按钮的
+            // 默认横向 padding，长文件名由行内 truncate 收口。
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding.x = 0.0;
+
             if tree.rows.is_empty() && tree.loading {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(13.0));
-                    ui.label(
-                        RichText::new(strings.filetree_loading)
-                            .small()
-                            .color(pal.fg_dim),
-                    );
-                });
+                placeholder_row(ui, strings.filetree_loading, pal);
             }
 
             for row in &tree.rows {
-                draw_row(ui, tree, row, pal, output);
+                ui.push_id(row.path.as_str(), |ui| {
+                    draw_row(ui, tree, row, pal, &mut selected_path, output);
+                });
             }
 
             if tree.truncated {
-                ui.add_space(5.0);
-                ui.label(
-                    RichText::new(strings.filetree_truncated)
-                        .small()
-                        .color(pal.warn),
-                );
+                placeholder_row(ui, strings.filetree_truncated, pal);
             }
             if let Some(error) = &tree.error {
-                ui.add_space(5.0);
                 ui.add(
                     egui::Label::new(
                         RichText::new(strings.filetree_unreadable)
-                            .small()
-                            .color(pal.warn),
+                            .size(11.0)
+                            .color(pal.fg_dim)
+                            .italics(),
                     )
                     .wrap(),
                 )
                 .on_hover_text(error);
             }
         });
+    if let Some(selected_path) = selected_path {
+        ui.data_mut(|data| data.insert_temp(selected_id, selected_path));
+    }
 }
 
 fn draw_row(
@@ -188,37 +175,48 @@ fn draw_row(
     tree: &crate::ssh_runtime::SshFileTreeView,
     row: &crate::ssh_runtime::SshFileTreeRow,
     pal: &Palette,
+    selected_path: &mut Option<String>,
     output: &mut Output,
 ) {
-    const ROW_HEIGHT: f32 = 25.0;
+    // 本地 ltreeview 的行高跟随 egui interact_size；不要另设 25px
+    // 大行高，否则同一应用内两棵文件树的密度明显不同。
+    let row_height = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
     );
-    if response.hovered() {
-        ui.painter().rect_filled(rect, 2.0, pal.bg_highlight);
+    let selected = selected_path.as_deref() == Some(row.path.as_str());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
 
     #[allow(clippy::cast_precision_loss)]
-    let indent = row.depth as f32 * 13.0;
-    let mut x = rect.left() + 2.0 + indent;
+    let indent = row.depth as f32 * 12.0;
+    let mut x = rect.left() + indent;
     if row.kind == DirectoryEntryKind::Directory {
-        let chevron_rect = egui::Rect::from_center_size(
-            egui::pos2(x + 6.0, rect.center().y),
-            egui::vec2(12.0, 16.0),
+        let triangle_rect = egui::Rect::from_center_size(
+            egui::pos2(x + 4.5, rect.center().y),
+            egui::vec2(9.0, 16.0),
         );
-        paint_chevron(ui.painter(), chevron_rect, row.expanded, pal.fg_dim);
-        x += 14.0;
+        paint_triangle(
+            ui.painter(),
+            triangle_rect,
+            row.expanded,
+            if response.hovered() {
+                pal.fg
+            } else {
+                pal.fg_dim
+            },
+        );
+        x += 11.0;
     } else {
-        x += 14.0;
+        // ltreeview 为叶节点保留 closer 槽，使同层文件名与目录名对齐。
+        x += 11.0;
     }
-
-    let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(x + 7.0, rect.center().y),
-        egui::vec2(15.0, 15.0),
-    );
-    paint_entry_icon(ui.painter(), icon_rect, row.kind, pal.info);
-    x += 19.0;
 
     let right_padding = if row.loading { 20.0 } else { 3.0 };
     let text_rect = egui::Rect::from_min_max(
@@ -227,17 +225,9 @@ fn draw_row(
     );
     ui.put(
         text_rect,
-        egui::Label::new(
-            RichText::new(&row.name)
-                .size(12.0)
-                .color(if response.hovered() {
-                    pal.fg
-                } else {
-                    pal.fg_dim
-                }),
-        )
-        .truncate()
-        .selectable(false),
+        egui::Label::new(RichText::new(&row.name).color(pal.fg))
+            .truncate()
+            .selectable(false),
     );
     if row.loading {
         let spinner_rect = egui::Rect::from_center_size(
@@ -247,20 +237,34 @@ fn draw_row(
         ui.put(spinner_rect, egui::Spinner::new().size(12.0));
     }
 
+    if response.clicked() || response.secondary_clicked() {
+        *selected_path = Some(row.path.clone());
+    }
     if response.clicked() && row.kind == DirectoryEntryKind::Directory {
         output.action = Some(SshRuntimeAction::ToggleDirectory {
-            profile_id: tree.profile_id.clone(),
+            session_id: tree.session_id,
             path: row.path.clone(),
         });
     }
-    response
-        .on_hover_text(&row.path)
-        .context_menu(|ui| {
-            if ui.button(crate::i18n::strings().filetree_menu_copy_abs).clicked() {
-                output.copy_text = Some(row.path.clone());
-                ui.close();
-            }
-        });
+    response.on_hover_text(&row.path).context_menu(|ui| {
+        if ui
+            .button(crate::i18n::strings().filetree_menu_copy_abs)
+            .clicked()
+        {
+            output.copy_text = Some(row.path.clone());
+            ui.close();
+        }
+    });
+}
+
+fn linux_basename(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+}
+
+fn placeholder_row(ui: &mut egui::Ui, text: &str, pal: &Palette) {
+    ui.label(RichText::new(text).size(11.0).color(pal.fg_dim).italics());
 }
 
 fn toolbar_icon_button(
@@ -270,20 +274,14 @@ fn toolbar_icon_button(
     tooltip: &str,
     pal: &Palette,
 ) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
-    if response.hovered() || active {
-        ui.painter().rect_filled(
-            rect,
-            3.0,
-            if active {
-                pal.selection
-            } else {
-                pal.bg_highlight
-            },
-        );
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), pal.bg_highlight);
     }
-    let color = if response.hovered() || active {
+    let color = if active {
+        pal.accent
+    } else if response.hovered() {
         pal.fg
     } else {
         pal.fg_dim
@@ -295,66 +293,27 @@ fn toolbar_icon_button(
     response.on_hover_text(tooltip)
 }
 
-fn paint_chevron(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    expanded: bool,
-    color: Color32,
-) {
+fn paint_triangle(painter: &egui::Painter, rect: egui::Rect, expanded: bool, color: Color32) {
     let center = rect.center();
-    let stroke = egui::Stroke::new(1.2_f32, color);
+    let radius = 3.5_f32;
     let points = if expanded {
-        [
-            center + egui::vec2(-4.0, -2.0),
-            center + egui::vec2(0.0, 2.0),
-            center + egui::vec2(4.0, -2.0),
+        vec![
+            egui::pos2(center.x - radius, center.y - radius * 0.5),
+            egui::pos2(center.x + radius, center.y - radius * 0.5),
+            egui::pos2(center.x, center.y + radius * 0.8),
         ]
     } else {
-        [
-            center + egui::vec2(-2.0, -4.0),
-            center + egui::vec2(2.0, 0.0),
-            center + egui::vec2(-2.0, 4.0),
+        vec![
+            egui::pos2(center.x - radius * 0.5, center.y - radius),
+            egui::pos2(center.x - radius * 0.5, center.y + radius),
+            egui::pos2(center.x + radius * 0.8, center.y),
         ]
     };
-    painter.line_segment([points[0], points[1]], stroke);
-    painter.line_segment([points[1], points[2]], stroke);
-}
-
-fn paint_entry_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    kind: DirectoryEntryKind,
-    color: Color32,
-) {
-    let stroke = egui::Stroke::new(1.1_f32, color);
-    if kind == DirectoryEntryKind::Directory {
-        let left = rect.left() + 1.0;
-        let right = rect.right() - 1.0;
-        let top = rect.top() + 3.0;
-        let bottom = rect.bottom() - 2.0;
-        painter.add(egui::Shape::line(
-            vec![
-                egui::pos2(left, bottom),
-                egui::pos2(left, top + 2.0),
-                egui::pos2(left + 5.0, top + 2.0),
-                egui::pos2(left + 7.0, top + 4.0),
-                egui::pos2(right, top + 4.0),
-                egui::pos2(right, bottom),
-                egui::pos2(left, bottom),
-            ],
-            stroke,
-        ));
-    } else {
-        let body = rect.shrink2(egui::vec2(2.5, 1.5));
-        painter.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Middle);
-        painter.line_segment(
-            [
-                egui::pos2(body.left() + 3.0, body.center().y),
-                egui::pos2(body.right() - 3.0, body.center().y),
-            ],
-            stroke,
-        );
-    }
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn paint_eye(painter: &egui::Painter, rect: egui::Rect, color: Color32, active: bool) {

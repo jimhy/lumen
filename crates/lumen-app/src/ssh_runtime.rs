@@ -1,15 +1,15 @@
 //! Main-thread adapter between the SSH transport actor and Lumen's terminal.
 //!
-//! Each profile owns an independent transport and terminal state.  The UI only
-//! chooses which profile is active; switching profiles or application modes
-//! never tears down the other background connections.
+//! Each session owns an independent transport and terminal state. Multiple
+//! sessions may reference the same server profile; switching sessions or
+//! application modes never tears down the other background connections.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use lumen_ssh::{
-    Command, ConnectionConfig, ConnectionMode, Credential, DisconnectReason, Event, EventErrorKind,
-    DirectoryEntry, DirectoryEntryKind, DirectoryError, HostKeyIdentity, KeepaliveConfig,
+    Command, ConnectionConfig, ConnectionMode, Credential, DirectoryEntry, DirectoryEntryKind,
+    DirectoryError, DisconnectReason, Event, EventErrorKind, HostKeyIdentity, KeepaliveConfig,
     MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
 };
 use lumen_term::Terminal;
@@ -21,6 +21,8 @@ const DEFAULT_ROWS: usize = 36;
 const DEFAULT_COLUMNS: usize = 120;
 const SSH_SCROLLBACK: usize = 10_000;
 const MONITOR_HISTORY_SAMPLES: usize = 60;
+
+pub type SshSessionId = u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -36,6 +38,7 @@ pub enum ConnectionState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownHostKey {
+    pub session_id: SshSessionId,
     pub profile_id: String,
     pub algorithm: String,
     pub sha256_fingerprint: String,
@@ -61,6 +64,7 @@ pub struct MetricsSummary {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeView {
+    pub session_id: SshSessionId,
     pub profile_id: String,
     pub profile_name: String,
     pub endpoint: String,
@@ -96,6 +100,7 @@ pub struct SshFileTreeRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshFileTreeView {
+    pub session_id: SshSessionId,
     pub profile_id: String,
     pub root: String,
     pub rows: Vec<SshFileTreeRow>,
@@ -108,8 +113,10 @@ pub struct SshFileTreeView {
 /// SSH 会话栏的一项。仅包含公开连接元数据与状态，不包含终端或凭据。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshSessionView {
+    pub session_id: SshSessionId,
     pub profile_id: String,
     pub profile_name: String,
+    pub display_name: String,
     pub endpoint: String,
     pub state: ConnectionState,
     pub active: bool,
@@ -203,6 +210,9 @@ impl EndpointIdentity {
 }
 
 struct RuntimeSession {
+    profile_id: String,
+    profile_session_number: usize,
+    auth_method: AuthMethod,
     profile_name: String,
     endpoint: String,
     endpoint_identity: EndpointIdentity,
@@ -234,8 +244,11 @@ struct DirectoryListing {
 }
 
 impl RuntimeSession {
-    fn new(profile: &SshProfile) -> Self {
+    fn new(profile: &SshProfile, profile_session_number: usize) -> Self {
         Self {
+            profile_id: profile.id.clone(),
+            profile_session_number,
+            auth_method: profile.auth_method,
             profile_name: profile.name.clone(),
             endpoint: endpoint(profile),
             endpoint_identity: EndpointIdentity::from_profile(profile),
@@ -262,6 +275,7 @@ impl RuntimeSession {
     }
 
     fn refresh_metadata(&mut self, profile: &SshProfile) {
+        self.auth_method = profile.auth_method;
         self.profile_name.clone_from(&profile.name);
         self.endpoint = endpoint(profile);
         self.endpoint_identity = EndpointIdentity::from_profile(profile);
@@ -310,51 +324,111 @@ struct ConnectionTestAttempt {
     state: ConnectionTestState,
 }
 
-#[derive(Default)]
 pub struct SshRuntime {
-    sessions: HashMap<String, RuntimeSession>,
-    session_order: Vec<String>,
-    active_profile_id: Option<String>,
+    sessions: HashMap<SshSessionId, RuntimeSession>,
+    session_order: Vec<SshSessionId>,
+    active_session_id: Option<SshSessionId>,
+    next_session_id: SshSessionId,
     connection_test: Option<ConnectionTestAttempt>,
 }
 
+impl Default for SshRuntime {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            session_order: Vec::new(),
+            active_session_id: None,
+            next_session_id: 1,
+            connection_test: None,
+        }
+    }
+}
+
 impl SshRuntime {
-    pub fn select_for_connect(&mut self, profile: &SshProfile) -> ConnectIntent {
-        self.active_profile_id = Some(profile.id.clone());
-        self.ensure_session(profile);
-        let session = self
-            .sessions
-            .get_mut(&profile.id)
-            .expect("刚插入的 SSH 会话必须存在");
+    /// 新建并激活一个独立会话，然后返回其认证意图。
+    ///
+    /// 即使同一个 profile 已有连接，本方法也总会分配新的会话。这样服务器
+    /// 双击与“新增会话”都能打开独立的远端 shell。
+    pub fn select_for_connect(&mut self, profile: &SshProfile) -> (SshSessionId, ConnectIntent) {
+        let session_id = self.create_session(profile);
+        let intent = self
+            .connect_intent(session_id, profile)
+            .expect("刚插入的 SSH 会话必须存在且属于当前 profile");
+        (session_id, intent)
+    }
+
+    /// 获取一个既有会话下一步的连接意图。
+    ///
+    /// 该入口供主机密钥确认后继续同一会话使用；它不会创建或替换会话。
+    pub fn connect_intent(
+        &mut self,
+        session_id: SshSessionId,
+        profile: &SshProfile,
+    ) -> Option<ConnectIntent> {
+        let session = self.sessions.get_mut(&session_id)?;
+        if session.profile_id != profile.id {
+            return None;
+        }
+        self.active_session_id = Some(session_id);
 
         if session.is_running() {
-            return ConnectIntent::AlreadyRunning;
+            return Some(ConnectIntent::AlreadyRunning);
         }
         // 未决主机密钥属于产生它的旧 endpoint。配置在弹窗期间被编辑时，
         // 不能先用新 profile 刷新身份再复用旧指纹提示。
         if session.unknown_host_key.is_some() {
-            return ConnectIntent::AwaitingHostKey;
+            return Some(ConnectIntent::AwaitingHostKey);
         }
         if session.changed_host_key.is_some() {
-            return ConnectIntent::HostKeyChanged;
+            return Some(ConnectIntent::HostKeyChanged);
         }
         session.refresh_metadata(profile);
         session.state = ConnectionState::CredentialRequired;
         session.detail = None;
-        match profile.auth_method {
+        Some(match profile.auth_method {
             AuthMethod::Password => ConnectIntent::Password,
             AuthMethod::PrivateKey => ConnectIntent::PrivateKey,
             AuthMethod::Agent => ConnectIntent::Agent,
-        }
+        })
     }
 
-    pub fn start(&mut self, profile: &SshProfile, credential: Credential) -> Result<(), String> {
-        self.active_profile_id = Some(profile.id.clone());
-        self.ensure_session(profile);
+    /// 凭据提交前复核它仍指向原来的待认证会话。
+    ///
+    /// UI 对话框可以跨帧存在；期间会话可能被关闭，服务器配置也可能被
+    /// 编辑。秘密写入本机安全存储前必须先通过这里的结构化检查。
+    #[must_use]
+    pub fn accepts_credential_for(
+        &self,
+        session_id: SshSessionId,
+        profile: &SshProfile,
+    ) -> bool {
+        self.sessions.get(&session_id).is_some_and(|session| {
+            session.profile_id == profile.id
+                && session.endpoint_identity.matches_profile(profile)
+                && session.auth_method == profile.auth_method
+                && session.state == ConnectionState::CredentialRequired
+                && session.unknown_host_key.is_none()
+                && session.changed_host_key.is_none()
+        })
+    }
+
+    pub fn start(
+        &mut self,
+        session_id: SshSessionId,
+        profile: &SshProfile,
+        credential: Credential,
+    ) -> Result<(), String> {
+        if !self.accepts_credential_for(session_id, profile) {
+            return Err("SSH credential request is stale".to_owned());
+        }
         let session = self
             .sessions
-            .get_mut(&profile.id)
-            .expect("刚插入的 SSH 会话必须存在");
+            .get_mut(&session_id)
+            .ok_or_else(|| "SSH session no longer exists".to_owned())?;
+        if session.profile_id != profile.id {
+            return Err("SSH session does not belong to this profile".to_owned());
+        }
+        self.active_session_id = Some(session_id);
         session.refresh_metadata(profile);
 
         // Replacing one profile's failed attempt does not affect any other
@@ -514,36 +588,48 @@ impl SshRuntime {
     }
 
     pub fn remove_profile(&mut self, profile_id: &str) {
-        self.close_session(profile_id);
+        let session_ids = self
+            .session_order
+            .iter()
+            .copied()
+            .filter(|session_id| {
+                self.sessions
+                    .get(session_id)
+                    .is_some_and(|session| session.profile_id == profile_id)
+            })
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.close_session(session_id);
+        }
     }
 
     /// 激活一个已打开的 SSH 会话；不会重连或改变其他后台连接。
-    pub fn activate_session(&mut self, profile_id: &str) -> bool {
-        if !self.sessions.contains_key(profile_id) {
+    pub fn activate_session(&mut self, session_id: SshSessionId) -> bool {
+        if !self.sessions.contains_key(&session_id) {
             return false;
         }
-        self.active_profile_id = Some(profile_id.to_owned());
+        self.active_session_id = Some(session_id);
         true
     }
 
     /// 关闭会话但保留服务器配置。若关闭当前会话，选择相邻会话。
-    pub fn close_session(&mut self, profile_id: &str) -> bool {
+    pub fn close_session(&mut self, session_id: SshSessionId) -> bool {
         let Some(index) = self
             .session_order
             .iter()
-            .position(|existing| existing == profile_id)
+            .position(|existing| *existing == session_id)
         else {
             return false;
         };
-        // Dropping the handle signals cancellation to the profile's dedicated
-        // actor. Other profile sessions remain untouched.
-        self.sessions.remove(profile_id);
+        // Dropping the handle signals cancellation to this session's dedicated
+        // actor. Other sessions, including the same profile's, remain untouched.
+        self.sessions.remove(&session_id);
         self.session_order.remove(index);
-        if self.active_profile_id.as_deref() == Some(profile_id) {
-            self.active_profile_id = self
+        if self.active_session_id == Some(session_id) {
+            self.active_session_id = self
                 .session_order
                 .get(index.min(self.session_order.len().saturating_sub(1)))
-                .cloned();
+                .copied();
         }
         true
     }
@@ -552,14 +638,19 @@ impl SshRuntime {
     pub fn session_views(&self) -> Vec<SshSessionView> {
         self.session_order
             .iter()
-            .filter_map(|profile_id| {
-                let session = self.sessions.get(profile_id)?;
+            .filter_map(|session_id| {
+                let session = self.sessions.get(session_id)?;
                 Some(SshSessionView {
-                    profile_id: profile_id.clone(),
+                    session_id: *session_id,
+                    profile_id: session.profile_id.clone(),
                     profile_name: session.profile_name.clone(),
+                    display_name: format!(
+                        "{} · {}",
+                        session.profile_name, session.profile_session_number
+                    ),
                     endpoint: session.endpoint.clone(),
                     state: session.state.clone(),
-                    active: self.active_profile_id.as_ref() == Some(profile_id),
+                    active: self.active_session_id.as_ref() == Some(session_id),
                 })
             })
             .collect()
@@ -567,18 +658,17 @@ impl SshRuntime {
 
     #[must_use]
     pub fn active_file_tree_view(&self) -> Option<SshFileTreeView> {
-        let profile_id = self.active_profile_id.as_ref()?;
-        let session = self.sessions.get(profile_id)?;
+        let session_id = self.active_session_id?;
+        let session = self.sessions.get(&session_id)?;
         let mut rows = Vec::new();
         append_file_tree_rows(session, &session.file_tree_root, 0, &mut rows);
         let truncated = session
             .directory_listings
             .iter()
-            .any(|(path, listing)| {
-                session.open_directories.contains(path) && listing.truncated
-            });
+            .any(|(path, listing)| session.open_directories.contains(path) && listing.truncated);
         Some(SshFileTreeView {
-            profile_id: profile_id.clone(),
+            session_id,
+            profile_id: session.profile_id.clone(),
             root: session.file_tree_root.clone(),
             rows,
             loading: !session.pending_directories.is_empty(),
@@ -590,8 +680,8 @@ impl SshRuntime {
 
     /// 展开或折叠一个来自当前树快照的目录。展示字符串不会被当作路径使用：
     /// 只有 runtime 缓存中仍存在的精确目录路径才会执行请求。
-    pub fn toggle_directory(&mut self, profile_id: &str, path: &str) -> bool {
-        let Some(session) = self.sessions.get_mut(profile_id) else {
+    pub fn toggle_directory(&mut self, session_id: SshSessionId, path: &str) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return false;
         };
         if !known_directory(session, path) {
@@ -609,29 +699,33 @@ impl SshRuntime {
         true
     }
 
-    pub fn refresh_file_tree(&mut self, profile_id: &str) -> bool {
-        let Some(session) = self.sessions.get_mut(profile_id) else {
+    pub fn refresh_file_tree(&mut self, session_id: SshSessionId) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return false;
         };
         cancel_directory_requests(session);
         session.directory_listings.clear();
         session.open_directories.clear();
-        session.open_directories.insert(session.file_tree_root.clone());
+        session
+            .open_directories
+            .insert(session.file_tree_root.clone());
         session.file_tree_error = None;
         let root = session.file_tree_root.clone();
         let _ = request_directory(session, &root);
         true
     }
 
-    pub fn toggle_hidden_files(&mut self, profile_id: &str) -> bool {
-        let Some(session) = self.sessions.get_mut(profile_id) else {
+    pub fn toggle_hidden_files(&mut self, session_id: SshSessionId) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return false;
         };
         session.show_hidden_files = !session.show_hidden_files;
         cancel_directory_requests(session);
         session.directory_listings.clear();
         session.open_directories.clear();
-        session.open_directories.insert(session.file_tree_root.clone());
+        session
+            .open_directories
+            .insert(session.file_tree_root.clone());
         session.file_tree_error = None;
         let root = session.file_tree_root.clone();
         let _ = request_directory(session, &root);
@@ -700,14 +794,15 @@ impl SshRuntime {
     }
 
     pub fn drain(&mut self) -> DrainOutcome {
-        let active_id = self.active_profile_id.clone();
+        let active_id = self.active_session_id;
         let mut outcome = DrainOutcome::default();
-        let profile_ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        let session_ids = self.sessions.keys().copied().collect::<Vec<_>>();
 
-        for profile_id in profile_ids {
-            let Some(session) = self.sessions.get_mut(&profile_id) else {
+        for session_id in session_ids {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
                 continue;
             };
+            let profile_id = session.profile_id.clone();
             let before_state = session.state.clone();
             let before_detail = session.detail.clone();
             let before_metrics = session.metrics.clone();
@@ -760,7 +855,7 @@ impl SshRuntime {
 
             outcome.sessions_changed |= before_state != session.state;
 
-            if active_id.as_deref() == Some(profile_id.as_str()) {
+            if active_id == Some(session_id) {
                 outcome.active_terminal_changed |= terminal_changed;
                 outcome.active_status_changed |= before_state != session.state
                     || before_detail != session.detail
@@ -836,10 +931,11 @@ impl SshRuntime {
     }
 
     pub fn active_view(&self) -> Option<RuntimeView> {
-        let profile_id = self.active_profile_id.as_ref()?;
-        let session = self.sessions.get(profile_id)?;
+        let session_id = self.active_session_id?;
+        let session = self.sessions.get(&session_id)?;
         Some(RuntimeView {
-            profile_id: profile_id.clone(),
+            session_id,
+            profile_id: session.profile_id.clone(),
             profile_name: session.profile_name.clone(),
             endpoint: session.endpoint.clone(),
             state: session.state.clone(),
@@ -856,7 +952,8 @@ impl SshRuntime {
                 .unknown_host_key
                 .as_ref()
                 .map(|identity| UnknownHostKey {
-                    profile_id: profile_id.clone(),
+                    session_id,
+                    profile_id: session.profile_id.clone(),
                     algorithm: identity.algorithm.clone(),
                     sha256_fingerprint: identity.sha256_fingerprint.clone(),
                 }),
@@ -874,11 +971,11 @@ impl SshRuntime {
 
     pub fn confirm_unknown_host_key(
         &mut self,
-        profile_id: &str,
+        session_id: SshSessionId,
         algorithm: &str,
         fingerprint: &str,
     ) -> bool {
-        let Some(session) = self.sessions.get_mut(profile_id) else {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return false;
         };
         let matches = session.unknown_host_key.as_ref().is_some_and(|identity| {
@@ -898,20 +995,22 @@ impl SshRuntime {
     /// `@`/`:` 可能让不同字段组合得到相同字符串。
     pub fn unknown_host_key_matches(
         &self,
+        session_id: SshSessionId,
         profile: &SshProfile,
         algorithm: &str,
         fingerprint: &str,
     ) -> bool {
-        self.sessions.get(&profile.id).is_some_and(|session| {
-            session.endpoint_identity.matches_profile(profile)
+        self.sessions.get(&session_id).is_some_and(|session| {
+            session.profile_id == profile.id
+                && session.endpoint_identity.matches_profile(profile)
                 && session.unknown_host_key.as_ref().is_some_and(|identity| {
                     identity.algorithm == algorithm && identity.sha256_fingerprint == fingerprint
                 })
         })
     }
 
-    pub fn dismiss_unknown_host_key(&mut self, profile_id: &str) {
-        let Some(session) = self.sessions.get_mut(profile_id) else {
+    pub fn dismiss_unknown_host_key(&mut self, session_id: SshSessionId) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
         session.unknown_host_key = None;
@@ -920,21 +1019,36 @@ impl SshRuntime {
     }
 
     fn active_session(&self) -> Option<&RuntimeSession> {
-        self.sessions.get(self.active_profile_id.as_ref()?)
+        self.sessions.get(&self.active_session_id?)
     }
 
     fn active_session_mut(&mut self) -> Option<&mut RuntimeSession> {
-        let profile_id = self.active_profile_id.as_ref()?.clone();
-        self.sessions.get_mut(&profile_id)
+        let session_id = self.active_session_id?;
+        self.sessions.get_mut(&session_id)
     }
 
-    fn ensure_session(&mut self, profile: &SshProfile) {
-        if self.sessions.contains_key(&profile.id) {
-            return;
-        }
-        self.session_order.push(profile.id.clone());
-        self.sessions
-            .insert(profile.id.clone(), RuntimeSession::new(profile));
+    fn create_session(&mut self, profile: &SshProfile) -> SshSessionId {
+        let session_id = self.next_session_id;
+        self.next_session_id = self
+            .next_session_id
+            .checked_add(1)
+            .expect("SSH session id space exhausted");
+        let profile_session_number = self
+            .sessions
+            .values()
+            .filter(|session| session.profile_id == profile.id)
+            .map(|session| session.profile_session_number)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("SSH profile session number space exhausted");
+        self.session_order.push(session_id);
+        self.sessions.insert(
+            session_id,
+            RuntimeSession::new(profile, profile_session_number),
+        );
+        self.active_session_id = Some(session_id);
+        session_id
     }
 }
 
@@ -958,9 +1072,10 @@ fn ssh_file_tree_root(profile: &SshProfile) -> String {
 fn known_directory(session: &RuntimeSession, path: &str) -> bool {
     path == session.file_tree_root
         || session.directory_listings.values().any(|listing| {
-            listing.entries.iter().any(|entry| {
-                entry.path == path && entry.kind == DirectoryEntryKind::Directory
-            })
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.path == path && entry.kind == DirectoryEntryKind::Directory)
         })
 }
 
@@ -1601,8 +1716,9 @@ mod tests {
     fn host_key_state_requires_exact_confirmation_and_never_accepts_changed_key() {
         let p = profile(AuthMethod::Agent);
         let mut runtime = SshRuntime::default();
-        assert_eq!(runtime.select_for_connect(&p), ConnectIntent::Agent);
-        let session = runtime.sessions.get_mut(&p.id).expect("session");
+        let (session_id, intent) = runtime.select_for_connect(&p);
+        assert_eq!(intent, ConnectIntent::Agent);
+        let session = runtime.sessions.get_mut(&session_id).expect("session");
         let unknown = HostKeyIdentity::new(
             "ssh-ed25519",
             "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC",
@@ -1614,14 +1730,14 @@ mod tests {
             },
         );
         assert_eq!(session.state, ConnectionState::AwaitingHostKey);
-        assert!(!runtime.confirm_unknown_host_key(&p.id, "ssh-ed25519", "SHA256:wrong"));
+        assert!(!runtime.confirm_unknown_host_key(session_id, "ssh-ed25519", "SHA256:wrong"));
         assert!(runtime.confirm_unknown_host_key(
-            &p.id,
+            session_id,
             &unknown.algorithm,
             &unknown.sha256_fingerprint
         ));
 
-        let session = runtime.sessions.get_mut(&p.id).expect("session");
+        let session = runtime.sessions.get_mut(&session_id).expect("session");
         apply_event(
             session,
             Event::HostKeyChanged {
@@ -1634,7 +1750,7 @@ mod tests {
         );
         assert_eq!(session.state, ConnectionState::HostKeyChanged);
         assert!(!runtime.confirm_unknown_host_key(
-            &p.id,
+            session_id,
             "ssh-ed25519",
             "SHA256:ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc"
         ));
@@ -1655,12 +1771,13 @@ mod tests {
         );
 
         let mut runtime = SshRuntime::default();
-        assert_eq!(runtime.select_for_connect(&original), ConnectIntent::Agent);
+        let (session_id, intent) = runtime.select_for_connect(&original);
+        assert_eq!(intent, ConnectIntent::Agent);
         let presented = HostKeyIdentity::new(
             "ssh-ed25519",
             "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABC",
         );
-        let session = runtime.sessions.get_mut(&original.id).expect("session");
+        let session = runtime.sessions.get_mut(&session_id).expect("session");
         apply_event(
             session,
             Event::HostKeyUnknown {
@@ -1668,17 +1785,19 @@ mod tests {
             },
         );
         assert!(runtime.unknown_host_key_matches(
+            session_id,
             &original,
             &presented.algorithm,
             &presented.sha256_fingerprint,
         ));
         assert_eq!(
-            runtime.select_for_connect(&colliding),
-            ConnectIntent::AwaitingHostKey,
+            runtime.connect_intent(session_id, &colliding),
+            Some(ConnectIntent::AwaitingHostKey),
             "重新点击连接不得把未决指纹改绑到新 endpoint"
         );
         assert!(
             !runtime.unknown_host_key_matches(
+                session_id,
                 &colliding,
                 &presented.algorithm,
                 &presented.sha256_fingerprint,
@@ -1728,13 +1847,111 @@ mod tests {
         second.id = "ssh_abcdef0123456789abcdef0123456789".to_owned();
         second.name = "prod".to_owned();
         let mut runtime = SshRuntime::default();
-        assert_eq!(runtime.select_for_connect(&first), ConnectIntent::Password);
-        assert_eq!(runtime.select_for_connect(&second), ConnectIntent::Password);
+        let (first_session_id, first_intent) = runtime.select_for_connect(&first);
+        let (second_session_id, second_intent) = runtime.select_for_connect(&second);
+        assert_eq!(first_intent, ConnectIntent::Password);
+        assert_eq!(second_intent, ConnectIntent::Password);
         assert_eq!(runtime.sessions.len(), 2);
-        assert_eq!(
-            runtime.active_profile_id.as_deref(),
-            Some(second.id.as_str())
+        assert_ne!(first_session_id, second_session_id);
+        assert_eq!(runtime.active_session_id, Some(second_session_id));
+    }
+
+    #[test]
+    fn same_profile_can_open_multiple_independent_sessions() {
+        let p = profile(AuthMethod::Password);
+        let mut runtime = SshRuntime::default();
+        let (first_session_id, first_intent) = runtime.select_for_connect(&p);
+        let (second_session_id, second_intent) = runtime.select_for_connect(&p);
+        assert_eq!(first_intent, ConnectIntent::Password);
+        assert_eq!(second_intent, ConnectIntent::Password);
+        assert_ne!(first_session_id, second_session_id);
+
+        runtime
+            .sessions
+            .get_mut(&first_session_id)
+            .expect("first session")
+            .show_hidden_files = true;
+        runtime
+            .sessions
+            .get_mut(&first_session_id)
+            .expect("first session")
+            .state = ConnectionState::Connected;
+        assert!(
+            runtime
+                .sessions
+                .get(&first_session_id)
+                .expect("first session")
+                .show_hidden_files
         );
+        assert!(
+            !runtime
+                .sessions
+                .get(&second_session_id)
+                .expect("second session")
+                .show_hidden_files,
+            "同一服务器的文件树状态必须按会话隔离"
+        );
+        assert_eq!(
+            runtime
+                .sessions
+                .get(&second_session_id)
+                .expect("second session")
+                .state,
+            ConnectionState::CredentialRequired,
+            "同一服务器的连接状态必须按会话隔离"
+        );
+
+        let views = runtime.session_views();
+        assert_eq!(views[0].profile_id, p.id);
+        assert_eq!(views[1].profile_id, p.id);
+        assert_eq!(views[0].display_name, "dev · 1");
+        assert_eq!(views[1].display_name, "dev · 2");
+        assert_eq!(views[0].session_id, first_session_id);
+        assert_eq!(views[1].session_id, second_session_id);
+    }
+
+    #[test]
+    fn credential_submission_requires_the_original_pending_session_and_endpoint() {
+        let profile = profile(AuthMethod::Password);
+        let mut runtime = SshRuntime::default();
+        let (session_id, _) = runtime.select_for_connect(&profile);
+        assert!(runtime.accepts_credential_for(session_id, &profile));
+
+        let mut edited = profile.clone();
+        edited.host = "other.example.test".to_owned();
+        assert!(!runtime.accepts_credential_for(session_id, &edited));
+
+        let mut changed_auth = profile.clone();
+        changed_auth.auth_method = AuthMethod::Agent;
+        assert!(!runtime.accepts_credential_for(session_id, &changed_auth));
+
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .expect("pending session")
+            .state = ConnectionState::Connected;
+        assert!(!runtime.accepts_credential_for(session_id, &profile));
+
+        assert!(runtime.close_session(session_id));
+        assert!(!runtime.accepts_credential_for(session_id, &profile));
+    }
+
+    #[test]
+    fn removing_profile_closes_all_of_its_sessions_only() {
+        let removed = profile(AuthMethod::Agent);
+        let mut kept = removed.clone();
+        kept.id = "ssh_abcdef0123456789abcdef0123456789".to_owned();
+        kept.name = "prod".to_owned();
+
+        let mut runtime = SshRuntime::default();
+        let (kept_session_id, _) = runtime.select_for_connect(&kept);
+        runtime.select_for_connect(&removed);
+        runtime.select_for_connect(&removed);
+        runtime.remove_profile(&removed.id);
+
+        assert_eq!(runtime.sessions.len(), 1);
+        assert_eq!(runtime.active_session_id, Some(kept_session_id));
+        assert_eq!(runtime.session_views()[0].profile_id, kept.id);
     }
 
     #[test]
@@ -1745,14 +1962,18 @@ mod tests {
         second.name = "prod".to_owned();
 
         let mut runtime = SshRuntime::default();
-        assert_eq!(runtime.select_for_connect(&first), ConnectIntent::Password);
-        assert_eq!(runtime.select_for_connect(&second), ConnectIntent::Password);
-        assert!(runtime.activate_session(&first.id));
+        let (first_session_id, first_intent) = runtime.select_for_connect(&first);
+        let (second_session_id, second_intent) = runtime.select_for_connect(&second);
+        assert_eq!(first_intent, ConnectIntent::Password);
+        assert_eq!(second_intent, ConnectIntent::Password);
+        assert!(runtime.activate_session(first_session_id));
 
         let sessions = runtime.session_views();
         assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, first_session_id);
         assert_eq!(sessions[0].profile_id, first.id);
         assert!(sessions[0].active);
+        assert_eq!(sessions[1].session_id, second_session_id);
         assert_eq!(sessions[1].profile_id, second.id);
         assert!(!sessions[1].active);
         assert_eq!(runtime.sessions.len(), 2);
@@ -1769,25 +1990,22 @@ mod tests {
         third.name = "stage".to_owned();
 
         let mut runtime = SshRuntime::default();
-        runtime.select_for_connect(&first);
-        runtime.select_for_connect(&second);
-        runtime.select_for_connect(&third);
-        assert!(runtime.activate_session(&second.id));
-        assert!(runtime.close_session(&second.id));
+        let (first_session_id, _) = runtime.select_for_connect(&first);
+        let (second_session_id, _) = runtime.select_for_connect(&second);
+        let (third_session_id, _) = runtime.select_for_connect(&third);
+        assert!(runtime.activate_session(second_session_id));
+        assert!(runtime.close_session(second_session_id));
 
-        assert_eq!(
-            runtime.active_profile_id.as_deref(),
-            Some(third.id.as_str())
-        );
+        assert_eq!(runtime.active_session_id, Some(third_session_id));
         assert_eq!(
             runtime
                 .session_views()
                 .iter()
-                .map(|session| session.profile_id.as_str())
+                .map(|session| session.session_id)
                 .collect::<Vec<_>>(),
-            vec![first.id.as_str(), third.id.as_str()]
+            vec![first_session_id, third_session_id]
         );
-        assert!(!runtime.close_session(&second.id));
+        assert!(!runtime.close_session(second_session_id));
     }
 
     #[test]
@@ -1809,7 +2027,7 @@ mod tests {
     #[test]
     fn directory_tree_drops_stale_replies_and_only_accepts_exact_children() {
         let p = profile(AuthMethod::Agent);
-        let mut session = RuntimeSession::new(&p);
+        let mut session = RuntimeSession::new(&p, 1);
         session.open_directories.insert("/".to_owned());
         session.pending_directories.insert(10, "/".to_owned());
         session.pending_directories.insert(11, "/".to_owned());
@@ -1859,7 +2077,7 @@ mod tests {
     #[test]
     fn disconnect_clears_directory_requests_without_affecting_terminal_error_semantics() {
         let p = profile(AuthMethod::Agent);
-        let mut session = RuntimeSession::new(&p);
+        let mut session = RuntimeSession::new(&p, 1);
         session.state = ConnectionState::Connected;
         session
             .pending_directories

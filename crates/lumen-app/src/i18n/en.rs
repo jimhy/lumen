@@ -271,6 +271,7 @@ pub static STRINGS: Strings = Strings {
     topbar_tab_ssh: "SSH",
     ssh_select_server: "Select an SSH server",
     ssh_no_sessions: "No open SSH sessions",
+    ssh_new_session: "New SSH session",
     ssh_title: "SSH Servers",
     ssh_search_hint: "Search servers",
     ssh_new_profile: "New server",

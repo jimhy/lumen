@@ -119,6 +119,7 @@ pub enum SshCredentialKind {
 }
 
 pub struct SshCredentialDialog {
+    session_id: crate::ssh_runtime::SshSessionId,
     profile_id: String,
     profile_name: String,
     expected_host: String,
@@ -132,6 +133,7 @@ pub struct SshCredentialDialog {
 
 impl SshCredentialDialog {
     pub(crate) fn open(
+        session_id: crate::ssh_runtime::SshSessionId,
         profile_id: String,
         profile_name: String,
         expected_host: String,
@@ -140,6 +142,7 @@ impl SshCredentialDialog {
         kind: SshCredentialKind,
     ) -> Self {
         Self {
+            session_id,
             profile_id,
             profile_name,
             expected_host,
@@ -150,6 +153,14 @@ impl SshCredentialDialog {
             private_key_path: None,
             key_passphrase: String::new(),
         }
+    }
+
+    pub(crate) const fn session_id(&self) -> crate::ssh_runtime::SshSessionId {
+        self.session_id
+    }
+
+    pub(crate) fn profile_id(&self) -> &str {
+        &self.profile_id
     }
 }
 
@@ -258,31 +269,38 @@ impl Drop for SshCredentialSubmission {
 }
 
 pub enum SshRuntimeAction {
-    ConnectWithCredential(SshCredentialSubmission),
-    ActivateSession {
+    NewSession {
         profile_id: String,
+    },
+    ConnectWithCredential {
+        session_id: crate::ssh_runtime::SshSessionId,
+        submission: SshCredentialSubmission,
+    },
+    ActivateSession {
+        session_id: crate::ssh_runtime::SshSessionId,
     },
     CloseSession {
-        profile_id: String,
+        session_id: crate::ssh_runtime::SshSessionId,
     },
     ToggleDirectory {
-        profile_id: String,
+        session_id: crate::ssh_runtime::SshSessionId,
         path: String,
     },
     RefreshFileTree {
-        profile_id: String,
+        session_id: crate::ssh_runtime::SshSessionId,
     },
     ToggleHiddenFiles {
-        profile_id: String,
+        session_id: crate::ssh_runtime::SshSessionId,
     },
     Disconnect,
     TrustHostKey {
+        session_id: crate::ssh_runtime::SshSessionId,
         profile_id: String,
         algorithm: String,
         fingerprint: String,
     },
     DismissHostKey {
-        profile_id: String,
+        session_id: crate::ssh_runtime::SshSessionId,
     },
 }
 
@@ -1076,7 +1094,13 @@ pub fn show(
                     .inner_margin(egui::Margin::symmetric(8, 10)),
             )
             .show_inside(root, |ui| {
-                ssh_session_sidebar_ui(ui, input.ssh_sessions, pal, &mut out);
+                ssh_session_sidebar_ui(
+                    ui,
+                    input.ssh_sessions,
+                    st.ssh_ui.selected_profile_id(),
+                    pal,
+                    &mut out,
+                );
             });
         let rect = sessions_resp.response.rect;
         {
@@ -2432,6 +2456,7 @@ fn swap_target(rects: &[egui::Rect], src: usize, pos: egui::Pos2) -> Option<usiz
 fn ssh_session_sidebar_ui(
     ui: &mut egui::Ui,
     sessions: &[crate::ssh_runtime::SshSessionView],
+    selected_profile_id: Option<&str>,
     pal: &theme::Palette,
     out: &mut ShellOutput,
 ) {
@@ -2445,6 +2470,59 @@ fn ssh_session_sidebar_ui(
         egui::FontId::proportional(12.0),
         pal.fg_dim,
     );
+
+    let add_size = egui::vec2(22.0, 22.0);
+    let add_rect = egui::Rect::from_center_size(
+        egui::pos2(title_rect.right() - add_size.x * 0.5, title_rect.center().y),
+        add_size,
+    );
+    let add_response = ui.interact(
+        add_rect,
+        ui.id().with("ssh_new_session"),
+        if selected_profile_id.is_some() {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    if add_response.hovered() && selected_profile_id.is_some() {
+        ui.painter().rect_filled(add_rect, 4.0, pal.bg_highlight);
+    }
+    let add_color = if selected_profile_id.is_none() {
+        pal.fg_dim.gamma_multiply(0.45)
+    } else if add_response.hovered() {
+        pal.fg
+    } else {
+        pal.fg_dim
+    };
+    let center = add_rect.center();
+    let stroke = egui::Stroke::new(1.2_f32, add_color);
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x - 5.0, center.y),
+            egui::pos2(center.x + 5.0, center.y),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x, center.y - 5.0),
+            egui::pos2(center.x, center.y + 5.0),
+        ],
+        stroke,
+    );
+    let add_tip = if selected_profile_id.is_some() {
+        strings.ssh_new_session
+    } else {
+        strings.ssh_select_server
+    };
+    if add_response.on_hover_text(add_tip).clicked() {
+        if let Some(profile_id) = selected_profile_id {
+            out.ssh_runtime_action = Some(SshRuntimeAction::NewSession {
+                profile_id: profile_id.to_owned(),
+            });
+        }
+    }
     ui.add_space(2.0);
 
     if sessions.is_empty() {
@@ -2476,7 +2554,7 @@ fn ssh_session_sidebar_ui(
                 );
                 let close_response = ui.interact(
                     close_rect,
-                    ui.id().with(("ssh_session_close", session.profile_id.as_str())),
+                    ui.id().with(("ssh_session_close", session.session_id)),
                     egui::Sense::click(),
                 );
                 let background = if session.active {
@@ -2509,7 +2587,7 @@ fn ssh_session_sidebar_ui(
                 ui.put(
                     name_rect,
                     egui::Label::new(
-                        egui::RichText::new(&session.profile_name)
+                        egui::RichText::new(&session.display_name)
                             .size(13.0)
                             .color(pal.fg),
                     )
@@ -2557,11 +2635,11 @@ fn ssh_session_sidebar_ui(
 
                 if close_response.on_hover_text(strings.menu_close).clicked() {
                     out.ssh_runtime_action = Some(SshRuntimeAction::CloseSession {
-                        profile_id: session.profile_id.clone(),
+                        session_id: session.session_id,
                     });
                 } else if response.clicked() {
                     out.ssh_runtime_action = Some(SshRuntimeAction::ActivateSession {
-                        profile_id: session.profile_id.clone(),
+                        session_id: session.session_id,
                     });
                 }
             }
@@ -3205,7 +3283,7 @@ fn ssh_monitor_ui(
 ) {
     let strings = crate::i18n::strings();
     egui::ScrollArea::vertical()
-        .id_salt(("ssh_monitor_scroll", view.profile_id.as_str()))
+        .id_salt(("ssh_monitor_scroll", view.session_id))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -3461,6 +3539,7 @@ fn paint_ssh_monitor_icon(
             }
         }
     }
+
 }
 
 fn ssh_monitor_system_card(
@@ -3506,7 +3585,7 @@ fn ssh_monitor_system_card(
                 .on_hover_text(&details.kernel_version);
             });
             ui.add_space(4.0);
-            egui::Grid::new(("ssh_monitor_system", view.profile_id.as_str()))
+            egui::Grid::new(("ssh_monitor_system", view.session_id))
                 .num_columns(2)
                 .spacing(egui::vec2(14.0, 2.0))
                 .show(ui, |ui| {
@@ -4239,9 +4318,14 @@ fn ssh_runtime_modals(
             });
     }
     if cancel_credentials {
-        st.ssh_credentials = None;
+        if let Some(dialog) = st.ssh_credentials.take() {
+            out.ssh_runtime_action = Some(SshRuntimeAction::CloseSession {
+                session_id: dialog.session_id,
+            });
+        }
     } else if submit_credentials {
         if let Some(mut dialog) = st.ssh_credentials.take() {
+            let session_id = dialog.session_id;
             let submission = SshCredentialSubmission {
                 profile_id: dialog.profile_id.clone(),
                 expected_host: dialog.expected_host.clone(),
@@ -4252,8 +4336,10 @@ fn ssh_runtime_modals(
                 private_key_path: dialog.private_key_path.take(),
                 key_passphrase: std::mem::take(&mut dialog.key_passphrase),
             };
-            out.ssh_runtime_action =
-                Some(SshRuntimeAction::ConnectWithCredential(submission));
+            out.ssh_runtime_action = Some(SshRuntimeAction::ConnectWithCredential {
+                session_id,
+                submission,
+            });
         }
     }
 
@@ -4298,13 +4384,14 @@ fn ssh_runtime_modals(
             });
         if accept {
             out.ssh_runtime_action = Some(SshRuntimeAction::TrustHostKey {
+                session_id: host_key.session_id,
                 profile_id: host_key.profile_id.clone(),
                 algorithm: host_key.algorithm.clone(),
                 fingerprint: host_key.sha256_fingerprint.clone(),
             });
         } else if dismiss {
             out.ssh_runtime_action = Some(SshRuntimeAction::DismissHostKey {
-                profile_id: host_key.profile_id.clone(),
+                session_id: host_key.session_id,
             });
         }
     }
