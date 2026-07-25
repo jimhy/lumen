@@ -171,7 +171,6 @@ struct Document {
     error: Option<String>,
     pending_save: Option<PendingSave>,
     save_conflict: bool,
-    saved_flash_until: Option<std::time::Instant>,
     source_valid: bool,
 }
 
@@ -190,7 +189,6 @@ impl Document {
             error: None,
             pending_save: None,
             save_conflict: false,
-            saved_flash_until: None,
             source_valid: true,
         }
     }
@@ -217,6 +215,10 @@ pub struct TextEditorState {
     documents: Vec<Document>,
     active_token: Option<u64>,
     next_token: u64,
+    /// 文档仍在内存中、但中央工作区是否正在显示编辑器。
+    ///
+    /// 隐藏只切换此标志；所有标签、正文、脏状态和异步读写状态都保留。
+    visible: bool,
     focus_editor: bool,
     find_open: bool,
     focus_find: bool,
@@ -238,6 +240,38 @@ impl TextEditorState {
     #[must_use]
     pub fn is_open(&self) -> bool {
         !self.documents.is_empty()
+    }
+
+    /// 编辑器既有打开文档，又正在占用中央工作区。
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        self.visible && self.is_open()
+    }
+
+    /// 暂时隐藏编辑器并把键盘/IME 交还工作区。
+    ///
+    /// 不关闭任何标签，也不改变正文、脏状态、关闭确认或异步保存状态。
+    pub fn hide(&mut self) -> bool {
+        if !self.is_visible() {
+            return false;
+        }
+        self.visible = false;
+        self.focus_editor = false;
+        self.focus_find = false;
+        self.dismiss_completion();
+        true
+    }
+
+    /// 恢复仍有打开文档的编辑器，并在下一帧聚焦当前正文。
+    pub fn restore(&mut self) -> bool {
+        if !self.is_open() || self.visible {
+            return false;
+        }
+        self.visible = true;
+        self.focus_editor = true;
+        self.focus_find = false;
+        self.dismiss_completion();
+        true
     }
 
     #[must_use]
@@ -270,6 +304,7 @@ impl TextEditorState {
             .map(|document| document.token)
         {
             self.active_token = Some(token);
+            self.visible = true;
             self.focus_editor = true;
             self.cancel_close_flow();
             self.dismiss_completion();
@@ -285,6 +320,7 @@ impl TextEditorState {
         self.documents
             .push(Document::loading(source.clone(), token));
         self.active_token = Some(token);
+        self.visible = true;
         self.find_open = false;
         self.focus_find = false;
         self.find_query.clear();
@@ -443,8 +479,6 @@ impl TextEditorState {
                 .unwrap_or(u64::MAX);
                 document.error = None;
                 document.save_conflict = false;
-                document.saved_flash_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                 (false, false)
             }
             Err(SaveFailure::Conflict) => {
@@ -488,7 +522,6 @@ impl TextEditorState {
             document.source_valid = false;
             document.pending_save = None;
             document.save_conflict = false;
-            document.saved_flash_until = None;
             document.error = Some(message.clone());
             if document.state == LoadState::Loading {
                 document.state = LoadState::Error;
@@ -504,6 +537,7 @@ impl TextEditorState {
     pub fn close_without_prompt(&mut self) {
         self.documents.clear();
         self.active_token = None;
+        self.visible = false;
         self.pending_close = None;
         self.post_save_close = None;
         self.close_editor_discarded.clear();
@@ -551,6 +585,7 @@ impl TextEditorState {
         self.close_editor_discarded.remove(&token);
         if self.documents.is_empty() {
             self.active_token = None;
+            self.visible = false;
             self.find_open = false;
             self.focus_find = false;
             self.find_query.clear();
@@ -664,12 +699,16 @@ pub struct Output {
     pub load: Option<LoadRequest>,
     pub save: Option<SaveRequest>,
     pub closed: bool,
+    pub hidden: bool,
 }
 
 /// 在中央工作区绘制编辑器。侧栏和目录树仍可见，终端继续在后台运行，
 /// 但调用方应把键盘/IME 焦点交给 egui。
 pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Output {
     let mut output = Output::default();
+    if !state.is_visible() {
+        return output;
+    }
     finish_deferred_action(state, &mut output);
     if output.closed {
         return output;
@@ -721,7 +760,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
         .inner_margin(egui::Margin::same(0))
         .show(ui, |ui| {
             editor_header(ui, state, pal, &mut output);
-            if output.closed || !state.is_open() {
+            if output.closed || output.hidden || !state.is_open() {
                 return;
             }
             if state.find_open {
@@ -772,6 +811,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
             }
         });
 
+    if output.hidden {
+        return output;
+    }
     if save_shortcut
         && output.save.is_none()
         && state.pending_close.is_none()
@@ -835,6 +877,24 @@ struct TabSnapshot {
     active: bool,
 }
 
+fn editor_hide_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), pal.bg_highlight);
+    }
+    let color = if response.hovered() { pal.fg } else { pal.fg_dim };
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.center().x - 5.0, rect.center().y + 3.0),
+            egui::pos2(rect.center().x + 5.0, rect.center().y + 3.0),
+        ],
+        egui::Stroke::new(1.4_f32, color),
+    );
+    response
+}
+
 fn editor_header(
     ui: &mut egui::Ui,
     state: &mut TextEditorState,
@@ -854,6 +914,7 @@ fn editor_header(
         .collect::<Vec<_>>();
     let mut activate = None;
     let mut close_tab = None;
+    let mut hide_editor = false;
     let mut close_editor = false;
     let close_editor_tip = if state.is_dirty() {
         crate::i18n::strings().text_editor_unsaved_title
@@ -873,7 +934,7 @@ fn editor_header(
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let tabs_width = (ui.available_width() - 32.0).max(96.0);
+                let tabs_width = (ui.available_width() - 60.0).max(96.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(tabs_width, 30.0),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -948,6 +1009,12 @@ fn editor_header(
                             });
                     },
                 );
+                if editor_hide_button(ui, pal)
+                    .on_hover_text(crate::i18n::strings().text_editor_hide)
+                    .clicked()
+                {
+                    hide_editor = true;
+                }
                 if ui
                     .add(
                         egui::Button::new(egui::RichText::new("×").size(14.0).color(pal.fg_dim))
@@ -967,28 +1034,24 @@ fn editor_header(
     if let Some(token) = close_tab {
         state.request_close_tab(token, output);
     }
+    if hide_editor && state.hide() {
+        output.hidden = true;
+        ui.ctx().memory_mut(|memory| {
+            if let Some(focused) = memory.focused() {
+                memory.surrender_focus(focused);
+            }
+        });
+    }
     if close_editor {
         state.request_close_editor(output);
     }
-    if output.closed {
+    if output.closed || output.hidden {
         return;
     }
 
-    let Some((source, dirty, saving, can_save, saved_recent)) =
-        state.active_document().map(|document| {
-            (
-                document.source.clone(),
-                document.dirty(),
-                document.pending_save.is_some(),
-                document.state == LoadState::Ready
-                    && document.source_valid
-                    && document.dirty()
-                    && document.pending_save.is_none(),
-                document
-                    .saved_flash_until
-                    .is_some_and(|until| until > std::time::Instant::now()),
-            )
-        })
+    let Some(source) = state
+        .active_document()
+        .map(|document| document.source.clone())
     else {
         return;
     };
@@ -1014,27 +1077,6 @@ fn editor_header(
                     .truncate()
                     .selectable(true),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(can_save, egui::Button::new(crate::i18n::strings().ssh_save))
-                        .on_hover_text("Ctrl+S")
-                        .clicked()
-                    {
-                        output.save = state.build_save_request(false);
-                    }
-                    let status = if saving {
-                        crate::i18n::strings().text_editor_saving
-                    } else if saved_recent || !dirty {
-                        crate::i18n::strings().text_editor_saved
-                    } else {
-                        crate::i18n::strings().text_editor_unsaved
-                    };
-                    ui.label(egui::RichText::new(status).size(11.0).color(if dirty {
-                        pal.fg
-                    } else {
-                        pal.fg_dim
-                    }));
-                });
             });
         });
 }
@@ -2290,6 +2332,116 @@ mod tests {
         assert_eq!(state.active_token, Some(first));
         assert_eq!(state.documents.len(), 2);
         assert_eq!(state.document(first).expect("first").text, "one changed");
+    }
+
+    #[test]
+    fn hide_and_restore_preserve_tabs_dirty_buffers_and_pending_save() {
+        let mut state = TextEditorState::default();
+        let first = open_loaded(&mut state, remote(2, "/tmp/first.txt"), "one");
+        edit(&mut state, first, "one changed");
+        let second = open_loaded(&mut state, ssh(3, 4, "/tmp/second.txt"), "two");
+        edit(&mut state, second, "two saving");
+        let save = state.build_save_request(false).expect("save request");
+        assert!(state.mark_saving(&save));
+        state.find_open = true;
+        state.find_query = "needle".to_owned();
+
+        assert!(state.is_open());
+        assert!(state.is_visible());
+        assert!(state.hide());
+        assert!(state.is_open());
+        assert!(!state.is_visible());
+        assert!(state.is_dirty());
+        assert_eq!(state.documents.len(), 2);
+        assert_eq!(state.active_token, Some(second));
+        assert_eq!(state.document(first).expect("first").text, "one changed");
+        assert_eq!(state.document(second).expect("second").text, "two saving");
+        assert!(state
+            .document(second)
+            .expect("second")
+            .pending_save
+            .is_some());
+        assert!(state.find_open);
+        assert_eq!(state.find_query, "needle");
+        assert!(!state.hide(), "重复隐藏不应报告状态变化");
+
+        assert!(state.restore());
+        assert!(state.is_visible());
+        assert!(state.focus_editor);
+        assert!(!state.restore(), "重复恢复不应报告状态变化");
+        assert_eq!(state.documents.len(), 2);
+        assert!(state.document(first).expect("first").dirty());
+        assert!(state
+            .document(second)
+            .expect("second")
+            .pending_save
+            .is_some());
+    }
+
+    #[test]
+    fn opening_a_file_restores_a_hidden_editor_without_losing_existing_tabs() {
+        let mut state = TextEditorState::default();
+        let first_source = remote(5, "/tmp/first.txt");
+        let first = open_loaded(&mut state, first_source.clone(), "one");
+        edit(&mut state, first, "one changed");
+        assert!(state.hide());
+
+        assert!(state.request_open(first_source).is_none());
+        assert!(state.is_visible());
+        assert_eq!(state.active_token, Some(first));
+        assert_eq!(state.documents.len(), 1);
+        assert_eq!(state.document(first).expect("first").text, "one changed");
+
+        assert!(state.hide());
+        let second = state
+            .request_open(remote(5, "/tmp/second.txt"))
+            .expect("new load request");
+        assert!(state.is_visible());
+        assert_eq!(state.active_token, Some(second.token));
+        assert_eq!(state.documents.len(), 2);
+        assert_eq!(state.document(first).expect("first").text, "one changed");
+    }
+
+    #[test]
+    fn async_load_and_save_results_apply_without_restoring_hidden_editor() {
+        let mut state = TextEditorState::default();
+        let load = state
+            .request_open(ssh(8, 9, "/tmp/async.txt"))
+            .expect("load request");
+        assert!(state.hide());
+        assert!(state.apply_loaded(load.token, Ok(b"before".to_vec())));
+        assert!(!state.is_visible());
+        assert_eq!(state.document(load.token).expect("document").text, "before");
+
+        assert!(state.restore());
+        edit(&mut state, load.token, "after");
+        let save = state.build_save_request(false).expect("save request");
+        assert!(state.mark_saving(&save));
+        assert!(state.hide());
+        assert!(state.apply_saved(save.token, Ok(())));
+
+        assert!(!state.is_visible());
+        assert!(state.is_open());
+        assert!(!state.is_dirty());
+        assert_eq!(state.document(load.token).expect("document").text, "after");
+        assert_eq!(
+            state.document(load.token).expect("document").saved_text,
+            "after"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_tab_also_clears_editor_visibility() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, ssh(6, 7, "/tmp/only.txt"), "clean");
+        let mut output = Output::default();
+
+        state.request_close_tab(token, &mut output);
+
+        assert!(output.closed);
+        assert!(!state.is_open());
+        assert!(!state.is_visible());
+        assert!(!state.restore());
     }
 
     #[test]

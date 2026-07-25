@@ -246,6 +246,7 @@ pub enum SshFileAction {
     OpenLocalCopy,
     CreateDirectory,
     CreateFile,
+    Rename,
     Delete,
     Download,
     Upload,
@@ -419,7 +420,8 @@ enum PendingFileRequest {
     },
     Operation {
         action: SshFileAction,
-        refresh_directory: Option<String>,
+        refresh_directories: Vec<String>,
+        invalidate_subtree: Option<String>,
         local_path: Option<PathBuf>,
     },
 }
@@ -1215,7 +1217,8 @@ impl SshRuntime {
             token,
             PendingFileRequest::Operation {
                 action,
-                refresh_directory: Some(directory),
+                refresh_directories: vec![directory],
+                invalidate_subtree: None,
                 local_path: None,
             },
         );
@@ -1249,7 +1252,49 @@ impl SshRuntime {
             token,
             PendingFileRequest::Operation {
                 action: SshFileAction::Delete,
-                refresh_directory,
+                refresh_directories: refresh_directory.into_iter().collect(),
+                invalidate_subtree: None,
+                local_path: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn move_entry(
+        &mut self,
+        session_id: SshSessionId,
+        source_path: String,
+        source_is_directory: bool,
+        target_directory: String,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| "SSH session no longer exists".to_owned())?;
+        let (source_parent, destination) = plan_move_entry(
+            session,
+            &source_path,
+            source_is_directory,
+            &target_directory,
+        )?;
+        let token = allocate_file_token(session)?;
+        send_file_command(
+            session,
+            FileCommand::Rename {
+                token,
+                from: source_path.clone(),
+                to: destination,
+            },
+        )?;
+
+        let refresh_directories = vec![target_directory, source_parent];
+        session.selected_file = None;
+        session.pending_file_requests.insert(
+            token,
+            PendingFileRequest::Operation {
+                action: SshFileAction::Rename,
+                refresh_directories,
+                invalidate_subtree: Some(source_path),
                 local_path: None,
             },
         );
@@ -1282,7 +1327,8 @@ impl SshRuntime {
             token,
             PendingFileRequest::Operation {
                 action: SshFileAction::Download,
-                refresh_directory: None,
+                refresh_directories: Vec::new(),
+                invalidate_subtree: None,
                 local_path: Some(completed_local_path),
             },
         );
@@ -1342,7 +1388,8 @@ impl SshRuntime {
             token,
             PendingFileRequest::Operation {
                 action: SshFileAction::Upload,
-                refresh_directory: Some(remote_directory),
+                refresh_directories: vec![remote_directory],
+                invalidate_subtree: None,
                 local_path: Some(completed_local_path),
             },
         );
@@ -1774,6 +1821,38 @@ fn known_tree_path(session: &RuntimeSession, path: &str, is_directory: bool) -> 
     })
 }
 
+fn plan_move_entry(
+    session: &RuntimeSession,
+    source_path: &str,
+    source_is_directory: bool,
+    target_directory: &str,
+) -> Result<(String, String), String> {
+    if source_path == session.file_tree_root
+        || !known_tree_path(session, source_path, source_is_directory)
+    {
+        return Err("The SSH file selection is stale".to_owned());
+    }
+    if !known_directory(session, target_directory) {
+        return Err("The SSH target directory is stale".to_owned());
+    }
+    let source_parent = linux_parent(source_path)
+        .ok_or_else(|| "The SSH source path is invalid".to_owned())?
+        .to_owned();
+    if source_parent == target_directory {
+        return Err("The SSH item is already in that directory".to_owned());
+    }
+    if source_is_directory && linux_path_is_same_or_descendant(target_directory, source_path) {
+        return Err("An SSH directory cannot be moved into itself".to_owned());
+    }
+
+    let destination_name = linux_basename(source_path);
+    validate_linux_entry_name(destination_name)?;
+    Ok((
+        source_parent,
+        join_linux_path(target_directory, destination_name),
+    ))
+}
+
 fn tree_entry_metadata(session: &RuntimeSession, path: &str) -> Option<(String, u64)> {
     session
         .directory_listings
@@ -1859,6 +1938,13 @@ fn join_linux_path(directory: &str, name: &str) -> String {
     } else {
         format!("{}/{name}", directory.trim_end_matches('/'))
     }
+}
+
+fn linux_path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn validate_linux_entry_name(name: &str) -> Result<(), String> {
@@ -2141,14 +2227,16 @@ fn apply_file_event(
         (
             PendingFileRequest::Operation {
                 action,
-                refresh_directory,
+                refresh_directories,
+                invalidate_subtree,
                 local_path,
             },
             FileEvent::OperationComplete { operation, .. },
         ) => {
-            let refreshed = refresh_directory
-                .as_deref()
-                .is_some_and(|path| refresh_cached_directory(session, path));
+            if let Some(path) = invalidate_subtree {
+                invalidate_cached_subtree(session, &path);
+            }
+            let refreshed = refresh_cached_directories(session, &refresh_directories);
             output.push(SshFileRuntimeEvent::OperationComplete {
                 session_id,
                 operation,
@@ -2253,6 +2341,52 @@ fn refresh_cached_directory(session: &mut RuntimeSession, path: &str) -> bool {
     session.directory_listings.remove(path);
     session.open_directories.insert(path.to_owned());
     request_directory(session, path)
+}
+
+fn refresh_cached_directories(session: &mut RuntimeSession, paths: &[String]) -> bool {
+    let mut refresh = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !refresh.iter().any(|existing| existing == path) && known_directory(session, path) {
+            refresh.push(path.clone());
+        }
+    }
+    for path in &refresh {
+        cancel_directory_path(session, path);
+        session.directory_listings.remove(path);
+        session.open_directories.insert(path.clone());
+    }
+    for path in &refresh {
+        let _ = request_directory(session, path);
+    }
+    !refresh.is_empty()
+}
+
+fn invalidate_cached_subtree(session: &mut RuntimeSession, root: &str) {
+    let pending_paths = session
+        .latest_directory_request
+        .keys()
+        .filter(|path| linux_path_is_same_or_descendant(path, root))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in pending_paths {
+        cancel_directory_path(session, &path);
+    }
+    session
+        .directory_listings
+        .retain(|path, _| !linux_path_is_same_or_descendant(path, root));
+    session
+        .open_directories
+        .retain(|path| !linux_path_is_same_or_descendant(path, root));
+    if session
+        .selected_file
+        .as_ref()
+        .is_some_and(|(path, _)| linux_path_is_same_or_descendant(path, root))
+    {
+        session.selected_file = None;
+    }
+    session
+        .search_entries
+        .retain(|entry| !linux_path_is_same_or_descendant(&entry.path, root));
 }
 
 fn directory_entry_belongs_to(parent: &str, entry: &DirectoryEntry) -> bool {
@@ -3464,6 +3598,206 @@ mod tests {
             runtime.active_paste_target(),
             Some((session_id, "/opt/project".to_owned())),
             "搜索结果文件的父目录也应成为粘贴目标"
+        );
+    }
+
+    fn move_test_session() -> RuntimeSession {
+        let p = profile(AuthMethod::Agent);
+        let mut session = RuntimeSession::new(&p);
+        session.file_tree_root = "/srv".to_owned();
+        session.directory_listings.insert(
+            "/srv".to_owned(),
+            DirectoryListing {
+                entries: vec![
+                    DirectoryEntry {
+                        name: "app".to_owned(),
+                        path: "/srv/app".to_owned(),
+                        kind: DirectoryEntryKind::Directory,
+                        size: 0,
+                    },
+                    DirectoryEntry {
+                        name: "apple".to_owned(),
+                        path: "/srv/apple".to_owned(),
+                        kind: DirectoryEntryKind::Directory,
+                        size: 0,
+                    },
+                    DirectoryEntry {
+                        name: "archive".to_owned(),
+                        path: "/srv/archive".to_owned(),
+                        kind: DirectoryEntryKind::Directory,
+                        size: 0,
+                    },
+                    DirectoryEntry {
+                        name: "readme.txt".to_owned(),
+                        path: "/srv/readme.txt".to_owned(),
+                        kind: DirectoryEntryKind::File,
+                        size: 12,
+                    },
+                ],
+                truncated: false,
+            },
+        );
+        session.directory_listings.insert(
+            "/srv/app".to_owned(),
+            DirectoryListing {
+                entries: vec![DirectoryEntry {
+                    name: "src".to_owned(),
+                    path: "/srv/app/src".to_owned(),
+                    kind: DirectoryEntryKind::Directory,
+                    size: 0,
+                }],
+                truncated: false,
+            },
+        );
+        session
+    }
+
+    #[test]
+    fn ssh_move_plan_rejects_root_same_parent_and_directory_cycles() {
+        let session = move_test_session();
+        assert_eq!(
+            plan_move_entry(&session, "/srv/readme.txt", false, "/srv/archive").unwrap(),
+            ("/srv".to_owned(), "/srv/archive/readme.txt".to_owned())
+        );
+        assert_eq!(
+            plan_move_entry(&session, "/srv/app", true, "/srv/apple").unwrap(),
+            ("/srv".to_owned(), "/srv/apple/app".to_owned()),
+            "路径组件不同的相同字符串前缀不得误判为子树"
+        );
+
+        for (source, is_directory, target) in [
+            ("/srv", true, "/srv/archive"),
+            ("/srv/readme.txt", false, "/srv"),
+            ("/srv/app", true, "/srv/app"),
+            ("/srv/app", true, "/srv/app/src"),
+        ] {
+            assert!(
+                plan_move_entry(&session, source, is_directory, target).is_err(),
+                "{source} -> {target} 必须被拒绝"
+            );
+        }
+        assert!(
+            plan_move_entry(&session, "/srv/readme.txt", true, "/srv/archive").is_err(),
+            "过期或伪造的目录类型不可绕过缓存校验"
+        );
+        assert!(
+            plan_move_entry(&session, "/srv/app", true, "/srv/missing").is_err(),
+            "目标目录必须仍在当前 SSH 文件树缓存中"
+        );
+    }
+
+    #[test]
+    fn completed_ssh_move_invalidates_subtree_and_refreshes_both_directories() {
+        let mut session = move_test_session();
+        session.directory_listings.insert(
+            "/srv/app/src".to_owned(),
+            DirectoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        );
+        session.directory_listings.insert(
+            "/srv/apple".to_owned(),
+            DirectoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        );
+        session.open_directories = HashSet::from([
+            "/srv".to_owned(),
+            "/srv/app".to_owned(),
+            "/srv/app/src".to_owned(),
+            "/srv/apple".to_owned(),
+        ]);
+        session.selected_file = Some(("/srv/app/src/main.rs".to_owned(), false));
+        session.search_entries = vec![
+            DirectoryEntry {
+                name: "main.rs".to_owned(),
+                path: "/srv/app/src/main.rs".to_owned(),
+                kind: DirectoryEntryKind::File,
+                size: 1,
+            },
+            DirectoryEntry {
+                name: "keep.txt".to_owned(),
+                path: "/srv/apple/keep.txt".to_owned(),
+                kind: DirectoryEntryKind::File,
+                size: 1,
+            },
+        ];
+        session
+            .pending_directories
+            .insert(41, "/srv/app/src".to_owned());
+        session
+            .latest_directory_request
+            .insert("/srv/app/src".to_owned(), 41);
+        session
+            .pending_directories
+            .insert(42, "/srv/apple".to_owned());
+        session
+            .latest_directory_request
+            .insert("/srv/apple".to_owned(), 42);
+        session.pending_file_requests.insert(
+            9,
+            PendingFileRequest::Operation {
+                action: SshFileAction::Rename,
+                refresh_directories: vec!["/srv/archive".to_owned(), "/srv".to_owned()],
+                invalidate_subtree: Some("/srv/app".to_owned()),
+                local_path: None,
+            },
+        );
+
+        let mut events = Vec::new();
+        assert!(apply_file_event(
+            7,
+            &mut session,
+            FileEvent::OperationComplete {
+                token: 9,
+                operation: FileOperation::Rename,
+                version: None,
+            },
+            &mut events,
+        ));
+        assert!(matches!(
+            events.as_slice(),
+            [SshFileRuntimeEvent::OperationComplete {
+                session_id: 7,
+                operation: FileOperation::Rename,
+                ..
+            }]
+        ));
+        assert!(!session.directory_listings.contains_key("/srv/app"));
+        assert!(!session.directory_listings.contains_key("/srv/app/src"));
+        assert!(
+            !session.directory_listings.contains_key("/srv"),
+            "源父目录缓存必须失效"
+        );
+        assert!(
+            session.directory_listings.contains_key("/srv/apple"),
+            "不相关子树缓存必须保留"
+        );
+        assert!(session.open_directories.contains("/srv"));
+        assert!(
+            session.open_directories.contains("/srv/archive"),
+            "目标即便此前折叠且仅由源父 listing 得知，也必须进入刷新集合"
+        );
+        assert!(!session.open_directories.contains("/srv/app"));
+        assert!(!session.open_directories.contains("/srv/app/src"));
+        assert!(session.selected_file.is_none());
+        assert_eq!(
+            session
+                .search_entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/srv/apple/keep.txt"]
+        );
+        assert!(!session.pending_directories.contains_key(&41));
+        assert!(!session
+            .latest_directory_request
+            .contains_key("/srv/app/src"));
+        assert_eq!(
+            session.pending_directories.get(&42).map(String::as_str),
+            Some("/srv/apple")
         );
     }
 

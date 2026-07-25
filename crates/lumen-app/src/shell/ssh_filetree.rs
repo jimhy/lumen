@@ -71,6 +71,12 @@ pub enum SshFileTreeIntent {
         session_id: crate::ssh_runtime::SshSessionId,
         directory: String,
     },
+    MoveEntry {
+        session_id: crate::ssh_runtime::SshSessionId,
+        source_path: String,
+        source_is_directory: bool,
+        target_directory: String,
+    },
     CreateEntry {
         session_id: crate::ssh_runtime::SshSessionId,
         directory: String,
@@ -94,6 +100,7 @@ pub struct Output {
     pub panel_width: Option<f32>,
     pub panel_rect: Option<egui::Rect>,
     pub hovered: bool,
+    pub focused: bool,
     pub copy_text: Option<String>,
     /// 目录激活时 SSH shell 正忙，未向终端注入 `cd`。
     pub busy_hint: bool,
@@ -371,7 +378,7 @@ fn draw_tree(
         .show(ui, |ui| {
             let (response, actions) = TreeView::new(state_id)
                 .allow_multi_selection(false)
-                .allow_drag_and_drop(false)
+                .allow_drag_and_drop(true)
                 .show_state(ui, &mut state, |builder| {
                     let root_open =
                         add_ltree_entry(builder, &root_entry, tree, pal, permissions, &deferred);
@@ -413,17 +420,46 @@ fn draw_tree(
                     }
                     builder.close_dir();
                 });
+            if response.clicked() || response.secondary_clicked() {
+                response.request_focus();
+            }
+            output.focused = response.has_focus();
 
             let mut activated = Vec::new();
             let mut selected_now = None;
+            let mut move_intent = None;
             for action in actions {
                 match action {
                     Action::Activate(action) => activated.extend(action.selected),
                     Action::SetSelected(selected) => selected_now = Some(selected),
-                    Action::Move(_)
-                    | Action::Drag(_)
-                    | Action::DragExternal(_)
-                    | Action::MoveExternal(_) => {}
+                    Action::Move(action) => {
+                        let Some(source) = action.source.first() else {
+                            continue;
+                        };
+                        move_intent = move_entry_intent(
+                            tree.session_id,
+                            &root_entry,
+                            &entries,
+                            source,
+                            &action.target,
+                        );
+                    }
+                    Action::Drag(action) => {
+                        let allowed = action.source.first().is_some_and(|source| {
+                            move_entry_intent(
+                                tree.session_id,
+                                &root_entry,
+                                &entries,
+                                source,
+                                &action.target,
+                            )
+                            .is_some()
+                        });
+                        if !allowed {
+                            action.remove_drop_marker(ui);
+                        }
+                    }
+                    Action::DragExternal(_) | Action::MoveExternal(_) => {}
                 }
             }
 
@@ -481,6 +517,12 @@ fn draw_tree(
                         size: entry.size,
                     });
                 }
+            }
+
+            if let Some(intent) = move_intent {
+                state.set_selected(Vec::new());
+                *selected_path = None;
+                output.intents.push(intent);
             }
         });
 
@@ -582,6 +624,10 @@ fn draw_search_results(
                     selected_path.as_deref() == Some(row.path.as_str()),
                     pal,
                 );
+                if response.clicked() || response.secondary_clicked() {
+                    response.request_focus();
+                }
+                output.focused |= response.has_focus();
                 if response.double_clicked() {
                     select_entry(
                         tree.session_id,
@@ -733,7 +779,7 @@ fn add_ltree_entry(
         NodeBuilder::dir(id)
             .activatable(true)
             .default_open(entry.is_root)
-            .drop_allowed(false)
+            .drop_allowed(true)
             .label_ui(move |ui| {
                 if shared_ltree_dir_label(ui, &label, refresh_id, fg_dim) {
                     refresh.borrow_mut().refresh = Some(refresh_path.clone());
@@ -910,6 +956,43 @@ fn apply_menu_action(
     }
 }
 
+fn move_entry_intent(
+    session_id: crate::ssh_runtime::SshSessionId,
+    root: &OwnedEntry,
+    entries: &[OwnedEntry],
+    source_path: &str,
+    target_directory: &str,
+) -> Option<SshFileTreeIntent> {
+    let source = entry_for_path(root, entries, source_path)?;
+    let target = entry_for_path(root, entries, target_directory)?;
+    if source.is_root || target.kind != DirectoryEntryKind::Directory {
+        return None;
+    }
+
+    let source_parent = linux_parent(&source.path)?;
+    if source_parent == target.path {
+        return None;
+    }
+    let source_is_directory = source.kind == DirectoryEntryKind::Directory;
+    if source_is_directory && linux_path_is_same_or_descendant(&target.path, &source.path) {
+        return None;
+    }
+
+    Some(SshFileTreeIntent::MoveEntry {
+        session_id,
+        source_path: source.path.clone(),
+        source_is_directory,
+        target_directory: target.path.clone(),
+    })
+}
+
+fn linux_path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn queue_change_directory(
     output: &mut Output,
     session_id: crate::ssh_runtime::SshSessionId,
@@ -1041,6 +1124,75 @@ mod tests {
                 session_id: 7,
                 directory: "/srv/app".to_owned(),
             }]
+        );
+    }
+
+    fn owned_entry(path: &str, kind: DirectoryEntryKind, is_root: bool) -> OwnedEntry {
+        OwnedEntry {
+            path: path.to_owned(),
+            name: linux_basename(path).to_owned(),
+            kind,
+            size: 0,
+            depth: usize::from(!is_root),
+            expanded: false,
+            loading: false,
+            is_root,
+        }
+    }
+
+    #[test]
+    fn tree_drag_moves_entries_only_into_safe_different_directories() {
+        let root = owned_entry("/srv", DirectoryEntryKind::Directory, true);
+        let entries = vec![
+            owned_entry("/srv/app", DirectoryEntryKind::Directory, false),
+            owned_entry("/srv/app/src", DirectoryEntryKind::Directory, false),
+            owned_entry("/srv/apple", DirectoryEntryKind::Directory, false),
+            owned_entry("/srv/archive", DirectoryEntryKind::Directory, false),
+            owned_entry("/srv/readme.txt", DirectoryEntryKind::File, false),
+        ];
+
+        assert_eq!(
+            move_entry_intent(7, &root, &entries, "/srv/readme.txt", "/srv/archive"),
+            Some(SshFileTreeIntent::MoveEntry {
+                session_id: 7,
+                source_path: "/srv/readme.txt".to_owned(),
+                source_is_directory: false,
+                target_directory: "/srv/archive".to_owned(),
+            })
+        );
+        assert_eq!(
+            move_entry_intent(7, &root, &entries, "/srv/app", "/srv/archive"),
+            Some(SshFileTreeIntent::MoveEntry {
+                session_id: 7,
+                source_path: "/srv/app".to_owned(),
+                source_is_directory: true,
+                target_directory: "/srv/archive".to_owned(),
+            })
+        );
+
+        assert!(
+            move_entry_intent(7, &root, &entries, "/srv", "/srv/archive").is_none(),
+            "文件树根节点不可移动"
+        );
+        assert!(
+            move_entry_intent(7, &root, &entries, "/srv/readme.txt", "/srv").is_none(),
+            "拖到原父目录只是无意义的同目录重排"
+        );
+        assert!(
+            move_entry_intent(7, &root, &entries, "/srv/app", "/srv/app").is_none(),
+            "目录不可移入自身"
+        );
+        assert!(
+            move_entry_intent(7, &root, &entries, "/srv/app", "/srv/app/src").is_none(),
+            "目录不可移入自己的子树"
+        );
+        assert!(
+            move_entry_intent(7, &root, &entries, "/srv/readme.txt", "/srv/readme.txt").is_none(),
+            "文件节点不是合法落点"
+        );
+        assert!(
+            move_entry_intent(7, &root, &entries, "/srv/app", "/srv/apple").is_some(),
+            "相同字符串前缀但不同路径组件不得被误判为子树"
         );
     }
 }

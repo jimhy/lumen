@@ -46,6 +46,8 @@ const BTN_GAP: f32 = 4.0;
 /// 一帧工具栏 UI 的产出。
 #[derive(Default)]
 pub struct ToolbarOutput {
+    /// 恢复暂时隐藏、但仍保留打开文档的内置编辑器。
+    pub restore_text_editor: bool,
     /// 切换远程设备栏显示/隐藏。None = 未点击，Some(v) = 新可见值。
     pub toggle_remote_list: Option<bool>,
     /// 切换 SSH 服务器栏显示/隐藏。None = 未点击，Some(v) = 新可见值。
@@ -62,6 +64,8 @@ pub struct ToolbarOutput {
 
 /// 工具栏按钮的当前状态（打包传入 [`show`]，仿 topbar::ViewState 模式）。
 pub struct ViewState {
+    /// 内置编辑器有打开文档、但当前已暂时隐藏。
+    pub text_editor_hidden: bool,
     /// 是否为远程视图；仅为 true 时渲染设备栏按钮。
     pub remote_view: bool,
     /// 是否为 SSH 视图；仅为 true 时渲染服务器栏按钮。
@@ -125,6 +129,18 @@ pub fn show(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let s = i18n::strings();
                 ui.add_space(RIGHT_MARGIN);
+
+                if view.text_editor_hidden {
+                    let (editor_rect, editor_resp) =
+                        ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
+                    draw_icon_editor(ui, editor_rect, pal);
+                    if editor_resp.on_hover_text(s.text_editor_restore).clicked() {
+                        out.restore_text_editor = true;
+                    }
+                    if view.session_actions_enabled {
+                        ui.add_space(BTN_GAP);
+                    }
+                }
 
                 // SSH 服务器选择页不操作后台本地 Session。
                 if view.session_actions_enabled {
@@ -233,6 +249,36 @@ pub fn show(
 // ── 图标绘制子函数（自 topbar 迁入；R8.2 精绘规格原样保留）────────────────
 // 视觉盒 ~18×14 逻辑 px 居中于 28×26 热区；线宽 1.2；
 // 颜色常态 fg_dim，hover fg；hover 圆角底 bg_highlight（圆角 4）。
+
+/// 暂时隐藏的文本编辑器：纸张轮廓 + 三行正文。
+fn draw_icon_editor(ui: &egui::Ui, rect: egui::Rect, pal: &Palette) {
+    let painter = ui.painter();
+    if ui.rect_contains_pointer(rect) {
+        painter.rect_filled(rect, egui::CornerRadius::same(4), pal.bg_highlight);
+    }
+    let color = if ui.rect_contains_pointer(rect) {
+        pal.fg
+    } else {
+        pal.fg_dim
+    };
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    let page = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 17.0));
+    painter.rect_stroke(
+        page,
+        egui::CornerRadius::same(1),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    for offset in [-4.0_f32, 0.0, 4.0] {
+        painter.line_segment(
+            [
+                egui::pos2(page.min.x + 3.0, page.center().y + offset),
+                egui::pos2(page.max.x - 3.0, page.center().y + offset),
+            ],
+            stroke,
+        );
+    }
+}
 
 /// 远程设备栏图标：显示器 + 手机，表达「设备列表」且与相邻的会话侧栏
 /// 图标保持明显区分。可见态用 fg，隐藏态用 fg_dim。
@@ -458,6 +504,7 @@ mod toolbar_layout_tests {
                 1,
                 &pal,
                 ViewState {
+                    text_editor_hidden: false,
                     remote_view: false,
                     ssh_view: false,
                     session_actions_enabled: true,
@@ -491,6 +538,7 @@ mod toolbar_layout_tests {
                 2,
                 &pal,
                 ViewState {
+                    text_editor_hidden: false,
                     remote_view: false,
                     ssh_view: false,
                     session_actions_enabled: true,
@@ -544,6 +592,7 @@ mod toolbar_layout_tests {
                 MAX_PANES,
                 &pal,
                 ViewState {
+                    text_editor_hidden: false,
                     remote_view: false,
                     ssh_view: false,
                     session_actions_enabled: true,
@@ -556,6 +605,7 @@ mod toolbar_layout_tests {
             );
             got_default = !out.new_pane
                 && !out.reset_layout
+                && !out.restore_text_editor
                 && out.toggle_remote_list.is_none()
                 && out.toggle_ssh_server_list.is_none()
                 && out.toggle_sidebar.is_none()
@@ -575,6 +625,7 @@ mod toolbar_layout_tests {
                     1,
                     &pal,
                     ViewState {
+                        text_editor_hidden: false,
                         remote_view,
                         ssh_view,
                         session_actions_enabled: true,
@@ -625,6 +676,7 @@ mod toolbar_layout_tests {
                     1,
                     &pal,
                     ViewState {
+                        text_editor_hidden: false,
                         remote_view: false,
                         ssh_view: true,
                         session_actions_enabled: false,
@@ -674,6 +726,7 @@ mod toolbar_layout_tests {
                 2,
                 &pal,
                 ViewState {
+                    text_editor_hidden: false,
                     remote_view: false,
                     ssh_view: true,
                     session_actions_enabled: false,
@@ -705,5 +758,58 @@ mod toolbar_layout_tests {
             .sum::<usize>();
         assert!(left >= 5, "SSH 模式必须保留会话栏与文件树按钮");
         assert_eq!(right, 0, "SSH 模式不得绘制本地新增/复位窗格按钮");
+    }
+
+    #[test]
+    fn 工具栏_隐藏编辑器按钮单击产出恢复动作() {
+        let ctx = egui::Context::default();
+        let pal = test_palette();
+        let pos = egui::pos2(1200.0 - RIGHT_MARGIN - BTN_W / 2.0, HEIGHT / 2.0);
+        let render = |events: Vec<egui::Event>| {
+            let mut input = test_input();
+            input.events = events;
+            let mut output = ToolbarOutput::default();
+            let _ = ctx.run_ui(input, |ui| {
+                output = show(
+                    ui,
+                    1,
+                    &pal,
+                    ViewState {
+                        text_editor_hidden: true,
+                        remote_view: false,
+                        ssh_view: true,
+                        session_actions_enabled: false,
+                        navigation_actions_enabled: true,
+                        remote_list_visible: true,
+                        ssh_server_list_visible: true,
+                        sidebar_visible: true,
+                        filetree_visible: true,
+                    },
+                );
+            });
+            output
+        };
+        let _ = render(vec![egui::Event::PointerMoved(pos)]);
+        let _ = render(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let output = render(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        assert!(output.restore_text_editor);
+        assert!(!output.new_pane);
+        assert!(!output.reset_layout);
     }
 }

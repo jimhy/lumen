@@ -854,7 +854,7 @@ fn ssh_file_operation_done_message(operation: lumen_ssh::FileOperation) -> Strin
         lumen_ssh::FileOperation::WriteText => "SSH 文件已保存".to_owned(),
         lumen_ssh::FileOperation::CreateDirectory => "SSH 文件夹已创建".to_owned(),
         lumen_ssh::FileOperation::CreateFile => "SSH 文件已创建".to_owned(),
-        lumen_ssh::FileOperation::Rename => "SSH 项目已重命名".to_owned(),
+        lumen_ssh::FileOperation::Rename => "SSH 项目已移动".to_owned(),
         lumen_ssh::FileOperation::Delete => "SSH 项目已永久删除".to_owned(),
         lumen_ssh::FileOperation::Download => "SSH 文件已下载".to_owned(),
         lumen_ssh::FileOperation::Upload => "文件已上传到 SSH 服务器".to_owned(),
@@ -872,6 +872,7 @@ fn ssh_file_error_message(
         ssh_runtime::SshFileAction::OpenLocalCopy => "下载并打开 SSH 文件",
         ssh_runtime::SshFileAction::CreateDirectory => "新建 SSH 文件夹",
         ssh_runtime::SshFileAction::CreateFile => "新建 SSH 文件",
+        ssh_runtime::SshFileAction::Rename => "移动 SSH 项目",
         ssh_runtime::SshFileAction::Delete => "删除 SSH 项目",
         ssh_runtime::SshFileAction::Download => "下载 SSH 文件",
         ssh_runtime::SshFileAction::Upload => "上传 SSH 文件",
@@ -1100,12 +1101,23 @@ struct AppState {
     ssh_paste_chains: HashMap<std::path::PathBuf, SshPasteChain>,
     /// 已完成 SSH→SSH 下载、正在上传的暂存文件；仅这些路径会在上传结束后删除。
     ssh_staged_uploads: HashSet<std::path::PathBuf>,
+    /// SSH 远端项导出到 Windows 文件剪贴板的当前代次。每次复制递增；
+    /// 较旧代次即使稍后才下载完成，也只能清理暂存，不能反抢系统剪贴板。
+    ssh_clipboard_export_generation: u64,
+    /// 正在为 Windows 文件剪贴板准备的 SSH 下载：本地暂存路径 → 发起时代次。
+    ssh_clipboard_exports: HashMap<std::path::PathBuf, SshClipboardExport>,
+    /// 当前写进系统 CF_HDROP 的本地暂存路径。该路径必须至少保留到下一次
+    /// SSH 复制成功替换系统剪贴板，否则资源管理器稍后粘贴会读到失效路径。
+    ssh_clipboard_ready_path: Option<std::path::PathBuf>,
     /// 粘贴完成后待刷新的目标目录 `(is_remote, dir)`：粘贴写文件到目录后，文件树缓存未更新、新
     /// 文件不显示，故传输完成（本机复制 / 下载 / 上传）时刷新该目录。do_file_paste 设、完成点消费。
     paste_refresh: Option<(bool, String)>,
-    /// 上一帧鼠标是否在文件树面板内（shell::show 报回）：winit 层 Ctrl+C/V 快捷键的门控
-    /// （egui 吞掉 Ctrl+V 必须在 winit 拦，但 winit 无 egui 的 contains_pointer，故用上一帧的）。
+    /// 上一帧鼠标是否在文件树面板内（shell::show 报回）；保留给鼠标
+    /// 焦点仲裁。Ctrl+C/V 已改用下面稳定的 TreeView 键盘焦点。
     filetree_hovered: bool,
+    /// 文件树原生 TreeView 是否持有键盘焦点。快捷键以焦点为准，
+    /// 不再要求鼠标持续悬停，也不会被 TreeView 自己的 egui 焦点反向阻断。
+    filetree_focused: bool,
     /// 本机复制粘贴（local→local，海风哥本轮新增）在途的完成回包通道（done, skipped, errors）。
     /// `Some` = 有一次本机复制在后台 fs 递归中；后台线程复制完经此回主线程弹 toast（并 send
     /// PtyWake 唤醒主循环收包，防空闲不重绘收不到）。同时充当并发闸：在途时拒绝起新本机复制。
@@ -2383,7 +2395,7 @@ impl AppState {
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.ssh_session_renaming.is_some()
             || self.shell_state.filetree.dialog_open()
-            || self.shell_state.text_editor.is_open()
+            || self.shell_state.text_editor.is_visible()
             || ssh_overlay;
         if overlay {
             return false;
@@ -2409,6 +2421,7 @@ impl AppState {
 
         self.terminal_focused = self.terminal_focus_allowed();
         self.filetree_hovered = false;
+        self.filetree_focused = false;
         self.hovered_link = None;
         self.hover_probe_cell = None;
         self.scrollbar_drag = None;
@@ -3839,6 +3852,7 @@ impl AppState {
             self.apply_ssh_file_runtime_events(std::mem::take(&mut outcome.file_events));
         }
         if !outcome.editor_invalidated_sessions.is_empty() {
+            self.invalidate_ssh_clipboard_exports(&outcome.editor_invalidated_sessions);
             let runtime_id = self.ssh_runtime.runtime_id();
             for session_id in outcome.editor_invalidated_sessions {
                 let sources = self
@@ -3865,6 +3879,159 @@ impl AppState {
                 }
             }
             self.window.request_redraw();
+        }
+    }
+
+    /// SSH 文件树“复制”的唯一入口：内部引用供 Lumen 三种模式互粘，同时
+    /// 预下载到独立临时目录；下载完成后才以 CF_HDROP 交给 Windows 资源管理器。
+    fn copy_ssh_file_to_clipboards(&mut self, item: SshClipboardItem) {
+        self.ssh_file_clipboard = Some(item.clone());
+        self.remote_ws.clear_file_clipboard();
+        self.remote_ws.cancel_clip_dir();
+        if let Some(service) = self.clipboard_svc.as_ref() {
+            service.clear();
+        }
+        let mut clipboard_sequence = system_clipboard_sequence_number();
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            if clipboard.clear().is_ok() {
+                clipboard_sequence =
+                    system_clipboard_sequence_number().or(clipboard_sequence);
+            }
+        }
+
+        self.ssh_clipboard_export_generation =
+            next_ssh_clipboard_generation(self.ssh_clipboard_export_generation);
+        let generation = self.ssh_clipboard_export_generation;
+        let destination = match create_ssh_clipboard_staging_path(generation, &item) {
+            Ok(path) => path,
+            Err(error) => {
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    i18n::fmt1(
+                        i18n::strings().ssh_clipboard_prepare_failed_fmt,
+                        error,
+                    ),
+                );
+                self.window.request_redraw();
+                return;
+            }
+        };
+        self.ssh_clipboard_exports.insert(
+            destination.clone(),
+            SshClipboardExport {
+                generation,
+                session_id: item.session_id,
+                clipboard_sequence,
+            },
+        );
+        if let Err(error) = self.ssh_runtime.download_file(
+            item.session_id,
+            item.path,
+            destination.clone(),
+            false,
+        ) {
+            self.ssh_clipboard_exports.remove(&destination);
+            remove_ssh_clipboard_staging_path(&destination);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                i18n::fmt1(
+                    i18n::strings().ssh_clipboard_prepare_failed_fmt,
+                    error,
+                ),
+            );
+            self.window.request_redraw();
+            return;
+        }
+        self.shell_state.toast.push(
+            shell::toast::ToastKind::Info,
+            i18n::fmt1(i18n::strings().ssh_clipboard_preparing_fmt, item.name),
+        );
+        self.window.request_redraw();
+    }
+
+    /// 返回 `true` 表示该下载属于 SSH→系统剪贴板链路，调用方不得再按普通
+    /// SSH 下载刷新文件树或显示“下载完成”通用提示。
+    fn complete_ssh_clipboard_export(&mut self, local_path: std::path::PathBuf) -> bool {
+        let Some(export) = self.ssh_clipboard_exports.remove(&local_path) else {
+            return false;
+        };
+        if !ssh_clipboard_export_is_current(
+            export.generation,
+            self.ssh_clipboard_export_generation,
+        ) {
+            remove_ssh_clipboard_staging_path(&local_path);
+            return true;
+        }
+        if clipboard_changed_since(
+            export.clipboard_sequence,
+            system_clipboard_sequence_number(),
+        ) {
+            remove_ssh_clipboard_staging_path(&local_path);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Info,
+                i18n::strings().ssh_clipboard_changed,
+            );
+            return true;
+        }
+
+        if clipboard_files::copy_files(std::slice::from_ref(&local_path)) {
+            if let Some(previous) = self.ssh_clipboard_ready_path.replace(local_path.clone()) {
+                if previous != local_path {
+                    remove_ssh_clipboard_staging_path(&previous);
+                }
+            }
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Info,
+                i18n::strings().ssh_clipboard_ready,
+            );
+        } else {
+            remove_ssh_clipboard_staging_path(&local_path);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                i18n::strings().ssh_clipboard_write_failed,
+            );
+        }
+        true
+    }
+
+    /// 返回 `true` 表示该失败属于 SSH→系统剪贴板链路。旧代次静默清理；
+    /// 只有当前复制显示错误，避免连续复制时旧任务失败干扰最新结果。
+    fn fail_ssh_clipboard_export(
+        &mut self,
+        local_path: &std::path::Path,
+        message: &str,
+    ) -> bool {
+        let Some(export) = self.ssh_clipboard_exports.remove(local_path) else {
+            return false;
+        };
+        remove_ssh_clipboard_staging_path(local_path);
+        if ssh_clipboard_export_is_current(
+            export.generation,
+            self.ssh_clipboard_export_generation,
+        ) {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                i18n::fmt1(
+                    i18n::strings().ssh_clipboard_prepare_failed_fmt,
+                    message,
+                ),
+            );
+        }
+        true
+    }
+
+    fn invalidate_ssh_clipboard_exports(
+        &mut self,
+        session_ids: &[ssh_runtime::SshSessionId],
+    ) {
+        let paths = self
+            .ssh_clipboard_exports
+            .iter()
+            .filter(|(_, export)| session_ids.contains(&export.session_id))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        for path in paths {
+            let _ = self.fail_ssh_clipboard_export(&path, "SSH 连接已断开");
         }
     }
 
@@ -3940,29 +4107,36 @@ impl AppState {
                 is_directory: _,
                 size,
             } => {
-                self.ssh_file_clipboard = Some(SshClipboardItem {
+                self.copy_ssh_file_to_clipboards(SshClipboardItem {
                     session_id,
                     path,
                     name,
                     size,
                 });
-                self.remote_ws.clear_file_clipboard();
-                if let Some(service) = self.clipboard_svc.as_ref() {
-                    service.clear();
-                }
-                if let Some(clipboard) = self.clipboard.as_mut() {
-                    let _ = clipboard.clear();
-                }
-                self.shell_state.toast.push(
-                    shell::toast::ToastKind::Info,
-                    i18n::fmt1(i18n::strings().remote_copied_fmt, 1),
-                );
             }
             SshFileTreeIntent::PasteInto {
                 session_id,
                 directory,
             } => {
                 self.paste_into_ssh(session_id, directory);
+            }
+            SshFileTreeIntent::MoveEntry {
+                session_id,
+                source_path,
+                source_is_directory,
+                target_directory,
+            } => {
+                if let Err(error) = self.ssh_runtime.move_entry(
+                    session_id,
+                    source_path,
+                    source_is_directory,
+                    target_directory,
+                ) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
             }
             SshFileTreeIntent::CreateEntry { .. } | SshFileTreeIntent::Delete { .. } => {
                 // The shell intercepts these two intents and opens the shared
@@ -4052,6 +4226,9 @@ impl AppState {
                 } => {
                     if operation == lumen_ssh::FileOperation::Download {
                         if let Some(local_path) = local_path {
+                            if self.complete_ssh_clipboard_export(local_path.clone()) {
+                                continue;
+                            }
                             if let Some(chain) = self.ssh_paste_chains.remove(&local_path) {
                                 match self.ssh_runtime.upload_entry(
                                     chain.target_session_id,
@@ -4094,13 +4271,16 @@ impl AppState {
                     error,
                     local_path,
                 } => {
+                    let message = ssh_file_error_message(operation, error);
                     if let Some(local_path) = local_path {
+                        if self.fail_ssh_clipboard_export(&local_path, &message) {
+                            continue;
+                        }
                         self.ssh_paste_chains.remove(&local_path);
                         if self.ssh_staged_uploads.remove(&local_path) {
                             remove_staged_path(&local_path);
                         }
                     }
-                    let message = ssh_file_error_message(operation, error);
                     if let Some(token) = document_token {
                         let source_matches = matches!(
                             self.shell_state.text_editor.source_for_token(token),
@@ -4630,7 +4810,7 @@ impl AppState {
             || self.shell_state.ssh_credentials.is_some()
             || self.shell_state.ssh_session_renaming.is_some()
             || self.shell_state.filetree.dialog_open()
-            || self.shell_state.text_editor.is_open()
+            || self.shell_state.text_editor.is_visible()
             || self.ssh_runtime.active_blocks_input()
     }
 
@@ -6355,7 +6535,7 @@ impl AppState {
                 || self.shell_state.pane_renaming.is_some()
                 || self.shell_state.ssh_session_renaming.is_some()
                 || self.shell_state.filetree.dialog_open()
-                || self.shell_state.text_editor.is_open()
+                || self.shell_state.text_editor.is_visible()
                 // 文件树搜索框（egui TextEdit）聚焦时能收 IME，须视作覆盖层、
                 // 把 IME 交还 egui，否则激进路由会把往搜索框打的中文劫持进
                 // 终端 composer（对抗审查 IME 项）。
@@ -6485,7 +6665,7 @@ impl AppState {
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.ssh_session_renaming.is_some()
             || self.shell_state.filetree.dialog_open()
-            || self.shell_state.text_editor.is_open()
+            || self.shell_state.text_editor.is_visible()
         {
             return;
         }
@@ -7411,8 +7591,16 @@ impl AppState {
         target_session_id: ssh_runtime::SshSessionId,
         target_directory: String,
     ) {
+        let system_has_files = clipboard_files::has_files();
         let local_paths = clipboard_files::paste_files();
-        if !local_paths.is_empty() {
+        let system_paths_are_current_ssh_export = self.ssh_file_clipboard.is_some()
+            && self
+                .ssh_clipboard_ready_path
+                .as_ref()
+                .is_some_and(|ready| {
+                    local_paths.len() == 1 && local_paths.first() == Some(ready)
+                });
+        if !local_paths.is_empty() && !system_paths_are_current_ssh_export {
             self.ssh_file_clipboard = None;
             for path in local_paths {
                 if let Err(error) = self.ssh_runtime.upload_file(
@@ -7426,6 +7614,14 @@ impl AppState {
                         .push(shell::toast::ToastKind::Error, error);
                 }
             }
+            self.window.request_redraw();
+            return;
+        }
+        if system_has_files && local_paths.is_empty() {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().file_clipboard_read_failed,
+            );
             self.window.request_redraw();
             return;
         }
@@ -7494,23 +7690,12 @@ impl AppState {
             else {
                 return;
             };
-            self.ssh_file_clipboard = Some(SshClipboardItem {
+            self.copy_ssh_file_to_clipboards(SshClipboardItem {
                 session_id,
                 path,
                 name,
                 size,
             });
-            self.remote_ws.clear_file_clipboard();
-            if let Some(service) = self.clipboard_svc.as_ref() {
-                service.clear();
-            }
-            if let Some(clipboard) = self.clipboard.as_mut() {
-                let _ = clipboard.clear();
-            }
-            self.shell_state.toast.push(
-                shell::toast::ToastKind::Info,
-                i18n::fmt1(i18n::strings().remote_copied_fmt, 1),
-            );
         } else if self.settings.layout.view_mode.is_remote() {
             self.ssh_file_clipboard = None;
             // 远程视图：复制选中的被控端项 → Lumen 内部剪贴板（远程路径进不了系统剪贴板，仅供下载）。
@@ -7747,6 +7932,15 @@ struct SshPasteChain {
     destination_name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SshClipboardExport {
+    generation: u64,
+    session_id: ssh_runtime::SshSessionId,
+    /// 开始准备时的 Windows 剪贴板代次；用户随后在资源管理器复制了
+    /// 其他内容时，完成回包不得覆盖用户更新后的剪贴板。
+    clipboard_sequence: Option<u32>,
+}
+
 /// 把系统剪贴板取出的本地路径转成 `ClipItem`（统一交给本机复制 / 上传编排）。`is_dir` 现读盘
 /// （系统剪贴板只给路径），失败按文件处理。
 fn paths_to_clipitems(paths: &[std::path::PathBuf]) -> Vec<remote_ws::ClipItem> {
@@ -7791,6 +7985,86 @@ fn safe_staging_file_name(name: &str) -> String {
     } else {
         result
     }
+}
+
+fn next_ssh_clipboard_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
+fn ssh_clipboard_export_is_current(export_generation: u64, current_generation: u64) -> bool {
+    export_generation != 0 && export_generation == current_generation
+}
+
+fn clipboard_changed_since(started: Option<u32>, current: Option<u32>) -> bool {
+    started != current
+}
+
+#[cfg(windows)]
+fn system_clipboard_sequence_number() -> Option<u32> {
+    // SAFETY: 只读取系统维护的全局剪贴板序号，不持有句柄或指针。
+    Some(unsafe {
+        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    })
+}
+
+#[cfg(not(windows))]
+fn system_clipboard_sequence_number() -> Option<u32> {
+    None
+}
+
+fn ssh_clipboard_staging_root() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "lumen_ssh_clipboard-{}",
+        std::process::id()
+    ))
+}
+
+fn ssh_clipboard_batch_directory(
+    root: &std::path::Path,
+    generation: u64,
+    session_id: ssh_runtime::SshSessionId,
+    nonce: u128,
+) -> std::path::PathBuf {
+    root.join(format!("{generation}-{session_id}-{nonce}"))
+}
+
+fn create_ssh_clipboard_staging_path(
+    generation: u64,
+    item: &SshClipboardItem,
+) -> std::io::Result<std::path::PathBuf> {
+    let root = ssh_clipboard_staging_root();
+    std::fs::create_dir_all(&root)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let batch =
+        ssh_clipboard_batch_directory(&root, generation, item.session_id, nonce);
+    std::fs::create_dir(&batch)?;
+    Ok(batch.join(safe_staging_file_name(&item.name)))
+}
+
+/// 只删除本进程创建的 `%TEMP%\lumen_ssh_clipboard-<pid>\<batch>`。
+///
+/// 下载目标可能是目录，也可能在失败时残留 SFTP 临时文件，因此以已验证的
+/// 唯一 batch 目录为最小清理单元；任何不符合两级布局的路径一律拒绝删除。
+fn remove_ssh_clipboard_staging_path(path: &std::path::Path) {
+    let root = ssh_clipboard_staging_root();
+    let Some(batch) = path.parent() else {
+        return;
+    };
+    if !root.is_absolute() || batch.parent() != Some(root.as_path()) {
+        log::warn!(
+            "拒绝清理不属于 SSH 文件剪贴板暂存区的路径：{}",
+            path.display()
+        );
+        return;
+    }
+    let _ = std::fs::remove_dir_all(batch);
 }
 
 fn remove_staged_path(path: &std::path::Path) {
@@ -8573,11 +8847,15 @@ impl App {
             ssh_file_clipboard: None,
             ssh_paste_chains: HashMap::new(),
             ssh_staged_uploads: HashSet::new(),
+            ssh_clipboard_export_generation: 0,
+            ssh_clipboard_exports: HashMap::new(),
+            ssh_clipboard_ready_path: None,
             local_copy_rx: None,
             clip_fetch_rx: None,
             clipboard_svc: None,
             paste_refresh: None,
             filetree_hovered: false,
+            filetree_focused: false,
             remote_viewport: None,
             mirror_texture: None,
             mirror_pane_textures: Vec::new(),
@@ -9294,7 +9572,7 @@ impl ApplicationHandler<PtyWake> for App {
             }
             if sidecar_merged
                 && !state.completion_candidates.is_empty()
-                && !state.shell_state.text_editor.is_open()
+                && !state.shell_state.text_editor.is_visible()
             {
                 // 若弹窗尚未打开（文件路径候选为空、等 sidecar），现在打开。
                 if !state.shell_state.completion.open {
@@ -9528,7 +9806,7 @@ impl ApplicationHandler<PtyWake> for App {
             && state.shell_state.pane_renaming.is_none()
             && state.shell_state.ssh_session_renaming.is_none()
             && !state.shell_state.filetree.dialog_open()
-            && !state.shell_state.text_editor.is_open()
+            && !state.shell_state.text_editor.is_visible()
         {
             if let WindowEvent::KeyboardInput { event: key, .. } = &event {
                 if key.state == ElementState::Pressed && !key.repeat {
@@ -9709,8 +9987,10 @@ impl ApplicationHandler<PtyWake> for App {
                 // 文件树 Ctrl+C / Ctrl+V 必须先于 SSH 终端的提前返回。
                 // egui 会把 Ctrl+V 消费成文本 Paste，Windows 文件剪贴板
                 // 没有文本时甚至不会留下 V 键信号，因此继续在 winit 层
-                // 统一裁决三种模式；文本输入控件聚焦时绝不拦截。
-                let filetree_shortcut_available = state.filetree_hovered
+                // 统一裁决三种模式。TreeView 本身会向 egui 请求键盘焦点，
+                // 因此不能再用 blanket `egui_wants_keyboard_input` 反向挡掉；
+                // 搜索框获得焦点时 TreeView 的 focused 会自然变为 false。
+                let filetree_shortcut_available = state.filetree_focused
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
@@ -9720,9 +10000,8 @@ impl ApplicationHandler<PtyWake> for App {
                     && state.shell_state.ssh_session_renaming.is_none()
                     && state.shell_state.renaming_device.is_none()
                     && !state.shell_state.filetree.dialog_open()
-                    && !state.shell_state.text_editor.is_open()
-                    && state.shell_state.ssh_credentials.is_none()
-                    && !state.egui_ctx.egui_wants_keyboard_input();
+                    && !state.shell_state.text_editor.is_visible()
+                    && state.shell_state.ssh_credentials.is_none();
                 if let Some(shortcut) = filetree_clipboard_shortcut(
                     event.state,
                     event.repeat,
@@ -9798,7 +10077,7 @@ impl ApplicationHandler<PtyWake> for App {
                         || state.shell_state.login.open
                         || state.shell_state.history_search.open
                         || state.shell_state.completion.open
-                        || state.shell_state.text_editor.is_open(),
+                        || state.shell_state.text_editor.is_visible(),
                     renaming: state.shell_state.renaming.is_some()
                         || state.shell_state.pane_renaming.is_some()
                         || state.shell_state.ssh_session_renaming.is_some(),
@@ -10381,8 +10660,19 @@ impl ApplicationHandler<PtyWake> for App {
             } => {
                 if state.settings.layout.view_mode.is_ssh() {
                     if button == MouseButton::Left && btn_state == ElementState::Pressed {
+                        let in_terminal = state.mouse_in_ssh_terminal();
                         state.terminal_focused =
-                            state.mouse_in_ssh_terminal() && state.terminal_focus_allowed();
+                            in_terminal && state.terminal_focus_allowed();
+                        if in_terminal {
+                            state.filetree_focused = false;
+                            state.egui_ctx.memory_mut(|memory| {
+                                if let Some(focused) = memory.focused() {
+                                    memory.surrender_focus(focused);
+                                }
+                            });
+                        } else if !state.filetree_hovered {
+                            state.filetree_focused = false;
+                        }
                     }
                     return;
                 }
@@ -10466,9 +10756,18 @@ impl ApplicationHandler<PtyWake> for App {
                     // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
                     let Some(pi) = state.pane_under_mouse() else {
                         state.terminal_focused = false;
+                        if !state.filetree_hovered {
+                            state.filetree_focused = false;
+                        }
                         return;
                     };
                     state.terminal_focused = true;
+                    state.filetree_focused = false;
+                    state.egui_ctx.memory_mut(|memory| {
+                        if let Some(focused) = memory.focused() {
+                            memory.surrender_focus(focused);
+                        }
+                    });
                     state.focus_pane(pi);
 
                     // ── footer 区域分流（第十一轮，input-editor feature）─
@@ -12286,8 +12585,10 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.term_clicked {
                     state.terminal_focused = state.terminal_focus_allowed();
                 }
-                // 文件树面板悬停态存到下一帧：winit 层 Ctrl+C/V 快捷键的门控（鼠标在文件树面板内）。
+                // 文件树悬停/键盘焦点存到下一帧；Ctrl+C/V 按 TreeView 焦点
+                // 仲裁，悬停仅保留给鼠标相关判断。
                 state.filetree_hovered = shell_out.filetree_hovered;
+                state.filetree_focused = shell_out.filetree_focused;
 
                 // ── footer 右键菜单动作 dispatch（第十一轮）───────────────
                 #[cfg(feature = "input-editor")]
@@ -12432,7 +12733,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
                     && !state.shell_state.completion.open
-                    && !state.shell_state.text_editor.is_open()
+                    && !state.shell_state.text_editor.is_visible()
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
                     state.terminal_focused = state.terminal_focus_allowed();
@@ -13050,10 +13351,15 @@ impl ApplicationHandler<PtyWake> for App {
                 } else if shell_out.filetree_dialog_closed {
                     state.terminal_focused = state.terminal_focus_allowed();
                 }
-                if state.shell_state.text_editor.is_open() {
+                if state.shell_state.text_editor.is_visible() {
                     state.terminal_focused = false;
-                } else if shell_out.text_editor_closed {
+                    state.filetree_focused = false;
+                } else if shell_out.text_editor_closed || shell_out.text_editor_hidden {
                     state.terminal_focused = state.terminal_focus_allowed();
+                }
+                if shell_out.text_editor_restored {
+                    state.terminal_focused = false;
+                    state.filetree_focused = false;
                 }
                 if shell_out.settings_opened
                     || state.shell_state.settings.open
@@ -14380,14 +14686,16 @@ impl ApplicationHandler<PtyWake> for App {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_ssh_account_id, clear_shared_token, controller_owns_sub_viewport, drain_order,
-        estimate_restored_pane_px, load_icon, maximized_overflow, scroll_to_bottom_action,
+        canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
+        controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
+        maximized_overflow, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
         should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
         ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
         ssh_sync_identity, ssh_test_profile, filetree_clipboard_shortcut,
-        view_mode_shortcut, width_worth_persisting, FileTreeClipboardShortcut, PaneLayout,
-        ScrollToBottomAction,
+        next_ssh_clipboard_generation, ssh_clipboard_batch_directory,
+        ssh_clipboard_export_is_current, view_mode_shortcut, width_worth_persisting,
+        FileTreeClipboardShortcut, PaneLayout, ScrollToBottomAction,
     };
     use winit::event::ElementState;
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -14491,6 +14799,30 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn ssh文件剪贴板代次跳过零且只认最新完成() {
+        assert_eq!(next_ssh_clipboard_generation(0), 1);
+        assert_eq!(next_ssh_clipboard_generation(u64::MAX), 1);
+        assert!(ssh_clipboard_export_is_current(7, 7));
+        assert!(!ssh_clipboard_export_is_current(6, 7));
+        assert!(!ssh_clipboard_export_is_current(0, 0));
+        assert!(!clipboard_changed_since(Some(12), Some(12)));
+        assert!(clipboard_changed_since(Some(12), Some(13)));
+        assert!(!clipboard_changed_since(None, None));
+        assert!(clipboard_changed_since(None, Some(13)));
+        assert!(clipboard_changed_since(Some(12), None));
+    }
+
+    #[test]
+    fn ssh文件剪贴板每批使用独立二级暂存目录() {
+        let root = std::path::Path::new(r"C:\Temp\lumen_ssh_clipboard-42");
+        let first = ssh_clipboard_batch_directory(root, 3, 9, 100);
+        let second = ssh_clipboard_batch_directory(root, 4, 9, 100);
+        assert_eq!(first, root.join("3-9-100"));
+        assert_eq!(second, root.join("4-9-100"));
+        assert_ne!(first, second);
     }
 
     #[test]

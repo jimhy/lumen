@@ -726,6 +726,9 @@ pub struct FileTreeOutput {
     pub panel_rect: Option<egui::Rect>,
     /// 本帧鼠标是否在文件树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键的门控）。
     pub hovered: bool,
+    /// 原生 TreeView 是否持有键盘焦点。文件复制/粘贴快捷键按焦点而非
+    /// 悬停判定，避免鼠标移开后失效，也避免搜索输入框聚焦时误传文件。
+    pub focused: bool,
 }
 
 /// 三种文件树共用的面板几何信息。
@@ -1252,6 +1255,10 @@ fn tree_ui(
                 .show_state(ui, tree, |builder| {
                     add_node(builder, &mut load, 0, pal, &menu);
                 });
+            if resp.clicked() || resp.secondary_clicked() {
+                resp.request_focus();
+            }
+            out.focused = resp.has_focus();
             // 本帧真实产生的 Activate 目标（回车键路径；鼠标双击因上游
             // bug 走不到这里，见 merge_double_click_activation）。
             let mut activated: Vec<usize> = Vec::new();
@@ -1458,6 +1465,10 @@ fn search_results_ui(
                     selected,
                     pal,
                 );
+                if resp.clicked() || resp.secondary_clicked() {
+                    resp.request_focus();
+                }
+                out.focused |= resp.has_focus();
                 if resp.double_clicked() {
                     activated = Some((path.clone(), *is_dir));
                 } else if resp.clicked() {
@@ -2220,6 +2231,8 @@ pub struct RemoteFileTreeOutput {
     pub panel_rect: Option<egui::Rect>,
     /// 本帧鼠标是否在远程树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键门控）。
     pub hovered: bool,
+    /// 原生 TreeView 是否持有键盘焦点。
+    pub focused: bool,
     /// 本帧被点击的目录节点 id（翻转展开态：纯本地、未缓存则触发 ListDir）。
     pub dir_clicks: Vec<usize>,
     /// 「显示隐藏项」勾选变化（main 闭包后 set + 重列根）。
@@ -2653,6 +2666,10 @@ fn remote_panel_ui(
                         directory_depth -= 1;
                     }
                 });
+            if response.clicked() || response.secondary_clicked() {
+                response.request_focus();
+            }
+            out.focused = response.has_focus();
 
             let mut activated = Vec::new();
             let mut selected_now = None;

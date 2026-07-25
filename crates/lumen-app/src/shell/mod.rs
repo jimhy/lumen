@@ -117,7 +117,7 @@ pub struct ShellState {
     pub ssh_ui: ssh_ui::SshUiState,
     /// SSH 密码/私钥本机安全保存对话框。关闭或锁屏丢弃时会清零明文缓冲。
     pub ssh_credentials: Option<SshCredentialDialog>,
-    /// 远程控制 / SSH 共用的单文档内置文本编辑器。
+    /// 远程控制 / SSH 共用的多标签内置文本编辑器。
     pub text_editor: text_editor::TextEditorState,
 }
 
@@ -666,6 +666,9 @@ pub struct ShellOutput {
     pub remote_clear_select: bool,
     /// 本帧鼠标是否在文件树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键门控）。
     pub filetree_hovered: bool,
+    /// 文件树原生 TreeView 是否持有键盘焦点。Ctrl+C/V 只按此状态
+    /// 路由文件操作，鼠标移开后仍有效，搜索输入聚焦时则自动让位。
+    pub filetree_focused: bool,
     /// part3c-2 #7：复制文件 / 文件夹到剪贴板 (来源侧, path, name, is_dir)。
     pub file_copy: Option<(crate::remote_ws::ClipSide, String, String, bool, u64)>,
     /// part3c-2 #7：粘贴到某目录 (目标侧, 目录 path)（main 据剪贴板侧 × 目标侧定方向）。
@@ -697,6 +700,10 @@ pub struct ShellOutput {
     pub text_editor_save: Option<text_editor::SaveRequest>,
     /// 内置文本编辑器本帧已关闭。
     pub text_editor_closed: bool,
+    /// 内置文本编辑器本帧已暂时隐藏，文档与脏状态仍保留。
+    pub text_editor_hidden: bool,
+    /// 内置文本编辑器本帧从工具栏恢复显示。
+    pub text_editor_restored: bool,
     /// 设置页本帧被打开（main 把终端焦点交给 egui）。
     pub settings_opened: bool,
     /// 设置页本帧被关闭（main 把焦点交还终端，IME 复位链路照旧）。
@@ -844,6 +851,7 @@ pub fn show(
         remote_select: None,
         remote_clear_select: false,
         filetree_hovered: false,
+        filetree_focused: false,
         file_copy: None,
         file_paste: None,
         overwrite_choice: None,
@@ -858,6 +866,8 @@ pub fn show(
         text_editor_load: None,
         text_editor_save: None,
         text_editor_closed: false,
+        text_editor_hidden: false,
+        text_editor_restored: false,
         settings_opened: false,
         settings_closed: false,
         settings_font_changed: false,
@@ -1021,6 +1031,7 @@ pub fn show(
         input.panes.len(),
         pal,
         toolbar::ViewState {
+            text_editor_hidden: st.text_editor.is_open() && !st.text_editor.is_visible(),
             remote_view: is_remote_view,
             ssh_view: is_ssh_view,
             session_actions_enabled: !is_ssh_view,
@@ -1033,6 +1044,9 @@ pub fn show(
     );
     if tbar.new_pane {
         out.new_pane = true;
+    }
+    if tbar.restore_text_editor && st.text_editor.restore() {
+        out.text_editor_restored = true;
     }
     if tbar.reset_layout {
         out.layout_reset = true;
@@ -1294,6 +1308,7 @@ pub fn show(
         );
         out.filetree_width = ssh_tree.panel_width;
         out.filetree_hovered = ssh_tree.hovered;
+        out.filetree_focused = ssh_tree.focused;
         for intent in std::mem::take(&mut ssh_tree.intents) {
             match intent {
                 ssh_filetree::SshFileTreeIntent::CreateEntry {
@@ -1372,6 +1387,7 @@ pub fn show(
         out.remote_select = rout.select;
         out.remote_clear_select = rout.clear_select;
         out.filetree_hovered = rout.hovered;
+        out.filetree_focused = rout.focused;
         // 复制远程项 → 剪贴板 Remote 侧（下载源）；粘贴到远程目录 → Remote 目标（上传，片5）。
         out.file_copy = rout
             .copy_files
@@ -1410,6 +1426,7 @@ pub fn show(
         );
         out.filetree_width = ft.panel_width;
         out.filetree_hovered = ft.hovered;
+        out.filetree_focused = ft.focused;
         out.cd_dir = ft.cd_dir;
         out.open_file = ft.open_file;
         out.copy_text = ft.copy_text;
@@ -1490,7 +1507,7 @@ pub fn show(
     // AltScreen 时 footer 隐藏（ComposerView::hidden），但状态栏仍保持可见以便
     // 用户随时知道当前模式（与 footer 逻辑独立）。
     #[cfg(feature = "input-editor")]
-    if !is_ssh_view && !st.text_editor.is_open() {
+    if !is_ssh_view && !st.text_editor.is_visible() {
         let sb_resp = egui::Panel::bottom("lumen_statusbar")
             .exact_size(statusbar::HEIGHT)
             .show_separator_line(false)
@@ -1533,11 +1550,12 @@ pub fn show(
 
             // 远程/SSH 文件右键“编辑”在中央工作区打开 Lumen 内置编辑器。
             // PTY 与远程控制连接继续在后台运行，但中央区不再渲染或命中终端。
-            if st.text_editor.is_open() {
+            if st.text_editor.is_visible() {
                 let editor = text_editor::show(ui, &mut st.text_editor, pal);
                 out.text_editor_load = editor.load;
                 out.text_editor_save = editor.save;
                 out.text_editor_closed = editor.closed;
+                out.text_editor_hidden = editor.hidden;
                 return;
             }
 

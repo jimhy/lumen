@@ -370,6 +370,18 @@ pub struct Strings {
     pub local_copy_busy: &'static str,
     /// 复制本地文件写入系统剪贴板失败的提示 toast。
     pub local_copy_clipboard_failed: &'static str,
+    /// 系统声明存在文件但剪贴板正忙，暂时无法读取。
+    pub file_clipboard_read_failed: &'static str,
+    /// SSH 文件复制到系统文件剪贴板前的准备提示（`{}` = 文件名）。
+    pub ssh_clipboard_preparing_fmt: &'static str,
+    /// SSH 暂存完成、可从资源管理器粘贴。
+    pub ssh_clipboard_ready: &'static str,
+    /// SSH 文件剪贴板准备失败（`{}` = 简短错误）。
+    pub ssh_clipboard_prepare_failed_fmt: &'static str,
+    /// 准备期间用户复制了其他内容，取消覆盖系统剪贴板。
+    pub ssh_clipboard_changed: &'static str,
+    /// 暂存下载完成但 CF_HDROP 写入失败。
+    pub ssh_clipboard_write_failed: &'static str,
     // 新建对话框
     /// "新建文件夹" 对话框标题
     pub filetree_create_dir_title: &'static str,
@@ -411,9 +423,8 @@ pub struct Strings {
     pub filetree_menu_delete: &'static str,
 
     // ── 内置远端文本编辑器 ─────────────────────────────────────────
-    pub text_editor_saving: &'static str,
-    pub text_editor_saved: &'static str,
-    pub text_editor_unsaved: &'static str,
+    pub text_editor_hide: &'static str,
+    pub text_editor_restore: &'static str,
     pub text_editor_find_hint: &'static str,
     pub text_editor_completion_title: &'static str,
     pub text_editor_completion_keys: &'static str,
