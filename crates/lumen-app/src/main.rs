@@ -146,6 +146,27 @@ fn profile_server_origin(
     (profile.auth_origin.as_deref() == Some(current.as_str())).then_some(current)
 }
 
+fn profile_origin_requires_reauth(
+    profile: &profile::Profile,
+    current_server_url: &str,
+) -> bool {
+    if profile
+        .token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(saved_origin) = profile.auth_origin.as_deref() else {
+        // 旧版缺字段由迁移入口处理；配置暂不可用时也必须保留档案。
+        return false;
+    };
+    let Ok(current_origin) = cloud::canonical_server_origin(current_server_url) else {
+        return false;
+    };
+    saved_origin != current_origin
+}
+
 fn canonical_ssh_account_id(
     profile: Option<&profile::Profile>,
     current_server_url: &str,
@@ -1071,6 +1092,9 @@ struct AppState {
     remote: remote::RemoteState,
     /// M5.3 远程控制 WS 引擎（配对 / 会话 / 数据面中继；part2a 引擎，UI part2b）。
     remote_ws: remote_ws::RemoteWs,
+    /// 当前登录上下文是否已尝试恢复上次主动控制目标。只在 WS 成功启动后置位；
+    /// 登出、换账号或换服务端时复位。
+    remote_restore_attempted: bool,
     /// M5.3 part3d 被控端镜像源签名：订阅会话的 `(tab_id, 各窗格(id,行,列), 焦点下标, 最大化下标)`。
     /// 变化（订阅切换 / 窗格增删 / 任一窗格 resize / 切焦点 / 最大化翻转 / 分隔条拖动改尺寸）即
     /// 重发全部窗格整屏快照 + 布局（`SubscriptionStarted`）。被控期间外为 None。
@@ -2603,7 +2627,31 @@ impl AppState {
         drop(self.ssh_sync.take());
         self.remote.stop();
         self.remote_ws.stop();
+        self.remote_restore_attempted = false;
         self.auth_token = None;
+    }
+
+    fn persist_remote_restore_target(&mut self) {
+        let Some((device_id, device_name)) = self
+            .remote_ws
+            .controller_peer()
+            .map(|(id, name)| (id.to_owned(), name.to_owned()))
+        else {
+            return;
+        };
+        if let Some(profile) = self.profile.as_mut() {
+            if profile.remember_remote_restore_target(&device_id, &device_name) {
+                profile.save();
+            }
+        }
+    }
+
+    fn clear_remote_restore_target(&mut self) {
+        if let Some(profile) = self.profile.as_mut() {
+            if profile.clear_remote_restore_target() {
+                profile.save();
+            }
+        }
     }
 
     fn reload_ssh_account_context(&mut self) {
@@ -2642,6 +2690,7 @@ impl AppState {
             }
         };
         self.auth_token = profile_auth_token(self.profile.as_ref(), &cloud::server_url());
+        self.remote_restore_attempted = false;
         self.ensure_ssh_sync_worker();
         self.window.request_redraw();
     }
@@ -4843,10 +4892,10 @@ impl AppState {
             mouse_x as f32 / points_per_pixel,
             mouse_y as f32 / points_per_pixel,
         );
-        !self
+        self
             .egui_ctx
             .layer_id_at(position)
-            .is_some_and(|layer| layer.order != egui::Order::Background)
+            .is_none_or(|layer| layer.order == egui::Order::Background)
     }
 
     /// 鼠标当前位置是否落在某个窗格关闭按钮上（上一帧布局的命中区，
@@ -8506,16 +8555,17 @@ impl App {
         // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
         let current_server_url = cloud::server_url();
         let mut user_profile = profile::Profile::load();
-        // 旧版 profile 没有签发 origin，或者 settings 已被外部改成另一
-        // 个服务端时，绝不能拿旧 bearer token 试探当前地址。升级后安全
-        // 退出一次，用户在当前 origin 重新登录即可建立明确绑定。
-        let profile_origin_reauth_required = user_profile.as_ref().is_some_and(|profile| {
-            profile
-                .token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty())
-                && profile_server_origin(Some(profile), &current_server_url).is_none()
-        });
+        // v1.0.15 及更早版本只有一个全局服务端，profile 尚无 auth_origin。
+        // 升级时把旧登录态一次性绑定到当时已配置且通过传输校验的 origin；
+        // 不能直接删除，否则远程心跳与控制 WS 都不会启动。
+        let profile_origin_migrated = user_profile
+            .as_mut()
+            .is_some_and(|profile| profile.migrate_legacy_auth_origin(&current_server_url));
+        // 已有来源与当前设置确实不一致时仍 fail-closed，避免把一个服务端
+        // 签发的 bearer token 发送给另一个服务端。
+        let profile_origin_reauth_required = user_profile
+            .as_ref()
+            .is_some_and(|profile| profile_origin_requires_reauth(profile, &current_server_url));
         if profile_origin_reauth_required {
             log::warn!("登录档案缺少有效服务端来源绑定，已安全退出并要求重新登录");
             profile::Profile::delete();
@@ -8531,11 +8581,25 @@ impl App {
             cloud::canonical_server_origin(&current_server_url),
             user_profile.as_ref(),
         ) {
+            if profile_origin_migrated {
+                cloud::claim_legacy_device_id_for_origin(
+                    &origin,
+                    profile.device_id.as_deref(),
+                );
+            }
             cloud::reconcile_device_id_for_origin(
                 &origin,
                 profile.auth_origin.as_deref(),
                 profile.device_id.as_deref(),
             );
+        }
+        if profile_origin_migrated {
+            if let Some(profile) = user_profile.as_ref() {
+                // 先完成旧 device_id 的单次认领，再提交 profile schema 迁移；
+                // 中途崩溃时下次启动仍会重试，不留下“已迁移但未标记旧身份”的窗口。
+                profile.save();
+            }
+            log::info!("已为旧版登录档案补齐服务端来源绑定");
         }
 
         // SSH 库存按 Lumen 账号隔离；账号首次使用时先以不可逆认领标记
@@ -8838,6 +8902,7 @@ impl App {
             auth_token: initial_auth_token,
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
+            remote_restore_attempted: false,
             mirror_src: None,
             mirror_bounds_sent: None,
             mirror_rect_px: None,
@@ -11807,14 +11872,34 @@ impl ApplicationHandler<PtyWake> for App {
                         state.auth_token.clone(),
                         account_server_origin.as_ref(),
                     ) {
-                        if let Err(error) = state.remote_ws.start(
+                        match state.remote_ws.start(
                             server_origin.clone(),
                             auth,
                             state.egui_ctx.clone(),
                             state.proxy.clone(),
                             state.wake_pending.clone(),
                         ) {
-                            log::warn!("启动远程 WS 失败: {}", error.user_message());
+                            Ok(()) => {
+                                if !state.remote_restore_attempted {
+                                    state.remote_restore_attempted = true;
+                                    if let Some((device_id, device_name)) = state
+                                        .profile
+                                        .as_ref()
+                                        .and_then(profile::Profile::remote_restore_target)
+                                        .map(|(id, name)| (id.to_owned(), name.to_owned()))
+                                    {
+                                        if state
+                                            .remote_ws
+                                            .restore_controller_session(device_id, device_name)
+                                        {
+                                            log::info!("正在恢复上次远程控制会话");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("启动远程 WS 失败: {}", error.user_message());
+                            }
                         }
                     }
                 }
@@ -12802,6 +12887,7 @@ impl ApplicationHandler<PtyWake> for App {
                     state.remote_ws.decline();
                 }
                 if shell_out.end_remote_session {
+                    state.clear_remote_restore_target();
                     state.remote_ws.end_session();
                 }
                 // M5.3 part3d：记录镜像区物理像素矩形（鼠标命中→镜像选区换算，part4b）+ Phase 3
@@ -12900,6 +12986,23 @@ impl ApplicationHandler<PtyWake> for App {
                 let remote_notices = state.remote_ws.take_notices();
                 if !remote_notices.is_empty() {
                     for n in &remote_notices {
+                        match n {
+                            remote_ws::Notice::SessionStarted {
+                                role: lumen_protocol::remote::Role::Controller,
+                                ..
+                            }
+                            | remote_ws::Notice::SessionRestored => {
+                                state.persist_remote_restore_target();
+                            }
+                            remote_ws::Notice::SessionStarted {
+                                role: lumen_protocol::remote::Role::Controlled,
+                                ..
+                            }
+                            | remote_ws::Notice::SessionEnded(_) => {
+                                state.clear_remote_restore_target();
+                            }
+                            _ => {}
+                        }
                         let (kind, text) = remote_notice_toast(n);
                         state.shell_state.toast.push(kind, text);
                         // 下载（→本地）/ 上传（→远程）完成 → 刷新粘贴目标目录，新文件立即显示。
@@ -14688,7 +14791,8 @@ mod tests {
     use super::{
         canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
         controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, scroll_to_bottom_action,
+        maximized_overflow, profile_auth_token, profile_origin_requires_reauth,
+        profile_server_origin, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
         should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
         ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
@@ -14937,6 +15041,45 @@ mod tests {
             Some(&trusted),
             "rsa-sha2-512",
             "SHA256:first",
+        ));
+    }
+
+    #[test]
+    fn 登录来源迁移只在明确不一致时要求重新认证() {
+        let mut profile = crate::profile::Profile {
+            token: Some("jwt-token".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            !profile_origin_requires_reauth(&profile, "https://lumen.example"),
+            "旧版缺 auth_origin 应先迁移，不能删除"
+        );
+        assert!(
+            !profile_origin_requires_reauth(&profile, ""),
+            "当前配置暂不可用时应保留旧档案"
+        );
+        assert!(profile.migrate_legacy_auth_origin("https://lumen.example"));
+        assert_eq!(
+            profile_server_origin(Some(&profile), "https://lumen.example").as_deref(),
+            Some("https://lumen.example")
+        );
+        let migrated_token =
+            profile_auth_token(Some(&profile), "https://lumen.example").expect("远程 token");
+        assert_eq!(migrated_token.read().unwrap().as_str(), "jwt-token");
+
+        assert!(!profile_origin_requires_reauth(
+            &profile,
+            "HTTPS://LUMEN.EXAMPLE:443/"
+        ));
+        assert!(profile_origin_requires_reauth(
+            &profile,
+            "https://other.example"
+        ));
+
+        profile.auth_origin = Some("not-a-valid-origin".to_owned());
+        assert!(profile_origin_requires_reauth(
+            &profile,
+            "https://lumen.example"
         ));
     }
 

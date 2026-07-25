@@ -585,6 +585,118 @@ pub fn reconcile_device_id_for_origin(
     }
 }
 
+/// 把 v1.0.15 及更早版本的设备 id 一次性认领到当前服务端分区。
+///
+/// 该兼容入口只应在“旧 profile 已绑定当前 origin”或用户正向当前 origin 登录时调用。
+/// 首次认领后写入本地标记，后续切换服务端不会再次复制旧 id，避免跨服务关联。
+///
+/// `fallback_legacy_id` 用于旧全局文件已丢失、但旧 profile 仍保有镜像 id 的升级场景；
+/// 全局文件存在时仍优先沿用旧版登录逻辑使用的全局值。
+pub fn claim_legacy_device_id_for_origin(
+    origin: &str,
+    fallback_legacy_id: Option<&str>,
+) -> bool {
+    let Some(data_root) = crate::paths::data_dir() else {
+        return false;
+    };
+    match claim_legacy_device_id_for_origin_at(&data_root, origin, fallback_legacy_id) {
+        Ok(claimed) => {
+            if claimed {
+                log::info!("已完成旧版全局 device_id 的单次服务端分区迁移");
+            }
+            claimed
+        }
+        Err(error) => {
+            log::warn!("迁移旧版全局 device_id 失败: {error}");
+            false
+        }
+    }
+}
+
+/// 返回尚未认领的旧版全局设备 id，供一次登录请求试用。
+///
+/// 本函数不写文件、不消费迁移机会；只有服务端鉴权成功且回传同一个 device id 后，
+/// 调用方才应通过 [`claim_legacy_device_id_for_origin`] 提交认领。
+pub fn legacy_device_id_candidate_for_origin(origin: &str) -> Option<String> {
+    let data_root = crate::paths::data_dir()?;
+    legacy_device_id_candidate_for_origin_at(&data_root, origin)
+}
+
+fn legacy_device_id_candidate_for_origin_at(
+    data_root: &std::path::Path,
+    origin: &str,
+) -> Option<String> {
+    let canonical = verified_server_origin(origin).ok()?;
+    if data_root.join("legacy_device_id_origin").exists() {
+        return None;
+    }
+    let target = device_id_path_for_origin_at(data_root, &canonical).ok()?;
+    if load_device_id_from(&target).is_some() {
+        return None;
+    }
+    load_device_id_from(&data_root.join("device_id"))
+}
+
+/// 当前 origin 是否已认领旧版全局设备 id。
+///
+/// 命中时登录请求应优先用 `device_id` 走旧服务端的兼容分支，不再同时发送新的
+/// origin-hash `hw_id`；否则 v2 服务端会把原始 hw_id 与新 hash 视为两台机器。
+pub fn legacy_device_id_claimed_for_origin(origin: &str) -> bool {
+    let Some(data_root) = crate::paths::data_dir() else {
+        return false;
+    };
+    legacy_device_id_claimed_for_origin_at(&data_root, origin)
+}
+
+fn legacy_device_id_claimed_for_origin_at(
+    data_root: &std::path::Path,
+    origin: &str,
+) -> bool {
+    let Ok(canonical) = canonical_server_origin(origin) else {
+        return false;
+    };
+    load_device_id_from(&data_root.join("legacy_device_id_origin"))
+        .is_some_and(|claimed| claimed == canonical)
+}
+
+fn claim_legacy_device_id_for_origin_at(
+    data_root: &std::path::Path,
+    origin: &str,
+    fallback_legacy_id: Option<&str>,
+) -> std::io::Result<bool> {
+    let canonical = verified_server_origin(origin).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid server origin for legacy device id migration",
+        )
+    })?;
+    let marker = data_root.join("legacy_device_id_origin");
+    if marker.exists() {
+        return Ok(false);
+    }
+    let Some(legacy_id) = load_device_id_from(&data_root.join("device_id")).or_else(|| {
+        fallback_legacy_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }) else {
+        return Ok(false);
+    };
+    let target = device_id_path_for_origin_at(data_root, &canonical).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid server origin for legacy device id migration",
+        )
+    })?;
+    if load_device_id_from(&target).is_none() {
+        save_device_id_to(&target, &legacy_id)?;
+    }
+    // 标记在目标写入成功后落盘；即使目标原本已存在，也要消费掉全局旧值，
+    // 防止将来切换 origin 时再次复制。
+    save_device_id_to(&marker, &canonical)?;
+    Ok(true)
+}
+
 /// 旧版全局设备 id 文件路径。仅用于本地兼容对账，联网鉴权不得读取。
 fn device_id_path() -> Option<PathBuf> {
     crate::paths::data_file("device_id")
@@ -977,6 +1089,112 @@ mod tests {
             Some(64)
         );
         assert_ne!(a, root.join("device_id"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 旧版全局设备id只允许被一个origin认领() {
+        let root = std::env::temp_dir().join(format!(
+            "lumen_legacy_device_claim_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("创建临时目录");
+        save_device_id_to(&root.join("device_id"), "legacy-device").expect("写旧设备 id");
+
+        assert_eq!(
+            legacy_device_id_candidate_for_origin_at(&root, "https://a.example").as_deref(),
+            Some("legacy-device")
+        );
+        assert!(
+            !root.join("legacy_device_id_origin").exists(),
+            "候选读取不能提前消费迁移机会"
+        );
+        let a = device_id_path_for_origin_at(&root, "https://a.example").expect("A 路径");
+        assert_eq!(load_device_id_from(&a), None);
+
+        assert!(
+            claim_legacy_device_id_for_origin_at(&root, "https://a.example", None)
+                .expect("认领 A")
+        );
+        assert_eq!(
+            load_device_id_from(&a).as_deref(),
+            Some("legacy-device")
+        );
+        assert_eq!(
+            load_device_id_from(&root.join("legacy_device_id_origin")).as_deref(),
+            Some("https://a.example")
+        );
+        assert!(legacy_device_id_claimed_for_origin_at(
+            &root,
+            "HTTPS://A.EXAMPLE:443/"
+        ));
+        assert!(!legacy_device_id_claimed_for_origin_at(
+            &root,
+            "https://b.example"
+        ));
+
+        assert!(
+            !claim_legacy_device_id_for_origin_at(&root, "https://b.example", None)
+                .expect("拒绝二次认领")
+        );
+        let b = device_id_path_for_origin_at(&root, "https://b.example").expect("B 路径");
+        assert_eq!(load_device_id_from(&b), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 旧设备id认领不覆盖已有同源分区值() {
+        let root = std::env::temp_dir().join(format!(
+            "lumen_legacy_device_existing_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("创建临时目录");
+        save_device_id_to(&root.join("device_id"), "stale-global").expect("写旧设备 id");
+        let target =
+            device_id_path_for_origin_at(&root, "https://a.example").expect("目标路径");
+        save_device_id_to(&target, "profile-device").expect("写同源设备 id");
+
+        assert!(
+            claim_legacy_device_id_for_origin_at(&root, "https://a.example", None)
+                .expect("消费旧设备 id")
+        );
+        assert_eq!(
+            load_device_id_from(&target).as_deref(),
+            Some("profile-device")
+        );
+        assert!(root.join("legacy_device_id_origin").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 旧profile镜像可在全局文件丢失时完成认领() {
+        let root = std::env::temp_dir().join(format!(
+            "lumen_legacy_profile_device_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("创建临时目录");
+
+        assert!(
+            claim_legacy_device_id_for_origin_at(
+                &root,
+                "https://a.example",
+                Some("profile-device")
+            )
+            .expect("从 profile 认领")
+        );
+        let target =
+            device_id_path_for_origin_at(&root, "https://a.example").expect("目标路径");
+        assert_eq!(
+            load_device_id_from(&target).as_deref(),
+            Some("profile-device")
+        );
+        assert!(legacy_device_id_claimed_for_origin_at(
+            &root,
+            "https://a.example"
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -197,7 +197,6 @@ pub enum SshMutationStatus {
 
 /// 一条服务端权威变更。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct SshSyncChange {
     /// 账号内严格单调递增 revision。
     pub revision: i64,
@@ -263,6 +262,51 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    #[test]
+    fn 服务端扁平变更响应可以被客户端反序列化() {
+        let response = SshSyncResponse {
+            schema_version: SSH_SYNC_SCHEMA_VERSION,
+            acks: Vec::new(),
+            changes: vec![SshSyncChange {
+                revision: 1,
+                updated_by_device: "device-1".to_owned(),
+                change: SshChange::UpsertProfile {
+                    profile: SshProfile {
+                        id: "ssh_00000000000000000000000000000000".to_owned(),
+                        name: "server".to_owned(),
+                        host: "example.test".to_owned(),
+                        port: 22,
+                        username: "root".to_owned(),
+                        auth_method: SshAuthMethod::PrivateKey,
+                        group_id: None,
+                        sort_order: 0,
+                        initial_directory: None,
+                        connect_timeout_secs: 15,
+                        keep_alive_secs: Some(30),
+                        monitor_enabled: true,
+                        trusted_host_key: None,
+                        created_at_ms: 1,
+                        updated_at_ms: 2,
+                    },
+                },
+            }],
+            next_cursor: 1,
+            has_more: false,
+        };
+
+        let json = serde_json::to_string(&response).expect("序列化服务端 SSH 同步回包");
+        let decoded =
+            serde_json::from_str::<SshSyncResponse>(&json).expect("客户端应能解析扁平 change");
+        assert_eq!(decoded, response);
+
+        let mut value = serde_json::to_value(&response).expect("转成 JSON value");
+        value["changes"][0]["profile"]["password"] = serde_json::json!("must-not-pass");
+        assert!(
+            serde_json::from_value::<SshSyncResponse>(value).is_err(),
+            "扁平外层取消 deny_unknown_fields 后，profile allowlist 仍必须拒绝秘密字段"
+        );
     }
 
     #[test]
