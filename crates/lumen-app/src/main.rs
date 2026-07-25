@@ -1092,6 +1092,9 @@ struct AppState {
     remote: remote::RemoteState,
     /// M5.3 远程控制 WS 引擎（配对 / 会话 / 数据面中继；part2a 引擎，UI part2b）。
     remote_ws: remote_ws::RemoteWs,
+    /// 当前登录上下文是否已尝试恢复上次主动控制目标。只在 WS 成功启动后置位；
+    /// 登出、换账号或换服务端时复位。
+    remote_restore_attempted: bool,
     /// M5.3 part3d 被控端镜像源签名：订阅会话的 `(tab_id, 各窗格(id,行,列), 焦点下标, 最大化下标)`。
     /// 变化（订阅切换 / 窗格增删 / 任一窗格 resize / 切焦点 / 最大化翻转 / 分隔条拖动改尺寸）即
     /// 重发全部窗格整屏快照 + 布局（`SubscriptionStarted`）。被控期间外为 None。
@@ -2624,7 +2627,31 @@ impl AppState {
         drop(self.ssh_sync.take());
         self.remote.stop();
         self.remote_ws.stop();
+        self.remote_restore_attempted = false;
         self.auth_token = None;
+    }
+
+    fn persist_remote_restore_target(&mut self) {
+        let Some((device_id, device_name)) = self
+            .remote_ws
+            .controller_peer()
+            .map(|(id, name)| (id.to_owned(), name.to_owned()))
+        else {
+            return;
+        };
+        if let Some(profile) = self.profile.as_mut() {
+            if profile.remember_remote_restore_target(&device_id, &device_name) {
+                profile.save();
+            }
+        }
+    }
+
+    fn clear_remote_restore_target(&mut self) {
+        if let Some(profile) = self.profile.as_mut() {
+            if profile.clear_remote_restore_target() {
+                profile.save();
+            }
+        }
     }
 
     fn reload_ssh_account_context(&mut self) {
@@ -2663,6 +2690,7 @@ impl AppState {
             }
         };
         self.auth_token = profile_auth_token(self.profile.as_ref(), &cloud::server_url());
+        self.remote_restore_attempted = false;
         self.ensure_ssh_sync_worker();
         self.window.request_redraw();
     }
@@ -8874,6 +8902,7 @@ impl App {
             auth_token: initial_auth_token,
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
+            remote_restore_attempted: false,
             mirror_src: None,
             mirror_bounds_sent: None,
             mirror_rect_px: None,
@@ -11843,14 +11872,34 @@ impl ApplicationHandler<PtyWake> for App {
                         state.auth_token.clone(),
                         account_server_origin.as_ref(),
                     ) {
-                        if let Err(error) = state.remote_ws.start(
+                        match state.remote_ws.start(
                             server_origin.clone(),
                             auth,
                             state.egui_ctx.clone(),
                             state.proxy.clone(),
                             state.wake_pending.clone(),
                         ) {
-                            log::warn!("启动远程 WS 失败: {}", error.user_message());
+                            Ok(()) => {
+                                if !state.remote_restore_attempted {
+                                    state.remote_restore_attempted = true;
+                                    if let Some((device_id, device_name)) = state
+                                        .profile
+                                        .as_ref()
+                                        .and_then(profile::Profile::remote_restore_target)
+                                        .map(|(id, name)| (id.to_owned(), name.to_owned()))
+                                    {
+                                        if state
+                                            .remote_ws
+                                            .restore_controller_session(device_id, device_name)
+                                        {
+                                            log::info!("正在恢复上次远程控制会话");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("启动远程 WS 失败: {}", error.user_message());
+                            }
                         }
                     }
                 }
@@ -12838,6 +12887,7 @@ impl ApplicationHandler<PtyWake> for App {
                     state.remote_ws.decline();
                 }
                 if shell_out.end_remote_session {
+                    state.clear_remote_restore_target();
                     state.remote_ws.end_session();
                 }
                 // M5.3 part3d：记录镜像区物理像素矩形（鼠标命中→镜像选区换算，part4b）+ Phase 3
@@ -12936,6 +12986,23 @@ impl ApplicationHandler<PtyWake> for App {
                 let remote_notices = state.remote_ws.take_notices();
                 if !remote_notices.is_empty() {
                     for n in &remote_notices {
+                        match n {
+                            remote_ws::Notice::SessionStarted {
+                                role: lumen_protocol::remote::Role::Controller,
+                                ..
+                            }
+                            | remote_ws::Notice::SessionRestored => {
+                                state.persist_remote_restore_target();
+                            }
+                            remote_ws::Notice::SessionStarted {
+                                role: lumen_protocol::remote::Role::Controlled,
+                                ..
+                            }
+                            | remote_ws::Notice::SessionEnded(_) => {
+                                state.clear_remote_restore_target();
+                            }
+                            _ => {}
+                        }
                         let (kind, text) = remote_notice_toast(n);
                         state.shell_state.toast.push(kind, text);
                         // 下载（→本地）/ 上传（→远程）完成 → 刷新粘贴目标目录，新文件立即显示。
