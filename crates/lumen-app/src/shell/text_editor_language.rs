@@ -6,10 +6,14 @@
 use std::{
     collections::BTreeMap,
     hash::{Hash as _, Hasher as _},
+    ops::Range,
     sync::Arc,
 };
 
-use super::theme::Palette;
+use super::{
+    text_editor_ops::{self, CommentStyle},
+    theme::Palette,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Language {
@@ -523,6 +527,29 @@ impl Language {
         )
     }
 
+    /// Ctrl+/ 注释切换使用的注释符：行注释前缀，或块注释包裹符号。
+    pub(super) const fn comment_style(self) -> Option<CommentStyle> {
+        match self {
+            Self::Rust
+            | Self::JavaScript
+            | Self::TypeScript
+            | Self::Go
+            | Self::Java
+            | Self::CLike
+            | Self::Json => Some(CommentStyle::Line("//")),
+            Self::Python
+            | Self::Shell
+            | Self::PowerShell
+            | Self::Yaml
+            | Self::Toml
+            | Self::Dockerfile => Some(CommentStyle::Line("#")),
+            Self::Sql => Some(CommentStyle::Line("--")),
+            Self::Css => Some(CommentStyle::Block("/*", "*/")),
+            Self::Html | Self::Xml | Self::Markdown => Some(CommentStyle::Block("<!--", "-->")),
+            Self::PlainText => None,
+        }
+    }
+
     const fn property_separator(self) -> Option<char> {
         match self {
             Self::Json | Self::Yaml | Self::Css => Some(':'),
@@ -543,6 +570,8 @@ enum TokenStyle {
     Property,
     Type,
     Operator,
+    /// 括号按嵌套深度着色（VSCode bracket pair colorization 风格）。
+    Bracket(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -557,6 +586,7 @@ struct SyntaxColors {
     property: egui::Color32,
     ty: egui::Color32,
     operator: egui::Color32,
+    brackets: [egui::Color32; 3],
 }
 
 impl SyntaxColors {
@@ -573,6 +603,11 @@ impl SyntaxColors {
                 property: egui::Color32::from_rgb(0x00, 0x10, 0x80),
                 ty: egui::Color32::from_rgb(0x26, 0x7F, 0x99),
                 operator: pal.fg_dim,
+                brackets: [
+                    egui::Color32::from_rgb(0x04, 0x31, 0xFA),
+                    egui::Color32::from_rgb(0x31, 0x93, 0x31),
+                    egui::Color32::from_rgb(0x7B, 0x38, 0x14),
+                ],
             }
         } else {
             Self {
@@ -586,6 +621,11 @@ impl SyntaxColors {
                 property: egui::Color32::from_rgb(0x9C, 0xDC, 0xFE),
                 ty: egui::Color32::from_rgb(0x4E, 0xC9, 0xB0),
                 operator: pal.fg_dim,
+                brackets: [
+                    egui::Color32::from_rgb(0xFF, 0xD7, 0x00),
+                    egui::Color32::from_rgb(0xDA, 0x70, 0xD6),
+                    egui::Color32::from_rgb(0x17, 0x9F, 0xFF),
+                ],
             }
         }
     }
@@ -601,6 +641,7 @@ impl SyntaxColors {
             TokenStyle::Property => self.property,
             TokenStyle::Type => self.ty,
             TokenStyle::Operator => self.operator,
+            TokenStyle::Bracket(depth) => self.brackets[depth as usize % self.brackets.len()],
         }
     }
 }
@@ -616,8 +657,16 @@ pub(super) fn highlight(
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
     let mut in_block_comment = false;
+    let mut bracket_depth = 0usize;
     for segment in text.split_inclusive('\n') {
-        highlight_segment(&mut job, segment, language, colors, &mut in_block_comment);
+        highlight_segment(
+            &mut job,
+            segment,
+            language,
+            colors,
+            &mut in_block_comment,
+            &mut bracket_depth,
+        );
     }
     if text.is_empty() {
         append(&mut job, "", TokenStyle::Plain, colors);
@@ -631,6 +680,7 @@ fn highlight_segment(
     language: Language,
     colors: SyntaxColors,
     in_block_comment: &mut bool,
+    bracket_depth: &mut usize,
 ) {
     if language == Language::PlainText {
         append(job, text, TokenStyle::Plain, colors);
@@ -753,10 +803,20 @@ fn highlight_segment(
             continue;
         }
         let end = index + ch.len_utf8();
-        let style = if ch.is_ascii_punctuation() {
-            TokenStyle::Operator
-        } else {
-            TokenStyle::Plain
+        let style = match ch {
+            // 括号按嵌套深度着色；深度跨行延续（与块注释同一通路），
+            // 字符串/注释内的括号走不到这里，不会污染计数。
+            '(' | '[' | '{' => {
+                let style = TokenStyle::Bracket((*bracket_depth % 3) as u8);
+                *bracket_depth += 1;
+                style
+            }
+            ')' | ']' | '}' => {
+                *bracket_depth = (*bracket_depth).saturating_sub(1);
+                TokenStyle::Bracket((*bracket_depth % 3) as u8)
+            }
+            _ if ch.is_ascii_punctuation() => TokenStyle::Operator,
+            _ => TokenStyle::Plain,
         };
         append(job, &text[index..end], style, colors);
         index = end;
@@ -904,7 +964,7 @@ fn number_end(text: &str, start: usize) -> usize {
     end.max(start + 1)
 }
 
-fn is_identifier_start(language: Language, ch: char) -> bool {
+pub(super) fn is_identifier_start(language: Language, ch: char) -> bool {
     ch == '_'
         || ch.is_alphabetic()
         || (ch == '$'
@@ -917,7 +977,7 @@ fn is_identifier_start(language: Language, ch: char) -> bool {
             ))
 }
 
-fn is_identifier_continue(language: Language, ch: char) -> bool {
+pub(super) fn is_identifier_continue(language: Language, ch: char) -> bool {
     is_identifier_start(language, ch)
         || ch.is_ascii_digit()
         || (ch == '-'
@@ -960,6 +1020,18 @@ pub(super) struct LanguageCache {
     layout: Option<Arc<egui::Galley>>,
     identifiers_key: Option<(u64, usize, Language)>,
     candidates: Vec<CompletionItem>,
+    /// 查找匹配缓存：(指纹, query, 大小写敏感)。
+    find_key: Option<(u64, String, bool)>,
+    find_results: Vec<Range<usize>>,
+    /// 选中词出现位置缓存：(指纹, 词)。
+    occurrence_key: Option<(u64, String)>,
+    occurrence_results: Vec<Range<usize>>,
+    /// 括号配对缓存：(指纹, 光标字符下标)。
+    bracket_key: Option<(u64, usize)>,
+    bracket: Option<(usize, Option<usize>)>,
+    /// 行首字符下标缓存（指纹）。
+    line_starts_key: Option<u64>,
+    line_starts: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1025,6 +1097,71 @@ impl LanguageCache {
             self.identifiers_key = Some(key);
         }
         completions_from_candidates(text, cursor_char, language, explicit, &self.candidates)
+    }
+
+    /// 查找匹配（缓存）；query 为空时恒为空切片。
+    pub(super) fn find_matches(
+        &mut self,
+        text: &str,
+        query: &str,
+        case_sensitive: bool,
+    ) -> &[Range<usize>] {
+        let fingerprint = text_fingerprint(text);
+        let key = (fingerprint, query.to_owned(), case_sensitive);
+        if self.find_key.as_ref() != Some(&key) {
+            self.find_results = text_editor_ops::find_matches(text, query, case_sensitive);
+            self.find_key = Some(key);
+        }
+        &self.find_results
+    }
+
+    /// 选中词出现位置（缓存，大小写敏感 + 标识符边界）。
+    pub(super) fn occurrences(
+        &mut self,
+        text: &str,
+        word: &str,
+        language: Language,
+    ) -> &[Range<usize>] {
+        let fingerprint = text_fingerprint(text);
+        let key = (fingerprint, word.to_owned());
+        if self.occurrence_key.as_ref() != Some(&key) {
+            self.occurrence_results = text_editor_ops::word_matches(text, word, |ch| {
+                is_identifier_continue(language, ch)
+            });
+            self.occurrence_key = Some(key);
+        }
+        &self.occurrence_results
+    }
+
+    /// 光标旁括号配对（缓存）。
+    pub(super) fn bracket_at(
+        &mut self,
+        text: &str,
+        cursor: usize,
+    ) -> Option<(usize, Option<usize>)> {
+        let fingerprint = text_fingerprint(text);
+        let key = (fingerprint, cursor);
+        if self.bracket_key != Some(key) {
+            self.bracket = text_editor_ops::matching_bracket(text, cursor);
+            self.bracket_key = Some(key);
+        }
+        self.bracket
+    }
+
+    /// 各行行首字符下标（缓存，升序，含 0；尾换行后多一行空行）。
+    pub(super) fn line_starts(&mut self, text: &str) -> &[usize] {
+        let fingerprint = text_fingerprint(text);
+        if self.line_starts_key != Some(fingerprint) {
+            self.line_starts.clear();
+            self.line_starts.push(0);
+            for (idx, ch) in text.chars().enumerate() {
+                if ch == '\n' {
+                    self.line_starts.push(idx + 1);
+                }
+            }
+            self.line_starts_key = Some(fingerprint);
+        }
+        &self.line_starts
     }
 }
 
@@ -1339,5 +1476,64 @@ mod tests {
             reused = Arc::ptr_eq(&first, &second);
         });
         assert!(reused, "未变化文本应复用已排版的语法高亮 Galley");
+    }
+
+    #[test]
+    fn comment_style_covers_every_language() {
+        assert_eq!(
+            Language::Rust.comment_style(),
+            Some(CommentStyle::Line("//"))
+        );
+        assert_eq!(
+            Language::Python.comment_style(),
+            Some(CommentStyle::Line("#"))
+        );
+        assert_eq!(
+            Language::Sql.comment_style(),
+            Some(CommentStyle::Line("--"))
+        );
+        assert_eq!(
+            Language::Css.comment_style(),
+            Some(CommentStyle::Block("/*", "*/"))
+        );
+        assert_eq!(
+            Language::Html.comment_style(),
+            Some(CommentStyle::Block("<!--", "-->"))
+        );
+        assert_eq!(Language::PlainText.comment_style(), None);
+    }
+
+    #[test]
+    fn bracket_depth_colors_cycle_but_skip_strings_and_comments() {
+        let source = "(\"(\" [(x)]) // (";
+        let job = highlight(
+            source,
+            Language::Rust,
+            &super::super::theme::DARK,
+            640.0,
+            13.0,
+        );
+        assert_eq!(job.text, source);
+        let colors = SyntaxColors::from_palette(&super::super::theme::DARK, 13.0);
+        // 按字节位置找 section 颜色。
+        let color_at = |byte: usize| {
+            job.sections
+                .iter()
+                .find(|section| section.byte_range.contains(&byte))
+                .map(|section| section.format.color)
+        };
+        assert_eq!(color_at(0), Some(colors.brackets[0]), "外层 ( 深度 0");
+        assert_eq!(
+            color_at(1),
+            Some(colors.string),
+            "字符串内的 ( 保持字符串色"
+        );
+        // "(\"(\" [" → [ 深度 1；(x) 的 ( 深度 2。
+        assert_eq!(color_at(5), Some(colors.brackets[1]), "[ 深度 1");
+        assert_eq!(color_at(6), Some(colors.brackets[2]), "( 深度 2");
+        assert_eq!(color_at(8), Some(colors.brackets[2]), ") 深度 2 配对色");
+        assert_eq!(color_at(9), Some(colors.brackets[1]), "] 深度 1 配对色");
+        assert_eq!(color_at(10), Some(colors.brackets[0]), ") 回到深度 0");
+        assert_eq!(color_at(15), Some(colors.comment), "注释内的 ( 保持注释色");
     }
 }

@@ -10,6 +10,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     text_editor_language::{CompletionKind, CompletionSet, Language, LanguageCache},
+    text_editor_ops::{self, EditPlan, TypedCharDecision},
     theme::Palette,
 };
 
@@ -223,6 +224,19 @@ pub struct TextEditorState {
     find_open: bool,
     focus_find: bool,
     find_query: String,
+    /// 查找栏的替换输入与替换行开关（Ctrl+H 或箭头按钮展开）。
+    replace_query: String,
+    find_replace_open: bool,
+    /// 查找大小写敏感开关（Aa）。
+    find_case_sensitive: bool,
+    /// Ctrl+G 跳转到行的小输入条。
+    goto_open: bool,
+    goto_query: String,
+    focus_goto: bool,
+    /// Alt+Z 软换行开关（全局偏好，不随标签切换重置）。
+    wrap: bool,
+    /// 查找/跳转请求的目标字符下标；editor_body 消费并滚动到可见。
+    pending_scroll: Option<(u64, usize)>,
     pending_close: Option<CloseIntent>,
     post_save_close: Option<CloseIntent>,
     /// 关闭整个编辑器时，用户已选择“不保存”的文档及其当时正文指纹。
@@ -258,6 +272,7 @@ impl TextEditorState {
         self.visible = false;
         self.focus_editor = false;
         self.focus_find = false;
+        self.focus_goto = false;
         self.dismiss_completion();
         true
     }
@@ -270,6 +285,7 @@ impl TextEditorState {
         self.visible = true;
         self.focus_editor = true;
         self.focus_find = false;
+        self.focus_goto = false;
         self.dismiss_completion();
         true
     }
@@ -324,6 +340,12 @@ impl TextEditorState {
         self.find_open = false;
         self.focus_find = false;
         self.find_query.clear();
+        self.replace_query.clear();
+        self.find_replace_open = false;
+        self.goto_open = false;
+        self.goto_query.clear();
+        self.focus_goto = false;
+        self.pending_scroll = None;
         self.focus_editor = false;
         self.dismiss_completion();
         LoadRequest { token, source }
@@ -544,6 +566,12 @@ impl TextEditorState {
         self.find_open = false;
         self.focus_find = false;
         self.find_query.clear();
+        self.replace_query.clear();
+        self.find_replace_open = false;
+        self.goto_open = false;
+        self.goto_query.clear();
+        self.focus_goto = false;
+        self.pending_scroll = None;
         self.language_caches.clear();
         self.dismiss_completion();
     }
@@ -589,6 +617,12 @@ impl TextEditorState {
             self.find_open = false;
             self.focus_find = false;
             self.find_query.clear();
+            self.replace_query.clear();
+            self.find_replace_open = false;
+            self.goto_open = false;
+            self.goto_query.clear();
+            self.focus_goto = false;
+            self.pending_scroll = None;
         } else if was_active {
             let next_index = index.min(self.documents.len() - 1);
             self.active_token = Some(self.documents[next_index].token);
@@ -745,11 +779,31 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
         ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::S));
     let find_shortcut =
         ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F));
+    let replace_shortcut =
+        ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::H));
+    let goto_shortcut =
+        ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::G));
+    let wrap_shortcut = ui.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Z));
     let active_state = state.active_document().map(|document| document.state);
-    if find_shortcut && active_state == Some(LoadState::Ready) {
-        state.find_open = true;
-        state.focus_find = true;
-        state.dismiss_completion();
+    if active_state == Some(LoadState::Ready) {
+        if find_shortcut || replace_shortcut {
+            state.find_open = true;
+            state.focus_find = true;
+            state.find_replace_open |= replace_shortcut;
+            state.goto_open = false;
+            state.focus_goto = false;
+            state.dismiss_completion();
+        }
+        if goto_shortcut {
+            state.goto_open = true;
+            state.focus_goto = true;
+            state.find_open = false;
+            state.focus_find = false;
+            state.dismiss_completion();
+        }
+        if wrap_shortcut {
+            state.wrap = !state.wrap;
+        }
     }
     if state.pending_close.is_some() || state.conflict_token().is_some() {
         state.dismiss_completion();
@@ -765,6 +819,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) -> Ou
             }
             if state.find_open {
                 find_bar(ui, state, pal);
+            }
+            if state.goto_open {
+                goto_bar(ui, state, pal);
             }
             ui.separator();
 
@@ -878,13 +935,16 @@ struct TabSnapshot {
 }
 
 fn editor_hide_button(ui: &mut egui::Ui, pal: &Palette) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(4), pal.bg_highlight);
     }
-    let color = if response.hovered() { pal.fg } else { pal.fg_dim };
+    let color = if response.hovered() {
+        pal.fg
+    } else {
+        pal.fg_dim
+    };
     ui.painter().line_segment(
         [
             egui::pos2(rect.center().x - 5.0, rect.center().y + 3.0),
@@ -1081,31 +1141,245 @@ fn editor_header(
         });
 }
 
+/// 设置编辑器选区并取回焦点（查找跳转、跳转行共用）。
+fn select_editor_range(ctx: &egui::Context, editor_id: egui::Id, range: std::ops::Range<usize>) {
+    let mut edit_state =
+        egui::widgets::text_edit::TextEditState::load(ctx, editor_id).unwrap_or_default();
+    edit_state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(range.start),
+            egui::text::CCursor::new(range.end),
+        )));
+    edit_state.store(ctx, editor_id);
+    ctx.memory_mut(|memory| memory.request_focus(editor_id));
+}
+
+fn editor_selection(ctx: &egui::Context, editor_id: egui::Id) -> std::ops::Range<usize> {
+    egui::widgets::text_edit::TextEditState::load(ctx, editor_id)
+        .and_then(|state| state.cursor.char_range())
+        .map(|range| range.as_sorted_char_range())
+        .unwrap_or(0..0)
+}
+
+/// 跳到下一个（next=true）或上一个匹配；越过文档端点时回绕。
+fn find_jump(
+    ctx: &egui::Context,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+    next: bool,
+) {
+    let selection = editor_selection(ctx, editor_id);
+    let target = {
+        let TextEditorState {
+            documents,
+            language_caches,
+            find_query,
+            find_case_sensitive,
+            ..
+        } = state;
+        let Some(document) = documents.iter().find(|document| document.token == token) else {
+            return;
+        };
+        let matches = language_caches.entry(token).or_default().find_matches(
+            &document.text,
+            find_query,
+            *find_case_sensitive,
+        );
+        if matches.is_empty() {
+            None
+        } else if next {
+            matches
+                .iter()
+                .find(|m| m.start >= selection.end)
+                .or_else(|| matches.first())
+        } else {
+            matches
+                .iter()
+                .rev()
+                .find(|m| m.end <= selection.start)
+                .or_else(|| matches.last())
+        }
+        .cloned()
+    };
+    if let Some(range) = target {
+        select_editor_range(ctx, editor_id, range.clone());
+        state.pending_scroll = Some((token, range.start));
+    }
+}
+
+/// 替换当前选中的匹配；选区不是匹配时改为跳到下一个匹配。
+fn replace_current(
+    ctx: &egui::Context,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+) {
+    let selection = editor_selection(ctx, editor_id);
+    let plan = {
+        let TextEditorState {
+            documents,
+            language_caches,
+            find_query,
+            find_case_sensitive,
+            replace_query,
+            ..
+        } = state;
+        let Some(document) = documents.iter().find(|document| document.token == token) else {
+            return;
+        };
+        let matches = language_caches.entry(token).or_default().find_matches(
+            &document.text,
+            find_query,
+            *find_case_sensitive,
+        );
+        if matches.contains(&selection) {
+            let cursor = selection.start + replace_query.chars().count();
+            Some(EditPlan {
+                replace_chars: selection,
+                insertion: replace_query.clone(),
+                selection_after: cursor..cursor,
+            })
+        } else {
+            None
+        }
+    };
+    if let Some(plan) = plan {
+        queue_edit_plan(state, token, plan);
+    } else {
+        find_jump(ctx, state, token, editor_id, true);
+    }
+}
+
+/// 全部替换：整个缓冲一次注入（单条可撤销）。
+fn replace_all_matches(state: &mut TextEditorState, token: u64) {
+    let plan = {
+        let TextEditorState {
+            documents,
+            language_caches,
+            find_query,
+            find_case_sensitive,
+            replace_query,
+            ..
+        } = state;
+        let Some(document) = documents.iter().find(|document| document.token == token) else {
+            return;
+        };
+        let matches = language_caches
+            .entry(token)
+            .or_default()
+            .find_matches(&document.text, find_query, *find_case_sensitive)
+            .to_vec();
+        if matches.is_empty() {
+            None
+        } else {
+            let new_text =
+                text_editor_ops::replace_matches(&document.text, &matches, replace_query);
+            let cursor = matches[0].start.min(text_editor_ops::char_count(&new_text));
+            Some(EditPlan {
+                replace_chars: 0..text_editor_ops::char_count(&document.text),
+                insertion: new_text,
+                selection_after: cursor..cursor,
+            })
+        }
+    };
+    if let Some(plan) = plan {
+        queue_edit_plan(state, token, plan);
+    }
+}
+
 fn find_bar(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
-    let matches = state
-        .active_document()
-        .map_or(0, |document| match_count(&document.text, &state.find_query));
+    let Some(token) = state.active_token else {
+        return;
+    };
+    let editor_id = ui.make_persistent_id(("lumen_text_editor", token));
+    let mut jump_next = None;
+    let mut do_replace = false;
+    let mut do_replace_all = false;
     egui::Frame::new()
         .fill(pal.bg_dark)
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                let toggle = if state.find_replace_open {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                if ui.small_button(toggle).clicked() {
+                    state.find_replace_open = !state.find_replace_open;
+                }
                 let response = ui.add_sized(
-                    [260.0, 24.0],
+                    [220.0, 24.0],
                     egui::TextEdit::singleline(&mut state.find_query)
                         .hint_text(crate::i18n::strings().text_editor_find_hint)
-                        .desired_width(260.0),
+                        .desired_width(220.0),
                 );
                 if state.focus_find {
                     response.request_focus();
                     state.focus_find = false;
                 }
-                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    jump_next = Some(!ui.input(|input| input.modifiers.shift));
+                    response.request_focus();
+                }
+                if (response.has_focus() || response.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape))
+                {
                     state.find_open = false;
                     state.focus_find = false;
                 }
+                if ui
+                    .selectable_label(state.find_case_sensitive, "Aa")
+                    .on_hover_text(crate::i18n::strings().text_editor_case_sensitive)
+                    .clicked()
+                {
+                    state.find_case_sensitive = !state.find_case_sensitive;
+                }
+                if ui
+                    .small_button("↑")
+                    .on_hover_text(crate::i18n::strings().text_editor_prev_match)
+                    .clicked()
+                {
+                    jump_next = Some(false);
+                }
+                if ui
+                    .small_button("↓")
+                    .on_hover_text(crate::i18n::strings().text_editor_next_match)
+                    .clicked()
+                {
+                    jump_next = Some(true);
+                }
+                // n/m：光标之后结束的第一个匹配算“当前”。
+                let (current, total) = {
+                    let TextEditorState {
+                        documents,
+                        language_caches,
+                        find_query,
+                        find_case_sensitive,
+                        ..
+                    } = state;
+                    documents
+                        .iter()
+                        .find(|document| document.token == token)
+                        .map(|document| {
+                            let matches = language_caches.entry(token).or_default().find_matches(
+                                &document.text,
+                                find_query,
+                                *find_case_sensitive,
+                            );
+                            let selection = editor_selection(ui.ctx(), editor_id);
+                            let current = matches
+                                .iter()
+                                .position(|m| m.end > selection.start)
+                                .map_or(0, |index| index + 1);
+                            (current, matches.len())
+                        })
+                        .unwrap_or((0, 0))
+                };
                 ui.label(
-                    egui::RichText::new(format!("{matches}"))
+                    egui::RichText::new(format!("{current}/{total}"))
                         .monospace()
                         .size(11.0)
                         .color(pal.fg_dim),
@@ -1115,7 +1389,384 @@ fn find_bar(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
                     state.focus_find = false;
                 }
             });
+            if state.find_replace_open {
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
+                    let response = ui.add_sized(
+                        [220.0, 24.0],
+                        egui::TextEdit::singleline(&mut state.replace_query)
+                            .hint_text(crate::i18n::strings().text_editor_replace)
+                            .desired_width(220.0),
+                    );
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        do_replace = true;
+                        response.request_focus();
+                    }
+                    if (response.has_focus() || response.lost_focus())
+                        && ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    {
+                        state.find_open = false;
+                        state.focus_find = false;
+                    }
+                    if ui
+                        .button(crate::i18n::strings().text_editor_replace)
+                        .clicked()
+                    {
+                        do_replace = true;
+                    }
+                    if ui
+                        .button(crate::i18n::strings().text_editor_replace_all)
+                        .clicked()
+                    {
+                        do_replace_all = true;
+                    }
+                });
+            }
         });
+    if let Some(next) = jump_next {
+        find_jump(ui.ctx(), state, token, editor_id, next);
+    }
+    if do_replace {
+        replace_current(ui.ctx(), state, token, editor_id);
+    }
+    if do_replace_all {
+        replace_all_matches(state, token);
+    }
+}
+
+/// Ctrl+G 跳转到行的小输入条。
+fn goto_bar(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
+    let Some(token) = state.active_token else {
+        return;
+    };
+    let editor_id = ui.make_persistent_id(("lumen_text_editor", token));
+    let mut jump = false;
+    egui::Frame::new()
+        .fill(pal.bg_dark)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let response = ui.add_sized(
+                    [120.0, 24.0],
+                    egui::TextEdit::singleline(&mut state.goto_query)
+                        .hint_text(crate::i18n::strings().text_editor_goto_hint)
+                        .desired_width(120.0),
+                );
+                if state.focus_goto {
+                    response.request_focus();
+                    state.focus_goto = false;
+                }
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    jump = true;
+                }
+                if (response.has_focus() || response.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape))
+                {
+                    state.goto_open = false;
+                    state.focus_goto = false;
+                }
+                if ui.small_button("×").clicked() {
+                    state.goto_open = false;
+                    state.focus_goto = false;
+                }
+            });
+        });
+    if jump {
+        if let Ok(line) = state.goto_query.trim().parse::<usize>() {
+            if line > 0 {
+                if let Some(document) = state.document(token) {
+                    let char_idx = text_editor_ops::goto_line_start(&document.text, line);
+                    select_editor_range(ui.ctx(), editor_id, char_idx..char_idx);
+                    state.pending_scroll = Some((token, char_idx));
+                }
+            }
+        }
+        state.goto_open = false;
+        state.focus_goto = false;
+    }
+}
+
+/// editor_body 单帧采集的展示数据（文本块借用结束后供状态栏/覆盖层使用）。
+struct EditorFrame {
+    response: egui::Response,
+    line_count: usize,
+    bytes: usize,
+    cursor_line: usize,
+    cursor_column: usize,
+    line_ending: LineEnding,
+    utf8_bom: bool,
+    language: Language,
+    error: Option<String>,
+    completion: Option<([u8; 32], CompletionSet, egui::Rect)>,
+    viewport_rect: egui::Rect,
+    viewport_clicked: bool,
+    /// 本帧正文 galley 与其屏幕位置（行号/高亮定位用）。
+    galley: std::sync::Arc<egui::Galley>,
+    galley_pos: egui::Pos2,
+    /// 行号栏宽度（含两侧留白）。
+    gutter_width: f32,
+    /// 等宽数字字宽与字号（缩进参考线/行号绘制用）。
+    char_width: f32,
+    font_size: f32,
+    /// 当前选区（字符下标，升序）。
+    cursor_range: Option<std::ops::Range<usize>>,
+}
+
+/// 字符区间的屏幕矩形（软换行跨视觉行时逐行切开）。
+fn range_rects(
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    range: &std::ops::Range<usize>,
+) -> Vec<egui::Rect> {
+    let start = galley
+        .pos_from_cursor(egui::text::CCursor::new(range.start))
+        .translate(galley_pos.to_vec2());
+    let end = galley
+        .pos_from_cursor(egui::text::CCursor::new(range.end))
+        .translate(galley_pos.to_vec2());
+    if (start.min.y - end.min.y).abs() < 1.0 {
+        let right = end.min.x.max(start.min.x + 2.0);
+        return vec![egui::Rect::from_min_max(
+            start.min,
+            egui::pos2(right, start.max.y),
+        )];
+    }
+    let mut out = Vec::new();
+    for row in &galley.rows {
+        let row_rect = row.rect().translate(galley_pos.to_vec2());
+        if row_rect.max.y <= start.min.y || row_rect.min.y >= end.max.y {
+            continue;
+        }
+        let left = if (row_rect.min.y - start.min.y).abs() < 1.0 {
+            start.min.x
+        } else {
+            row_rect.min.x
+        };
+        let right = if (row_rect.min.y - end.min.y).abs() < 1.0 {
+            end.min.x
+        } else {
+            row_rect.max.x
+        };
+        out.push(egui::Rect::from_min_max(
+            egui::pos2(left, row_rect.min.y),
+            egui::pos2(right.max(left + 2.0), row_rect.max.y),
+        ));
+    }
+    out
+}
+
+/// 行号栏、当前行、缩进参考线与各类高亮的覆盖绘制。
+///
+/// 全部画在 TextEdit 之上（半透明）：galley 已含本帧滚动偏移。
+/// 行号栏最后以不透明底绘制，遮住横向滚动滑到栏下的正文，保持栏位固定。
+fn paint_editor_overlays(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    frame: &EditorFrame,
+    pal: &Palette,
+) {
+    let viewport = frame.viewport_rect;
+    let painter = ui.painter().with_clip_rect(viewport);
+    let galley = &frame.galley;
+    let galley_pos = frame.galley_pos;
+    let text_left = viewport.left() + frame.gutter_width;
+
+    let TextEditorState {
+        documents,
+        language_caches,
+        find_open,
+        find_query,
+        find_case_sensitive,
+        ..
+    } = state;
+    let Some(document) = documents.iter().find(|document| document.token == token) else {
+        return;
+    };
+    let cache = language_caches.entry(token).or_default();
+    let text = &document.text;
+    let cursor_line0 = frame.cursor_line.saturating_sub(1);
+
+    // ── 沿 galley 行走可见行：行号、当前行、参考线共用一次遍历 ──
+    let unit = detected_indent_unit(text, "", frame.language);
+    let unit_cols = if unit == "\t" {
+        4
+    } else {
+        unit.chars().count().max(1)
+    };
+    let line_starts = cache.line_starts(text).to_vec();
+    let mut line_no = 0usize;
+    let mut line_levels = 0usize;
+    let mut current_line_rows: Vec<egui::Rect> = Vec::new();
+    let mut gutter_rows: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut guides: Vec<(usize, egui::Rect)> = Vec::new();
+    let mut first_visible_line = None;
+    let mut last_visible_line = 0usize;
+    for (row_idx, row) in galley.rows.iter().enumerate() {
+        let is_line_start = row_idx == 0 || galley.rows[row_idx - 1].ends_with_newline;
+        if is_line_start {
+            let start = line_starts.get(line_no).copied().unwrap_or(usize::MAX);
+            let end = line_starts
+                .get(line_no + 1)
+                .copied()
+                .unwrap_or_else(|| text_editor_ops::char_count(text));
+            let line_text = text_editor_ops::slice_chars(text, start..end);
+            line_levels = text_editor_ops::indent_columns(line_text, unit_cols) / unit_cols;
+        }
+        let row_rect = row.rect().translate(galley_pos.to_vec2());
+        if row_rect.min.y > viewport.bottom() {
+            break;
+        }
+        if row_rect.max.y >= viewport.top() {
+            first_visible_line.get_or_insert(line_no);
+            last_visible_line = line_no;
+            if line_no == cursor_line0 {
+                current_line_rows.push(row_rect);
+            }
+            if is_line_start {
+                gutter_rows.push((line_no, row_rect));
+            }
+            for level in 1..=line_levels.min(8) {
+                guides.push((level, row_rect));
+            }
+        }
+        if row.ends_with_newline {
+            line_no += 1;
+        }
+    }
+
+    // ── 当前行高亮（整条视口宽，行号栏部分稍后由栏底盖住）──
+    for row_rect in &current_line_rows {
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(viewport.left(), row_rect.min.y),
+                egui::pos2(viewport.right(), row_rect.max.y),
+            ),
+            0.0,
+            pal.fg.gamma_multiply(0.05),
+        );
+    }
+
+    // ── 可见字符区间：匹配类高亮只画可见部分 ──
+    let visible_chars = first_visible_line.map_or(0..0, |first| {
+        let start = line_starts.get(first).copied().unwrap_or(0);
+        let end = line_starts
+            .get(last_visible_line + 1)
+            .copied()
+            .unwrap_or_else(|| text_editor_ops::char_count(text));
+        start..end
+    });
+
+    // ── 查找匹配高亮（当前选中的匹配更亮）──
+    if *find_open && !find_query.is_empty() {
+        let selected = frame.cursor_range.clone();
+        let matches: Vec<std::ops::Range<usize>> = cache
+            .find_matches(text, find_query, *find_case_sensitive)
+            .iter()
+            .filter(|m| visible_chars.contains(&m.start))
+            .take(500)
+            .cloned()
+            .collect();
+        for m in &matches {
+            let fill = if selected.as_ref() == Some(m) {
+                pal.accent.gamma_multiply(0.55)
+            } else {
+                pal.accent.gamma_multiply(0.28)
+            };
+            for rect in range_rects(galley, galley_pos, m) {
+                painter.rect_filled(rect, egui::CornerRadius::same(2), fill);
+            }
+        }
+    }
+
+    // ── 选中词出现高亮 ──
+    if let Some(sel) = frame
+        .cursor_range
+        .clone()
+        .filter(|sel| !sel.is_empty() && sel.end - sel.start <= 64)
+    {
+        let word = text_editor_ops::slice_chars(text, sel.clone());
+        if !word.is_empty()
+            && !word.chars().any(char::is_whitespace)
+            && word.chars().next().is_some_and(|ch| {
+                super::text_editor_language::is_identifier_start(frame.language, ch)
+            })
+        {
+            let occurrences: Vec<std::ops::Range<usize>> = cache
+                .occurrences(text, word, frame.language)
+                .iter()
+                .filter(|m| visible_chars.contains(&m.start))
+                .take(300)
+                .cloned()
+                .collect();
+            for m in &occurrences {
+                for rect in range_rects(galley, galley_pos, m) {
+                    painter.rect_filled(
+                        rect,
+                        egui::CornerRadius::same(2),
+                        pal.fg.gamma_multiply(0.16),
+                    );
+                }
+            }
+        }
+    }
+
+    // ── 括号匹配（失配用错误色）──
+    if let Some(sel) = frame.cursor_range.clone().filter(|sel| sel.is_empty()) {
+        if let Some((bracket, matched)) = cache.bracket_at(text, sel.start) {
+            let fill = if matched.is_some() {
+                pal.accent.gamma_multiply(0.40)
+            } else {
+                pal.error.gamma_multiply(0.55)
+            };
+            for idx in [bracket, matched.unwrap_or(bracket)] {
+                for rect in range_rects(galley, galley_pos, &(idx..idx + 1)) {
+                    painter.rect_filled(rect, egui::CornerRadius::same(2), fill);
+                }
+            }
+        }
+    }
+
+    // ── 缩进参考线 ──
+    for (level, row_rect) in &guides {
+        let x = text_left + (level * unit_cols) as f32 * frame.char_width;
+        if x >= viewport.right() {
+            continue;
+        }
+        painter.line_segment(
+            [egui::pos2(x, row_rect.min.y), egui::pos2(x, row_rect.max.y)],
+            egui::Stroke::new(1.0_f32, pal.fg_dim.gamma_multiply(0.22)),
+        );
+    }
+
+    // ── 行号栏（最后画，保持栏位固定）──
+    let gutter_rect =
+        egui::Rect::from_min_max(viewport.min, egui::pos2(text_left, viewport.bottom()));
+    painter.rect_filled(gutter_rect, 0.0, pal.bg_dark);
+    let font_id = egui::FontId::monospace(frame.font_size);
+    for (line, row_rect) in &gutter_rows {
+        let color = if *line == cursor_line0 {
+            pal.fg
+        } else {
+            pal.fg_dim
+        };
+        painter.text(
+            egui::pos2(text_left - 8.0, row_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            (line + 1).to_string(),
+            font_id.clone(),
+            color,
+        );
+    }
+    painter.line_segment(
+        [
+            egui::pos2(text_left - 0.5, viewport.top()),
+            egui::pos2(text_left - 0.5, viewport.bottom()),
+        ],
+        egui::Stroke::new(1.0_f32, pal.panel_outline.gamma_multiply(0.6)),
+    );
 }
 
 fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
@@ -1147,21 +1798,15 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         .as_ref()
         .is_some_and(|completion| completion.token == token);
     let ime_composing = state.ime_composing;
-
-    struct EditorFrame {
-        response: egui::Response,
-        line_count: usize,
-        bytes: usize,
-        cursor_line: usize,
-        cursor_column: usize,
-        line_ending: LineEnding,
-        utf8_bom: bool,
-        language: Language,
-        error: Option<String>,
-        completion: Option<([u8; 32], CompletionSet, egui::Rect)>,
-        viewport_rect: egui::Rect,
-        viewport_clicked: bool,
-    }
+    let wrap = state.wrap;
+    // 查找/跳转的滚动目标：只消费属于当前标签的，其他放回去。
+    let pending_scroll = match state.pending_scroll.take() {
+        Some((pending_token, char_idx)) if pending_token == token => Some(char_idx),
+        other => {
+            state.pending_scroll = other;
+            None
+        }
+    };
 
     let frame = {
         let TextEditorState {
@@ -1200,6 +1845,29 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         let desired_rows = ((viewport_rect.height() - 4.0).max(row_height) / row_height)
             .floor()
             .max(1.0) as usize;
+        // 行号栏宽度：行数位数（至少 3 位）× 数字宽 + 两侧留白。
+        let line_count = document.text.lines().count().max(1);
+        let font_size = editor_ui
+            .style()
+            .text_styles
+            .get(&egui::TextStyle::Monospace)
+            .map_or(13.0, |font| font.size);
+        let char_width = editor_ui
+            .fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        "0".to_owned(),
+                        egui::FontId::monospace(font_size),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            })
+            .max(1.0);
+        let digits = line_count.max(999).to_string().len();
+        let gutter_width =
+            (digits as f32 * char_width + 16.0).min((viewport_rect.width() * 0.5).max(0.0));
+        let text_width = (viewport_rect.width() - gutter_width).max(20.0);
         let scroll_output = egui::ScrollArea::both()
             .id_salt(("lumen_text_editor_scroll", token))
             .auto_shrink([false, false])
@@ -1208,20 +1876,35 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
             .min_scrolled_width(viewport_rect.width())
             .min_scrolled_height(viewport_rect.height())
             .show(&mut editor_ui, |ui| {
-                let mut layouter =
-                    |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
-                        cache.layout(ui, buffer.as_str(), language, pal, wrap_width)
-                    };
-                egui::TextEdit::multiline(&mut document.text)
-                    .id(editor_id)
-                    .font(egui::TextStyle::Monospace)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(desired_rows)
-                    .min_size(egui::vec2(viewport_rect.width(), 0.0))
-                    .lock_focus(true)
-                    .layouter(&mut layouter)
-                    .show(ui)
+                let edit_output = ui
+                    .horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        // 行号栏预留的固定宽度；栏本身在滚动区外绘制，不随横向滚动。
+                        ui.add_space(gutter_width);
+                        let mut layouter =
+                            |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+                                cache.layout(ui, buffer.as_str(), language, pal, wrap_width)
+                            };
+                        egui::TextEdit::multiline(&mut document.text)
+                            .id(editor_id)
+                            .font(egui::TextStyle::Monospace)
+                            .code_editor()
+                            .desired_width(if wrap { text_width } else { f32::INFINITY })
+                            .desired_rows(desired_rows)
+                            .min_size(egui::vec2(text_width, 0.0))
+                            .lock_focus(true)
+                            .layouter(&mut layouter)
+                            .show(ui)
+                    })
+                    .inner;
+                if let Some(target) = pending_scroll {
+                    let caret = edit_output
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(target))
+                        .translate(edit_output.galley_pos.to_vec2());
+                    ui.scroll_to_rect(caret, Some(egui::Align::Center));
+                }
+                edit_output
             });
         let mut edit_output = scroll_output.inner;
         let visible_text_rect = scroll_output.inner_rect.intersect(viewport_rect);
@@ -1243,6 +1926,9 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         let cursor = edit_output.cursor_range.and_then(|range| range.single());
         let cursor_char = cursor.map_or(0, |cursor| cursor.index);
         let (cursor_line, cursor_column) = cursor_line_column(&document.text, cursor_char);
+        let cursor_range = edit_output
+            .cursor_range
+            .map(|range| range.as_sorted_char_range());
         let should_complete = !ime_composing
             && !suppress_completion
             && !editor_edit_applied
@@ -1263,7 +1949,7 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
         };
         EditorFrame {
             response: edit_output.response.response,
-            line_count: document.text.lines().count().max(1),
+            line_count,
             bytes: document.text.len(),
             cursor_line,
             cursor_column,
@@ -1274,8 +1960,16 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
             completion,
             viewport_rect,
             viewport_clicked: editor_response.clicked(),
+            galley: std::sync::Arc::clone(&edit_output.galley),
+            galley_pos: edit_output.galley_pos,
+            gutter_width,
+            char_width,
+            font_size,
+            cursor_range,
         }
     };
+
+    paint_editor_overlays(ui, state, token, &frame, pal);
 
     if focus_editor || frame.viewport_clicked {
         frame.response.request_focus();
@@ -1346,6 +2040,21 @@ fn editor_body(ui: &mut egui::Ui, state: &mut TextEditorState, pal: &Palette) {
                             .size(10.0)
                             .color(pal.fg_dim),
                     );
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(crate::i18n::strings().text_editor_wrap)
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(if state.wrap { pal.accent } else { pal.fg_dim }),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Alt+Z")
+                        .clicked()
+                    {
+                        state.wrap = !state.wrap;
+                    }
                 });
             });
         });
@@ -1405,6 +2114,9 @@ fn prepare_completion_input(
         return (false, None, true);
     }
 
+    // 行操作 / 注释 / 缩进 / 括号自动闭合（仅编辑器聚焦时生效）。
+    prepare_editor_ops(ui, state, token, editor_id, language);
+
     let explicit_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Space);
     let explicit = ui.input_mut(|input| input.consume_shortcut(&explicit_shortcut));
 
@@ -1454,6 +2166,247 @@ fn prepare_completion_input(
         injected = inject_pending_completion(ui, state, token, editor_id);
     }
     (explicit, injected, false)
+}
+
+/// 编辑器代码编辑操作：行操作/注释/缩进快捷键与括号自动闭合。
+///
+/// 需要改文本的操作统一转成 [`EditPlan`] 走 `pending_completion`
+/// 单条 Paste 注入（一步可撤销）；只动光标的操作直接改写
+/// `TextEditState`。在 TextEdit 处理输入之前调用。
+fn prepare_editor_ops(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+    language: Language,
+) {
+    if state.pending_close.is_some() || state.conflict_token().is_some() {
+        return;
+    }
+    if !ui.memory(|memory| memory.has_focus(editor_id)) {
+        return;
+    }
+    let Some(selection) = editor_char_range(ui, editor_id) else {
+        return;
+    };
+    if let Some(plan) = shortcut_edit_plan(ui, state, token, language, &selection) {
+        queue_edit_plan(state, token, plan);
+        state.completion = None;
+        return;
+    }
+    auto_close_input(ui, state, token, editor_id, &selection);
+}
+
+fn editor_char_range(ui: &egui::Ui, editor_id: egui::Id) -> Option<std::ops::Range<usize>> {
+    egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+        .and_then(|state| state.cursor.char_range())
+        .map(|range| range.as_sorted_char_range())
+}
+
+/// 把编辑计划排入单条注入队列（指纹取自当前文档，inject 时校验）。
+fn queue_edit_plan(state: &mut TextEditorState, token: u64, plan: EditPlan) {
+    let Some(document) = state.document(token) else {
+        return;
+    };
+    state.pending_completion = Some(PendingCompletion {
+        token,
+        fingerprint: sha256(document.text.as_bytes()),
+        replace_chars: plan.replace_chars,
+        insertion: plan.insertion,
+        post_selection: Some(plan.selection_after),
+    });
+}
+
+/// 带修饰键的编辑快捷键：返回 Some 表示已消费按键并给出编辑计划。
+fn shortcut_edit_plan(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    language: Language,
+    selection: &std::ops::Range<usize>,
+) -> Option<EditPlan> {
+    let document = state.document(token)?;
+    let text = &document.text;
+    let command = egui::Modifiers::COMMAND;
+    let command_shift = command.plus(egui::Modifiers::SHIFT);
+    let alt = egui::Modifiers::ALT;
+    let alt_shift = alt.plus(egui::Modifiers::SHIFT);
+    if ui.input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(command, egui::Key::Slash))
+    }) {
+        return language
+            .comment_style()
+            .and_then(|style| text_editor_ops::toggle_comment(text, selection, style));
+    }
+    if ui.input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(command_shift, egui::Key::K))
+    }) {
+        return Some(text_editor_ops::delete_lines(text, selection));
+    }
+    if ui.input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(alt, egui::Key::ArrowUp))
+    }) {
+        return text_editor_ops::move_lines(text, selection, true);
+    }
+    if ui.input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(alt, egui::Key::ArrowDown))
+    }) {
+        return text_editor_ops::move_lines(text, selection, false);
+    }
+    if ui.input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(
+            alt_shift,
+            egui::Key::ArrowDown,
+        ))
+    }) {
+        return Some(text_editor_ops::duplicate(text, selection));
+    }
+    // 块缩进：弹窗开着时 Tab 让位给补全接受；空选区 Tab 保留 egui 默认插入。
+    let popup_open = state
+        .completion
+        .as_ref()
+        .is_some_and(|completion| completion.token == token);
+    if !popup_open {
+        if !selection.is_empty()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+        {
+            let unit = detected_indent_unit(text, &line_indent_at(text, selection.start), language);
+            return text_editor_ops::indent_lines(text, selection, &unit, false);
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
+            let unit = detected_indent_unit(text, &line_indent_at(text, selection.start), language);
+            return text_editor_ops::indent_lines(text, selection, &unit, true);
+        }
+    }
+    None
+}
+
+/// 括号/引号自动闭合、越过闭合符、成对退格删除。
+fn auto_close_input(
+    ui: &mut egui::Ui,
+    state: &mut TextEditorState,
+    token: u64,
+    editor_id: egui::Id,
+    selection: &std::ops::Range<usize>,
+) {
+    // 成对退格删除：先判定、后消费（普通退格必须原样通过）。
+    let pair_delete = state
+        .document(token)
+        .and_then(|document| text_editor_ops::backspace_pair_range(&document.text, selection));
+    if let Some(range) = pair_delete {
+        if consume_plain_key(ui, egui::Key::Backspace) {
+            queue_edit_plan(
+                state,
+                token,
+                EditPlan {
+                    replace_chars: range.clone(),
+                    insertion: String::new(),
+                    selection_after: range.start..range.start,
+                },
+            );
+            return;
+        }
+    }
+    // 单字符 Text 事件：自动闭合 / 包裹 / 越过。
+    let typed = ui.input(|input| {
+        input
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                egui::Event::Text(text) if text.chars().count() == 1 => {
+                    text.chars().next().map(|ch| (index, ch))
+                }
+                _ => None,
+            })
+    });
+    let Some((event_index, ch)) = typed else {
+        return;
+    };
+    let Some(document) = state.document(token) else {
+        return;
+    };
+    match text_editor_ops::typed_char_decision(&document.text, selection, ch) {
+        TypedCharDecision::Plain => {}
+        TypedCharDecision::Pair { open, close } => {
+            remove_event(ui, event_index);
+            queue_edit_plan(
+                state,
+                token,
+                EditPlan {
+                    replace_chars: selection.clone(),
+                    insertion: format!("{open}{close}"),
+                    selection_after: selection.start + 1..selection.start + 1,
+                },
+            );
+        }
+        TypedCharDecision::Wrap { open, close } => {
+            let inner = text_editor_ops::slice_chars(&document.text, selection.clone()).to_owned();
+            remove_event(ui, event_index);
+            queue_edit_plan(
+                state,
+                token,
+                EditPlan {
+                    replace_chars: selection.clone(),
+                    insertion: format!("{open}{inner}{close}"),
+                    selection_after: selection.start + 1..selection.end + 1,
+                },
+            );
+        }
+        TypedCharDecision::SkipCloser => {
+            remove_event(ui, event_index);
+            if let Some(mut edit_state) =
+                egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+            {
+                edit_state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(selection.start + 1),
+                    )));
+                edit_state.store(ui.ctx(), editor_id);
+            }
+        }
+    }
+}
+
+/// 消费一个无修饰键的按下事件；没有该事件时不消费任何东西。
+fn consume_plain_key(ui: &mut egui::Ui, key: egui::Key) -> bool {
+    ui.input_mut(|input| {
+        let mut consumed = false;
+        input.events.retain(|event| {
+            let hit = !consumed
+                && matches!(
+                    event,
+                    egui::Event::Key {
+                        key: event_key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if *event_key == key && *modifiers == egui::Modifiers::NONE
+                );
+            consumed |= hit;
+            !hit
+        });
+        consumed
+    })
+}
+
+fn remove_event(ui: &mut egui::Ui, index: usize) {
+    ui.input_mut(|input| {
+        if index < input.events.len() {
+            input.events.remove(index);
+        }
+    });
+}
+
+/// 选区所在行的前导空白（缩进单位探测用）。
+fn line_indent_at(text: &str, char_idx: usize) -> String {
+    let line = text_editor_ops::line_index_at(text, char_idx);
+    let range = text_editor_ops::line_range(text, line);
+    text_editor_ops::slice_chars(text, range)
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -1535,7 +2488,19 @@ fn inject_pending_completion(
     edit_state.store(ui.ctx(), editor_id);
     ui.memory_mut(|memory| memory.request_focus(editor_id));
     ui.input_mut(|input| {
-        input.events.push(egui::Event::Paste(pending.insertion));
+        if pending.insertion.is_empty() {
+            // egui 忽略空 Paste：删除统一改发 Backspace，选区内容作为
+            // 一次普通删除进入撤销栈（同样一步可撤销）。
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: Some(egui::Key::Backspace),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        } else {
+            input.events.push(egui::Event::Paste(pending.insertion));
+        }
     });
     Some(InjectedEditorEdit {
         post_selection: pending.post_selection,
@@ -2154,13 +3119,6 @@ fn centered_error(ui: &mut egui::Ui, text: &str, pal: &Palette) {
             ui.label(egui::RichText::new(text).color(pal.error));
         },
     );
-}
-
-fn match_count(text: &str, query: &str) -> usize {
-    if query.is_empty() {
-        return 0;
-    }
-    text.match_indices(query).count()
 }
 
 struct DecodedText {
@@ -3005,5 +3963,242 @@ mod tests {
         );
         assert!(short.0 <= 500.0, "编辑器不得把根内容区撑高：{short:?}");
         assert!(error.0 <= 500.0, "错误提示也不得把内容区撑高：{error:?}");
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// 建文档 + 首帧建立 TextEditState/焦点/光标，返回 (ctx, editor_id)。
+    fn focused_editor(
+        state: &mut TextEditorState,
+        token: u64,
+        cursor: usize,
+        id: &str,
+    ) -> (egui::Context, egui::Id) {
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new(id);
+        let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
+            let document = state.document_mut(token).expect("document");
+            let mut output = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+            output
+                .state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(cursor),
+                )));
+            output.state.store(ui.ctx(), editor_id);
+            ui.memory_mut(|memory| memory.request_focus(editor_id));
+        });
+        (ctx, editor_id)
+    }
+
+    /// 跑一帧输入事件 + prepare_completion_input + TextEdit，应用注入后选区。
+    fn drive_ops_frame(
+        ctx: &egui::Context,
+        state: &mut TextEditorState,
+        token: u64,
+        editor_id: egui::Id,
+        language: Language,
+        input: egui::RawInput,
+    ) -> Option<InjectedEditorEdit> {
+        let mut injected_out = None;
+        let _ = ctx.run_ui(input, |ui| {
+            let (_, injected, _) = prepare_completion_input(ui, state, token, editor_id, language);
+            let document = state.document_mut(token).expect("document");
+            let mut output = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+            if let Some(post_selection) = injected.as_ref().and_then(|i| i.post_selection.clone()) {
+                output
+                    .state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(post_selection.start),
+                        egui::text::CCursor::new(post_selection.end),
+                    )));
+                output.state.store(ui.ctx(), editor_id);
+            }
+            injected_out = injected;
+        });
+        injected_out
+    }
+
+    fn undo_once(
+        ctx: &egui::Context,
+        state: &mut TextEditorState,
+        token: u64,
+        editor_id: egui::Id,
+    ) {
+        let modifiers = egui::Modifiers::COMMAND;
+        let mut input = egui_input(vec![key_event(egui::Key::Z, modifiers)]);
+        input.modifiers = modifiers;
+        let _ = ctx.run_ui(input, |ui| {
+            let document = state.document_mut(token).expect("document");
+            let _ = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+        });
+    }
+
+    #[test]
+    fn comment_toggle_injects_one_undoable_edit() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(12, "/tmp/main.py"), "a = 1\nb = 2");
+        let (ctx, editor_id) = focused_editor(&mut state, token, 1, "ops_comment");
+
+        let modifiers = egui::Modifiers::COMMAND;
+        let mut input = egui_input(vec![key_event(egui::Key::Slash, modifiers)]);
+        input.modifiers = modifiers;
+        let injected = drive_ops_frame(&ctx, &mut state, token, editor_id, Language::Python, input);
+        assert!(injected.is_some(), "Ctrl+/ 应排队注入");
+        assert_eq!(
+            state.document(token).expect("document").text,
+            "# a = 1\nb = 2"
+        );
+        let cursor = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|edit_state| edit_state.cursor.char_range())
+            .and_then(|range| range.single())
+            .expect("cursor");
+        assert_eq!(cursor.index, 8, "空选区注释后光标移到下一行行首");
+
+        undo_once(&ctx, &mut state, token, editor_id);
+        assert_eq!(
+            state.document(token).expect("document").text,
+            "a = 1\nb = 2",
+            "注释切换必须能被一次 Ctrl+Z 完整撤销"
+        );
+    }
+
+    #[test]
+    fn typed_open_bracket_auto_closes_pair() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(13, "/tmp/a.rs"), "a ");
+        let (ctx, editor_id) = focused_editor(&mut state, token, 2, "ops_autoclose");
+
+        let injected = drive_ops_frame(
+            &ctx,
+            &mut state,
+            token,
+            editor_id,
+            Language::Rust,
+            egui_input(vec![egui::Event::Text("(".to_owned())]),
+        );
+        assert!(injected.is_some(), "开括号应注入成对符号");
+        assert_eq!(state.document(token).expect("document").text, "a ()");
+        let cursor = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|edit_state| edit_state.cursor.char_range())
+            .and_then(|range| range.single())
+            .expect("cursor");
+        assert_eq!(cursor.index, 3, "光标落在成对符号中间");
+    }
+
+    #[test]
+    fn typed_closer_skips_existing_closer() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(14, "/tmp/a.rs"), "()");
+        let (ctx, editor_id) = focused_editor(&mut state, token, 1, "ops_skip");
+
+        let injected = drive_ops_frame(
+            &ctx,
+            &mut state,
+            token,
+            editor_id,
+            Language::Rust,
+            egui_input(vec![egui::Event::Text(")".to_owned())]),
+        );
+        assert!(injected.is_none(), "越过闭合符不产生文本编辑");
+        assert_eq!(state.document(token).expect("document").text, "()");
+        let cursor = egui::widgets::text_edit::TextEditState::load(&ctx, editor_id)
+            .and_then(|edit_state| edit_state.cursor.char_range())
+            .and_then(|range| range.single())
+            .expect("cursor");
+        assert_eq!(cursor.index, 2, "光标右移越过已有闭合符");
+    }
+
+    #[test]
+    fn backspace_deletes_empty_pair() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(15, "/tmp/a.rs"), "()");
+        let (ctx, editor_id) = focused_editor(&mut state, token, 1, "ops_pair_bs");
+
+        let injected = drive_ops_frame(
+            &ctx,
+            &mut state,
+            token,
+            editor_id,
+            Language::Rust,
+            egui_input(vec![key_event(egui::Key::Backspace, egui::Modifiers::NONE)]),
+        );
+        assert!(injected.is_some(), "空对中间退格应注入整对删除");
+        assert_eq!(state.document(token).expect("document").text, "");
+    }
+
+    #[test]
+    fn delete_line_shortcut_removes_current_line() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(16, "/tmp/a.rs"), "keep\ndel\nkeep2");
+        let (ctx, editor_id) = focused_editor(&mut state, token, 6, "ops_del_line");
+
+        let modifiers = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+        let mut input = egui_input(vec![key_event(egui::Key::K, modifiers)]);
+        input.modifiers = modifiers;
+        let injected = drive_ops_frame(&ctx, &mut state, token, editor_id, Language::Rust, input);
+        assert!(injected.is_some());
+        assert_eq!(state.document(token).expect("document").text, "keep\nkeep2");
+    }
+
+    #[test]
+    fn move_line_up_swaps_with_previous() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(17, "/tmp/a.rs"), "one\ntwo");
+        let (ctx, editor_id) = focused_editor(&mut state, token, 5, "ops_move");
+
+        let modifiers = egui::Modifiers::ALT;
+        let mut input = egui_input(vec![key_event(egui::Key::ArrowUp, modifiers)]);
+        input.modifiers = modifiers;
+        let injected = drive_ops_frame(&ctx, &mut state, token, editor_id, Language::Rust, input);
+        assert!(injected.is_some());
+        assert_eq!(state.document(token).expect("document").text, "two\none");
+    }
+
+    #[test]
+    fn replace_all_rewrites_document_as_one_undoable_edit() {
+        let mut state = TextEditorState::default();
+        let token = open_loaded(&mut state, remote(18, "/tmp/a.txt"), "foo bar foo");
+        state.find_query = "foo".to_owned();
+        state.replace_query = "baz".to_owned();
+        replace_all_matches(&mut state, token);
+        assert!(state.pending_completion.is_some(), "全部替换应排队注入");
+
+        let ctx = egui::Context::default();
+        let editor_id = egui::Id::new("ops_replace_all");
+        let _ = ctx.run_ui(egui_input(Vec::new()), |ui| {
+            assert!(inject_pending_completion(ui, &mut state, token, editor_id).is_some());
+            let document = state.document_mut(token).expect("document");
+            let _ = egui::TextEdit::multiline(&mut document.text)
+                .id(editor_id)
+                .code_editor()
+                .show(ui);
+        });
+        assert_eq!(state.document(token).expect("document").text, "baz bar baz");
+
+        undo_once(&ctx, &mut state, token, editor_id);
+        assert_eq!(
+            state.document(token).expect("document").text,
+            "foo bar foo",
+            "全部替换必须能被一次 Ctrl+Z 完整撤销"
+        );
     }
 }

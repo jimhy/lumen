@@ -241,6 +241,13 @@ pub static STRINGS: Strings = Strings {
         "此檔案混用了多種或舊式換行符號。請開啟本機副本，以免改變原始位元組格式。",
     text_editor_source_invalidated: "遠端工作階段已變更，請重新開啟檔案後再儲存。",
     text_editor_closed_account_change: "帳號已變更，遠端編輯器已安全關閉。",
+    text_editor_replace: "取代",
+    text_editor_replace_all: "全部取代",
+    text_editor_case_sensitive: "區分大小寫",
+    text_editor_prev_match: "上一個符合（Shift+Enter）",
+    text_editor_next_match: "下一個符合（Enter）",
+    text_editor_goto_hint: "跳至行號",
+    text_editor_wrap: "自動換行",
     // main.rs toast
     toast_bg_load_failed_fmt: "背景圖片載入失敗：{}",
     toast_max_panes_fmt: "每個工作階段最多 {} 個窗格",

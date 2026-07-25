@@ -234,6 +234,13 @@ pub static STRINGS: Strings = Strings {
         "此文件混用了多种或旧式换行符。请打开本地副本，以免改变原始字节格式。",
     text_editor_source_invalidated: "远程会话已变化，请重新打开文件后再保存。",
     text_editor_closed_account_change: "账号已变化，远程编辑器已安全关闭。",
+    text_editor_replace: "替换",
+    text_editor_replace_all: "全部替换",
+    text_editor_case_sensitive: "区分大小写",
+    text_editor_prev_match: "上一个匹配（Shift+Enter）",
+    text_editor_next_match: "下一个匹配（Enter）",
+    text_editor_goto_hint: "跳转到行",
+    text_editor_wrap: "软换行",
     // main.rs toast
     toast_bg_load_failed_fmt: "背景图加载失败：{}",
     toast_max_panes_fmt: "每个会话最多 {} 个窗格",

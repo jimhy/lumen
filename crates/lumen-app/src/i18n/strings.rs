@@ -453,6 +453,19 @@ pub struct Strings {
     pub text_editor_mixed_eol_error: &'static str,
     pub text_editor_source_invalidated: &'static str,
     pub text_editor_closed_account_change: &'static str,
+    /// 查找栏替换输入框占位文本与「替换当前」按钮
+    pub text_editor_replace: &'static str,
+    /// 查找栏「全部替换」按钮
+    pub text_editor_replace_all: &'static str,
+    /// 查找栏大小写敏感开关悬停提示
+    pub text_editor_case_sensitive: &'static str,
+    /// 查找栏上一个/下一个匹配按钮悬停提示
+    pub text_editor_prev_match: &'static str,
+    pub text_editor_next_match: &'static str,
+    /// Ctrl+G 跳转到行输入框占位文本
+    pub text_editor_goto_hint: &'static str,
+    /// 状态栏软换行开关（Alt+Z）
+    pub text_editor_wrap: &'static str,
 
     // ── main.rs toast ────────────────────────────────────────────────
     /// 背景图加载失败 toast，单参 `{}`：错误文本

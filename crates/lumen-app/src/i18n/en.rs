@@ -243,6 +243,13 @@ pub static STRINGS: Strings = Strings {
         "The remote session changed. Reopen the file before saving it.",
     text_editor_closed_account_change:
         "The remote editor was closed because the account changed.",
+    text_editor_replace: "Replace",
+    text_editor_replace_all: "Replace All",
+    text_editor_case_sensitive: "Match Case",
+    text_editor_prev_match: "Previous Match (Shift+Enter)",
+    text_editor_next_match: "Next Match (Enter)",
+    text_editor_goto_hint: "Go to Line",
+    text_editor_wrap: "Wrap",
     // main.rs toasts
     toast_bg_load_failed_fmt: "Background image load failed: {}",
     toast_max_panes_fmt: "Maximum {} panes per session",
