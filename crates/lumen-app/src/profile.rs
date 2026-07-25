@@ -38,8 +38,8 @@ pub struct Profile {
     pub device_id: Option<String>,
     /// 签发当前登录态的 canonical 服务端 origin。
     ///
-    /// 旧版 profile 缺少该字段时为 `None`；调用方必须 fail-closed，不得把旧 token、
-    /// device id 或账号级数据自动发送给当前设置中的任意服务端。
+    /// 旧版 profile 缺少该字段时为 `None`；升级入口会把它一次性绑定到当时已配置且
+    /// 通过传输校验的服务端。已有来源与当前设置不一致时仍须 fail-closed。
     #[serde(default)]
     pub auth_origin: Option<String>,
     /// M5：鉴权 token（JWT，短期）。**不是密码**，仅用于后续 REST 鉴权。
@@ -96,6 +96,27 @@ impl Profile {
             token: Some(resp.token),
             token_expires_at: resp.expires_at,
         }
+    }
+
+    /// 把 v1.0.15 及更早版本的登录档案一次性绑定到当前服务端。
+    ///
+    /// 旧版只支持一个全局服务端，`settings.json` 与 `profile.json` 共同构成当时的
+    /// 登录上下文；升级时应补齐来源字段，而不是删除仍有效的 token。只迁移“字段缺失 +
+    /// token 非空”的旧档案，已有来源（包括与当前设置不一致的来源）绝不改写。
+    pub fn migrate_legacy_auth_origin(&mut self, configured_origin: &str) -> bool {
+        if self.auth_origin.is_some()
+            || self
+                .token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+        {
+            return false;
+        }
+        let Ok(origin) = crate::cloud::verified_server_origin(configured_origin) else {
+            return false;
+        };
+        self.auth_origin = Some(origin);
+        true
     }
 
     /// 档案文件路径：应用数据目录下的 `profile.json`（目录按构建类型
@@ -198,10 +219,13 @@ impl Profile {
     fn sanitize(&mut self) {
         self.email = self.email.trim().to_owned();
         self.display_name = self.display_name.trim().to_owned();
-        self.auth_origin = self
-            .auth_origin
-            .take()
-            .and_then(|origin| crate::cloud::canonical_server_origin(&origin).ok());
+        self.auth_origin = self.auth_origin.take().map(|origin| {
+            let trimmed = origin.trim().to_owned();
+            // 合法值统一规范化；显式但非法的值必须保留为 Some，令启动入口
+            // 与当前 origin 比对失败并要求重新认证。若折叠成 None，会被误判
+            // 为旧版缺字段并自动迁移。
+            crate::cloud::canonical_server_origin(&trimmed).unwrap_or(trimmed)
+        });
         if self.display_name.is_empty() {
             self.display_name = display_name_of(&self.email);
         }
@@ -325,6 +349,62 @@ mod tests {
     }
 
     #[test]
+    fn 旧登录档案平滑迁移服务端来源() {
+        let mut profile = Profile {
+            email: "user@example.com".to_owned(),
+            display_name: "user".to_owned(),
+            user_id: Some("user-id".to_owned()),
+            device_id: Some("device-id".to_owned()),
+            token: Some("legacy-token".to_owned()),
+            ..Default::default()
+        };
+        let path = temp_path("legacy_origin_migration");
+        let _ = std::fs::remove_file(&path);
+        profile.save_to(&path).expect("写入旧格式档案");
+        profile = Profile::load_from(&path).expect("加载旧格式档案");
+
+        assert!(profile.migrate_legacy_auth_origin("HTTPS://LUMEN.EXAMPLE:443/"));
+        assert_eq!(
+            profile.auth_origin.as_deref(),
+            Some("https://lumen.example")
+        );
+        assert_eq!(profile.token.as_deref(), Some("legacy-token"));
+        assert_eq!(profile.device_id.as_deref(), Some("device-id"));
+
+        profile.save_to(&path).expect("迁移后覆盖写盘");
+        let reloaded = Profile::load_from(&path).expect("迁移后重载");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(reloaded, profile);
+    }
+
+    #[test]
+    fn 已绑定来源或无效旧档案绝不被迁移覆盖() {
+        let mut bound = Profile {
+            token: Some("token".to_owned()),
+            auth_origin: Some("https://old.example".to_owned()),
+            ..Default::default()
+        };
+        assert!(!bound.migrate_legacy_auth_origin("https://new.example"));
+        assert_eq!(
+            bound.auth_origin.as_deref(),
+            Some("https://old.example")
+        );
+
+        let mut no_token = Profile::default();
+        assert!(!no_token.migrate_legacy_auth_origin("https://lumen.example"));
+        assert_eq!(no_token.auth_origin, None);
+
+        let mut invalid_transport = Profile {
+            token: Some("token".to_owned()),
+            ..Default::default()
+        };
+        assert!(!invalid_transport.migrate_legacy_auth_origin(
+            "https://public.example/not-an-origin"
+        ));
+        assert_eq!(invalid_transport.auth_origin, None);
+    }
+
+    #[test]
     fn 损坏文件降级未登录() {
         let path = temp_path("corrupt");
         std::fs::write(&path, "{ 这不是 json !!!").expect("写测试文件失败");
@@ -363,7 +443,7 @@ mod tests {
         assert_eq!(p.display_name, "jimhy");
         assert_eq!(
             p.auth_origin, None,
-            "旧 profile 保留为无来源，供调用方 fail-closed"
+            "加载层保留旧格式，由启动迁移入口补齐来源"
         );
     }
 
@@ -379,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn 非法鉴权来源加载后降为无来源() {
+    fn 非法鉴权来源保留字段以触发fail_closed() {
         let path = temp_path("invalid_origin");
         std::fs::write(
             &path,
@@ -388,7 +468,10 @@ mod tests {
         .expect("写测试文件失败");
         let profile = Profile::load_from(&path).expect("档案主体仍可加载");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(profile.auth_origin, None);
+        assert_eq!(
+            profile.auth_origin.as_deref(),
+            Some("https://user:pass@example.com/path")
+        );
         assert_eq!(profile.token.as_deref(), Some("secret"));
     }
 

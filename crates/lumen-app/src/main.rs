@@ -146,6 +146,27 @@ fn profile_server_origin(
     (profile.auth_origin.as_deref() == Some(current.as_str())).then_some(current)
 }
 
+fn profile_origin_requires_reauth(
+    profile: &profile::Profile,
+    current_server_url: &str,
+) -> bool {
+    if profile
+        .token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(saved_origin) = profile.auth_origin.as_deref() else {
+        // 旧版缺字段由迁移入口处理；配置暂不可用时也必须保留档案。
+        return false;
+    };
+    let Ok(current_origin) = cloud::canonical_server_origin(current_server_url) else {
+        return false;
+    };
+    saved_origin != current_origin
+}
+
 fn canonical_ssh_account_id(
     profile: Option<&profile::Profile>,
     current_server_url: &str,
@@ -4843,10 +4864,10 @@ impl AppState {
             mouse_x as f32 / points_per_pixel,
             mouse_y as f32 / points_per_pixel,
         );
-        !self
+        self
             .egui_ctx
             .layer_id_at(position)
-            .is_some_and(|layer| layer.order != egui::Order::Background)
+            .is_none_or(|layer| layer.order == egui::Order::Background)
     }
 
     /// 鼠标当前位置是否落在某个窗格关闭按钮上（上一帧布局的命中区，
@@ -8506,16 +8527,17 @@ impl App {
         // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
         let current_server_url = cloud::server_url();
         let mut user_profile = profile::Profile::load();
-        // 旧版 profile 没有签发 origin，或者 settings 已被外部改成另一
-        // 个服务端时，绝不能拿旧 bearer token 试探当前地址。升级后安全
-        // 退出一次，用户在当前 origin 重新登录即可建立明确绑定。
-        let profile_origin_reauth_required = user_profile.as_ref().is_some_and(|profile| {
-            profile
-                .token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty())
-                && profile_server_origin(Some(profile), &current_server_url).is_none()
-        });
+        // v1.0.15 及更早版本只有一个全局服务端，profile 尚无 auth_origin。
+        // 升级时把旧登录态一次性绑定到当时已配置且通过传输校验的 origin；
+        // 不能直接删除，否则远程心跳与控制 WS 都不会启动。
+        let profile_origin_migrated = user_profile
+            .as_mut()
+            .is_some_and(|profile| profile.migrate_legacy_auth_origin(&current_server_url));
+        // 已有来源与当前设置确实不一致时仍 fail-closed，避免把一个服务端
+        // 签发的 bearer token 发送给另一个服务端。
+        let profile_origin_reauth_required = user_profile
+            .as_ref()
+            .is_some_and(|profile| profile_origin_requires_reauth(profile, &current_server_url));
         if profile_origin_reauth_required {
             log::warn!("登录档案缺少有效服务端来源绑定，已安全退出并要求重新登录");
             profile::Profile::delete();
@@ -8531,11 +8553,25 @@ impl App {
             cloud::canonical_server_origin(&current_server_url),
             user_profile.as_ref(),
         ) {
+            if profile_origin_migrated {
+                cloud::claim_legacy_device_id_for_origin(
+                    &origin,
+                    profile.device_id.as_deref(),
+                );
+            }
             cloud::reconcile_device_id_for_origin(
                 &origin,
                 profile.auth_origin.as_deref(),
                 profile.device_id.as_deref(),
             );
+        }
+        if profile_origin_migrated {
+            if let Some(profile) = user_profile.as_ref() {
+                // 先完成旧 device_id 的单次认领，再提交 profile schema 迁移；
+                // 中途崩溃时下次启动仍会重试，不留下“已迁移但未标记旧身份”的窗口。
+                profile.save();
+            }
+            log::info!("已为旧版登录档案补齐服务端来源绑定");
         }
 
         // SSH 库存按 Lumen 账号隔离；账号首次使用时先以不可逆认领标记
@@ -14688,7 +14724,8 @@ mod tests {
     use super::{
         canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
         controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, scroll_to_bottom_action,
+        maximized_overflow, profile_auth_token, profile_origin_requires_reauth,
+        profile_server_origin, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
         should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
         ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
@@ -14937,6 +14974,45 @@ mod tests {
             Some(&trusted),
             "rsa-sha2-512",
             "SHA256:first",
+        ));
+    }
+
+    #[test]
+    fn 登录来源迁移只在明确不一致时要求重新认证() {
+        let mut profile = crate::profile::Profile {
+            token: Some("jwt-token".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            !profile_origin_requires_reauth(&profile, "https://lumen.example"),
+            "旧版缺 auth_origin 应先迁移，不能删除"
+        );
+        assert!(
+            !profile_origin_requires_reauth(&profile, ""),
+            "当前配置暂不可用时应保留旧档案"
+        );
+        assert!(profile.migrate_legacy_auth_origin("https://lumen.example"));
+        assert_eq!(
+            profile_server_origin(Some(&profile), "https://lumen.example").as_deref(),
+            Some("https://lumen.example")
+        );
+        let migrated_token =
+            profile_auth_token(Some(&profile), "https://lumen.example").expect("远程 token");
+        assert_eq!(migrated_token.read().unwrap().as_str(), "jwt-token");
+
+        assert!(!profile_origin_requires_reauth(
+            &profile,
+            "HTTPS://LUMEN.EXAMPLE:443/"
+        ));
+        assert!(profile_origin_requires_reauth(
+            &profile,
+            "https://other.example"
+        ));
+
+        profile.auth_origin = Some("not-a-valid-origin".to_owned());
+        assert!(profile_origin_requires_reauth(
+            &profile,
+            "https://lumen.example"
         ));
     }
 

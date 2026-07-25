@@ -398,6 +398,17 @@ fn capture_auth_origin(configured_origin: &str) -> Result<String, CloudError> {
     cloud::verified_server_origin(configured_origin)
 }
 
+fn should_send_origin_hardware_id(device_id: Option<&str>, legacy_identity: bool) -> bool {
+    !(legacy_identity
+        && device_id
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()))
+}
+
+fn legacy_device_claim_confirmed(candidate: Option<&str>, server_device_id: &str) -> bool {
+    candidate.is_some_and(|value| value == server_device_id)
+}
+
 /// 后台执行鉴权：注册模式先注册再登录；登录模式直接登录。构造 [`Profile`]。
 fn do_auth(mode: AuthMode, origin: &str, email: &str, password: &str) -> AuthResult {
     let client = CloudClient::new(origin.to_owned());
@@ -409,11 +420,25 @@ fn do_auth(mode: AuthMode, origin: &str, email: &str, password: &str) -> AuthRes
         .as_ref()
         .and_then(|profile| profile.device_id.as_deref());
     cloud::reconcile_device_id_for_origin(origin, previous_origin, previous_device_id);
+    let persisted_device_id = cloud::load_device_id_for_origin(origin);
+    let legacy_device_claimed = cloud::legacy_device_id_claimed_for_origin(origin);
+    // v1.0.16 曾误删旧 profile。分区 id 尚不存在时，可先用保留的全局 id
+    // 尝试登录；鉴权成功且服务端回传同 id 后才正式认领，错误密码/错账号不落标记。
+    let legacy_device_candidate = persisted_device_id
+        .is_none()
+        .then(|| cloud::legacy_device_id_candidate_for_origin(origin))
+        .flatten();
+    let device_id = persisted_device_id.or_else(|| legacy_device_candidate.clone());
+    let legacy_identity = legacy_device_claimed || legacy_device_candidate.is_some();
+    let hw_id = should_send_origin_hardware_id(device_id.as_deref(), legacy_identity)
+        .then(|| cloud::hardware_id_for_origin(origin))
+        .flatten();
     let device = DeviceInfo {
-        // 设备 id 按服务端 origin 分区；旧版全局 id 与其他服务的 profile 都不回退。
-        device_id: cloud::load_device_id_for_origin(origin),
-        // 原始 MachineGuid/machine-id 不出机，仅发送按 origin 派生的稳定伪名。
-        hw_id: cloud::hardware_id_for_origin(origin),
+        // 设备 id 按服务端 origin 分区；旧版全局 id 仅经上方一次性认领进入当前分区。
+        device_id,
+        // 旧设备行在 v2 服务端仍保存原始 hw_id；若同时发送新的 origin hash，服务端会
+        // 误建新设备。已认领且 did 完整时只按 did 复用旧行；其余流程仍只发送 origin hash。
+        hw_id,
         name: cloud::device_name(),
         os: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -440,6 +465,15 @@ fn do_auth(mode: AuthMode, origin: &str, email: &str, password: &str) -> AuthRes
                 // 写盘失败不阻断本次登录（内存态已生效），但记警告——下次重登会回退 profile
                 // 镜像 + hw_id 兜底，不会因此造出幽灵。
                 log::warn!("持久化 device_id 失败: {e}");
+            }
+            if legacy_device_claim_confirmed(
+                legacy_device_candidate.as_deref(),
+                &resp.device_id,
+            ) {
+                cloud::claim_legacy_device_id_for_origin(
+                    origin,
+                    legacy_device_candidate.as_deref(),
+                );
             }
             Ok(Profile::from_auth(resp, origin.to_owned()))
         }
@@ -479,5 +513,28 @@ mod tests {
         assert!(!state.submitting);
         assert!(state.rx.is_none());
         assert_eq!(state.server_error.as_deref(), Some(AUTH_WORKER_START_ERROR));
+    }
+
+    #[test]
+    fn 旧设备认领后优先按did复用v2服务端设备行() {
+        assert!(!should_send_origin_hardware_id(
+            Some("legacy-device"),
+            true
+        ));
+        assert!(should_send_origin_hardware_id(None, true));
+        assert!(should_send_origin_hardware_id(Some(""), true));
+        assert!(should_send_origin_hardware_id(
+            Some("current-device"),
+            false
+        ));
+        assert!(legacy_device_claim_confirmed(
+            Some("legacy-device"),
+            "legacy-device"
+        ));
+        assert!(!legacy_device_claim_confirmed(
+            Some("legacy-device"),
+            "new-account-device"
+        ));
+        assert!(!legacy_device_claim_confirmed(None, "legacy-device"));
     }
 }
