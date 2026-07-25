@@ -43,11 +43,14 @@ env_logger.workspace = true
 log.workspace = true
 lumen-pty.workspace = true
 lumen-renderer.workspace = true
+lumen-ssh.workspace = true
 lumen-term.workspace = true
 # M5 远程控制：客户端/服务端共享协议类型（纯 serde，跨平台）。
 lumen-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
 # P0 应用锁：Argon2id 密码校验；随机盐与明文临时缓冲清零。
 argon2 = { version = "0.5", features = ["std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

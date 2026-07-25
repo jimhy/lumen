@@ -74,6 +74,7 @@ cargo run -p lumen-server
 | DELETE | `/api/v1/devices/{id}` | Bearer | 删除设备 |
 | GET/PUT | `/api/v1/sync/settings` | Bearer | 偏好同步（version 守卫 last-write-wins） |
 | GET/POST | `/api/v1/sync/history` | Bearer | 命令历史同步（`text+ts` 去重） |
+| POST | `/api/v1/sync/ssh` | Bearer | SSH 分组/服务器配置账号级增量同步（schema v1；不接收密码、密钥或本地路径） |
 | GET (升级) | `/api/v1/ws` | Bearer（`Authorization` 头） | **M5.3** 远程控制 WebSocket 中继 |
 
 类型定义见 `crates/lumen-protocol`（客户端/服务端共享）。
@@ -87,6 +88,27 @@ cargo run -p lumen-server
 会话生命周期 / 数据面盲转），传输层在 `src/ws.rs`。配对码由**服务端生成、仅下发
 被控端展示**、控制端人工输入、服务端校验（attempts=5、TTL 120s、后台 GC）。
 数据面 `Relay` 载荷为不透明 JSON，服务端原样转发不解析（part2/3 扩展零改服务端）。
+
+### 3.2 SSH 清单同步
+
+`POST /api/v1/sync/ssh` 使用独立 schema v1 和显式 allowlist，只同步分组、连接
+元数据及公开主机指纹；协议中没有密码、私钥、私钥路径、口令或系统凭据引用字段，
+未知字段会被拒绝。
+
+- 同一记录按服务端接收顺序 LWW；`base_revision` 仅用于审计/冲突观测，墓碑永久
+  阻止已删 ID 被陈旧客户端复活。
+- ID 固定为 `grp_` / `ssh_` / `mut_` 加 32 位小写十六进制。同账号重复
+  `mutation_id` 只有正文 SHA-256 完全相同才作为幂等重试，否则返回 400。
+- 活跃上限与客户端一致：1,000 个分组、10,000 台服务器；活跃记录与墓碑合计
+  最多保留 100,000 个实体 ID，防止用不存在 ID 无限灌入墓碑。
+- 单次最多 200 个 mutation/变更；三类增量查询分别在 SQL 中
+  `ORDER BY revision LIMIT (limit + 1)`（最大 201），由客户端使用
+  `has_more` 续拉。
+- checkpoint 只记录请求携带、即客户端已经应用的 `cursor`。未来游标会在任何
+  mutation 落库前被拒绝。
+
+所有 Bearer 鉴权除 JWT 验签外还会确认 token 中的设备仍属于该账号；删除设备后，
+旧 JWT 不能再访问同步端点、建立新 WebSocket 或调用续期接口。
 
 ---
 

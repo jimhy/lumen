@@ -90,7 +90,12 @@ pub fn now_secs() -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
-/// 鉴权提取器：从 `Authorization: Bearer <jwt>` 解出当前用户/设备。
+/// 鉴权提取器：从 `Authorization: Bearer <jwt>` 解出当前用户/设备，并确认
+/// 该设备仍登记在账户下。
+///
+/// JWT 是无状态的，单纯验签无法感知“删除设备”。这里的轻量存在性查询让删除
+/// 设备立即对后续 REST、WebSocket 握手和 token 续期生效；已经删除的设备即使
+/// 持有尚未到期的旧 token 也会得到 401。
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     /// 账户 id。
@@ -116,6 +121,17 @@ impl FromRequestParts<AppState> for AuthUser {
             .or_else(|| header.strip_prefix("bearer "))
             .ok_or(AppError::Unauthorized)?;
         let claims = verify_token(&state.config.jwt_secret, token.trim())?;
+        let client = state.pool.get().await?;
+        let device_exists = client
+            .query_opt(
+                "SELECT 1 FROM devices WHERE id=$1 AND user_id=$2",
+                &[&claims.did, &claims.sub],
+            )
+            .await?
+            .is_some();
+        if !device_exists {
+            return Err(AppError::Unauthorized);
+        }
         Ok(AuthUser {
             user_id: claims.sub,
             device_id: claims.did,

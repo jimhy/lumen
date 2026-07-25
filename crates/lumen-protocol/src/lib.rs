@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod remote;
+pub mod ssh_sync;
 
 /// 协议版本号。任何破坏性变更必须递增；登录响应回传，客户端可比对。
 ///
@@ -22,13 +23,13 @@ pub mod remote;
 /// 一次性切到「`(TabId, SessionId)` 双 id 多会话」`OutputWithId`/`ResizeWithId`/
 /// `SubscriptionStarted`（K2：不双发灰度）。旧 v1 客户端收新帧 `from_value` 失败即丢弃、
 /// 镜像空白，故须配 [`MIN_SUPPORTED_VERSION`] 版本门把 v1 挡在配对前。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 服务端仍兼容的最低客户端协议版本（M5.3 WebSocket `Welcome` 下发；低于此
 /// 的客户端应提示用户升级）。当前 = [`PROTOCOL_VERSION`]，破坏性裁撤旧消息时上调。
 ///
 /// part3d Phase 1 上调至 2：part3d 双 id 数据面与 v1 单焦点镜像不兼容，两端须同为 ≥2。
-pub const MIN_SUPPORTED_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_VERSION: u32 = 3;
 
 /// REST 端点路径（客户端与服务端共用，避免字符串漂移）。
 pub mod routes {
@@ -46,6 +47,8 @@ pub mod routes {
     pub const SYNC_SETTINGS: &str = "/api/v1/sync/settings";
     /// 命令历史同步：`GET ?since=<ts_ms>` 拉取 / `POST` 推送。
     pub const SYNC_HISTORY: &str = "/api/v1/sync/history";
+    /// SSH 服务器清单增量同步 `POST`（与偏好 blob、远程控制协议完全独立）。
+    pub const SYNC_SSH: &str = "/api/v1/sync/ssh";
     /// 设备心跳 `POST`（保持本设备在线，刷新 `last_seen`；M5.2）。
     pub const HEARTBEAT: &str = "/api/v1/heartbeat";
     /// 远程控制 WebSocket 长连接 `GET`（升级；M5.3 终端远程，需 `Authorization` 头）。

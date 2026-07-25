@@ -50,6 +50,10 @@ mod profile;
 mod session;
 mod sessions_store;
 mod settings;
+// P1 SSH：领域库存先独立落地，UI/连接/同步分批接线。
+#[allow(dead_code)]
+mod ssh;
+mod ssh_runtime;
 mod shell;
 mod single_instance;
 // M3.8 批2 Snap Layouts 子类化（仅 Windows）。
@@ -58,7 +62,7 @@ mod snap_layouts;
 /// F3 热更（自动更新）：查 GitHub latest Release + 下载 Inno Setup 安装包。
 mod update;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -76,7 +80,7 @@ use shell::layout::{DividerKind, PaneLayout};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 // M3.8 自绘标题栏：Windows 平台扩展（无边框阴影 / 圆角）。
 #[cfg(target_os = "windows")]
@@ -120,6 +124,118 @@ const BG_DRAIN_CAP: usize = 256 * 1024;
 #[derive(Debug)]
 struct PtyWake;
 
+/// 与一个登录账号、一个服务端地址绑定的 SSH 同步会话。
+///
+/// token 与远程心跳/控制共享同一 `Arc`。切换账号时必须先把它原地清空，
+/// 再 drop worker，令仍在途的旧账号任务即使晚一步读 token 也拿不到凭据。
+struct ActiveSshSync {
+    account_id: String,
+    server_url: String,
+    token: Arc<RwLock<String>>,
+    worker: ssh::SshSyncWorker,
+    /// 相同错误在退避重试期间只提示一次；成功回包后清空。
+    last_failure: Option<String>,
+}
+
+fn profile_server_origin(
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Option<String> {
+    let profile = profile?;
+    let current = cloud::canonical_server_origin(current_server_url).ok()?;
+    (profile.auth_origin.as_deref() == Some(current.as_str())).then_some(current)
+}
+
+fn canonical_ssh_account_id(
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Option<String> {
+    let profile = profile?;
+    let server_origin = profile_server_origin(Some(profile), current_server_url)?;
+    let raw = profile.user_id.as_deref()?;
+    ssh::StorageScope::account(&server_origin, raw)
+        .ok()?
+        .canonical_account_id()
+        .ok()
+        .flatten()
+}
+
+fn ssh_sync_identity(
+    profile: Option<&profile::Profile>,
+    server_url: &str,
+) -> Option<(String, String)> {
+    let profile = profile?;
+    profile
+        .token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())?;
+    let server_origin = profile_server_origin(Some(profile), server_url)?;
+    let account_id = canonical_ssh_account_id(Some(profile), &server_origin)?;
+    Some((account_id, server_origin))
+}
+
+fn profile_auth_token(
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Option<Arc<RwLock<String>>> {
+    let profile = profile?;
+    profile_server_origin(Some(profile), current_server_url)?;
+    profile
+        .token
+        .as_ref()
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| Arc::new(RwLock::new(token.clone())))
+}
+
+fn clear_shared_token(token: &Arc<RwLock<String>>) {
+    use zeroize::Zeroize as _;
+
+    match token.write() {
+        Ok(mut value) => value.zeroize(),
+        Err(poisoned) => poisoned.into_inner().zeroize(),
+    }
+}
+
+fn load_ssh_store_for_profile(
+    data_root: &std::path::Path,
+    profile: Option<&profile::Profile>,
+    current_server_url: &str,
+) -> Result<ssh::SshStore, ssh::StoreError> {
+    let Some(profile) = profile else {
+        return ssh::SshStore::load(data_root, ssh::StorageScope::Local);
+    };
+    let Some(server_origin) = profile_server_origin(Some(profile), current_server_url) else {
+        return ssh::SshStore::load(data_root, ssh::StorageScope::Local);
+    };
+    let Some(account_id) = canonical_ssh_account_id(Some(profile), &server_origin) else {
+        return ssh::SshStore::load(data_root, ssh::StorageScope::Local);
+    };
+    ssh::SshStore::load_account_claiming_unclaimed(data_root, &server_origin, &account_id)
+}
+
+fn should_trigger_ssh_sync_after_local_change(
+    worker_account: Option<&str>,
+    store_account: Option<&str>,
+) -> bool {
+    matches!(
+        (worker_account, store_account),
+        (Some(worker), Some(store)) if worker == store
+    )
+}
+
+fn should_apply_ssh_sync_event(
+    worker_account: Option<&str>,
+    store_account: Option<&str>,
+    event_account: &str,
+) -> bool {
+    should_trigger_ssh_sync_after_local_change(worker_account, store_account)
+        && worker_account == Some(event_account)
+}
+
+fn should_continue_ssh_sync(has_more: bool, pending_mutations: usize) -> bool {
+    has_more || pending_mutations > 0
+}
+
 /// M5.3 part4 本地输入优先仲裁窗口：被控端本地用户在此窗口内有过输入，则丢弃控制端
 /// 转发来的远程输入（本地输入优先，海风哥拍板）。
 const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_millis(800);
@@ -127,6 +243,11 @@ const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_
 /// M5.3 part3b 控制端镜像的离屏纹理保留 id（避开自增的会话 id，取 `u64::MAX`）。
 /// 镜像 `Terminal` 复用窗格同款 wgpu 渲染器画进此 id 的离屏纹理（上色/属性/光标）。
 const MIRROR_OFFSCREEN_ID: session::SessionId = u64::MAX;
+
+/// SSH active terminal's dedicated renderer target. Keep it below the full
+/// mirror reservation (`MAX`, then `MAX-1..MAX-MAX_PANES`) so no terminal
+/// domain can alias another domain's texture or row cache.
+const SSH_OFFSCREEN_ID: session::SessionId = MIRROR_OFFSCREEN_ID - 2 - MAX_PANES as u64;
 
 /// part3d 被控端镜像源签名：订阅会话的 `(tab_id, 各窗格(id,行,列), 焦点下标, 最大化下标)`。
 /// 变化即重发全部窗格整屏快照 + 布局（`SubscriptionStarted`）。
@@ -549,6 +670,56 @@ fn controller_owns_sub_viewport(tab_index: usize, active_tab: usize, app_locked:
     tab_index != active_tab || app_locked
 }
 
+/// 三种工作模式的全局快捷键。只接受精确的 Ctrl+Shift 组合，避免
+/// Alt/Super 等额外修饰键参与时误切模式。
+fn view_mode_shortcut(
+    modifiers: ModifiersState,
+    physical_key: PhysicalKey,
+) -> Option<settings::ViewMode> {
+    if modifiers != (ModifiersState::CONTROL | ModifiersState::SHIFT) {
+        return None;
+    }
+    match physical_key {
+        PhysicalKey::Code(KeyCode::Digit1) => Some(settings::ViewMode::Local),
+        PhysicalKey::Code(KeyCode::Digit2) => Some(settings::ViewMode::Remote),
+        PhysicalKey::Code(KeyCode::Digit3) => Some(settings::ViewMode::Ssh),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTreeClipboardShortcut {
+    Copy,
+    Paste,
+}
+
+/// 文件树复制/粘贴必须先于 SSH 终端输入路由裁决，否则 SSH 分支会把
+/// Ctrl+C / Ctrl+V 编成控制字符后提前返回，文件树快捷键永远不可达。
+///
+/// 只接收精确的 Ctrl+C / Ctrl+V：Ctrl+Shift+C/V 等终端组合仍交给
+/// 当前终端；搜索框、重命名框或其他模态打开时由调用方把 `available`
+/// 置为 false，让文本控件保留自己的复制/粘贴语义。
+fn filetree_clipboard_shortcut(
+    state: ElementState,
+    repeat: bool,
+    modifiers: ModifiersState,
+    physical_key: PhysicalKey,
+    available: bool,
+) -> Option<FileTreeClipboardShortcut> {
+    if !available
+        || state != ElementState::Pressed
+        || repeat
+        || modifiers != ModifiersState::CONTROL
+    {
+        return None;
+    }
+    match physical_key {
+        PhysicalKey::Code(KeyCode::KeyC) => Some(FileTreeClipboardShortcut::Copy),
+        PhysicalKey::Code(KeyCode::KeyV) => Some(FileTreeClipboardShortcut::Paste),
+        _ => None,
+    }
+}
+
 /// 终端区滚动条的逐窗格几何（仅 scrollback 非空、内容区够高的可见
 /// 窗格各一条）。run_ui 闭包内据此绘制轨道/滑块并处理拖动，闭包后把
 /// 目标 `display_offset` 落到对应 grid。几何取自上一帧 `pane_rects_px`
@@ -562,6 +733,89 @@ struct ScrollbarGeom {
     thumb: egui::Rect,
     /// scrollback 行数（拖动反算 `display_offset` 用：进度 ↔ 偏移）。
     scrollback: usize,
+}
+
+fn ssh_profile_draft(
+    profile: &ssh::SshProfile,
+    trusted_host_key: Option<ssh::HostKeyTrust>,
+) -> ssh::NewSshProfile {
+    ssh::NewSshProfile {
+        name: profile.name.clone(),
+        host: profile.host.clone(),
+        port: profile.port,
+        username: profile.username.clone(),
+        auth_method: profile.auth_method,
+        group_id: profile.group_id.clone(),
+        initial_directory: profile.initial_directory.clone(),
+        connect_timeout_secs: profile.connect_timeout_secs,
+        keep_alive_secs: profile.keep_alive_secs,
+        monitor_enabled: profile.monitor_enabled,
+        trusted_host_key,
+    }
+}
+
+fn ssh_host_key_confirmation_is_current(
+    current: Option<&ssh::HostKeyTrust>,
+    algorithm: &str,
+    fingerprint: &str,
+) -> bool {
+    current.is_none_or(|trusted| {
+        trusted.algorithm == algorithm && trusted.fingerprint == fingerprint
+    })
+}
+
+fn ssh_test_profile(form_id: u64, draft: &ssh::NewSshProfile) -> ssh::SshProfile {
+    ssh::SshProfile {
+        id: format!("ssh_{form_id:032x}"),
+        name: draft.name.clone(),
+        host: draft.host.clone(),
+        port: draft.port,
+        username: draft.username.clone(),
+        auth_method: draft.auth_method,
+        group_id: draft.group_id.clone(),
+        sort_order: 0,
+        initial_directory: draft.initial_directory.clone(),
+        connect_timeout_secs: draft.connect_timeout_secs,
+        keep_alive_secs: draft.keep_alive_secs,
+        monitor_enabled: false,
+        trusted_host_key: draft.trusted_host_key.clone(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    }
+}
+
+fn ssh_profile_matches_test_target(saved: &ssh::SshProfile, test: &ssh::SshProfile) -> bool {
+    saved.host == test.host
+        && saved.port == test.port
+        && saved.username == test.username
+        && saved.auth_method == test.auth_method
+}
+
+fn ssh_private_key_submission_is_valid(
+    draft: &ssh::NewSshProfile,
+    saved_profile: Option<&ssh::SshProfile>,
+    saved_binding: Option<&ssh::SshLocalBinding>,
+    selected_path: Option<&std::path::Path>,
+) -> bool {
+    if draft.auth_method != ssh::AuthMethod::PrivateKey {
+        return true;
+    }
+    if let Some(path) = selected_path {
+        return path.is_absolute() && path.is_file();
+    }
+    saved_profile.is_some_and(|profile| {
+        profile.host == draft.host
+            && profile.port == draft.port
+            && profile.username == draft.username
+            && profile.auth_method == ssh::AuthMethod::PrivateKey
+            && saved_binding.is_some_and(|binding| {
+                binding.profile_id == profile.id
+                    && binding
+                        .private_key_path
+                        .as_deref()
+                        .is_some_and(|path| path.is_absolute() && path.is_file())
+            })
+    })
 }
 
 /// 「回到底部」按钮要操作的视口所有者。
@@ -592,6 +846,70 @@ fn scroll_to_bottom_action(
         Some(ScrollToBottomAction::AlternateApp)
     } else {
         None
+    }
+}
+
+fn ssh_file_operation_done_message(operation: lumen_ssh::FileOperation) -> String {
+    match operation {
+        lumen_ssh::FileOperation::WriteText => "SSH 文件已保存".to_owned(),
+        lumen_ssh::FileOperation::CreateDirectory => "SSH 文件夹已创建".to_owned(),
+        lumen_ssh::FileOperation::CreateFile => "SSH 文件已创建".to_owned(),
+        lumen_ssh::FileOperation::Rename => "SSH 项目已移动".to_owned(),
+        lumen_ssh::FileOperation::Delete => "SSH 项目已永久删除".to_owned(),
+        lumen_ssh::FileOperation::Download => "SSH 文件已下载".to_owned(),
+        lumen_ssh::FileOperation::Upload => "文件已上传到 SSH 服务器".to_owned(),
+    }
+}
+
+fn ssh_file_error_message(
+    operation: ssh_runtime::SshFileAction,
+    error: lumen_ssh::FileError,
+) -> String {
+    let action = match operation {
+        ssh_runtime::SshFileAction::Search => "搜索 SSH 文件",
+        ssh_runtime::SshFileAction::ReadText => "读取 SSH 文件",
+        ssh_runtime::SshFileAction::WriteText => "保存 SSH 文件",
+        ssh_runtime::SshFileAction::OpenLocalCopy => "下载并打开 SSH 文件",
+        ssh_runtime::SshFileAction::CreateDirectory => "新建 SSH 文件夹",
+        ssh_runtime::SshFileAction::CreateFile => "新建 SSH 文件",
+        ssh_runtime::SshFileAction::Rename => "移动 SSH 项目",
+        ssh_runtime::SshFileAction::Delete => "删除 SSH 项目",
+        ssh_runtime::SshFileAction::Download => "下载 SSH 文件",
+        ssh_runtime::SshFileAction::Upload => "上传 SSH 文件",
+    };
+    format!("{action}失败：{error}")
+}
+
+fn remote_edit_error_message(error: lumen_protocol::remote::EditFileError) -> String {
+    use lumen_protocol::remote::EditFileError;
+    match error {
+        EditFileError::InvalidRequest => "远程文件编辑请求无效",
+        EditFileError::NotFound => "远程文件已不存在",
+        EditFileError::PermissionDenied => "没有权限编辑此远程文件",
+        EditFileError::TooLarge => "文件超过内置编辑器的 1 MiB 上限",
+        EditFileError::NotRegular => "只能编辑普通文本文件",
+        EditFileError::Symlink => "为安全起见，内置编辑器不直接编辑符号链接",
+        EditFileError::Busy => "远程文件服务正忙，请稍后重试",
+        EditFileError::ChangedDuringRead => "读取过程中远程文件发生了变化，请重试",
+        EditFileError::LengthMismatch | EditFileError::Integrity => {
+            "远程文件传输校验失败，请重试"
+        }
+        EditFileError::Cancelled => "远程文件编辑操作已取消",
+        EditFileError::StaleSession => "远程控制会话已变化，请重新打开文件",
+        EditFileError::Io => "远程文件读写失败",
+    }
+    .to_owned()
+}
+
+fn remote_parent_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let separator = trimmed.rfind(['/', '\\'])?;
+    if separator == 0
+        || (separator == 2 && trimmed.as_bytes().get(1).copied() == Some(b':'))
+    {
+        Some(&trimmed[..=separator])
+    } else {
+        Some(&trimmed[..separator])
     }
 }
 
@@ -656,6 +974,25 @@ struct AppState {
     /// 登录档案：None = 未登录。顶栏头像、头像菜单、设置页
     /// Account 三处 UI 同源此字段；登录写盘 / 登出删盘（profile.json）。
     profile: Option<profile::Profile>,
+    /// 当前账号（未登录时为 unclaimed）的 SSH 库存单 owner。UI 与
+    /// 后续同步 worker 的回包都只在主线程串行修改它。
+    ssh_store: Option<ssh::SshStore>,
+    /// 当前登录账号的 SSH 云同步 worker；未登录、账号/token/服务端
+    /// 地址不完整或库存加载失败时为 None。
+    ssh_sync: Option<ActiveSshSync>,
+    /// 数据目录不可用或库存损坏时的只读空库存，保证 SSH 页面仍可打开
+    /// 并展示明确错误，而不是把损坏文件覆盖成空数据。
+    ssh_empty_inventory: ssh::SshInventory,
+    /// SSH transports and terminal state, isolated from local PTYs and remote
+    /// mirrors. Sessions remain alive while another mode or the lock is shown.
+    ssh_runtime: ssh_runtime::SshRuntime,
+    /// 明确发生密码认证/私钥错误的 profile。下次连接必须先让用户重输，
+    /// 避免后台反复自动尝试 Credential Manager 中的错误凭据。
+    ssh_force_credential_prompt: HashSet<String>,
+    /// Stable egui binding for [`SSH_OFFSCREEN_ID`].
+    ssh_texture: Option<egui::TextureId>,
+    /// Active SSH terminal content rectangle in physical pixels.
+    ssh_rect_px: Option<(f32, f32, f32, f32)>,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     /// 最近一次按键时刻（端到端延迟埋点用，跟随激活会话即可）。
@@ -754,12 +1091,33 @@ struct AppState {
     mirror_pane_rects_px: Vec<(session::SessionId, f32, f32, f32, f32)>,
     /// M5.3 part3c-2 #7：粘贴检测到同名、等用户在覆盖模态拍板的待决下载（None = 无待决）。
     pending_paste: Option<PendingPaste>,
+    /// SSH 远端项粘贴到 Lumen 本地树时的同名待决下载。SSH 传输使用
+    /// 独立 SFTP actor，不能塞进 RemoteWs 的 [`PendingPaste`]。
+    pending_ssh_download: Option<PendingSshDownload>,
+    /// SSH 文件树的内部复制引用。远端路径不会伪装成本机 CF_HDROP；
+    /// 粘贴时才经对应 SSH 会话传输。
+    ssh_file_clipboard: Option<SshClipboardItem>,
+    /// SSH→SSH 跨目录/跨服务器文件粘贴的临时下载后续上传。
+    ssh_paste_chains: HashMap<std::path::PathBuf, SshPasteChain>,
+    /// 已完成 SSH→SSH 下载、正在上传的暂存文件；仅这些路径会在上传结束后删除。
+    ssh_staged_uploads: HashSet<std::path::PathBuf>,
+    /// SSH 远端项导出到 Windows 文件剪贴板的当前代次。每次复制递增；
+    /// 较旧代次即使稍后才下载完成，也只能清理暂存，不能反抢系统剪贴板。
+    ssh_clipboard_export_generation: u64,
+    /// 正在为 Windows 文件剪贴板准备的 SSH 下载：本地暂存路径 → 发起时代次。
+    ssh_clipboard_exports: HashMap<std::path::PathBuf, SshClipboardExport>,
+    /// 当前写进系统 CF_HDROP 的本地暂存路径。该路径必须至少保留到下一次
+    /// SSH 复制成功替换系统剪贴板，否则资源管理器稍后粘贴会读到失效路径。
+    ssh_clipboard_ready_path: Option<std::path::PathBuf>,
     /// 粘贴完成后待刷新的目标目录 `(is_remote, dir)`：粘贴写文件到目录后，文件树缓存未更新、新
     /// 文件不显示，故传输完成（本机复制 / 下载 / 上传）时刷新该目录。do_file_paste 设、完成点消费。
     paste_refresh: Option<(bool, String)>,
-    /// 上一帧鼠标是否在文件树面板内（shell::show 报回）：winit 层 Ctrl+C/V 快捷键的门控
-    /// （egui 吞掉 Ctrl+V 必须在 winit 拦，但 winit 无 egui 的 contains_pointer，故用上一帧的）。
+    /// 上一帧鼠标是否在文件树面板内（shell::show 报回）；保留给鼠标
+    /// 焦点仲裁。Ctrl+C/V 已改用下面稳定的 TreeView 键盘焦点。
     filetree_hovered: bool,
+    /// 文件树原生 TreeView 是否持有键盘焦点。快捷键以焦点为准，
+    /// 不再要求鼠标持续悬停，也不会被 TreeView 自己的 egui 焦点反向阻断。
+    filetree_focused: bool,
     /// 本机复制粘贴（local→local，海风哥本轮新增）在途的完成回包通道（done, skipped, errors）。
     /// `Some` = 有一次本机复制在后台 fs 递归中；后台线程复制完经此回主线程弹 toast（并 send
     /// PtyWake 唤醒主循环收包，防空闲不重绘收不到）。同时充当并发闸：在途时拒绝起新本机复制。
@@ -1137,15 +1495,21 @@ impl AppState {
         self.autoscroll_at = None;
         self.shell_state.renaming = None;
         self.shell_state.pane_renaming = None;
+        self.shell_state.ssh_session_renaming = None;
         self.shell_state.renaming_device = None;
         self.shell_state.history_search.open = false;
         self.shell_state.history_search.query.clear();
         self.shell_state.completion.open = false;
         self.shell_state.login.close_for_app_lock();
-        self.shell_state
-            .settings
-            .clear_sensitive_for_app_lock();
+        self.shell_state.settings.clear_sensitive_for_app_lock();
         self.shell_state.remote_ui.reset();
+        self.shell_state.ssh_ui.close_for_app_lock();
+        // 表单测试不是已建立的工作会话；锁屏关闭表单时一并丢弃其
+        // 一次性 probe 与凭据副本。正式 SSH actor 仍继续后台运行。
+        self.ssh_runtime.cancel_any_connection_test();
+        // 丢弃一次性对话框会清零秘密，并关闭它尚未认证的会话；已经建立
+        // 的 SSH actor 与远程控制会话仍继续在后台运行。
+        self.discard_ssh_credential_dialog();
         self.lock_ui.clear();
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
@@ -1200,13 +1564,7 @@ impl AppState {
             }
         }
         self.last_local_input = now;
-        self.terminal_focused = !(self.shell_state.settings.open
-            || self.shell_state.login.open
-            || self.shell_state.history_search.open
-            || self.shell_state.completion.open
-            || self.shell_state.renaming.is_some()
-            || self.shell_state.pane_renaming.is_some()
-            || self.shell_state.filetree.dialog_open());
+        self.terminal_focused = self.terminal_focus_allowed();
         self.update_window_title();
         app_lock::set_window_capture_protection(&self.window, false);
         self.window.request_redraw();
@@ -1409,13 +1767,23 @@ impl AppState {
     /// 增量，保证控制端镜像「快照先于增量」的顺序。
     fn pump_remote(&mut self) {
         if !self.remote_ws.is_running() {
+            self.invalidate_stale_text_editor_source();
+            let edit_events = self.remote_ws.take_edit_events();
+            if !edit_events.is_empty() {
+                self.apply_remote_edit_events(edit_events);
+            }
             return;
         }
         let changed = self.remote_ws.poll();
+        self.invalidate_stale_text_editor_source();
         // 控制端：清理停滞的在途 Fetch（超时删半成品临时文件）。仅在有事件唤醒 pump_remote
         // 时运行（传输中 FileChunk 持续唤醒、足以及时清理）；对端彻底静默时退而依赖会话结束
         // (clear) 与下次启动 (start 清目录) 兜底，临时文件不会无界堆积。
         self.remote_ws.sweep_fetch_stalls();
+        let edit_events = self.remote_ws.take_edit_events();
+        if !edit_events.is_empty() {
+            self.apply_remote_edit_events(edit_events);
+        }
         // H2：会话结束（不再控制）→ 清待决覆盖粘贴，否则覆盖模态会在死会话上复活下载。
         if !self.remote_ws.is_controlling() {
             self.pending_paste = None;
@@ -1423,7 +1791,7 @@ impl AppState {
         // part3d 控制端：进入远程视图且尚未订阅任何会话 → 自动订阅列表首个，使镜像立即有内容
         // （否则用户须先手动点列表项；首个=被控端侧栏顺序首位）。订阅后本分支不再触发。
         if self.remote_ws.is_controlling()
-            && self.settings.layout.view_mode
+            && self.settings.layout.view_mode.is_remote()
             && self.remote_ws.subscribed_tab().is_none()
         {
             if let Some(first) = self.remote_ws.remote_tabs().first().map(|t| t.id) {
@@ -1816,10 +2184,2130 @@ impl AppState {
         }
     }
 
+    fn text_editor_source_is_current(
+        &self,
+        source: &shell::text_editor::TextFileSource,
+    ) -> bool {
+        use shell::text_editor::TextFileSource;
+        match source {
+            TextFileSource::Remote { generation, .. } => {
+                self.remote_ws.is_controlling()
+                    && *generation == self.remote_ws.edit_generation()
+            }
+            TextFileSource::Ssh {
+                runtime_id,
+                session_id,
+                ..
+            } => {
+                *runtime_id == self.ssh_runtime.runtime_id()
+                    && self.ssh_runtime.contains_session(*session_id)
+            }
+        }
+    }
+
+    fn invalidate_stale_text_editor_source(&mut self) {
+        let stale_sources = self
+            .shell_state
+            .text_editor
+            .sources()
+            .filter(|source| !self.text_editor_source_is_current(source))
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in stale_sources {
+            self.shell_state.text_editor.invalidate_source(
+                &source,
+                i18n::strings().text_editor_source_invalidated,
+            );
+        }
+    }
+
+    fn apply_remote_edit_events(&mut self, events: Vec<remote_ws::EditEvent>) {
+        use shell::text_editor::{SaveFailure, TextFileSource};
+        let current_generation = self.remote_ws.edit_generation();
+        for event in events {
+            match event {
+                remote_ws::EditEvent::Loaded { token, bytes, .. } => {
+                    if matches!(
+                        self.shell_state.text_editor.source_for_token(token),
+                        Some(TextFileSource::Remote { generation, .. })
+                            if *generation == current_generation
+                    ) {
+                        self.shell_state.text_editor.apply_loaded(token, Ok(bytes));
+                    }
+                }
+                remote_ws::EditEvent::Saved { token, .. } => {
+                    let path = match self.shell_state.text_editor.source_for_token(token) {
+                        Some(TextFileSource::Remote { generation, path })
+                            if *generation == current_generation =>
+                        {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(path) = path {
+                        if self
+                            .shell_state
+                            .text_editor
+                            .apply_saved(token, Ok(()))
+                        {
+                            if let Some(parent) = remote_parent_path(&path) {
+                                self.remote_ws.refresh_remote_path(parent);
+                            }
+                        }
+                    }
+                }
+                remote_ws::EditEvent::Conflict { token, .. } => {
+                    if matches!(
+                        self.shell_state.text_editor.source_for_token(token),
+                        Some(TextFileSource::Remote { generation, .. })
+                            if *generation == current_generation
+                    ) {
+                        self.shell_state
+                            .text_editor
+                            .apply_saved(token, Err(SaveFailure::Conflict));
+                    }
+                }
+                remote_ws::EditEvent::Error { token, error, .. } => {
+                    let message = remote_edit_error_message(error);
+                    if matches!(
+                        self.shell_state.text_editor.source_for_token(token),
+                        Some(TextFileSource::Remote { generation, .. })
+                            if *generation == current_generation
+                    ) && !self.shell_state.text_editor.apply_saved(
+                        token,
+                        Err(SaveFailure::Message(message.clone())),
+                    ) {
+                        self.shell_state
+                            .text_editor
+                            .apply_loaded(token, Err(message));
+                    }
+                }
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    fn open_text_editor(&mut self, source: shell::text_editor::TextFileSource) {
+        if !self.text_editor_source_is_current(&source) {
+            self.invalidate_stale_text_editor_source();
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().text_editor_source_invalidated,
+            );
+            self.window.request_redraw();
+            return;
+        }
+        if let Some(request) = self.shell_state.text_editor.request_open(source) {
+            self.start_text_editor_load(request);
+        }
+        self.terminal_focused = false;
+        self.window.request_redraw();
+    }
+
+    fn start_text_editor_load(&mut self, request: shell::text_editor::LoadRequest) {
+        if !self.text_editor_source_is_current(&request.source) {
+            self.shell_state.text_editor.invalidate_source(
+                &request.source,
+                i18n::strings().text_editor_source_invalidated,
+            );
+            return;
+        }
+        let token = request.token;
+        let result = match request.source {
+            shell::text_editor::TextFileSource::Remote { path, .. } => {
+                self.remote_ws.start_edit_fetch(token, path);
+                Ok(())
+            }
+            shell::text_editor::TextFileSource::Ssh {
+                session_id, path, ..
+            } => {
+                self.ssh_runtime.read_text(session_id, token, path)
+            }
+        };
+        if let Err(error) = result {
+            self.shell_state
+                .text_editor
+                .apply_loaded(token, Err(error));
+        }
+    }
+
+    fn start_text_editor_save(&mut self, request: shell::text_editor::SaveRequest) {
+        use shell::text_editor::{SaveFailure, TextFileSource};
+        if !self.text_editor_source_is_current(&request.source) {
+            self.shell_state.text_editor.invalidate_source(
+                &request.source,
+                i18n::strings().text_editor_source_invalidated,
+            );
+            return;
+        }
+        if !self.shell_state.text_editor.mark_saving(&request) {
+            return;
+        }
+        let token = request.token;
+        let result = match request.source {
+            TextFileSource::Remote { path, .. } => {
+                self.remote_ws.start_edit_save(
+                    token,
+                    path,
+                    request.bytes,
+                    lumen_protocol::remote::FileRevision {
+                        len: request.expected_len,
+                        sha256: request.expected_sha256,
+                    },
+                    request.force,
+                );
+                Ok(())
+            }
+            TextFileSource::Ssh {
+                session_id, path, ..
+            } => self.ssh_runtime.write_text(
+                session_id,
+                token,
+                path,
+                request.bytes,
+                request.expected_sha256,
+                request.force,
+            ),
+        };
+        if let Err(error) = result {
+            self.shell_state
+                .text_editor
+                .apply_saved(token, Err(SaveFailure::Message(error)));
+        }
+    }
+
     /// 控制端镜像视图是否生效（控制中 且 处于「远程」视图）：决定键盘是否转发给
     /// 被控端而非本地执行（bug3：切回「本地」视图则本地输入、不转发、不画镜像）。
     fn is_mirror_active(&self) -> bool {
-        self.remote_ws.is_controlling() && self.settings.layout.view_mode
+        self.remote_ws.is_controlling() && self.settings.layout.view_mode.is_remote()
+    }
+
+    /// 当前工作模式和覆盖层是否允许把键盘/IME 焦点交给终端。
+    fn terminal_focus_allowed(&self) -> bool {
+        let ssh_overlay = self.settings.layout.view_mode.is_ssh()
+            && (self.shell_state.ssh_credentials.is_some()
+                || self.ssh_runtime.active_blocks_input());
+        let overlay = self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.history_search.open
+            || self.shell_state.completion.open
+            || self.shell_state.renaming.is_some()
+            || self.shell_state.pane_renaming.is_some()
+            || self.shell_state.ssh_session_renaming.is_some()
+            || self.shell_state.filetree.dialog_open()
+            || self.shell_state.text_editor.is_visible()
+            || ssh_overlay;
+        if overlay {
+            return false;
+        }
+        !self.settings.layout.view_mode.is_ssh() || self.ssh_runtime.active_accepts_input()
+    }
+
+    /// 工作模式切换的唯一状态入口。保持后台本地 PTY / 远程连接运行，
+    /// 只切换本机可见域并清理上一模式遗留的交互状态。
+    fn switch_view_mode(&mut self, next: settings::ViewMode) -> bool {
+        if self.settings.layout.view_mode == next {
+            return false;
+        }
+
+        // 必须在改 view_mode 前补发 Release：远程镜像输入路由依赖旧模式。
+        self.release_held_report_buttons();
+        self.settings.layout.view_mode = next;
+        if !next.is_ssh() {
+            // 切走时丢弃并清零一次性凭据，同时关闭对应的待认证会话；
+            // 已建立的 actor 保持后台运行。
+            self.discard_ssh_credential_dialog();
+        }
+
+        self.terminal_focused = self.terminal_focus_allowed();
+        self.filetree_hovered = false;
+        self.filetree_focused = false;
+        self.hovered_link = None;
+        self.hover_probe_cell = None;
+        self.scrollbar_drag = None;
+        self.autoscroll_drag = 0;
+        self.autoscroll_at = None;
+        self.last_left_click = None;
+        self.pane_rects_px.clear();
+        self.pane_close_rects_px.clear();
+        self.divider_rects_px.clear();
+        self.panel_resize_rects_px.clear();
+        self.ssh_rect_px = None;
+        self.mirror_rect_px = None;
+        self.mirror_pane_rects_px.clear();
+        self.remote_ws.clear_mirror_selection();
+
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                pane.selecting = false;
+                #[cfg(feature = "input-editor")]
+                {
+                    pane.preedit = None;
+                }
+            }
+        }
+
+        if next.is_remote() {
+            self.remote.request_refresh();
+        }
+        self.update_window_title();
+        self.window.request_redraw();
+        true
+    }
+
+    fn ensure_ssh_sync_worker(&mut self) {
+        let server_url = cloud::server_url();
+        let Some((account_id, server_url)) =
+            ssh_sync_identity(self.profile.as_ref(), &server_url)
+        else {
+            // 地址被清空时只停止同步，不抹掉仍供远程功能使用的当前账号 token。
+            drop(self.ssh_sync.take());
+            return;
+        };
+        let Some(token) = self.auth_token.clone() else {
+            drop(self.ssh_sync.take());
+            return;
+        };
+        let token_is_present = token
+            .read()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !token_is_present {
+            drop(self.ssh_sync.take());
+            return;
+        }
+
+        let Some(store) = self.ssh_store.as_ref() else {
+            drop(self.ssh_sync.take());
+            return;
+        };
+        if !should_trigger_ssh_sync_after_local_change(
+            Some(&account_id),
+            store.account_id(),
+        ) {
+            log::warn!(
+                "拒绝启动 SSH 同步：worker 账号与库存作用域不一致（worker={account_id}）"
+            );
+            drop(self.ssh_sync.take());
+            return;
+        }
+        let Some(snapshot) = store.sync_snapshot() else {
+            drop(self.ssh_sync.take());
+            return;
+        };
+
+        if self.ssh_sync.as_ref().is_some_and(|active| {
+            active.account_id == account_id
+                && active.server_url == server_url
+                && Arc::ptr_eq(&active.token, &token)
+        }) {
+            return;
+        }
+
+        // 防御性处理绕过标准切换入口的状态漂移。地址变化且账号/token
+        // 未变时不能清 token；账号或 token 句柄变化时先清旧句柄再 drop。
+        if let Some(active) = self.ssh_sync.as_ref() {
+            if active.account_id != account_id || !Arc::ptr_eq(&active.token, &token) {
+                clear_shared_token(&active.token);
+            }
+        }
+        drop(self.ssh_sync.take());
+        if token
+            .read()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let proxy = self.proxy.clone();
+        let notifier: ssh::SshSyncNotifier = Arc::new(move || {
+            // 同步数据只留在 worker 自身事件通道；自定义事件仅负责唤醒
+            // winit 主线程，绝不携带账号、配置或错误正文。
+            let _ = proxy.send_event(PtyWake);
+        });
+        match ssh::SshSyncWorker::start_with_notifier(
+            server_url.clone(),
+            token.clone(),
+            snapshot,
+            Some(notifier),
+        ) {
+            Ok(worker) => {
+                info!("SSH 配置同步已启动：account={account_id}");
+                self.ssh_sync = Some(ActiveSshSync {
+                    account_id,
+                    server_url,
+                    token,
+                    worker,
+                    last_failure: None,
+                });
+            }
+            Err(error) => {
+                log::error!("启动 SSH 配置同步线程失败: {error}");
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    format!("SSH 配置同步启动失败: {error}"),
+                );
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn invalidate_account_for_server_url_change(&mut self) {
+        let had_account_state =
+            self.profile.is_some() || self.auth_token.is_some() || self.ssh_sync.is_some();
+        if !had_account_state {
+            return;
+        }
+
+        // token 未携带签发 origin，绝不能把旧地址签发的 bearer token 或
+        // 账号 SSH 快照送往用户刚填写的新地址。先原地抹 token、停掉
+        // 全部账号网络 worker，再删除登录档案并切回 Local 库存。
+        self.stop_account_bound_workers();
+        profile::Profile::delete();
+        self.profile = None;
+        self.reload_ssh_account_context();
+        if let Some(service) = self.clipboard_svc.as_ref() {
+            service.clear();
+        }
+        self.shell_state.toast.push(
+            shell::toast::ToastKind::Warn,
+            "服务器地址已更改，为保护账号数据，请重新登录",
+        );
+        self.window.request_redraw();
+    }
+
+    fn stop_account_bound_workers(&mut self) {
+        if self.shell_state.text_editor.is_open() {
+            self.shell_state.text_editor.close_without_prompt();
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().text_editor_closed_account_change,
+            );
+            self.window.request_redraw();
+        }
+
+        // 顺序是安全约束：先原地抹空所有旧 token Arc，再 drop worker。
+        if let Some(active) = self.ssh_sync.as_ref() {
+            clear_shared_token(&active.token);
+        }
+        if let Some(token) = self.auth_token.as_ref() {
+            let already_cleared = self
+                .ssh_sync
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.token, token));
+            if !already_cleared {
+                clear_shared_token(token);
+            }
+        }
+        drop(self.ssh_sync.take());
+        self.remote.stop();
+        self.remote_ws.stop();
+        self.auth_token = None;
+    }
+
+    fn reload_ssh_account_context(&mut self) {
+        // SSH 连接和全部瞬时 UI 都属于旧账号。切换库存前先清掉，
+        // 防止旧 profile id、凭据对话框或 actor 落到新账号页面。
+        self.discard_ssh_credential_dialog();
+        self.ssh_runtime = ssh_runtime::SshRuntime::default();
+        self.ssh_force_credential_prompt.clear();
+        self.shell_state.ssh_ui = shell::ssh_ui::SshUiState::default();
+        self.ssh_rect_px = None;
+        self.terminal_focused = self.terminal_focus_allowed();
+
+        self.ssh_store = match paths::data_dir() {
+            Some(data_root) => {
+                match load_ssh_store_for_profile(
+                    &data_root,
+                    self.profile.as_ref(),
+                    &cloud::server_url(),
+                ) {
+                    Ok(store) => Some(store),
+                    Err(error) => {
+                        log::error!("切换账号后加载 SSH 库存失败（保留原文件）: {error}");
+                        self.shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error.to_string());
+                        None
+                    }
+                }
+            }
+            None => {
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    "无法解析 Lumen 数据目录，SSH 配置本次不可写",
+                );
+                None
+            }
+        };
+        self.auth_token = profile_auth_token(self.profile.as_ref(), &cloud::server_url());
+        self.ensure_ssh_sync_worker();
+        self.window.request_redraw();
+    }
+
+    fn notify_ssh_local_change(&self) {
+        let Some(active) = self.ssh_sync.as_ref() else {
+            return;
+        };
+        let Some(store) = self.ssh_store.as_ref() else {
+            return;
+        };
+        if !should_trigger_ssh_sync_after_local_change(
+            Some(&active.account_id),
+            store.account_id(),
+        ) {
+            return;
+        }
+        if let Some(snapshot) = store.sync_snapshot() {
+            active.worker.update_snapshot_and_trigger(snapshot);
+        }
+    }
+
+    fn show_ssh_sync_failure_once(&mut self, account_id: &str, message: String) {
+        let should_show = self
+            .ssh_sync
+            .as_mut()
+            .filter(|active| active.account_id == account_id)
+            .is_some_and(|active| {
+                if active.last_failure.as_deref() == Some(message.as_str()) {
+                    false
+                } else {
+                    active.last_failure = Some(message.clone());
+                    true
+                }
+            });
+        if should_show {
+            log::warn!("SSH 配置同步失败：account={account_id}, {message}");
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                format!("SSH 配置同步失败: {message}"),
+            );
+            self.window.request_redraw();
+        }
+    }
+
+    fn drain_ssh_sync(&mut self) {
+        let events = self
+            .ssh_sync
+            .as_ref()
+            .map(|active| {
+                std::iter::from_fn(|| active.worker.poll()).collect::<Vec<ssh::SshSyncEvent>>()
+            })
+            .unwrap_or_default();
+
+        for event in events {
+            let event_account = match &event {
+                ssh::SshSyncEvent::Completed(completed) => {
+                    completed.snapshot.account_id().to_owned()
+                }
+                ssh::SshSyncEvent::Failed(failed) => failed.account_id.clone(),
+            };
+            let worker_account = self
+                .ssh_sync
+                .as_ref()
+                .map(|active| active.account_id.as_str());
+            let store_account = self
+                .ssh_store
+                .as_ref()
+                .and_then(ssh::SshStore::account_id);
+            if !should_apply_ssh_sync_event(
+                worker_account,
+                store_account,
+                &event_account,
+            ) {
+                log::warn!(
+                    "丢弃过期 SSH 同步事件：event_account={event_account}, worker_account={worker_account:?}, store_account={store_account:?}"
+                );
+                continue;
+            }
+
+            match event {
+                ssh::SshSyncEvent::Failed(failed) => {
+                    // 失败事件不触碰 SshStore；worker 自身按退避计划重试。
+                    self.show_ssh_sync_failure_once(
+                        &failed.account_id,
+                        format!("{}: {}", failed.error.code(), failed.error.user_message()),
+                    );
+                }
+                ssh::SshSyncEvent::Completed(completed) => {
+                    let applied = {
+                        let Some(store) = self.ssh_store.as_mut() else {
+                            continue;
+                        };
+                        let profiles_before = store
+                            .inventory()
+                            .profiles()
+                            .iter()
+                            .map(|profile| {
+                                (
+                                    profile.id.clone(),
+                                    store.binding(&profile.id).cloned(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        match store.apply_sync_completed(completed) {
+                            Ok(report) => {
+                                let removed_profiles = profiles_before
+                                    .iter()
+                                    .filter(|(id, _)| store.inventory().profile(id).is_none())
+                                    .map(|(id, _)| id.clone())
+                                    .collect::<Vec<_>>();
+                                let changed_bindings = profiles_before
+                                    .into_iter()
+                                    .filter_map(|(id, before)| {
+                                        let after = store.binding(&id).cloned();
+                                        (before != after).then_some((before, after))
+                                    })
+                                    .collect::<Vec<_>>();
+                                let snapshot = store.sync_snapshot();
+                                let pending_mutations = store.pending_sync_mutations();
+                                Ok((
+                                    report,
+                                    snapshot,
+                                    pending_mutations,
+                                    removed_profiles,
+                                    changed_bindings,
+                                ))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+
+                    let Ok((
+                        report,
+                        snapshot,
+                        pending_mutations,
+                        removed_profiles,
+                        changed_bindings,
+                    )) = applied
+                    else {
+                        let error = applied.expect_err("上方已匹配错误分支");
+                        self.show_ssh_sync_failure_once(
+                            &event_account,
+                            format!("应用服务端回包失败: {error}"),
+                        );
+                        continue;
+                    };
+
+                    if let Some(active) = self
+                        .ssh_sync
+                        .as_mut()
+                        .filter(|active| active.account_id == event_account)
+                    {
+                        active.last_failure = None;
+                        if let Some(snapshot) = snapshot {
+                            active.worker.update_snapshot(snapshot);
+                            if should_continue_ssh_sync(report.has_more, pending_mutations) {
+                                active.worker.trigger();
+                            }
+                        }
+                    }
+
+                    // 只断开真正被远端删除（或被服务端拒绝并清理）的 profile；
+                    // 远端编辑、移动和删组保留正在运行的 SSH actor。
+                    if !removed_profiles.is_empty() {
+                        let selected_removed = self
+                            .shell_state
+                            .ssh_ui
+                            .selected_profile_id()
+                            .is_some_and(|selected| {
+                                removed_profiles.iter().any(|id| id == selected)
+                            });
+                        for profile_id in &removed_profiles {
+                            self.discard_ssh_credential_dialog_for_profile(profile_id);
+                            self.ssh_runtime.remove_profile(profile_id);
+                            self.ssh_force_credential_prompt.remove(profile_id);
+                        }
+                        if selected_removed {
+                            self.shell_state.ssh_ui.select_profile(None);
+                        }
+                        self.ssh_rect_px = None;
+                        self.terminal_focused = self.terminal_focus_allowed();
+                    }
+                    for (before, after) in &changed_bindings {
+                        self.delete_obsolete_ssh_secrets(before.as_ref(), after.as_ref());
+                    }
+                    info!(
+                        "SSH 配置同步完成：ack={} changes={} rejected={} cursor={} deferred={}",
+                        report.acknowledged,
+                        report.applied_changes,
+                        report.rejected.len(),
+                        report.server_cursor,
+                        report.deferred_changes
+                    );
+                    self.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// 串行施加 SSH 页面动作。`SshStore` 是唯一写 owner；每次 CRUD
+    /// 内部会把库存与本机凭据绑定作为同一 generation 原子提交。
+    fn apply_ssh_ui_actions(&mut self, actions: Vec<shell::ssh_ui::SshUiAction>) {
+        use shell::ssh_ui::SshUiAction;
+
+        for action in actions {
+            let action = match action {
+                SshUiAction::ConnectProfile { id } => {
+                    self.shell_state.ssh_ui.select_profile(Some(id.clone()));
+                    self.begin_ssh_profile_connect(&id);
+                    continue;
+                }
+                SshUiAction::SubmitProfile(submission) => {
+                    self.apply_ssh_profile_submission(*submission);
+                    continue;
+                }
+                SshUiAction::CancelConnectionTest { form_id } => {
+                    if self.ssh_runtime.cancel_connection_test(form_id) {
+                        self.window.request_redraw();
+                    }
+                    continue;
+                }
+                action => action,
+            };
+
+            let Some(store) = self.ssh_store.as_mut() else {
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    "SSH 配置存储不可用，请先处理启动时的存储错误",
+                );
+                continue;
+            };
+
+            let mut deleted_profile = None;
+            let result = match action {
+                SshUiAction::CreateGroup { name } => store.create_group(&name).map(|_| ()),
+                SshUiAction::RenameGroup { id, name } => store.rename_group(&id, &name),
+                SshUiAction::DeleteGroup { id } => store.delete_group(&id),
+                SshUiAction::DeleteProfile { id } => {
+                    let binding = store.binding(&id).cloned();
+                    let result = store.delete_profile(&id);
+                    if result.is_ok() {
+                        deleted_profile = Some((id, binding));
+                    }
+                    result
+                }
+                SshUiAction::MoveProfile {
+                    id,
+                    target_group_id,
+                    target_index,
+                } => store.move_profile(&id, target_group_id.as_deref(), target_index),
+                SshUiAction::ConnectProfile { .. }
+                | SshUiAction::SubmitProfile(_)
+                | SshUiAction::CancelConnectionTest { .. } => {
+                    unreachable!("特殊 SSH UI 动作已在上方处理")
+                }
+            };
+            match result {
+                Ok(()) => {
+                    self.notify_ssh_local_change();
+                    if let Some((id, binding)) = deleted_profile {
+                        self.discard_ssh_credential_dialog_for_profile(&id);
+                        self.ssh_runtime.remove_profile(&id);
+                        self.ssh_force_credential_prompt.remove(&id);
+                        self.delete_obsolete_ssh_secrets(binding.as_ref(), None);
+                        self.ssh_rect_px = None;
+                        self.terminal_focused = false;
+                    }
+                    self.window.request_redraw();
+                }
+                Err(error) => {
+                    error!("SSH 配置变更失败: {error}");
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error.to_string());
+                    self.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn apply_ssh_profile_submission(&mut self, submission: shell::ssh_ui::SshProfileSubmission) {
+        use shell::ssh_ui::ProfileSubmitIntent;
+
+        match submission.intent() {
+            ProfileSubmitIntent::Save => self.save_ssh_profile_submission(submission),
+            ProfileSubmitIntent::TestConnection => {
+                self.begin_ssh_connection_test(submission);
+            }
+        }
+    }
+
+    fn save_ssh_profile_submission(&mut self, mut submission: shell::ssh_ui::SshProfileSubmission) {
+        let form_id = submission.form_id();
+        self.ssh_runtime.cancel_connection_test(form_id);
+        let host_key_verified_for_endpoint = submission.host_key_verified_for_current_endpoint();
+        let editing_id = submission.take_editing_id();
+        let draft = submission.take_draft();
+        let mut password = zeroize::Zeroizing::new(submission.take_password());
+        let private_key_path = submission.take_private_key_path();
+        let mut key_passphrase =
+            zeroize::Zeroizing::new(submission.take_key_passphrase());
+
+        // UI 会禁用无效提交，但主线程必须在任何 inventory mutation 前再次
+        // 复核本机私钥。编辑且 endpoint/auth 均未变化时允许沿用现有绑定；
+        // 新建、切换认证方式或修改 endpoint 都必须显式选择文件。
+        let private_key_submission_is_valid = {
+            let store = self.ssh_store.as_ref();
+            let saved_profile = editing_id.as_deref().and_then(|profile_id| {
+                store.and_then(|store| store.inventory().profile(profile_id))
+            });
+            let saved_binding = editing_id
+                .as_deref()
+                .and_then(|profile_id| store.and_then(|store| store.binding(profile_id)));
+            ssh_private_key_submission_is_valid(
+                &draft,
+                saved_profile,
+                saved_binding,
+                private_key_path.as_deref(),
+            )
+        };
+        if !private_key_submission_is_valid {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "请选择当前设备上存在的 SSH 私钥文件后再保存",
+            );
+            self.window.request_redraw();
+            return;
+        }
+
+        let saved = (|| -> Result<(String, Option<ssh::SshLocalBinding>), String> {
+            let store = self
+                .ssh_store
+                .as_mut()
+                .ok_or_else(|| "SSH 配置存储不可用，请先处理启动时的存储错误".to_owned())?;
+            match editing_id {
+                Some(id) => {
+                    let previous = store.binding(&id).cloned();
+                    if host_key_verified_for_endpoint {
+                        store
+                            .update_profile_with_verified_host_key(&id, draft)
+                            .map_err(|error| error.to_string())?;
+                    } else {
+                        store
+                            .update_profile(&id, draft)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok((id, previous))
+                }
+                None => store
+                    .create_profile(draft)
+                    .map(|id| (id, None))
+                    .map_err(|error| error.to_string()),
+            }
+        })();
+
+        let (profile_id, previous_binding) = match saved {
+            Ok(saved) => saved,
+            Err(error) => {
+                log::error!("SSH 服务器表单保存失败: {error}");
+                self.shell_state
+                    .toast
+                    .push(shell::toast::ToastKind::Error, error);
+                self.window.request_redraw();
+                return;
+            }
+        };
+        let profile = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.inventory().profile(&profile_id))
+            .cloned();
+        let Some(profile) = profile else {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器已保存，但无法重新读取配置",
+            );
+            self.window.request_redraw();
+            return;
+        };
+
+        let mut credential_save_failed = false;
+        match profile.auth_method {
+            ssh::AuthMethod::Password if !password.is_empty() => {
+                let credential_submission = shell::SshCredentialSubmission::from_password(
+                    profile.id.clone(),
+                    profile.host.clone(),
+                    profile.port,
+                    profile.username.clone(),
+                    std::mem::take(&mut *password),
+                );
+                if self
+                    .save_ssh_credential_submission(&profile, credential_submission)
+                    .is_err()
+                {
+                    credential_save_failed = true;
+                }
+            }
+            ssh::AuthMethod::PrivateKey => {
+                if let Some(path) = private_key_path {
+                    let credential_submission =
+                        shell::SshCredentialSubmission::from_private_key(
+                            profile.id.clone(),
+                            profile.host.clone(),
+                            profile.port,
+                            profile.username.clone(),
+                            path,
+                            std::mem::take(&mut *key_passphrase),
+                        );
+                    if self
+                        .save_ssh_credential_submission(&profile, credential_submission)
+                        .is_err()
+                    {
+                        credential_save_failed = true;
+                    }
+                }
+            }
+            ssh::AuthMethod::Password
+            | ssh::AuthMethod::Agent
+                if !password.is_empty() || !key_passphrase.is_empty() =>
+            {
+                log::warn!("忽略认证方式已变化的 SSH 表单凭据缓冲");
+            }
+            ssh::AuthMethod::Password | ssh::AuthMethod::Agent => {}
+        }
+
+        let current_binding = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile_id))
+            .cloned();
+        self.delete_obsolete_ssh_secrets(previous_binding.as_ref(), current_binding.as_ref());
+        self.notify_ssh_local_change();
+        self.shell_state
+            .ssh_ui
+            .select_profile(Some(profile_id.clone()));
+        if credential_save_failed {
+            let message = if profile.auth_method == ssh::AuthMethod::PrivateKey {
+                "SSH 服务器已保存，但无法安全绑定本机私钥"
+            } else {
+                "SSH 服务器已保存，但密码无法安全写入本机凭据存储"
+            };
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                message,
+            );
+        }
+        self.window.request_redraw();
+    }
+
+    fn begin_ssh_connection_test(&mut self, mut submission: shell::ssh_ui::SshProfileSubmission) {
+        let form_id = submission.form_id();
+        let connection_revision = submission.connection_revision();
+        let editing_id = submission.take_editing_id();
+        let draft = submission.take_draft();
+        let mut password = zeroize::Zeroizing::new(submission.take_password());
+        let private_key_path = submission.take_private_key_path();
+        let mut key_passphrase =
+            zeroize::Zeroizing::new(submission.take_key_passphrase());
+        let profile = ssh_test_profile(form_id, &draft);
+
+        let saved_credential = || -> Option<lumen_ssh::Credential> {
+            let profile_id = editing_id.as_deref()?;
+            let saved_profile = self.ssh_store.as_ref()?.inventory().profile(profile_id)?;
+            if !ssh_profile_matches_test_target(saved_profile, &profile) {
+                return None;
+            }
+            self.load_saved_ssh_credential(saved_profile).ok().flatten()
+        };
+
+        let credential = match profile.auth_method {
+            ssh::AuthMethod::Password if !password.is_empty() => Some(
+                lumen_ssh::Credential::password(std::mem::take(&mut *password)),
+            ),
+            ssh::AuthMethod::PrivateKey => match private_key_path {
+                Some(path) if path.is_absolute() && path.is_file() => {
+                    let passphrase = (!key_passphrase.is_empty()).then(|| {
+                        lumen_ssh::SecretString::new(std::mem::take(&mut *key_passphrase))
+                    });
+                    Some(lumen_ssh::Credential::private_key(path, passphrase))
+                }
+                Some(_) => None,
+                None => saved_credential(),
+            },
+            ssh::AuthMethod::Password => saved_credential(),
+            ssh::AuthMethod::Agent => Some(lumen_ssh::Credential::agent()),
+        };
+        let Some(credential) = credential else {
+            let message = match profile.auth_method {
+                ssh::AuthMethod::Password => "请输入密码，或先保存本机密码后再测试连接",
+                ssh::AuthMethod::PrivateKey => "请选择当前设备上存在的 SSH 私钥文件",
+                ssh::AuthMethod::Agent => unreachable!("SSH Agent 不需要本机表单凭据"),
+            };
+            self.ssh_runtime
+                .fail_connection_test(form_id, connection_revision, &profile, message);
+            self.window.request_redraw();
+            return;
+        };
+
+        if let Err(error) = self.ssh_runtime.start_connection_test(
+            form_id,
+            connection_revision,
+            &profile,
+            credential,
+        ) {
+            log::warn!("启动 SSH 连接测试失败: {error}");
+        }
+        self.window.request_redraw();
+    }
+
+    /// 删除旧 binding 中已不再被新 binding 引用的 Credential Manager
+    /// 秘密。库存 generation 已在调用前提交；清理失败只产生不含 target
+    /// 的安全提示，不回滚库存，也不影响其他 profile。
+    fn delete_obsolete_ssh_secrets(
+        &mut self,
+        previous: Option<&ssh::SshLocalBinding>,
+        current: Option<&ssh::SshLocalBinding>,
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let retained = [
+            current.and_then(|binding| binding.password_credential_ref.as_deref()),
+            current.and_then(|binding| binding.key_passphrase_credential_ref.as_deref()),
+        ];
+        let mut cleanup_failed = false;
+        for raw_reference in [
+            previous.password_credential_ref.as_deref(),
+            previous.key_passphrase_credential_ref.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if retained.into_iter().flatten().any(|value| value == raw_reference) {
+                continue;
+            }
+            let Ok(reference) = raw_reference.parse::<ssh::CredentialReference>() else {
+                log::warn!("跳过格式非法的旧 SSH 本机凭据引用");
+                cleanup_failed = true;
+                continue;
+            };
+            if let Err(error) = ssh::delete_secret(&reference) {
+                log::warn!("清理旧 SSH 本机凭据失败: {error}");
+                cleanup_failed = true;
+            }
+        }
+        if cleanup_failed {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                "SSH 配置已保存，但旧的本机凭据未能完全清理",
+            );
+        }
+    }
+
+    fn open_ssh_credential_dialog(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+        profile: &ssh::SshProfile,
+        kind: shell::SshCredentialKind,
+    ) {
+        // 凭据弹窗是全局单槽；新请求覆盖旧请求前必须关闭旧的待认证
+        // 会话，不能在会话栏留下永远无法继续的空 Shell。
+        self.discard_ssh_credential_dialog();
+        self.terminal_focused = false;
+        self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
+            session_id,
+            profile.id.clone(),
+            profile.name.clone(),
+            profile.host.clone(),
+            profile.port,
+            profile.username.clone(),
+            kind,
+        ));
+    }
+
+    fn discard_ssh_credential_dialog(&mut self) {
+        if let Some(dialog) = self.shell_state.ssh_credentials.take() {
+            self.ssh_runtime.close_session(dialog.session_id());
+        }
+    }
+
+    fn discard_ssh_credential_dialog_for_profile(&mut self, profile_id: &str) {
+        let matches = self
+            .shell_state
+            .ssh_credentials
+            .as_ref()
+            .is_some_and(|dialog| dialog.profile_id() == profile_id);
+        if matches {
+            self.discard_ssh_credential_dialog();
+        }
+    }
+
+    fn clear_ssh_credential_dialog_for_session(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+    ) -> bool {
+        let matches = self
+            .shell_state
+            .ssh_credentials
+            .as_ref()
+            .is_some_and(|dialog| dialog.session_id() == session_id);
+        if matches {
+            // 会话由调用方关闭；这里只清零并丢弃它的弹窗秘密。
+            self.shell_state.ssh_credentials.take();
+        }
+        matches
+    }
+
+    /// 从当前作用域的 local binding 与 Credential Manager 重新组装一次性
+    /// transport credential。任何缺失/损坏都返回空，让调用方提示用户；
+    /// 这里不缓存 SecretString，host-key 确认后的重试也会再次读取 vault。
+    fn load_saved_ssh_credential(
+        &self,
+        profile: &ssh::SshProfile,
+    ) -> Result<Option<lumen_ssh::Credential>, ()> {
+        let Some(binding) = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile.id))
+        else {
+            return Ok(None);
+        };
+        let read_bound_secret =
+            |raw: &str, expected_slot: ssh::CredentialSlot| -> Result<_, ()> {
+                let reference = raw.parse::<ssh::CredentialReference>().map_err(|_| ())?;
+                if reference.profile_id() != profile.id || reference.slot() != expected_slot {
+                    return Err(());
+                }
+                ssh::read_secret(&reference).map_err(|_| ())
+            };
+
+        match profile.auth_method {
+            ssh::AuthMethod::Password => {
+                let Some(raw) = binding.password_credential_ref.as_deref() else {
+                    return Ok(None);
+                };
+                let Some(secret) =
+                    read_bound_secret(raw, ssh::CredentialSlot::Password)?
+                else {
+                    return Ok(None);
+                };
+                if secret.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(lumen_ssh::Credential::password(secret)))
+            }
+            ssh::AuthMethod::PrivateKey => {
+                let Some(path) = binding.private_key_path.as_ref() else {
+                    return Ok(None);
+                };
+                if !path.is_absolute() || !path.is_file() {
+                    return Ok(None);
+                }
+                let passphrase = match binding.key_passphrase_credential_ref.as_deref() {
+                    Some(raw) => {
+                        let Some(secret) =
+                            read_bound_secret(raw, ssh::CredentialSlot::KeyPassphrase)?
+                        else {
+                            return Ok(None);
+                        };
+                        if secret.is_empty() {
+                            return Ok(None);
+                        }
+                        Some(secret)
+                    }
+                    None => None,
+                };
+                Ok(Some(lumen_ssh::Credential::private_key(
+                    path.clone(),
+                    passphrase,
+                )))
+            }
+            ssh::AuthMethod::Agent => Ok(Some(lumen_ssh::Credential::agent())),
+        }
+    }
+
+    fn begin_ssh_profile_connect(&mut self, profile_id: &str) {
+        let profile = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.inventory().profile(profile_id))
+            .cloned();
+        let Some(profile) = profile else {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器配置不存在或存储不可用",
+            );
+            return;
+        };
+
+        let (session_id, intent) = self.ssh_runtime.select_for_connect(&profile);
+        self.apply_ssh_connect_intent(session_id, &profile, intent);
+        self.update_window_title();
+        self.window.request_redraw();
+    }
+
+    fn continue_ssh_profile_connect(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+        profile_id: &str,
+    ) {
+        let profile = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.inventory().profile(profile_id))
+            .cloned();
+        let Some(profile) = profile else {
+            self.ssh_runtime.close_session(session_id);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 服务器配置不存在或存储不可用",
+            );
+            return;
+        };
+        let Some(intent) = self.ssh_runtime.connect_intent(session_id, &profile) else {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                "SSH 会话已关闭，请重新连接",
+            );
+            return;
+        };
+        self.apply_ssh_connect_intent(session_id, &profile, intent);
+        self.window.request_redraw();
+    }
+
+    fn apply_ssh_connect_intent(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+        profile: &ssh::SshProfile,
+        intent: ssh_runtime::ConnectIntent,
+    ) {
+        use ssh_runtime::ConnectIntent;
+        match intent {
+            ConnectIntent::AlreadyRunning => {
+                self.terminal_focused = self.terminal_focus_allowed();
+            }
+            ConnectIntent::Password => {
+                if self.ssh_force_credential_prompt.contains(&profile.id) {
+                    self.open_ssh_credential_dialog(
+                        session_id,
+                        profile,
+                        shell::SshCredentialKind::Password,
+                    );
+                } else {
+                    match self.load_saved_ssh_credential(profile) {
+                        Ok(Some(credential)) => {
+                            self.start_ssh_connection(session_id, profile, credential);
+                        }
+                        Ok(None) => self.open_ssh_credential_dialog(
+                            session_id,
+                            profile,
+                            shell::SshCredentialKind::Password,
+                        ),
+                        Err(()) => {
+                            log::warn!("读取 SSH 本机密码凭据失败，将要求重新输入");
+                            self.ssh_force_credential_prompt.insert(profile.id.clone());
+                            self.shell_state.toast.push(
+                                shell::toast::ToastKind::Warn,
+                                "本机 SSH 凭据不可用，请重新输入",
+                            );
+                            self.open_ssh_credential_dialog(
+                                session_id,
+                                profile,
+                                shell::SshCredentialKind::Password,
+                            );
+                        }
+                    }
+                }
+            }
+            ConnectIntent::PrivateKey => {
+                if self.ssh_force_credential_prompt.contains(&profile.id) {
+                    self.open_ssh_credential_dialog(
+                        session_id,
+                        profile,
+                        shell::SshCredentialKind::PrivateKey,
+                    );
+                } else {
+                    match self.load_saved_ssh_credential(profile) {
+                        Ok(Some(credential)) => {
+                            self.start_ssh_connection(session_id, profile, credential);
+                        }
+                        Ok(None) => self.open_ssh_credential_dialog(
+                            session_id,
+                            profile,
+                            shell::SshCredentialKind::PrivateKey,
+                        ),
+                        Err(()) => {
+                            log::warn!("读取 SSH 本机私钥口令失败，将要求重新输入");
+                            self.ssh_force_credential_prompt.insert(profile.id.clone());
+                            self.shell_state.toast.push(
+                                shell::toast::ToastKind::Warn,
+                                "本机 SSH 凭据不可用，请重新输入",
+                            );
+                            self.open_ssh_credential_dialog(
+                                session_id,
+                                profile,
+                                shell::SshCredentialKind::PrivateKey,
+                            );
+                        }
+                    }
+                }
+            }
+            ConnectIntent::Agent => {
+                self.start_ssh_connection(session_id, profile, lumen_ssh::Credential::agent());
+            }
+            ConnectIntent::AwaitingHostKey | ConnectIntent::HostKeyChanged => {
+                self.terminal_focused = false;
+            }
+        }
+    }
+
+    fn start_ssh_connection(
+        &mut self,
+        session_id: ssh_runtime::SshSessionId,
+        profile: &ssh::SshProfile,
+        credential: lumen_ssh::Credential,
+    ) {
+        match self.ssh_runtime.start(session_id, profile, credential) {
+            Ok(()) => {
+                self.terminal_focused = false;
+                self.window.request_redraw();
+            }
+            Err(error) => {
+                self.terminal_focused = false;
+                self.shell_state
+                    .toast
+                    .push(shell::toast::ToastKind::Error, error);
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// 把对话框 submission 事务性保存到本机安全存储并组装本次连接凭据。
+    ///
+    /// 顺序固定为：写新随机 Credential Manager target → 原子提交 binding →
+    /// 删除旧 target。binding 失败时立即幂等删除新 target。任何严格复核失败
+    /// 都发生在写 secret 之前。
+    fn save_ssh_credential_submission(
+        &mut self,
+        profile: &ssh::SshProfile,
+        mut submission: shell::SshCredentialSubmission,
+    ) -> Result<lumen_ssh::Credential, ()> {
+        let expected_kind = match profile.auth_method {
+            ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
+            ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
+            ssh::AuthMethod::Agent => {
+                log::warn!("拒绝为 SSH agent 认证保存交互式凭据");
+                return Err(());
+            }
+        };
+        if !submission.matches_target(
+            &profile.id,
+            &profile.host,
+            profile.port,
+            &profile.username,
+            expected_kind,
+        ) {
+            log::warn!("拒绝已过期或认证方式不匹配的 SSH 凭据提交");
+            return Err(());
+        }
+
+        let previous = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile.id))
+            .cloned();
+        let mut binding = previous.clone().unwrap_or_else(|| ssh::SshLocalBinding {
+            profile_id: profile.id.clone(),
+            private_key_path: None,
+            password_credential_ref: None,
+            key_passphrase_credential_ref: None,
+        });
+
+        let credential = match submission.kind() {
+            shell::SshCredentialKind::Password => {
+                if submission.password().is_empty() {
+                    return Err(());
+                }
+                let reference =
+                    ssh::CredentialReference::password(&profile.id).map_err(|error| {
+                        log::warn!("创建 SSH 密码凭据引用失败: {error}");
+                    })?;
+                binding.private_key_path = None;
+                binding.password_credential_ref = Some(reference.target());
+                binding.key_passphrase_credential_ref = None;
+                let transaction = ssh::write_secret_with_commit(
+                    &reference,
+                    submission.password(),
+                    || {
+                        self.ssh_store
+                            .as_mut()
+                            .ok_or(())
+                            .and_then(|store| store.upsert_binding(binding).map_err(|_| ()))
+                    },
+                );
+                if let Err(error) = transaction {
+                    match error {
+                        ssh::CredentialTransactionError::Write(error) => {
+                            log::warn!("写入 SSH 本机密码凭据失败: {error}");
+                        }
+                        ssh::CredentialTransactionError::Commit {
+                            rollback_error, ..
+                        } => {
+                            log::warn!("提交 SSH 本机密码绑定失败");
+                            if let Some(error) = rollback_error {
+                                log::warn!("回滚新 SSH 本机密码凭据失败: {error}");
+                            }
+                        }
+                    }
+                    return Err(());
+                }
+                lumen_ssh::Credential::password(submission.take_password())
+            }
+            shell::SshCredentialKind::PrivateKey => {
+                let Some(path) = submission.private_key_path() else {
+                    return Err(());
+                };
+                if !path.is_absolute() || !path.is_file() {
+                    return Err(());
+                }
+                let new_reference = if submission.key_passphrase().is_empty() {
+                    None
+                } else {
+                    let reference = ssh::CredentialReference::key_passphrase(&profile.id)
+                        .map_err(|error| {
+                            log::warn!("创建 SSH 私钥口令引用失败: {error}");
+                        })?;
+                    Some(reference)
+                };
+                binding.private_key_path = submission.private_key_path().map(ToOwned::to_owned);
+                binding.password_credential_ref = None;
+                binding.key_passphrase_credential_ref =
+                    new_reference.as_ref().map(ssh::CredentialReference::target);
+                let transaction = match new_reference.as_ref() {
+                    Some(reference) => ssh::write_secret_with_commit(
+                        reference,
+                        submission.key_passphrase(),
+                        || {
+                            self.ssh_store
+                                .as_mut()
+                                .ok_or(())
+                                .and_then(|store| store.upsert_binding(binding).map_err(|_| ()))
+                        },
+                    ),
+                    None => self
+                        .ssh_store
+                        .as_mut()
+                        .ok_or(ssh::CredentialTransactionError::Commit {
+                            error: (),
+                            rollback_error: None,
+                        })
+                        .and_then(|store| {
+                            store.upsert_binding(binding).map_err(|_| {
+                                ssh::CredentialTransactionError::Commit {
+                                    error: (),
+                                    rollback_error: None,
+                                }
+                            })
+                        }),
+                };
+                if let Err(error) = transaction {
+                    match error {
+                        ssh::CredentialTransactionError::Write(error) => {
+                            log::warn!("写入 SSH 本机私钥口令失败: {error}");
+                        }
+                        ssh::CredentialTransactionError::Commit {
+                            rollback_error, ..
+                        } => {
+                            log::warn!("提交 SSH 本机私钥绑定失败");
+                            if let Some(error) = rollback_error {
+                                log::warn!("回滚新 SSH 本机私钥口令失败: {error}");
+                            }
+                        }
+                    }
+                    return Err(());
+                }
+                let path = submission
+                    .take_private_key_path()
+                    .expect("私钥路径已在上方严格校验");
+                let passphrase = (!submission.key_passphrase().is_empty()).then(|| {
+                    lumen_ssh::SecretString::new(submission.take_key_passphrase())
+                });
+                lumen_ssh::Credential::private_key(path, passphrase)
+            }
+        };
+
+        let current = self
+            .ssh_store
+            .as_ref()
+            .and_then(|store| store.binding(&profile.id))
+            .cloned();
+        self.delete_obsolete_ssh_secrets(previous.as_ref(), current.as_ref());
+        self.ssh_force_credential_prompt.remove(&profile.id);
+        Ok(credential)
+    }
+
+    fn apply_ssh_runtime_action(&mut self, action: shell::SshRuntimeAction) {
+        use shell::SshRuntimeAction;
+        match action {
+            SshRuntimeAction::NewSession { profile_id } => {
+                self.shell_state
+                    .ssh_ui
+                    .select_profile(Some(profile_id.clone()));
+                self.begin_ssh_profile_connect(&profile_id);
+            }
+            SshRuntimeAction::ConnectWithCredential {
+                session_id,
+                submission,
+            } => {
+                let profile_id = submission.profile_id().to_owned();
+                let profile = self
+                    .ssh_store
+                    .as_ref()
+                    .and_then(|store| store.inventory().profile(&profile_id))
+                    .cloned();
+                let Some(profile) = profile else {
+                    self.ssh_runtime.close_session(session_id);
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 服务器配置已不存在",
+                    );
+                    return;
+                };
+                if !self
+                    .ssh_runtime
+                    .accepts_credential_for(session_id, &profile)
+                {
+                    self.ssh_runtime.close_session(session_id);
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 凭据请求已过期，请重新连接",
+                    );
+                    return;
+                }
+                if let Ok(credential) =
+                    self.save_ssh_credential_submission(&profile, submission)
+                {
+                    self.start_ssh_connection(session_id, &profile, credential);
+                } else {
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "无法安全保存 SSH 本机凭据，请重新选择或输入",
+                    );
+                    let kind = match profile.auth_method {
+                        ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
+                        ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
+                        ssh::AuthMethod::Agent => {
+                            self.ssh_runtime.close_session(session_id);
+                            return;
+                        }
+                    };
+                    self.open_ssh_credential_dialog(session_id, &profile, kind);
+                }
+            }
+            SshRuntimeAction::ActivateSession { session_id } => {
+                if self.ssh_runtime.activate_session(session_id) {
+                    let active_profile_id = self
+                        .ssh_runtime
+                        .active_view()
+                        .map(|view| view.profile_id.clone());
+                    if let Some(active_profile_id) = active_profile_id {
+                        self.shell_state
+                            .ssh_ui
+                            .select_profile(Some(active_profile_id));
+                    }
+                    self.terminal_focused = self.ssh_runtime.active_accepts_input();
+                    self.update_window_title();
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::CloseSession { session_id } => {
+                let cleared_dialog =
+                    self.clear_ssh_credential_dialog_for_session(session_id);
+                if self.ssh_runtime.close_session(session_id) || cleared_dialog {
+                    let active_profile_id = self
+                        .ssh_runtime
+                        .active_view()
+                        .map(|view| view.profile_id.clone());
+                    if let Some(active_profile_id) = active_profile_id {
+                        self.shell_state
+                            .ssh_ui
+                            .select_profile(Some(active_profile_id));
+                    }
+                    self.terminal_focused = self.ssh_runtime.active_accepts_input();
+                    self.ssh_rect_px = None;
+                    self.update_window_title();
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::RenameSession { session_id, name } => {
+                if self.ssh_runtime.rename_session(session_id, &name) {
+                    self.update_window_title();
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::Disconnect => {
+                self.ssh_runtime.disconnect_active();
+                self.terminal_focused = false;
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::DismissHostKey { session_id } => {
+                self.ssh_runtime.dismiss_unknown_host_key(session_id);
+                self.terminal_focused = false;
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::TrustHostKey {
+                session_id,
+                profile_id,
+                algorithm,
+                fingerprint,
+            } => {
+                let current_profile = self
+                    .ssh_store
+                    .as_ref()
+                    .and_then(|store| store.inventory().profile(&profile_id))
+                    .cloned();
+                let exact_pending = current_profile.as_ref().is_some_and(|profile| {
+                    let trust_is_current = ssh_host_key_confirmation_is_current(
+                        profile.trusted_host_key.as_ref(),
+                        &algorithm,
+                        &fingerprint,
+                    );
+                    trust_is_current
+                        && self.ssh_runtime.unknown_host_key_matches(
+                            session_id,
+                            profile,
+                            &algorithm,
+                            &fingerprint,
+                        )
+                });
+                if !exact_pending {
+                    self.ssh_runtime.dismiss_unknown_host_key(session_id);
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        "SSH 主机密钥确认已过期，请重新连接",
+                    );
+                    return;
+                }
+                let Some(profile) = current_profile else {
+                    return;
+                };
+                let draft = ssh_profile_draft(
+                    &profile,
+                    Some(ssh::HostKeyTrust {
+                        algorithm: algorithm.clone(),
+                        fingerprint: fingerprint.clone(),
+                    }),
+                );
+                let result = self
+                    .ssh_store
+                    .as_mut()
+                    .ok_or_else(|| "SSH 配置存储不可用".to_owned())
+                    .and_then(|store| {
+                        store
+                            .update_profile(&profile_id, draft)
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = result {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                    return;
+                }
+                self.notify_ssh_local_change();
+                if self.ssh_runtime.confirm_unknown_host_key(
+                    session_id,
+                    &algorithm,
+                    &fingerprint,
+                ) {
+                    // Never cache/reuse the credential that reached the first
+                    // host-key probe. Password/private-key modes prompt again.
+                    self.continue_ssh_profile_connect(session_id, &profile_id);
+                }
+            }
+        }
+    }
+
+    fn drain_ssh_runtime(&mut self) {
+        let mut outcome = self.ssh_runtime.drain();
+        for profile_id in &outcome.credential_failures {
+            self.ssh_force_credential_prompt.insert(profile_id.clone());
+        }
+        for profile_id in &outcome.connected_profiles {
+            self.ssh_force_credential_prompt.remove(profile_id);
+        }
+        if self.settings.layout.view_mode.is_ssh() && self.ssh_runtime.active_blocks_input() {
+            self.terminal_focused = false;
+        } else if outcome.active_became_connected
+            && self.settings.layout.view_mode.is_ssh()
+            && self.ssh_runtime.active_accepts_input()
+            && self.shell_state.ssh_credentials.is_none()
+        {
+            self.terminal_focused = true;
+        }
+        if !self.app_lock.is_locked()
+            && self.settings.layout.view_mode.is_ssh()
+            && (outcome.active_terminal_changed
+                || outcome.active_status_changed
+                || outcome.sessions_changed
+                || outcome.connection_test_changed)
+        {
+            self.window.request_redraw();
+        }
+        if outcome.sessions_changed && self.settings.layout.view_mode.is_ssh() {
+            self.update_window_title();
+        }
+        if !outcome.file_events.is_empty() {
+            self.apply_ssh_file_runtime_events(std::mem::take(&mut outcome.file_events));
+        }
+        if !outcome.editor_invalidated_sessions.is_empty() {
+            self.invalidate_ssh_clipboard_exports(&outcome.editor_invalidated_sessions);
+            let runtime_id = self.ssh_runtime.runtime_id();
+            for session_id in outcome.editor_invalidated_sessions {
+                let sources = self
+                    .shell_state
+                    .text_editor
+                    .sources()
+                    .filter(|source| {
+                        matches!(
+                            source,
+                            shell::text_editor::TextFileSource::Ssh {
+                                runtime_id: source_runtime,
+                                session_id: source_session,
+                                ..
+                            } if *source_runtime == runtime_id && *source_session == session_id
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for source in sources {
+                    self.shell_state.text_editor.invalidate_source(
+                        &source,
+                        i18n::strings().text_editor_source_invalidated,
+                    );
+                }
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    /// SSH 文件树“复制”的唯一入口：内部引用供 Lumen 三种模式互粘，同时
+    /// 预下载到独立临时目录；下载完成后才以 CF_HDROP 交给 Windows 资源管理器。
+    fn copy_ssh_file_to_clipboards(&mut self, item: SshClipboardItem) {
+        self.ssh_file_clipboard = Some(item.clone());
+        self.remote_ws.clear_file_clipboard();
+        self.remote_ws.cancel_clip_dir();
+        if let Some(service) = self.clipboard_svc.as_ref() {
+            service.clear();
+        }
+        let mut clipboard_sequence = system_clipboard_sequence_number();
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            if clipboard.clear().is_ok() {
+                clipboard_sequence =
+                    system_clipboard_sequence_number().or(clipboard_sequence);
+            }
+        }
+
+        self.ssh_clipboard_export_generation =
+            next_ssh_clipboard_generation(self.ssh_clipboard_export_generation);
+        let generation = self.ssh_clipboard_export_generation;
+        let destination = match create_ssh_clipboard_staging_path(generation, &item) {
+            Ok(path) => path,
+            Err(error) => {
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    i18n::fmt1(
+                        i18n::strings().ssh_clipboard_prepare_failed_fmt,
+                        error,
+                    ),
+                );
+                self.window.request_redraw();
+                return;
+            }
+        };
+        self.ssh_clipboard_exports.insert(
+            destination.clone(),
+            SshClipboardExport {
+                generation,
+                session_id: item.session_id,
+                clipboard_sequence,
+            },
+        );
+        if let Err(error) = self.ssh_runtime.download_file(
+            item.session_id,
+            item.path,
+            destination.clone(),
+            false,
+        ) {
+            self.ssh_clipboard_exports.remove(&destination);
+            remove_ssh_clipboard_staging_path(&destination);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                i18n::fmt1(
+                    i18n::strings().ssh_clipboard_prepare_failed_fmt,
+                    error,
+                ),
+            );
+            self.window.request_redraw();
+            return;
+        }
+        self.shell_state.toast.push(
+            shell::toast::ToastKind::Info,
+            i18n::fmt1(i18n::strings().ssh_clipboard_preparing_fmt, item.name),
+        );
+        self.window.request_redraw();
+    }
+
+    /// 返回 `true` 表示该下载属于 SSH→系统剪贴板链路，调用方不得再按普通
+    /// SSH 下载刷新文件树或显示“下载完成”通用提示。
+    fn complete_ssh_clipboard_export(&mut self, local_path: std::path::PathBuf) -> bool {
+        let Some(export) = self.ssh_clipboard_exports.remove(&local_path) else {
+            return false;
+        };
+        if !ssh_clipboard_export_is_current(
+            export.generation,
+            self.ssh_clipboard_export_generation,
+        ) {
+            remove_ssh_clipboard_staging_path(&local_path);
+            return true;
+        }
+        if clipboard_changed_since(
+            export.clipboard_sequence,
+            system_clipboard_sequence_number(),
+        ) {
+            remove_ssh_clipboard_staging_path(&local_path);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Info,
+                i18n::strings().ssh_clipboard_changed,
+            );
+            return true;
+        }
+
+        if clipboard_files::copy_files(std::slice::from_ref(&local_path)) {
+            if let Some(previous) = self.ssh_clipboard_ready_path.replace(local_path.clone()) {
+                if previous != local_path {
+                    remove_ssh_clipboard_staging_path(&previous);
+                }
+            }
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Info,
+                i18n::strings().ssh_clipboard_ready,
+            );
+        } else {
+            remove_ssh_clipboard_staging_path(&local_path);
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                i18n::strings().ssh_clipboard_write_failed,
+            );
+        }
+        true
+    }
+
+    /// 返回 `true` 表示该失败属于 SSH→系统剪贴板链路。旧代次静默清理；
+    /// 只有当前复制显示错误，避免连续复制时旧任务失败干扰最新结果。
+    fn fail_ssh_clipboard_export(
+        &mut self,
+        local_path: &std::path::Path,
+        message: &str,
+    ) -> bool {
+        let Some(export) = self.ssh_clipboard_exports.remove(local_path) else {
+            return false;
+        };
+        remove_ssh_clipboard_staging_path(local_path);
+        if ssh_clipboard_export_is_current(
+            export.generation,
+            self.ssh_clipboard_export_generation,
+        ) {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                i18n::fmt1(
+                    i18n::strings().ssh_clipboard_prepare_failed_fmt,
+                    message,
+                ),
+            );
+        }
+        true
+    }
+
+    fn invalidate_ssh_clipboard_exports(
+        &mut self,
+        session_ids: &[ssh_runtime::SshSessionId],
+    ) {
+        let paths = self
+            .ssh_clipboard_exports
+            .iter()
+            .filter(|(_, export)| session_ids.contains(&export.session_id))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        for path in paths {
+            let _ = self.fail_ssh_clipboard_export(&path, "SSH 连接已断开");
+        }
+    }
+
+    fn apply_ssh_filetree_intent(&mut self, intent: shell::ssh_filetree::SshFileTreeIntent) {
+        use shell::ssh_filetree::SshFileTreeIntent;
+        match intent {
+            SshFileTreeIntent::Select {
+                session_id,
+                path,
+                is_directory,
+            } => {
+                self.ssh_runtime
+                    .select_file(session_id, path, is_directory);
+            }
+            SshFileTreeIntent::ClearSelection { session_id } => {
+                self.ssh_runtime.clear_file_selection(session_id);
+            }
+            SshFileTreeIntent::ToggleDirectory { session_id, path } => {
+                if self.ssh_runtime.toggle_directory(session_id, &path) {
+                    self.window.request_redraw();
+                }
+            }
+            SshFileTreeIntent::RefreshDirectory { session_id, path } => {
+                if self.ssh_runtime.refresh_directory(session_id, &path) {
+                    self.window.request_redraw();
+                }
+            }
+            SshFileTreeIntent::ChangeDirectory { session_id, path } => {
+                let command = shell::filetree::cd_command_posix(&path);
+                if !command.is_empty() {
+                    match self.ssh_runtime.send_input_to(session_id, command) {
+                        Ok(()) => self.terminal_focused = true,
+                        Err(error) => self
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error),
+                    }
+                }
+            }
+            SshFileTreeIntent::OpenLocalCopy {
+                session_id,
+                path,
+                name,
+                ..
+            } => {
+                if let Err(error) = self.ssh_runtime.open_local_copy(session_id, path, &name) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+            }
+            SshFileTreeIntent::Edit {
+                session_id, path, ..
+            } => {
+                self.open_text_editor(shell::text_editor::TextFileSource::Ssh {
+                    runtime_id: self.ssh_runtime.runtime_id(),
+                    session_id,
+                    path,
+                });
+            }
+            SshFileTreeIntent::Search { session_id, query } => {
+                if let Err(error) = self.ssh_runtime.search_files(session_id, query) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
+            }
+            SshFileTreeIntent::CopyFiles {
+                session_id,
+                path,
+                name,
+                is_directory: _,
+                size,
+            } => {
+                self.copy_ssh_file_to_clipboards(SshClipboardItem {
+                    session_id,
+                    path,
+                    name,
+                    size,
+                });
+            }
+            SshFileTreeIntent::PasteInto {
+                session_id,
+                directory,
+            } => {
+                self.paste_into_ssh(session_id, directory);
+            }
+            SshFileTreeIntent::MoveEntry {
+                session_id,
+                source_path,
+                source_is_directory,
+                target_directory,
+            } => {
+                if let Err(error) = self.ssh_runtime.move_entry(
+                    session_id,
+                    source_path,
+                    source_is_directory,
+                    target_directory,
+                ) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
+            }
+            SshFileTreeIntent::CreateEntry { .. } | SshFileTreeIntent::Delete { .. } => {
+                // The shell intercepts these two intents and opens the shared
+                // create/permanent-delete confirmation modal before they reach main.
+            }
+        }
+    }
+
+    fn apply_ssh_file_runtime_events(
+        &mut self,
+        events: Vec<ssh_runtime::SshFileRuntimeEvent>,
+    ) {
+        use shell::text_editor::{SaveFailure, TextFileSource};
+        let runtime_id = self.ssh_runtime.runtime_id();
+        for event in events {
+            match event {
+                ssh_runtime::SshFileRuntimeEvent::TextLoaded {
+                    session_id,
+                    document_token,
+                    bytes,
+                    ..
+                } => {
+                    let source_matches = matches!(
+                        self.shell_state
+                            .text_editor
+                            .source_for_token(document_token),
+                        Some(TextFileSource::Ssh {
+                            runtime_id: source_runtime,
+                            session_id: source_session,
+                            ..
+                        }) if *source_runtime == runtime_id && *source_session == session_id
+                    );
+                    if source_matches {
+                        self.shell_state
+                            .text_editor
+                            .apply_loaded(document_token, Ok(bytes));
+                    }
+                }
+                ssh_runtime::SshFileRuntimeEvent::TextSaved {
+                    session_id,
+                    document_token,
+                    ..
+                } => {
+                    let source_matches = matches!(
+                        self.shell_state
+                            .text_editor
+                            .source_for_token(document_token),
+                        Some(TextFileSource::Ssh {
+                            runtime_id: source_runtime,
+                            session_id: source_session,
+                            ..
+                        }) if *source_runtime == runtime_id && *source_session == session_id
+                    );
+                    if source_matches {
+                        self.shell_state
+                            .text_editor
+                            .apply_saved(document_token, Ok(()));
+                    }
+                }
+                ssh_runtime::SshFileRuntimeEvent::TextConflict {
+                    session_id,
+                    document_token,
+                } => {
+                    let source_matches = matches!(
+                        self.shell_state
+                            .text_editor
+                            .source_for_token(document_token),
+                        Some(TextFileSource::Ssh {
+                            runtime_id: source_runtime,
+                            session_id: source_session,
+                            ..
+                        }) if *source_runtime == runtime_id && *source_session == session_id
+                    );
+                    if source_matches {
+                        self.shell_state
+                            .text_editor
+                            .apply_saved(document_token, Err(SaveFailure::Conflict));
+                    }
+                }
+                ssh_runtime::SshFileRuntimeEvent::LocalCopyReady { local_path, .. } => {
+                    shell::filetree::open_with_default(&local_path);
+                }
+                ssh_runtime::SshFileRuntimeEvent::OperationComplete {
+                    operation,
+                    local_path,
+                    ..
+                } => {
+                    if operation == lumen_ssh::FileOperation::Download {
+                        if let Some(local_path) = local_path {
+                            if self.complete_ssh_clipboard_export(local_path.clone()) {
+                                continue;
+                            }
+                            if let Some(chain) = self.ssh_paste_chains.remove(&local_path) {
+                                match self.ssh_runtime.upload_entry(
+                                    chain.target_session_id,
+                                    local_path.clone(),
+                                    chain.target_directory,
+                                    chain.destination_name,
+                                    false,
+                                ) {
+                                    Ok(()) => {
+                                        self.ssh_staged_uploads.insert(local_path);
+                                    }
+                                    Err(error) => {
+                                        remove_staged_path(&local_path);
+                                        self.shell_state.toast.push(
+                                            shell::toast::ToastKind::Error,
+                                            error,
+                                        );
+                                    }
+                                }
+                            } else if let Some(parent) = local_path.parent() {
+                                self.shell_state.filetree.refresh_dir(parent);
+                            }
+                        }
+                    } else if operation == lumen_ssh::FileOperation::Upload {
+                        if let Some(local_path) = local_path {
+                            if self.ssh_staged_uploads.remove(&local_path) {
+                                remove_staged_path(&local_path);
+                            }
+                        }
+                    }
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Info,
+                        ssh_file_operation_done_message(operation),
+                    );
+                }
+                ssh_runtime::SshFileRuntimeEvent::Error {
+                    session_id,
+                    document_token,
+                    operation,
+                    error,
+                    local_path,
+                } => {
+                    let message = ssh_file_error_message(operation, error);
+                    if let Some(local_path) = local_path {
+                        if self.fail_ssh_clipboard_export(&local_path, &message) {
+                            continue;
+                        }
+                        self.ssh_paste_chains.remove(&local_path);
+                        if self.ssh_staged_uploads.remove(&local_path) {
+                            remove_staged_path(&local_path);
+                        }
+                    }
+                    if let Some(token) = document_token {
+                        let source_matches = matches!(
+                            self.shell_state.text_editor.source_for_token(token),
+                            Some(TextFileSource::Ssh {
+                                runtime_id: source_runtime,
+                                session_id: source_session,
+                                ..
+                            }) if *source_runtime == runtime_id
+                                && *source_session == session_id
+                        );
+                        if source_matches
+                            && !self.shell_state.text_editor.apply_saved(
+                                token,
+                                Err(SaveFailure::Message(message.clone())),
+                            )
+                        {
+                            self.shell_state.text_editor.apply_loaded(token, Err(message));
+                        }
+                    } else {
+                        self.shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, message);
+                    }
+                }
+            }
+        }
+        self.window.request_redraw();
     }
 
     fn dispatch(
@@ -2316,6 +4804,51 @@ impl AppState {
             .position(|p| p.id == *sid)
     }
 
+    fn ssh_modal_open(&self) -> bool {
+        self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.ssh_credentials.is_some()
+            || self.shell_state.ssh_session_renaming.is_some()
+            || self.shell_state.filetree.dialog_open()
+            || self.shell_state.text_editor.is_visible()
+            || self.ssh_runtime.active_blocks_input()
+    }
+
+    fn routes_input_to_ssh(&self) -> bool {
+        ssh_runtime::should_route_terminal_input(
+            self.settings.layout.view_mode,
+            self.terminal_focused,
+            self.ssh_modal_open(),
+            self.ssh_runtime.active_accepts_input(),
+        )
+    }
+
+    fn mouse_in_ssh_terminal(&self) -> bool {
+        if !self.settings.layout.view_mode.is_ssh() || self.mouse_on_panel_resize() {
+            return false;
+        }
+        let Some((x, y, width, height)) = self.ssh_rect_px else {
+            return false;
+        };
+        let (mouse_x, mouse_y) = self.mouse_pos;
+        if mouse_x < f64::from(x)
+            || mouse_y < f64::from(y)
+            || mouse_x >= f64::from(x + width)
+            || mouse_y >= f64::from(y + height)
+        {
+            return false;
+        }
+        let points_per_pixel = self.egui_ctx.pixels_per_point();
+        let position = egui::pos2(
+            mouse_x as f32 / points_per_pixel,
+            mouse_y as f32 / points_per_pixel,
+        );
+        !self
+            .egui_ctx
+            .layer_id_at(position)
+            .is_some_and(|layer| layer.order != egui::Order::Background)
+    }
+
     /// 鼠标当前位置是否落在某个窗格关闭按钮上（上一帧布局的命中区，
     /// 与 pane_rects_px 同源同陈旧度）。
     fn mouse_on_pane_close(&self) -> bool {
@@ -2517,6 +5050,27 @@ impl AppState {
             return;
         }
         self.window.set_ime_allowed(true);
+        if self.settings.layout.view_mode.is_ssh() {
+            let Some((px, py, _, _)) = self.ssh_rect_px else {
+                return;
+            };
+            let Some((row, column, _)) = self.ssh_runtime.active_cursor() else {
+                return;
+            };
+            let (cell_width, cell_height) = self.renderer.cell_size();
+            let (cursor_x, cursor_y) = self.renderer.cell_origin(row, column);
+            self.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(
+                    f64::from(px + cursor_x),
+                    f64::from(py + cursor_y),
+                ),
+                winit::dpi::PhysicalSize::new(
+                    f64::from(cell_width),
+                    f64::from(cell_height),
+                ),
+            );
+            return;
+        }
         // M5.3 part4c：镜像态把候选框定位到**镜像光标**（被控端光标）在终端区的像素位置，
         // 使控制端打中文时候选框出现在远端光标处（跟随态有效；回看态 mirror_cursor=None
         // 则跳过本次定位，候选框留在上次位置）。
@@ -3968,7 +6522,7 @@ impl AppState {
     /// （`bypass_egui` 的 `terminal_focused && Ime` 项已覆盖），故对 Win11
     /// 正常路径零影响；仅焦点翻转窗口期生效。
     fn ime_should_route_to_composer(&self) -> bool {
-        if self.app_lock.is_locked() {
+        if self.app_lock.is_locked() || self.settings.layout.view_mode.is_ssh() {
             return false;
         }
         #[cfg(feature = "input-editor")]
@@ -3979,7 +6533,9 @@ impl AppState {
                 || self.shell_state.completion.open
                 || self.shell_state.renaming.is_some()
                 || self.shell_state.pane_renaming.is_some()
+                || self.shell_state.ssh_session_renaming.is_some()
                 || self.shell_state.filetree.dialog_open()
+                || self.shell_state.text_editor.is_visible()
                 // 文件树搜索框（egui TextEdit）聚焦时能收 IME，须视作覆盖层、
                 // 把 IME 交还 egui，否则激进路由会把往搜索框打的中文劫持进
                 // 终端 composer（对抗审查 IME 项）。
@@ -4037,13 +6593,7 @@ impl AppState {
         // 自行退出触发的 activate 可能发生在用户正往设置页/登录表单/
         // 重命名框打字时，无脑置 true 会让在途按键直写邻位会话的 PTY
         // （bypass_egui 即刻生效，等不到下一帧的纠偏）。
-        self.terminal_focused = !(self.shell_state.settings.open
-            || self.shell_state.login.open
-            || self.shell_state.history_search.open
-            || self.shell_state.completion.open
-            || self.shell_state.renaming.is_some()
-            || self.shell_state.pane_renaming.is_some()
-            || self.shell_state.filetree.dialog_open());
+        self.terminal_focused = self.terminal_focus_allowed();
         // 防御（composer Win10 IME）：切 tab 复位焦点窗格的 IME 预编辑残留，
         // 防止切回时上一 tab 半成品组合串串入。激进修复（见
         // ime_should_route_to_composer）负责焦点翻转期首字直达 composer。
@@ -4113,7 +6663,9 @@ impl AppState {
             || self.shell_state.completion.open
             || self.shell_state.renaming.is_some()
             || self.shell_state.pane_renaming.is_some()
+            || self.shell_state.ssh_session_renaming.is_some()
             || self.shell_state.filetree.dialog_open()
+            || self.shell_state.text_editor.is_visible()
         {
             return;
         }
@@ -4663,12 +7215,26 @@ impl AppState {
         self.activate(idx);
     }
 
-    /// 窗口标题跟随激活 tab（与侧栏条目同源 display_title：自定义名 >
-    /// 焦点窗格 cwd > OSC 标题 > 「会话 N」，恒非空）。
+    /// 窗口标题跟随当前模式的激活会话。本地模式与 tab 的
+    /// `display_title` 同源；SSH 模式与会话栏同源（自定义名优先，
+    /// 否则当前 Linux cwd 尾目录名）。
     fn update_window_title(&self) {
         if self.app_lock.is_locked() {
             self.window
                 .set_title(&format!("Lumen — {}", i18n::strings().lock_screen_title));
+            return;
+        }
+        if self.settings.layout.view_mode.is_ssh() {
+            let title = self
+                .ssh_runtime
+                .session_views()
+                .into_iter()
+                .find(|session| session.active)
+                .map_or_else(
+                    || i18n::strings().topbar_tab_ssh.to_owned(),
+                    |session| session.display_name,
+                );
+            self.window.set_title(&format!("Lumen [ime-r4] — {title}"));
             return;
         }
         let title = self.tabs[self.active_tab].display_title();
@@ -4941,15 +7507,11 @@ impl AppState {
             remote_items.as_ref().map_or(0, Vec::len),
             clipboard_files::has_files(),
         );
-        // 记下目标目录：传输完成后刷新它，让粘贴进来的文件立即显示（本地树 / 远程树缓存不会自更新）。
-        self.paste_refresh = Some((
-            matches!(target_side, remote_ws::ClipSide::Remote),
-            dir.clone(),
-        ));
         match target_side {
             remote_ws::ClipSide::Local => {
                 if let Some(items) = remote_items {
                     // 下载：远程剪贴板 → 本地目录（撞名弹覆盖模态）。
+                    self.paste_refresh = Some((false, dir.clone()));
                     let dest_root = std::path::Path::new(&dir);
                     let conflicts = items
                         .iter()
@@ -4965,12 +7527,24 @@ impl AppState {
                     } else {
                         self.remote_ws.start_download(items, dir, true);
                     }
+                } else if let Some(item) = self.ssh_file_clipboard.clone() {
+                    let destination =
+                        std::path::Path::new(&dir).join(safe_staging_file_name(&item.name));
+                    if destination.exists() {
+                        self.pending_ssh_download = Some(PendingSshDownload {
+                            item,
+                            destination,
+                        });
+                    } else {
+                        self.start_ssh_download_to_local(item, destination, false);
+                    }
                 } else {
                     // 本机复制：系统剪贴板文件 → 本地目录。
                     let paths = clipboard_files::paste_files();
                     if paths.is_empty() {
                         log::info!("[本机复制] 系统剪贴板无文件，忽略粘贴");
                     } else {
+                        self.paste_refresh = Some((false, dir.clone()));
                         let items = paths_to_clipitems(&paths);
                         self.paste_local_files(items, dir);
                     }
@@ -4982,11 +7556,113 @@ impl AppState {
                 if paths.is_empty() {
                     log::info!("[上传] 系统剪贴板无文件，忽略粘贴");
                 } else {
+                    self.paste_refresh = Some((true, dir.clone()));
                     let items = paths_to_clipitems(&paths);
                     self.remote_ws.start_upload(items, dir);
                 }
             }
         }
+    }
+
+    fn start_ssh_download_to_local(
+        &mut self,
+        item: SshClipboardItem,
+        destination: std::path::PathBuf,
+        overwrite: bool,
+    ) {
+        match self
+            .ssh_runtime
+            .download_file(item.session_id, item.path, destination, overwrite)
+        {
+            Ok(()) => self.shell_state.toast.push(
+                shell::toast::ToastKind::Info,
+                i18n::strings().remote_download_started,
+            ),
+            Err(error) => self
+                .shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, error),
+        }
+        self.window.request_redraw();
+    }
+
+    fn paste_into_ssh(
+        &mut self,
+        target_session_id: ssh_runtime::SshSessionId,
+        target_directory: String,
+    ) {
+        let system_has_files = clipboard_files::has_files();
+        let local_paths = clipboard_files::paste_files();
+        let system_paths_are_current_ssh_export = self.ssh_file_clipboard.is_some()
+            && self
+                .ssh_clipboard_ready_path
+                .as_ref()
+                .is_some_and(|ready| {
+                    local_paths.len() == 1 && local_paths.first() == Some(ready)
+                });
+        if !local_paths.is_empty() && !system_paths_are_current_ssh_export {
+            self.ssh_file_clipboard = None;
+            for path in local_paths {
+                if let Err(error) = self.ssh_runtime.upload_file(
+                    target_session_id,
+                    path,
+                    target_directory.clone(),
+                    false,
+                ) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+            }
+            self.window.request_redraw();
+            return;
+        }
+        if system_has_files && local_paths.is_empty() {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().file_clipboard_read_failed,
+            );
+            self.window.request_redraw();
+            return;
+        }
+
+        let Some(item) = self.ssh_file_clipboard.clone() else {
+            return;
+        };
+        let staging_root = std::env::temp_dir().join("lumen_ssh_paste");
+        if let Err(error) = std::fs::create_dir_all(&staging_root) {
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Error,
+                format!("无法创建 SSH 粘贴暂存目录：{error}"),
+            );
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let staging_path = staging_root.join(format!(
+            "{nonce}-{}-{}",
+            item.size,
+            safe_staging_file_name(&item.name)
+        ));
+        self.ssh_paste_chains.insert(
+            staging_path.clone(),
+            SshPasteChain {
+                target_session_id,
+                target_directory,
+                destination_name: item.name.clone(),
+            },
+        );
+        if let Err(error) =
+            self.ssh_runtime
+                .download_file(item.session_id, item.path, staging_path.clone(), false)
+        {
+            self.ssh_paste_chains.remove(&staging_path);
+            self.shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, error);
+        }
+        self.window.request_redraw();
     }
 
     /// 粘贴传输完成后刷新目标目录（消费 `paste_refresh`）：本地 → 刷新本地树该目录；远程 → 刷新
@@ -5008,7 +7684,20 @@ impl AppState {
     /// Lumen 内部剪贴板（下载源）；本地视图 → 复制选中本地项到系统剪贴板（CF_HDROP，与资源管理器
     /// 互通）。无选中则忽略。
     fn filetree_ctrl_c(&mut self) {
-        if self.settings.layout.view_mode {
+        if self.settings.layout.view_mode.is_ssh() {
+            let Some((session_id, path, name, _is_directory, size)) =
+                self.ssh_runtime.active_selected_file()
+            else {
+                return;
+            };
+            self.copy_ssh_file_to_clipboards(SshClipboardItem {
+                session_id,
+                path,
+                name,
+                size,
+            });
+        } else if self.settings.layout.view_mode.is_remote() {
+            self.ssh_file_clipboard = None;
             // 远程视图：复制选中的被控端项 → Lumen 内部剪贴板（远程路径进不了系统剪贴板，仅供下载）。
             if let Some((path, name, is_dir, size)) = self
                 .remote_ws
@@ -5041,7 +7730,11 @@ impl AppState {
                     .toast
                     .push(shell::toast::ToastKind::Info, msg);
             }
-        } else if let Some((path, _is_dir)) = self.shell_state.filetree.selected_item() {
+        } else if self.settings.layout.view_mode.is_local() {
+            self.ssh_file_clipboard = None;
+            let Some((path, _is_dir)) = self.shell_state.filetree.selected_item() else {
+                return;
+            };
             // 本地视图：复制选中项 → 系统剪贴板（CF_HDROP），清 Lumen 内部远程剪贴板。
             let ok = clipboard_files::copy_files(&[path]);
             self.remote_ws.clear_file_clipboard();
@@ -5069,16 +7762,23 @@ impl AppState {
     /// 无文本时连信号都没）。按当前视图定目标目录：远程视图 → 选中目录 / 树根（上传）；本地视图 →
     /// 选中目录 / 树根（下载或本机复制）。无目标目录则忽略。
     fn filetree_ctrl_v(&mut self) {
-        if self.settings.layout.view_mode {
+        if self.settings.layout.view_mode.is_ssh() {
+            if let Some((session_id, directory)) = self.ssh_runtime.active_paste_target() {
+                self.paste_into_ssh(session_id, directory);
+            }
+        } else if self.settings.layout.view_mode.is_remote() {
             // 远程视图：上传到选中的远程目录（或树根）。
-            let dir = self.remote_ws.remote_filetree().and_then(|ft| {
-                ft.selected_dir()
-                    .or_else(|| ft.root_label().map(str::to_owned))
-            });
+            let dir = self
+                .remote_ws
+                .remote_filetree()
+                .and_then(remote_ws::RemoteFileTree::paste_target_dir);
             if let Some(dir) = dir {
                 self.do_file_paste(remote_ws::ClipSide::Remote, dir);
             }
-        } else if let Some(dir) = self.shell_state.filetree.paste_target_dir() {
+        } else if self.settings.layout.view_mode.is_local() {
+            let Some(dir) = self.shell_state.filetree.paste_target_dir() else {
+                return;
+            };
             // 本地视图：下载 / 本机复制到选中目录（或树根）。
             self.do_file_paste(remote_ws::ClipSide::Local, dir.display().to_string());
         }
@@ -5213,6 +7913,34 @@ struct PendingPaste {
     local: bool,
 }
 
+#[derive(Clone)]
+struct SshClipboardItem {
+    session_id: ssh_runtime::SshSessionId,
+    path: String,
+    name: String,
+    size: u64,
+}
+
+struct PendingSshDownload {
+    item: SshClipboardItem,
+    destination: std::path::PathBuf,
+}
+
+struct SshPasteChain {
+    target_session_id: ssh_runtime::SshSessionId,
+    target_directory: String,
+    destination_name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SshClipboardExport {
+    generation: u64,
+    session_id: ssh_runtime::SshSessionId,
+    /// 开始准备时的 Windows 剪贴板代次；用户随后在资源管理器复制了
+    /// 其他内容时，完成回包不得覆盖用户更新后的剪贴板。
+    clipboard_sequence: Option<u32>,
+}
+
 /// 把系统剪贴板取出的本地路径转成 `ClipItem`（统一交给本机复制 / 上传编排）。`is_dir` 现读盘
 /// （系统剪贴板只给路径），失败按文件处理。
 fn paths_to_clipitems(paths: &[std::path::PathBuf]) -> Vec<remote_ws::ClipItem> {
@@ -5230,6 +7958,121 @@ fn paths_to_clipitems(paths: &[std::path::PathBuf]) -> Vec<remote_ws::ClipItem> 
             }
         })
         .collect()
+}
+
+fn safe_staging_file_name(name: &str) -> String {
+    let mut result = name
+        .chars()
+        .take(180)
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while result.ends_with(' ') || result.ends_with('.') {
+        result.pop();
+    }
+    if result.is_empty() || result == "." || result == ".." {
+        "remote-file".to_owned()
+    } else {
+        result
+    }
+}
+
+fn next_ssh_clipboard_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
+fn ssh_clipboard_export_is_current(export_generation: u64, current_generation: u64) -> bool {
+    export_generation != 0 && export_generation == current_generation
+}
+
+fn clipboard_changed_since(started: Option<u32>, current: Option<u32>) -> bool {
+    started != current
+}
+
+#[cfg(windows)]
+fn system_clipboard_sequence_number() -> Option<u32> {
+    // SAFETY: 只读取系统维护的全局剪贴板序号，不持有句柄或指针。
+    Some(unsafe {
+        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+    })
+}
+
+#[cfg(not(windows))]
+fn system_clipboard_sequence_number() -> Option<u32> {
+    None
+}
+
+fn ssh_clipboard_staging_root() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "lumen_ssh_clipboard-{}",
+        std::process::id()
+    ))
+}
+
+fn ssh_clipboard_batch_directory(
+    root: &std::path::Path,
+    generation: u64,
+    session_id: ssh_runtime::SshSessionId,
+    nonce: u128,
+) -> std::path::PathBuf {
+    root.join(format!("{generation}-{session_id}-{nonce}"))
+}
+
+fn create_ssh_clipboard_staging_path(
+    generation: u64,
+    item: &SshClipboardItem,
+) -> std::io::Result<std::path::PathBuf> {
+    let root = ssh_clipboard_staging_root();
+    std::fs::create_dir_all(&root)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let batch =
+        ssh_clipboard_batch_directory(&root, generation, item.session_id, nonce);
+    std::fs::create_dir(&batch)?;
+    Ok(batch.join(safe_staging_file_name(&item.name)))
+}
+
+/// 只删除本进程创建的 `%TEMP%\lumen_ssh_clipboard-<pid>\<batch>`。
+///
+/// 下载目标可能是目录，也可能在失败时残留 SFTP 临时文件，因此以已验证的
+/// 唯一 batch 目录为最小清理单元；任何不符合两级布局的路径一律拒绝删除。
+fn remove_ssh_clipboard_staging_path(path: &std::path::Path) {
+    let root = ssh_clipboard_staging_root();
+    let Some(batch) = path.parent() else {
+        return;
+    };
+    if !root.is_absolute() || batch.parent() != Some(root.as_path()) {
+        log::warn!(
+            "拒绝清理不属于 SSH 文件剪贴板暂存区的路径：{}",
+            path.display()
+        );
+        return;
+    }
+    let _ = std::fs::remove_dir_all(batch);
+}
+
+fn remove_staged_path(path: &std::path::Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 在 `dir` 下为 `name` 找一个不冲突的副本名（文件管理器式「X (1)」「X (2)」…）。同目录粘贴
@@ -5661,14 +8504,64 @@ impl App {
         }
 
         // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
-        let user_profile = profile::Profile::load();
+        let current_server_url = cloud::server_url();
+        let mut user_profile = profile::Profile::load();
+        // 旧版 profile 没有签发 origin，或者 settings 已被外部改成另一
+        // 个服务端时，绝不能拿旧 bearer token 试探当前地址。升级后安全
+        // 退出一次，用户在当前 origin 重新登录即可建立明确绑定。
+        let profile_origin_reauth_required = user_profile.as_ref().is_some_and(|profile| {
+            profile
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+                && profile_server_origin(Some(profile), &current_server_url).is_none()
+        });
+        if profile_origin_reauth_required {
+            log::warn!("登录档案缺少有效服务端来源绑定，已安全退出并要求重新登录");
+            profile::Profile::delete();
+            user_profile = None;
+        }
         match &user_profile {
             Some(p) => info!("登录态加载：{} <{}>", p.display_name, p.email),
             None => info!("登录态：未登录"),
         }
-        // 启动对账：device_id 独立文件若缺失而 profile 尚有镜像值，回写修复——把双源背离消灭在
-        // 「下次重登带空 id → 服务端造幽灵」爆发之前（修「幽灵设备」的廉价治本兜底）。
-        cloud::reconcile_device_id(user_profile.as_ref().and_then(|p| p.device_id.as_deref()));
+        // 设备 id 也按签发 origin 分区；只允许同源 profile 修复对应分区，
+        // 旧版全局 device_id 不再参与联网，避免跨自建服务关联或误认设备。
+        if let (Ok(origin), Some(profile)) = (
+            cloud::canonical_server_origin(&current_server_url),
+            user_profile.as_ref(),
+        ) {
+            cloud::reconcile_device_id_for_origin(
+                &origin,
+                profile.auth_origin.as_deref(),
+                profile.device_id.as_deref(),
+            );
+        }
+
+        // SSH 库存按 Lumen 账号隔离；账号首次使用时先以不可逆认领标记
+        // 导入未登录清单。无账号/账号 ID 非规范时仍只读写 Local，绝不
+        // 把一份未确认归属的缓存交给同步 worker。
+        let (ssh_store, ssh_store_load_error) = match paths::data_dir() {
+            Some(data_root) => {
+                match load_ssh_store_for_profile(
+                    &data_root,
+                    user_profile.as_ref(),
+                    &current_server_url,
+                ) {
+                    Ok(store) => (Some(store), None),
+                    Err(error) => {
+                        error!("加载 SSH 库存失败（保留原文件）: {error}");
+                        (None, Some(error.to_string()))
+                    }
+                }
+            }
+            None => (
+                None,
+                Some("无法解析 Lumen 数据目录，SSH 配置本次不可写".to_owned()),
+            ),
+        };
+        let initial_auth_token =
+            profile_auth_token(user_profile.as_ref(), &current_server_url);
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
@@ -5872,6 +8765,9 @@ impl App {
 
         // 在 app_settings 被 move 进 AppState 之前读出 classic_mode（第十八轮）。
         let init_force_fallback = app_settings.classic_mode;
+        // SSH 模式启动时先停在服务器选择层，绝不能让后台本地 PTY
+        // 取得键盘/IME 焦点。
+        let init_terminal_focused = !app_settings.layout.view_mode.is_ssh();
         // auto_check 初值（app_settings 随后 move 进 settings 字段，先取出）。
         let init_auto_check = app_settings.update.auto_check;
         // 生效代理初值（同上，先取出 owned）。
@@ -5910,6 +8806,13 @@ impl App {
             layout_dirty: false,
             layout_apply_logged: false,
             profile: user_profile,
+            ssh_store,
+            ssh_sync: None,
+            ssh_empty_inventory: ssh::SshInventory::default(),
+            ssh_runtime: ssh_runtime::SshRuntime::default(),
+            ssh_force_credential_prompt: HashSet::new(),
+            ssh_texture: None,
+            ssh_rect_px: None,
             modifiers: ModifiersState::default(),
             clipboard,
             last_key_at: None,
@@ -5932,7 +8835,7 @@ impl App {
             update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
             update_proxy: Arc::new(std::sync::Mutex::new(init_proxy)),
             egui_ctx,
-            auth_token: None,
+            auth_token: initial_auth_token,
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
             mirror_src: None,
@@ -5940,11 +8843,19 @@ impl App {
             mirror_rect_px: None,
             mirror_pane_rects_px: Vec::new(),
             pending_paste: None,
+            pending_ssh_download: None,
+            ssh_file_clipboard: None,
+            ssh_paste_chains: HashMap::new(),
+            ssh_staged_uploads: HashSet::new(),
+            ssh_clipboard_export_generation: 0,
+            ssh_clipboard_exports: HashMap::new(),
+            ssh_clipboard_ready_path: None,
             local_copy_rx: None,
             clip_fetch_rx: None,
             clipboard_svc: None,
             paste_refresh: None,
             filetree_hovered: false,
+            filetree_focused: false,
             remote_viewport: None,
             mirror_texture: None,
             mirror_pane_textures: Vec::new(),
@@ -5962,7 +8873,7 @@ impl App {
             pane_close_rects_px: Vec::new(),
             divider_rects_px: Vec::new(),
             panel_resize_rects_px: Vec::new(),
-            terminal_focused: true,
+            terminal_focused: init_terminal_focused,
             egui_repaint_at: None,
             was_popup_open: false,
             shell_state: shell::ShellState::default(),
@@ -5997,6 +8908,19 @@ impl App {
         // 必须在此显式从 settings 读出。两入口（顶栏②按钮 + Ctrl+B）切换时均同步
         // 写盘（见 shell_out 处理段与 ToggleFiletree 分支），重启即可还原。
         state.shell_state.filetree.visible = state.settings.layout.filetree_visible;
+        if let Some(error) = ssh_store_load_error {
+            state
+                .shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, error);
+        }
+        if profile_origin_reauth_required {
+            state.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                "为保护账号数据，升级后请在当前 Lumen 服务器重新登录",
+            );
+        }
+        state.ensure_ssh_sync_worker();
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
         if stale_cwd > 0 {
             state.shell_state.toast.push(
@@ -6153,6 +9077,8 @@ impl ApplicationHandler<PtyWake> for App {
         // 应用锁密码线程复用 PtyWake 唤醒主循环；先提交结果，再处理
         // PTY/远程事件，解锁首帧即可与最新终端状态对齐。
         state.drain_lock_crypto();
+        state.drain_ssh_runtime();
+        state.drain_ssh_sync();
         // F3：drain 更新消息（发现新版/检查结果/下载完成）。下载完成会拉起
         // 安装器并请求优雅退出——走与 CloseRequested 同路径（落盘 + flush
         // 历史 + exit），让安装器替换 exe。
@@ -6644,7 +9570,10 @@ impl ApplicationHandler<PtyWake> for App {
                 state.completion_candidates.extend(new_items);
                 sidecar_merged = true;
             }
-            if sidecar_merged && !state.completion_candidates.is_empty() {
+            if sidecar_merged
+                && !state.completion_candidates.is_empty()
+                && !state.shell_state.text_editor.is_visible()
+            {
                 // 若弹窗尚未打开（文件路径候选为空、等 sidecar），现在打开。
                 if !state.shell_state.completion.open {
                     state.shell_state.completion.open = true;
@@ -6672,6 +9601,20 @@ impl ApplicationHandler<PtyWake> for App {
         //   （其余仍在同步区间的窗格由 RedrawRequested 的逐窗格门控
         //   各自跳过，保留上一完整帧）。
         let now = Instant::now();
+        // SSH actors intentionally do not share the local PTY wake channel.
+        // Poll only while at least one actor exists, at ~30fps. This keeps
+        // background sessions and monitoring current even behind the app lock,
+        // while an idle app returns to ControlFlow::Wait with no busy loop.
+        if state.ssh_runtime.has_live_connections() {
+            state.drain_ssh_runtime();
+        }
+        // notifier 正常会用 PtyWake 立即唤醒；这里作为安全帧点非阻塞
+        // drain，覆盖事件循环合并/关闭前的边界，不引入轮询唤醒。
+        state.drain_ssh_sync();
+        let ssh_poll_at = state
+            .ssh_runtime
+            .has_live_connections()
+            .then(|| now + Duration::from_millis(33));
 
         // 应用锁退避与自动入口。软件锁默认关闭；所有入口都先经过
         // is_enabled 门控，因此缺少 app_lock.json 的旧用户零行为变化。
@@ -6727,7 +9670,7 @@ impl ApplicationHandler<PtyWake> for App {
             return;
         }
         // 未到点计划中的最早时刻（含 egui 计划）。
-        let mut wake: Option<Instant> = None;
+        let mut wake: Option<Instant> = ssh_poll_at;
         if state.app_lock.is_enabled()
             && !state.app_lock.is_locked()
             && state.app_lock.config().idle_timeout_minutes() > 0
@@ -6852,6 +9795,40 @@ impl ApplicationHandler<PtyWake> for App {
             }
         }
 
+        // Ctrl+Shift+1/2/3 切换本地/远程/SSH。覆盖层或编辑态打开时
+        // 不抢键；应用锁已在上方优先处理并由下方总闸隔离。
+        if !state.app_lock.is_locked()
+            && !state.shell_state.settings.open
+            && !state.shell_state.login.open
+            && !state.shell_state.history_search.open
+            && !state.shell_state.completion.open
+            && state.shell_state.renaming.is_none()
+            && state.shell_state.pane_renaming.is_none()
+            && state.shell_state.ssh_session_renaming.is_none()
+            && !state.shell_state.filetree.dialog_open()
+            && !state.shell_state.text_editor.is_visible()
+        {
+            if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+                if key.state == ElementState::Pressed && !key.repeat {
+                    if let Some(next) = view_mode_shortcut(state.modifiers, key.physical_key) {
+                        if state.switch_view_mode(next) {
+                            if let Some(err) = state.settings.save() {
+                                state.shell_state.toast.push(
+                                    shell::toast::ToastKind::Error,
+                                    i18n::fmt1(
+                                        i18n::strings().toast_settings_save_failed_fmt,
+                                        &err,
+                                    ),
+                                );
+                            }
+                            state.window.request_redraw();
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
         // —— egui 先行消化事件 ——
         // 终端聚焦时键盘与 IME 整体绕过 egui：Tab/方向键不被 egui 的
         // 焦点导航偷走、IME 提交不被双投。其余事件先喂 egui（面板悬停
@@ -6872,7 +9849,8 @@ impl ApplicationHandler<PtyWake> for App {
             matches!(event, WindowEvent::Ime(_)) && state.ime_should_route_to_composer();
         let bypass_egui = matches!(event, WindowEvent::RedrawRequested)
             || (!state.app_lock.is_locked()
-                && state.terminal_focused
+                && ((!state.settings.layout.view_mode.is_ssh() && state.terminal_focused)
+                    || state.routes_input_to_ssh())
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
@@ -6953,6 +9931,9 @@ impl ApplicationHandler<PtyWake> for App {
             // 拖放按鼠标落点窗格）。路径转义 / Compose 分流与文件树拖放
             // 共用 insert_path_into_pane。
             WindowEvent::DroppedFile(path) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
                 let idx = state.tabs[state.active_tab].focused;
                 state.insert_path_into_pane(idx, &path);
                 state.window.request_redraw();
@@ -7003,6 +9984,51 @@ impl ApplicationHandler<PtyWake> for App {
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // 文件树 Ctrl+C / Ctrl+V 必须先于 SSH 终端的提前返回。
+                // egui 会把 Ctrl+V 消费成文本 Paste，Windows 文件剪贴板
+                // 没有文本时甚至不会留下 V 键信号，因此继续在 winit 层
+                // 统一裁决三种模式。TreeView 本身会向 egui 请求键盘焦点，
+                // 因此不能再用 blanket `egui_wants_keyboard_input` 反向挡掉；
+                // 搜索框获得焦点时 TreeView 的 focused 会自然变为 false。
+                let filetree_shortcut_available = state.filetree_focused
+                    && !state.shell_state.settings.open
+                    && !state.shell_state.login.open
+                    && !state.shell_state.history_search.open
+                    && !state.shell_state.completion.open
+                    && state.shell_state.renaming.is_none()
+                    && state.shell_state.pane_renaming.is_none()
+                    && state.shell_state.ssh_session_renaming.is_none()
+                    && state.shell_state.renaming_device.is_none()
+                    && !state.shell_state.filetree.dialog_open()
+                    && !state.shell_state.text_editor.is_visible()
+                    && state.shell_state.ssh_credentials.is_none();
+                if let Some(shortcut) = filetree_clipboard_shortcut(
+                    event.state,
+                    event.repeat,
+                    state.modifiers,
+                    event.physical_key,
+                    filetree_shortcut_available,
+                ) {
+                    match shortcut {
+                        FileTreeClipboardShortcut::Copy => state.filetree_ctrl_c(),
+                        FileTreeClipboardShortcut::Paste => state.filetree_ctrl_v(),
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
+
+                if state.settings.layout.view_mode.is_ssh() {
+                    if event.state == ElementState::Pressed && state.routes_input_to_ssh() {
+                        if let Some(bytes) = input::encode_key(&event, state.modifiers) {
+                            if let Err(error) = state.ssh_runtime.send_input(bytes) {
+                                log::warn!("SSH 输入发送失败: {error}");
+                            } else {
+                                state.last_key_at = Some(Instant::now());
+                            }
+                        }
+                    }
+                    return;
+                }
                 // —— M4.1 批B：事件 → keymap 查表 → Action → dispatch ——
                 //
                 // 原八层 if-else 拦截链已全部平移进 keymap 静态表
@@ -7027,33 +10053,6 @@ impl ApplicationHandler<PtyWake> for App {
                     );
                 let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
 
-                // —— 文件树 Ctrl+C / Ctrl+V（winit 层直接拦）——
-                // egui 把 Ctrl+V 吞成 Event::Paste（读剪贴板**文本**）：文件剪贴板（CF_HDROP）无文本
-                // 时既不产生 Paste、也吞掉 V 键事件，egui input 层根本检测不到；Ctrl+C 一并统一在此
-                // 处理。门控用「鼠标在文件树面板内」（上一帧 shell::show 报回，与右键菜单一致——点终端
-                // 不改 terminal_focused 故不能用它当门控），复用右键复制/粘贴编排，命中则不走下方 keymap。
-                if pressed
-                    && state.modifiers.control_key()
-                    && state.filetree_hovered
-                    && !state.shell_state.settings.open
-                    && !state.shell_state.login.open
-                {
-                    use winit::keyboard::{KeyCode, PhysicalKey};
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => {
-                            state.filetree_ctrl_c();
-                            state.window.request_redraw();
-                            return;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyV) => {
-                            state.filetree_ctrl_v();
-                            state.window.request_redraw();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-
                 // 组装守卫状态（从 AppState 采样，不缓存）。
                 // M5.3 part4b：镜像态（控制中+远程视图）下 Ctrl+C 的「复制 vs 中断」裁决
                 // 须按**镜像选区**而非本地窗格——否则有镜像选区时 Ctrl+C 判不出选区→走
@@ -7077,9 +10076,11 @@ impl ApplicationHandler<PtyWake> for App {
                     overlay_open: state.shell_state.settings.open
                         || state.shell_state.login.open
                         || state.shell_state.history_search.open
-                        || state.shell_state.completion.open,
+                        || state.shell_state.completion.open
+                        || state.shell_state.text_editor.is_visible(),
                     renaming: state.shell_state.renaming.is_some()
-                        || state.shell_state.pane_renaming.is_some(),
+                        || state.shell_state.pane_renaming.is_some()
+                        || state.shell_state.ssh_session_renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
                     terminal_focused: state.terminal_focused,
                     // part4c：镜像态按**被控端**焦点窗格 win32 模式裁决（控制端转发
@@ -7455,6 +10456,9 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x, position.y);
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
 
                 // 镜像态（远程视图）：拖选进行中则更新选区终点并 return；其余
                 // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
@@ -7594,6 +10598,9 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    return;
+                }
                 // F10：指针移出窗口，清除链接 hover 态（否则离屏纹理里残留
                 // 一条 hover 下划线，直到该窗格下次重渲才消失）。probe 也清成
                 // None，原格重入时不会因 probe 相等而跳过重新探测。
@@ -7612,6 +10619,21 @@ impl ApplicationHandler<PtyWake> for App {
                 state.release_held_report_buttons();
             }
             WindowEvent::Focused(focused) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if state
+                        .ssh_runtime
+                        .active_terminal()
+                        .is_some_and(lumen_term::Terminal::focus_event)
+                    {
+                        let sequence = if focused {
+                            b"\x1b[I".to_vec()
+                        } else {
+                            b"\x1b[O".to_vec()
+                        };
+                        let _ = state.ssh_runtime.send_input(sequence);
+                    }
+                    return;
+                }
                 // 失焦相当于交互中断：向焦点窗格补发配对 Release 再清按住态
                 // 与 motion 节流缓存。winit 在失活、非自愿丢失指针捕获时不会
                 // 合成按键释放——不补发则程序留下幻影按住、本地 held 卡住后
@@ -7635,7 +10657,26 @@ impl ApplicationHandler<PtyWake> for App {
                 state: btn_state,
                 button,
                 ..
-            } => match (button, btn_state) {
+            } => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if button == MouseButton::Left && btn_state == ElementState::Pressed {
+                        let in_terminal = state.mouse_in_ssh_terminal();
+                        state.terminal_focused =
+                            in_terminal && state.terminal_focus_allowed();
+                        if in_terminal {
+                            state.filetree_focused = false;
+                            state.egui_ctx.memory_mut(|memory| {
+                                if let Some(focused) = memory.focused() {
+                                    memory.surrender_focus(focused);
+                                }
+                            });
+                        } else if !state.filetree_hovered {
+                            state.filetree_focused = false;
+                        }
+                    }
+                    return;
+                }
+                match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
                     // 无边框窗口边缘拖动 resize（左/右/下及下方两角）：命中窗口
                     // 外缘则记下方向、下一帧 RedrawRequested 内发起系统 resize 拖动
@@ -7715,9 +10756,18 @@ impl ApplicationHandler<PtyWake> for App {
                     // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
                     let Some(pi) = state.pane_under_mouse() else {
                         state.terminal_focused = false;
+                        if !state.filetree_hovered {
+                            state.filetree_focused = false;
+                        }
                         return;
                     };
                     state.terminal_focused = true;
+                    state.filetree_focused = false;
+                    state.egui_ctx.memory_mut(|memory| {
+                        if let Some(focused) = memory.focused() {
+                            memory.surrender_focus(focused);
+                        }
+                    });
                     state.focus_pane(pi);
 
                     // ── footer 区域分流（第十一轮，input-editor feature）─
@@ -8052,8 +11102,9 @@ impl ApplicationHandler<PtyWake> for App {
                 (MouseButton::Middle, ElementState::Released) if state.is_mirror_active() => {
                     state.report_mirror_mouse_button(MouseButton::Middle, false);
                 }
-                _ => {}
-            },
+                    _ => {}
+                }
+            }
             // IME 组合开始（焦点失而复得后的首个组合串关键）：立即把候选框
             // 钉到焦点窗格光标，**别等下一帧 RedrawRequested**——否则首字组合串
             // 会用 egui 残留的左上角位置画在最左、且 OS 自绘组合串成孤儿删不掉
@@ -8067,6 +11118,11 @@ impl ApplicationHandler<PtyWake> for App {
             // text 为空或 cursor_range 为 None + 空串 → 清空预编辑（预编辑取消）。
             // 其余态：事件本身已由 egui-winit 处理（路由已交 egui），此处忽略。
             WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    // The platform IME owns composition; only Commit is sent
+                    // to the remote UTF-8 terminal.
+                    return;
+                }
                 // 激进修复（composer Win10）：焦点翻转期首字也归 composer。
                 let route = state.ime_should_route_to_composer();
                 log::info!(
@@ -8107,6 +11163,18 @@ impl ApplicationHandler<PtyWake> for App {
                 let _ = (text, cursor);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if state.routes_input_to_ssh() {
+                        if let Err(error) =
+                            state.ssh_runtime.send_input(text.into_bytes())
+                        {
+                            log::warn!("SSH IME 文本发送失败: {error}");
+                        } else {
+                            state.last_key_at = Some(Instant::now());
+                        }
+                    }
+                    return;
+                }
                 // 仅终端聚焦时把 IME 提交文本写入 shell（焦点窗格）；
                 // egui 输入框聚焦时事件已喂给 egui 消化，再写 PTY 就是
                 // 双投。激进修复（composer Win10）：焦点翻转期 Compose 态
@@ -8157,6 +11225,21 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if state.settings.layout.view_mode.is_ssh() {
+                    if !state.mouse_in_ssh_terminal() {
+                        return;
+                    }
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
+                        MouseScrollDelta::PixelDelta(position) => {
+                            (position.y / f64::from(state.renderer.cell_size().1)) as isize
+                        }
+                    };
+                    if state.ssh_runtime.scroll_active(lines) {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
                 // 终端窗格区内滚轮归终端，区外（侧栏等）归 egui；滚动
                 // 作用于**焦点窗格**（F5 拍板：键盘/IME/滚轮/选区全部
                 // 跟焦点，悬停别的窗格不抢路由——要滚哪个先点哪个）。
@@ -8572,6 +11655,8 @@ impl ApplicationHandler<PtyWake> for App {
                     .collect();
                 let was_renaming = state.shell_state.renaming.is_some();
                 let was_pane_renaming = state.shell_state.pane_renaming.is_some();
+                let was_ssh_session_renaming =
+                    state.shell_state.ssh_session_renaming.is_some();
                 // 文件树输入：焦点窗格的 cwd（OSC 9;9 上报）与空闲态
                 // （cd 注入闸门，见 Terminal::shell_waiting_input）。
                 // 焦点窗格 cwd：先取 OSC 9;9 上报值（Windows shell 集成）。
@@ -8592,6 +11677,8 @@ impl ApplicationHandler<PtyWake> for App {
                 #[cfg(not(unix))]
                 let active_cwd = osc_cwd;
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
+                let remote_shell_idle = state.remote_ws.focused_mirror_shell_idle();
+                let ssh_shell_idle = state.ssh_runtime.active_shell_idle();
                 // 背景图参数（P13）：仅当纹理已加载且 settings 启用时传入。
                 // 同时检查 enabled：用户本帧拨动开关关闭后，bg_texture 清空在
                 // apply_background_image（run_ui 之后）才执行；提前在此过滤
@@ -8684,36 +11771,51 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 // 共享 token 句柄（登录后懒建）：心跳 worker 自动续期时写回，WS + REST 共读同一份，
                 // 确保续期后处处用新 token（治本：免 7 天到期后全面 401）。必须单一实例供两者共享。
+                let current_server_url = cloud::server_url();
+                let account_server_origin =
+                    profile_server_origin(state.profile.as_ref(), &current_server_url)
+                        .filter(|origin| cloud::validate_server_transport(origin).is_ok());
                 if state.auth_token.is_none() {
-                    if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
-                        state.auth_token = Some(std::sync::Arc::new(std::sync::RwLock::new(tok)));
-                    }
+                    state.auth_token =
+                        profile_auth_token(state.profile.as_ref(), &current_server_url);
                 }
                 // M5.2：已登录但远程线程未起（启动时已登录 / 刚登录）→ 启动；
                 // 每帧收取后台心跳/设备列表回包。M5.3：远程控制 WS 同生命周期。
                 if !state.remote.is_running() {
-                    if let Some(auth) = state.auth_token.clone() {
+                    if let (Some(auth), Some(server_origin)) = (
+                        state.auth_token.clone(),
+                        account_server_origin.as_ref(),
+                    ) {
                         let exp = state.profile.as_ref().map_or(0, |p| p.token_expires_at);
                         let ctx = state.egui_ctx.clone();
                         // 传 proxy + wake_pending：设备列表后台线程拉到新数据后须唤醒空闲 winit 循环
                         // （否则停在远程视图时在线状态不自动刷新，要切 tab 才更新）。
-                        state.remote.start(
+                        if let Err(error) = state.remote.start(
+                            server_origin.clone(),
                             auth,
                             exp,
                             ctx,
                             state.proxy.clone(),
                             state.wake_pending.clone(),
-                        );
+                        ) {
+                            log::warn!("启动远程心跳失败: {}", error.user_message());
+                        }
                     }
                 }
                 if !state.remote_ws.is_running() {
-                    if let Some(auth) = state.auth_token.clone() {
-                        state.remote_ws.start(
+                    if let (Some(auth), Some(server_origin)) = (
+                        state.auth_token.clone(),
+                        account_server_origin.as_ref(),
+                    ) {
+                        if let Err(error) = state.remote_ws.start(
+                            server_origin.clone(),
                             auth,
                             state.egui_ctx.clone(),
                             state.proxy.clone(),
                             state.wake_pending.clone(),
-                        );
+                        ) {
+                            log::warn!("启动远程 WS 失败: {}", error.user_message());
+                        }
                     }
                 }
                 let _ = state.remote.poll();
@@ -8833,6 +11935,24 @@ impl ApplicationHandler<PtyWake> for App {
                 // 状态栏文件传输进度（控制端活跃 Fetch/Put 聚合；空闲 None → 状态栏照常显示 cwd）。
                 // owned，借给 shell_input；须在其前算、生命周期覆盖本帧渲染。
                 let transfer_status = state.remote_ws.transfer_status();
+                if state.settings.layout.view_mode.is_ssh()
+                    && state.ssh_runtime.has_active_terminal()
+                    && state.ssh_texture.is_none()
+                {
+                    state.renderer.ensure_offscreen(SSH_OFFSCREEN_ID, 1, 1);
+                    if let Some(view) = state.renderer.offscreen_view(SSH_OFFSCREEN_ID) {
+                        state.ssh_texture =
+                            Some(state.egui_renderer.register_native_texture(
+                                state.renderer.device(),
+                                view,
+                                wgpu::FilterMode::Nearest,
+                            ));
+                    }
+                }
+                let ssh_runtime_view = state.ssh_runtime.active_view();
+                let ssh_session_views = state.ssh_runtime.session_views();
+                let ssh_file_tree_view = state.ssh_runtime.active_file_tree_view();
+                let ssh_connection_test_view = state.ssh_runtime.connection_test_view();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -8865,6 +11985,8 @@ impl ApplicationHandler<PtyWake> for App {
                     },
                     cwd: active_cwd.as_deref(),
                     shell_idle,
+                    remote_shell_idle,
+                    ssh_shell_idle,
                     os_dark: state.os_dark,
                     bg_image,
                     // 底部状态栏所需：当前有效输入模式 + 经典直通开关（M4.1 批E）
@@ -8904,6 +12026,15 @@ impl ApplicationHandler<PtyWake> for App {
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
                     remote_devices: &state.remote.devices,
+                    ssh_inventory: state
+                        .ssh_store
+                        .as_ref()
+                        .map_or(&state.ssh_empty_inventory, ssh::SshStore::inventory),
+                    ssh_runtime: ssh_runtime_view.as_ref(),
+                    ssh_sessions: &ssh_session_views,
+                    ssh_file_tree: ssh_file_tree_view.as_ref(),
+                    ssh_connection_test: ssh_connection_test_view.as_ref(),
+                    ssh_terminal_tex: state.ssh_texture,
                     active_device_id: state.remote.active_device_id.as_deref(),
                     remote_pairing: state.remote_ws.pairing.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
@@ -8914,28 +12045,37 @@ impl ApplicationHandler<PtyWake> for App {
                     // 为 None → 画「等待 cwd」占位，绝不回落本机树（修 #2：未连接设备时远程 tab
                     // 显示本地树）。注意用 view_mode（远程 tab 选中）而非 is_mirror_active
                     // （= 控制中 且 远程 tab），否则未控制时回落本地树。
-                    remote_filetree: if state.settings.layout.view_mode {
+                    remote_filetree: if state.settings.layout.view_mode.is_remote() {
                         state.remote_ws.remote_filetree()
                     } else {
                         None
                     },
-                    remote_view_active: state.settings.layout.view_mode,
                     // part3c-2 #7：文件剪贴板来源侧 + 待决覆盖冲突项数（驱动菜单 / 覆盖模态）。
                     file_clipboard_side: state.remote_ws.file_clipboard().map(|c| c.side),
+                    ssh_file_clipboard_available: state.ssh_file_clipboard.is_some(),
                     overwrite_conflict_count: state
                         .pending_paste
                         .as_ref()
                         .map(|p| p.conflict_count)
+                        .or_else(|| state.pending_ssh_download.as_ref().map(|_| 1))
                         .or_else(|| state.remote_ws.upload_conflict_count()),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
-                let scroll_to_bottom_targets = state.scroll_to_bottom_overlays();
+                let scroll_to_bottom_targets = if state.settings.layout.view_mode.is_ssh() {
+                    Vec::new()
+                } else {
+                    state.scroll_to_bottom_overlays()
+                };
                 let mut scroll_to_bottom_req: Option<(SessionId, ScrollToBottomAction)> = None;
                 // 终端滚动条目标几何（同样须在借 shell_state 前算好）。
                 // 拖动/点击后把目标绝对 display_offset 记入 scroll_set_req，
                 // 闭包后落到对应 grid。
-                let scrollbar_targets = state.scrollbar_overlays();
+                let scrollbar_targets = if state.settings.layout.view_mode.is_ssh() {
+                    Vec::new()
+                } else {
+                    state.scrollbar_overlays()
+                };
                 let mut scroll_set_req: Option<(SessionId, usize)> = None;
                 let scrollbar_drag = &mut state.scrollbar_drag;
                 let shell_state = &mut state.shell_state;
@@ -9431,14 +12571,24 @@ impl ApplicationHandler<PtyWake> for App {
                     Some(UpdateAction::Later) => state.update_dismissed = true,
                     None => {}
                 }
-                let Some(shell_out) = shell_out else {
+                let Some(mut shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
                 };
-                if shell_out.term_clicked {
-                    state.terminal_focused = true;
+                let ssh_actions = std::mem::take(&mut shell_out.ssh_actions);
+                state.apply_ssh_ui_actions(ssh_actions);
+                if let Some(action) = shell_out.ssh_runtime_action.take() {
+                    state.apply_ssh_runtime_action(action);
                 }
-                // 文件树面板悬停态存到下一帧：winit 层 Ctrl+C/V 快捷键的门控（鼠标在文件树面板内）。
+                for intent in std::mem::take(&mut shell_out.ssh_filetree_intents) {
+                    state.apply_ssh_filetree_intent(intent);
+                }
+                if shell_out.term_clicked {
+                    state.terminal_focused = state.terminal_focus_allowed();
+                }
+                // 文件树悬停/键盘焦点存到下一帧；Ctrl+C/V 按 TreeView 焦点
+                // 仲裁，悬停仅保留给鼠标相关判断。
                 state.filetree_hovered = shell_out.filetree_hovered;
+                state.filetree_focused = shell_out.filetree_focused;
 
                 // ── footer 右键菜单动作 dispatch（第十一轮）───────────────
                 #[cfg(feature = "input-editor")]
@@ -9551,14 +12701,17 @@ impl ApplicationHandler<PtyWake> for App {
                 // 直通 PTY（Esc 关不掉菜单、打字进 shell）。
                 if state.shell_state.renaming.is_some()
                     || state.shell_state.pane_renaming.is_some()
+                    || state.shell_state.ssh_session_renaming.is_some()
                     || state.shell_state.renaming_device.is_some()
                 {
                     state.terminal_focused = false;
                 } else if (was_renaming && shell_out.rename_ended_by_key)
                     || (was_pane_renaming && shell_out.pane_rename_ended_by_key)
+                    || (was_ssh_session_renaming
+                        && shell_out.ssh_session_rename_ended_by_key)
                     || shell_out.rename_device_ended_by_key
                 {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
                 // —— egui 弹层（右键菜单/头像菜单等 Popup）焦点路由 ——
                 // 打开期间键盘恒归 egui：右键打开菜单不经过左键焦点
@@ -9574,14 +12727,16 @@ impl ApplicationHandler<PtyWake> for App {
                 } else if state.was_popup_open
                     && state.shell_state.renaming.is_none()
                     && state.shell_state.pane_renaming.is_none()
+                    && state.shell_state.ssh_session_renaming.is_none()
                     && state.shell_state.renaming_device.is_none()
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
                     && !state.shell_state.completion.open
+                    && !state.shell_state.text_editor.is_visible()
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
                 state.was_popup_open = popup_open;
 
@@ -10063,7 +13218,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // 叠层场景），后判打开保证焦点不被错误交还终端 ——
                 if shell_out.settings_closed || shell_out.login_closed {
                     // 关闭后焦点交还终端（IME 强制复位链路每帧照旧执行）。
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
                 }
 
                 // —— 历史搜索面板（M4.3）输出处理 ——
@@ -10194,7 +13349,17 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.shell_state.filetree.dialog_open() {
                     state.terminal_focused = false;
                 } else if shell_out.filetree_dialog_closed {
-                    state.terminal_focused = true;
+                    state.terminal_focused = state.terminal_focus_allowed();
+                }
+                if state.shell_state.text_editor.is_visible() {
+                    state.terminal_focused = false;
+                    state.filetree_focused = false;
+                } else if shell_out.text_editor_closed || shell_out.text_editor_hidden {
+                    state.terminal_focused = state.terminal_focus_allowed();
+                }
+                if shell_out.text_editor_restored {
+                    state.terminal_focused = false;
+                    state.filetree_focused = false;
                 }
                 if shell_out.settings_opened
                     || state.shell_state.settings.open
@@ -10307,6 +13472,7 @@ impl ApplicationHandler<PtyWake> for App {
                             &actual,
                         )
                     });
+                    state.shell_state.text_editor.invalidate_visual_cache();
                 }
                 if shell_out.settings_theme_changed {
                     // 主题即时生效（P12 画廊点选/槽位变更/Sync 开关
@@ -10337,6 +13503,14 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
+                // SSH 服务器栏显隐：与远程设备栏交互一致，但状态独立持久化。
+                let ssh_server_list_changed =
+                    if let Some(v) = shell_out.toggle_ssh_server_list {
+                        state.settings.layout.ssh_server_list_visible = v;
+                        true
+                    } else {
+                        false
+                    };
                 // 第十九轮：顶栏② 文件树显隐——写入 settings 并触发存盘。
                 // shell/mod.rs 已在 toggle_filetree 信号路径同步更新
                 // ShellState::filetree.visible（两入口共享同一状态源）；
@@ -10348,40 +13522,9 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
-                // M5.2：本地/远程 tab 切换 → 写 settings 并触发存盘。
+                // 三种工作模式切换 → 写 settings 并触发存盘。
                 let view_mode_changed = if let Some(v) = shell_out.toggle_view_mode {
-                    // 切视图前先补发仍按住的鼠标上报键的 Release（本地↔镜像视图是
-                    // mouse_report_held / mirror_report_sid 共用态的边界，不 flush 会两端
-                    // 幻影按住）。**务必在改 view_mode 之前**：release_held_report_buttons
-                    // 按 mirror_report_sid.is_some() 而非 view_mode 判路、send 只看
-                    // is_controlling()，故切前 flush 能把 Release 投到正确一侧。
-                    state.release_held_report_buttons();
-                    state.settings.layout.view_mode = v;
-                    // 切到远程视图：请求后台立即刷新一次设备列表。
-                    if v {
-                        state.remote.request_refresh();
-                    }
-                    // part4b：切换视图即清镜像选区/拖选态——否则远程→本地→远程后会复制
-                    // 陈旧选区、或（左键仍按住时切换）回来后产生幻影拖选。
-                    state.remote_ws.clear_mirror_selection();
-                    // F10：切视图同时清链接 hover——本地窗格 id 与镜像 session_id 来自
-                    // 两台机器、各自从 0 自增，撞号是常态；本地/镜像两条渲染循环各按自己
-                    // 的 id 过滤同一 hovered_link，切态后若鼠标不动，陈旧 hover 会被另一
-                    // 态按撞号命中、误画一条下划线（直到下次 CursorMoved 重探才自愈）。
-                    // 切态即清、连带 probe（重入原格不会因 probe 相等跳过重探）。
-                    state.hovered_link = None;
-                    state.hover_probe_cell = None;
-                    // part4c：切视图复位焦点窗格 preedit（仿 activate()）——否则进镜像态前
-                    // 本地打了一半的中文组合串，退出镜像态后会残留在 footer/composer。
-                    #[cfg(feature = "input-editor")]
-                    {
-                        let ti = state.active_tab;
-                        let pi = state.tabs[ti].focused;
-                        if let Some(p) = state.tabs[ti].panes.get_mut(pi) {
-                            p.preedit = None;
-                        }
-                    }
-                    true
+                    state.switch_view_mode(v)
                 } else {
                     false
                 };
@@ -10395,6 +13538,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_server_url_changed
                     || sidebar_changed
                     || remote_list_changed
+                    || ssh_server_list_changed
                     || filetree_changed
                     || view_mode_changed;
                 // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。
@@ -10410,11 +13554,16 @@ impl ApplicationHandler<PtyWake> for App {
                         *g = state.settings.proxy.effective_url().map(str::to_owned);
                     }
                 }
-                // M5.2：服务端地址改动 → 更新 cloud 全局。注意：运行中的心跳 worker 在 start
-                // 时已一次性捕获旧地址（CloudClient::new(server_url())，循环外不热切），故状态栏
-                // 连接指示要到「下次登录」worker 用新地址重启后才与新地址一致——与设置页
-                // 「改后下次登录生效」提示相符（登录 UI/心跳每次新建 client 时才读新全局）。
+                // 服务端 origin 改动后旧 token 不可复用：先清登录态和账号
+                // worker，再发布新全局地址。重新登录取得新 origin 的 token 后
+                // 才会重新加载账号库存并启动 SSH 同步。
                 if shell_out.settings_server_url_changed {
+                    let previous_origin = cloud::server_url();
+                    let next_origin =
+                        cloud::canonical_server_origin(&state.settings.server_url).ok();
+                    if next_origin.as_deref() != Some(previous_origin.as_str()) {
+                        state.invalidate_account_for_server_url_change();
+                    }
                     cloud::set_server_url(&state.settings.server_url);
                 }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
@@ -10476,6 +13625,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // —— 登录/登出动作：state.profile 是唯一数据源，更新后
                 // 顶栏头像、头像菜单、设置页 Account 三处下一帧即联动 ——
                 if let Some(p) = shell_out.logged_in {
+                    state.stop_account_bound_workers();
                     // 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
                     p.save();
                     info!("登录成功：{} <{}>", p.display_name, p.email);
@@ -10486,24 +13636,15 @@ impl ApplicationHandler<PtyWake> for App {
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();
                     state.profile = Some(p);
-                    // 新登录态：清共享 token 句柄，下帧据新 token 重建（供心跳续期 + WS 共读）。
-                    state.auth_token = None;
-                    // 关键：停掉仍握着旧 token 句柄的后台线程，下帧据新 token 重启——否则
-                    // 「已登录时点重新登录」（token 被服务端失效的自愈场景）后，心跳/WS 仍用
-                    // 旧死 token 死循环，重登白做、needs_relogin 永不清除。
-                    state.remote.stop();
-                    state.remote_ws.stop();
+                    state.reload_ssh_account_context();
                 }
                 if shell_out.logged_out {
                     // 登出：删 profile.json，三处 UI 即时回未登录态。
+                    state.stop_account_bound_workers();
                     profile::Profile::delete();
                     info!("已登出（profile.json 已删除）");
                     state.profile = None;
-                    state.auth_token = None; // 清共享 token 句柄
-                                             // M5.2：停止远程心跳/设备列表后台线程，清空缓存。
-                    state.remote.stop();
-                    // M5.3：停止远程控制 WS 引擎，清远程会话/配对态。
-                    state.remote_ws.stop();
+                    state.reload_ssh_account_context();
                     // 片6：登出后被控端不可达，清掉系统剪贴板里指向它的虚拟文件，免得粘贴空等失败。
                     if let Some(svc) = state.clipboard_svc.as_ref() {
                         svc.clear();
@@ -10523,6 +13664,9 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(id) = shell_out.remote_select {
                     state.remote_ws.set_remote_selected(id);
                 }
+                if shell_out.remote_clear_select {
+                    state.remote_ws.clear_remote_selected();
+                }
                 if let Some(show) = shell_out.remote_toggle_hidden {
                     state.remote_ws.set_remote_show_hidden(show);
                 }
@@ -10530,9 +13674,18 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(path) = shell_out.remote_fetch_open {
                     state.remote_ws.start_fetch_open(path);
                 }
+                // 右键“编辑”始终进入 Lumen 内置编辑器；双击仍是下载本地副本后
+                // 交给系统默认编辑器，两条保存链路不会混用。
+                if let Some((path, _name, _size)) = shell_out.remote_edit_file {
+                    state.open_text_editor(shell::text_editor::TextFileSource::Remote {
+                        generation: state.remote_ws.edit_generation(),
+                        path,
+                    });
+                }
                 // 复制：本地文件 → **系统剪贴板**（CF_HDROP，与资源管理器及任意应用互通，海风哥
                 // 反馈核心）；远程文件路径在被控端、进不了系统剪贴板 → 存 Lumen 内部（仅供下载到本地）。
                 if let Some((side, path, name, is_dir, size)) = shell_out.file_copy {
+                    state.ssh_file_clipboard = None;
                     log::info!(
                         "[文件剪贴板] 复制: side={side:?} is_dir={is_dir} size={size} path={path}"
                     );
@@ -10619,6 +13772,14 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                             shell::OverwriteChoice::Cancel => {}
                         }
+                    } else if let Some(pending) = state.pending_ssh_download.take() {
+                        if choice == shell::OverwriteChoice::Overwrite {
+                            state.start_ssh_download_to_local(
+                                pending.item,
+                                pending.destination,
+                                true,
+                            );
+                        }
                     } else {
                         state.remote_ws.resolve_upload_conflict(choice);
                     }
@@ -10687,6 +13848,29 @@ impl ApplicationHandler<PtyWake> for App {
                     state.remote_ws.remote_delete(path, is_dir);
                     state.window.request_redraw();
                 }
+                if let Some((session_id, dir, name, is_dir)) = shell_out.ssh_create {
+                    if let Err(error) = state
+                        .ssh_runtime
+                        .create_entry(session_id, dir, &name, is_dir)
+                    {
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error);
+                    }
+                    state.window.request_redraw();
+                }
+                if let Some((session_id, path, is_dir)) = shell_out.ssh_delete {
+                    if let Err(error) =
+                        state.ssh_runtime.delete_entry(session_id, path, is_dir)
+                    {
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error);
+                    }
+                    state.window.request_redraw();
+                }
                 // 远程菜单「进入文件夹」= 命令行 cd：注入 `cd '<被控端路径>'` 到远程会话
                 // （与本地一致，走 send_input → InputWithId → 被控端 PTY）。未在镜像某个
                 // 远程终端时无处注入 → 提示而非静默无效。控制字符路径被 cd_command_raw 拒。
@@ -10704,6 +13888,12 @@ impl ApplicationHandler<PtyWake> for App {
                         state.window.request_redraw();
                     }
                 }
+                if let Some(request) = shell_out.text_editor_load {
+                    state.start_text_editor_load(request);
+                }
+                if let Some(request) = shell_out.text_editor_save {
+                    state.start_text_editor_save(request);
+                }
 
                 // —— 窗格矩形（物理像素）变化 → 逐窗格重建离屏 + resize ——
                 // 对各边按 epaint 同款语义取整后求宽高：分数 DPI（如
@@ -10719,6 +13909,49 @@ impl ApplicationHandler<PtyWake> for App {
                 // 矩形应用与终端渲染（egui 呈现旧画面一帧，与 activate
                 // 的「先切再补帧」同款瞬态），请求下一帧按新结构重来。
                 let ppp = full_output.pixels_per_point;
+                if state.settings.layout.view_mode.is_ssh() {
+                    state.ssh_rect_px = shell_out.ssh_terminal_rect.and_then(|rect| {
+                        let (width, height) = (rect.width(), rect.height());
+                        (width.is_finite()
+                            && height.is_finite()
+                            && width >= 1.0
+                            && height >= 1.0)
+                            .then(|| {
+                                let x0 = (rect.min.x * ppp).round();
+                                let y0 = (rect.min.y * ppp).round();
+                                let x1 = (rect.max.x * ppp).round();
+                                let y1 = (rect.max.y * ppp).round();
+                                (x0, y0, x1 - x0, y1 - y0)
+                            })
+                    });
+                    if let Some((_, _, width, height)) = state.ssh_rect_px {
+                        let texture_width = width.max(1.0) as u32;
+                        let texture_height = height.max(1.0) as u32;
+                        if state.renderer.ensure_offscreen(
+                            SSH_OFFSCREEN_ID,
+                            texture_width,
+                            texture_height,
+                        ) {
+                            if let (Some(view), Some(texture)) = (
+                                state.renderer.offscreen_view(SSH_OFFSCREEN_ID),
+                                state.ssh_texture,
+                            ) {
+                                state.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    state.renderer.device(),
+                                    view,
+                                    wgpu::FilterMode::Nearest,
+                                    texture,
+                                );
+                            }
+                        }
+                        let (rows, columns) = state
+                            .renderer
+                            .grid_size_for(texture_width, texture_height);
+                        state.ssh_runtime.resize_active(rows, columns);
+                    }
+                } else {
+                    state.ssh_rect_px = None;
+                }
                 // 面板拖宽手柄命中区（P10）：raw 鼠标让位判定用
                 // （mouse_on_panel_resize）。与窗格结构无关，无条件
                 // 按本帧布局更新（文件树收起时本帧为空 = 不让位）。
@@ -11147,6 +14380,33 @@ impl ApplicationHandler<PtyWake> for App {
                         rendered += 1;
                     }
                 }
+                if state.settings.layout.view_mode.is_ssh()
+                    && state.ssh_texture.is_some()
+                    && state.ssh_rect_px.is_some()
+                {
+                    if let Some(terminal) = state.ssh_runtime.active_terminal_mut() {
+                        terminal.grid_mut().take_dirty();
+                    }
+                    let cursor = state
+                        .ssh_runtime
+                        .active_cursor()
+                        .unwrap_or((0, 0, false));
+                    let (renderer, runtime) = (&mut state.renderer, &state.ssh_runtime);
+                    if let Some(terminal) = runtime.active_terminal() {
+                        if let Err(error) = renderer.render(
+                            SSH_OFFSCREEN_ID,
+                            terminal,
+                            None,
+                            cursor,
+                            None,
+                            None,
+                        ) {
+                            log::error!("SSH 终端渲染失败: {error:#}");
+                        } else {
+                            rendered += 1;
+                        }
+                    }
+                }
                 if rendered > 0 {
                     // ESU 直渲限频基准（整帧粒度，多窗格共享）。
                     state.last_term_render_at = Some(render_t0);
@@ -11426,10 +14686,19 @@ impl ApplicationHandler<PtyWake> for App {
 #[cfg(test)]
 mod tests {
     use super::{
+        canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
         controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, scroll_to_bottom_action, width_worth_persisting, PaneLayout,
-        ScrollToBottomAction,
+        maximized_overflow, scroll_to_bottom_action,
+        should_apply_ssh_sync_event, should_continue_ssh_sync,
+        should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
+        ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
+        ssh_sync_identity, ssh_test_profile, filetree_clipboard_shortcut,
+        next_ssh_clipboard_generation, ssh_clipboard_batch_directory,
+        ssh_clipboard_export_is_current, view_mode_shortcut, width_worth_persisting,
+        FileTreeClipboardShortcut, PaneLayout, ScrollToBottomAction,
     };
+    use winit::event::ElementState;
+    use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
     // ── 本机复制粘贴（local→local，海风哥本轮新增）单测 ───────────────────
     use super::{local_copy_item, unique_copy_name, CopyStats};
@@ -11439,6 +14708,332 @@ mod tests {
         assert!(controller_owns_sub_viewport(1, 0, false));
         assert!(!controller_owns_sub_viewport(0, 0, false));
         assert!(controller_owns_sub_viewport(0, 0, true));
+    }
+
+    #[test]
+    fn 工作模式快捷键_精确匹配_ctrl_shift_数字键() {
+        let modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::Digit1)),
+            Some(crate::settings::ViewMode::Local)
+        );
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::Digit2)),
+            Some(crate::settings::ViewMode::Remote)
+        );
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::Digit3)),
+            Some(crate::settings::ViewMode::Ssh)
+        );
+    }
+
+    #[test]
+    fn 工作模式快捷键_额外修饰键或其他按键不匹配() {
+        let modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            view_mode_shortcut(
+                modifiers | ModifiersState::ALT,
+                PhysicalKey::Code(KeyCode::Digit3)
+            ),
+            None
+        );
+        assert_eq!(
+            view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::KeyS)),
+            None
+        );
+    }
+
+    #[test]
+    fn 文件树复制粘贴快捷键在ssh终端路由之前精确匹配() {
+        assert_eq!(
+            filetree_clipboard_shortcut(
+                ElementState::Pressed,
+                false,
+                ModifiersState::CONTROL,
+                PhysicalKey::Code(KeyCode::KeyC),
+                true,
+            ),
+            Some(FileTreeClipboardShortcut::Copy)
+        );
+        assert_eq!(
+            filetree_clipboard_shortcut(
+                ElementState::Pressed,
+                false,
+                ModifiersState::CONTROL,
+                PhysicalKey::Code(KeyCode::KeyV),
+                true,
+            ),
+            Some(FileTreeClipboardShortcut::Paste)
+        );
+    }
+
+    #[test]
+    fn 文件树复制粘贴不抢终端组合键和文本输入控件() {
+        for (repeat, modifiers, available) in [
+            (true, ModifiersState::CONTROL, true),
+            (
+                false,
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                true,
+            ),
+            (false, ModifiersState::CONTROL, false),
+        ] {
+            assert_eq!(
+                filetree_clipboard_shortcut(
+                    ElementState::Pressed,
+                    repeat,
+                    modifiers,
+                    PhysicalKey::Code(KeyCode::KeyC),
+                    available,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            filetree_clipboard_shortcut(
+                ElementState::Released,
+                false,
+                ModifiersState::CONTROL,
+                PhysicalKey::Code(KeyCode::KeyV),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ssh文件剪贴板代次跳过零且只认最新完成() {
+        assert_eq!(next_ssh_clipboard_generation(0), 1);
+        assert_eq!(next_ssh_clipboard_generation(u64::MAX), 1);
+        assert!(ssh_clipboard_export_is_current(7, 7));
+        assert!(!ssh_clipboard_export_is_current(6, 7));
+        assert!(!ssh_clipboard_export_is_current(0, 0));
+        assert!(!clipboard_changed_since(Some(12), Some(12)));
+        assert!(clipboard_changed_since(Some(12), Some(13)));
+        assert!(!clipboard_changed_since(None, None));
+        assert!(clipboard_changed_since(None, Some(13)));
+        assert!(clipboard_changed_since(Some(12), None));
+    }
+
+    #[test]
+    fn ssh文件剪贴板每批使用独立二级暂存目录() {
+        let root = std::path::Path::new(r"C:\Temp\lumen_ssh_clipboard-42");
+        let first = ssh_clipboard_batch_directory(root, 3, 9, 100);
+        let second = ssh_clipboard_batch_directory(root, 4, 9, 100);
+        assert_eq!(first, root.join("3-9-100"));
+        assert_eq!(second, root.join("4-9-100"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ssh测试连接使用独立profile且凭据回退按结构化目标匹配() {
+        let draft = crate::ssh::NewSshProfile {
+            name: "test".to_owned(),
+            host: "b@c".to_owned(),
+            username: "a".to_owned(),
+            auth_method: crate::ssh::AuthMethod::Password,
+            monitor_enabled: true,
+            ..Default::default()
+        };
+        let saved = ssh_test_profile(41, &draft);
+        assert_eq!(saved.id, "ssh_00000000000000000000000000000029");
+        assert!(!saved.monitor_enabled, "Probe 不得启动服务器监控");
+        assert!(ssh_profile_matches_test_target(&saved, &saved));
+
+        let mut colliding = saved.clone();
+        colliding.host = "c".to_owned();
+        colliding.username = "a@b".to_owned();
+        assert_eq!(
+            format!("{}@{}", saved.username, saved.host),
+            format!("{}@{}", colliding.username, colliding.host),
+            "回归样例必须能碰撞旧展示字符串"
+        );
+        assert!(!ssh_profile_matches_test_target(&saved, &colliding));
+    }
+
+    #[test]
+    fn ssh私钥表单提交在写库存前严格校验本机文件与复用目标() {
+        let mut draft = crate::ssh::NewSshProfile {
+            name: "key-server".to_owned(),
+            host: "server.example.test".to_owned(),
+            username: "alice".to_owned(),
+            auth_method: crate::ssh::AuthMethod::PrivateKey,
+            ..Default::default()
+        };
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft, None, None, None
+        ));
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft,
+            None,
+            None,
+            Some(std::path::Path::new("relative-key")),
+        ));
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft,
+            None,
+            None,
+            Some(std::env::temp_dir().as_path()),
+        ));
+
+        let key_path = std::env::temp_dir().join(format!(
+            "lumen-main-key-validation-{}",
+            std::process::id()
+        ));
+        std::fs::write(&key_path, b"test-key").expect("创建临时私钥");
+        assert!(ssh_private_key_submission_is_valid(
+            &draft,
+            None,
+            None,
+            Some(&key_path),
+        ));
+
+        let saved = ssh_test_profile(73, &draft);
+        let binding = crate::ssh::SshLocalBinding {
+            profile_id: saved.id.clone(),
+            private_key_path: Some(key_path.clone()),
+            password_credential_ref: None,
+            key_passphrase_credential_ref: None,
+        };
+        assert!(ssh_private_key_submission_is_valid(
+            &draft,
+            Some(&saved),
+            Some(&binding),
+            None,
+        ));
+
+        draft.host = "other.example.test".to_owned();
+        assert!(!ssh_private_key_submission_is_valid(
+            &draft,
+            Some(&saved),
+            Some(&binding),
+            None,
+        ));
+        let _ = std::fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn ssh主机密钥并发确认不能覆盖已信任的不同指纹() {
+        let trusted = crate::ssh::HostKeyTrust {
+            algorithm: "ssh-ed25519".to_owned(),
+            fingerprint: "SHA256:first".to_owned(),
+        };
+        assert!(ssh_host_key_confirmation_is_current(
+            None,
+            "ssh-ed25519",
+            "SHA256:first",
+        ));
+        assert!(ssh_host_key_confirmation_is_current(
+            Some(&trusted),
+            "ssh-ed25519",
+            "SHA256:first",
+        ));
+        assert!(!ssh_host_key_confirmation_is_current(
+            Some(&trusted),
+            "ssh-ed25519",
+            "SHA256:second",
+        ));
+        assert!(!ssh_host_key_confirmation_is_current(
+            Some(&trusted),
+            "rsa-sha2-512",
+            "SHA256:first",
+        ));
+    }
+
+    #[test]
+    fn ssh同步身份只接受规范账号_非空token和服务端地址() {
+        let mut profile = crate::profile::Profile {
+            user_id: Some("550E8400-E29B-41D4-A716-446655440000".to_owned()),
+            token: Some("jwt-token".to_owned()),
+            auth_origin: Some("https://lumen.example".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_ssh_account_id(Some(&profile), "https://lumen.example").as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            ssh_sync_identity(Some(&profile), "https://lumen.example"),
+            Some((
+                "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                "https://lumen.example".to_owned()
+            ))
+        );
+
+        profile.token = Some("   ".to_owned());
+        assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
+        profile.token = Some("jwt-token".to_owned());
+        assert!(ssh_sync_identity(Some(&profile), "   ").is_none());
+        assert!(ssh_sync_identity(Some(&profile), "https://other.example").is_none());
+        profile.auth_origin = None;
+        assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
+        profile.auth_origin = Some("https://lumen.example".to_owned());
+        profile.user_id = Some("not-a-canonical-account".to_owned());
+        assert!(
+            canonical_ssh_account_id(Some(&profile), "https://lumen.example").is_none()
+        );
+        assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
+    }
+
+    #[test]
+    fn ssh本地变更只触发同账号worker() {
+        let account = "550e8400-e29b-41d4-a716-446655440000";
+        let other = "550e8400-e29b-41d4-a716-446655440001";
+        assert!(should_trigger_ssh_sync_after_local_change(
+            Some(account),
+            Some(account)
+        ));
+        assert!(!should_trigger_ssh_sync_after_local_change(
+            Some(account),
+            Some(other)
+        ));
+        assert!(!should_trigger_ssh_sync_after_local_change(
+            Some(account),
+            None
+        ));
+        assert!(!should_trigger_ssh_sync_after_local_change(
+            None,
+            Some(account)
+        ));
+    }
+
+    #[test]
+    fn ssh同步事件须同时匹配worker与当前库存账号() {
+        let account = "550e8400-e29b-41d4-a716-446655440000";
+        let stale = "550e8400-e29b-41d4-a716-446655440001";
+        assert!(should_apply_ssh_sync_event(
+            Some(account),
+            Some(account),
+            account
+        ));
+        assert!(!should_apply_ssh_sync_event(
+            Some(account),
+            Some(account),
+            stale
+        ));
+        assert!(!should_apply_ssh_sync_event(
+            Some(account),
+            Some(stale),
+            account
+        ));
+        assert!(!should_apply_ssh_sync_event(Some(account), None, account));
+    }
+
+    #[test]
+    fn ssh同步完成后仅有更多页或待发变更才续触发() {
+        assert!(!should_continue_ssh_sync(false, 0));
+        assert!(should_continue_ssh_sync(true, 0));
+        assert!(should_continue_ssh_sync(false, 1));
+        assert!(should_continue_ssh_sync(true, 1));
+    }
+
+    #[test]
+    fn ssh账号切换会原地清空所有共享token句柄() {
+        let token = std::sync::Arc::new(std::sync::RwLock::new("old-token".to_owned()));
+        let worker_view = token.clone();
+        clear_shared_token(&token);
+        assert!(token.read().unwrap().is_empty());
+        assert!(worker_view.read().unwrap().is_empty());
     }
 
     #[test]

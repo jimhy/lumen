@@ -13,7 +13,7 @@
 use std::sync::mpsc::{self, Receiver};
 
 use lumen_protocol::{DeviceInfo, LoginRequest};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::cloud::{self, CloudClient, CloudError};
 use crate::i18n;
@@ -23,6 +23,7 @@ use super::theme::Palette;
 
 /// 居中卡片宽度（逻辑像素）。
 const CARD_WIDTH: f32 = 320.0;
+const AUTH_WORKER_START_ERROR: &str = "无法启动登录任务，请稍后重试";
 
 /// 登录 / 注册模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,7 +330,7 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
 /// 本地校验通过后启动后台鉴权线程。
 fn start_auth(ctx: &egui::Context, st: &mut LoginUiState) {
     let email = st.email.trim().to_string();
-    let password = st.password.clone();
+    let password = Zeroizing::new(st.password.clone());
     // 本地校验：邮箱含 `@`（前后段非空）、密码非空。
     let valid_email = email
         .split_once('@')
@@ -345,11 +346,21 @@ fn start_auth(ctx: &egui::Context, st: &mut LoginUiState) {
         return;
     }
     // 注册模式：两次密码必须一致。
-    if st.register_mode && password != st.password2 {
+    if st.register_mode && password.as_str() != st.password2 {
         st.error = None;
         st.server_error = Some(i18n::strings().login_err_password_mismatch.to_string());
         return;
     }
+    // 在点击/回车提交的主线程时刻捕获并验证 origin。之后即使用户立即把全局地址
+    // 从 A 改为 B，此线程里的密码也只可能发往不可变的 A。
+    let origin = match capture_auth_origin(&cloud::server_url()) {
+        Ok(origin) => origin,
+        Err(error) => {
+            st.error = None;
+            st.server_error = Some(error.user_message());
+            return;
+        }
+    };
     st.error = None;
     st.server_error = None;
 
@@ -362,23 +373,47 @@ fn start_auth(ctx: &egui::Context, st: &mut LoginUiState) {
     st.rx = Some(rx);
     st.submitting = true;
     let ctx2 = ctx.clone();
-    std::thread::spawn(move || {
-        let result = do_auth(mode, &email, &password);
-        // 发送失败（UI 已关闭丢弃 rx）忽略即可。
-        let _ = tx.send(result);
-        ctx2.request_repaint();
-    });
+    let spawned = std::thread::Builder::new()
+        .name("lumen-auth".to_owned())
+        .spawn(move || {
+            let result = do_auth(mode, &origin, &email, &password);
+            // 发送失败（UI 已关闭丢弃 rx）忽略即可。
+            let _ = tx.send(result);
+            ctx2.request_repaint();
+        });
+    if spawned.is_err() {
+        // spawn 失败会在返回前销毁未运行的闭包，闭包内 `Zeroizing<String>` 密码随即清零。
+        rollback_auth_worker_start(st);
+    }
+}
+
+fn rollback_auth_worker_start(st: &mut LoginUiState) {
+    st.submitting = false;
+    st.rx = None;
+    st.error = None;
+    st.server_error = Some(AUTH_WORKER_START_ERROR.to_owned());
+}
+
+fn capture_auth_origin(configured_origin: &str) -> Result<String, CloudError> {
+    cloud::verified_server_origin(configured_origin)
 }
 
 /// 后台执行鉴权：注册模式先注册再登录；登录模式直接登录。构造 [`Profile`]。
-fn do_auth(mode: AuthMode, email: &str, password: &str) -> AuthResult {
-    let client = CloudClient::new(cloud::server_url());
+fn do_auth(mode: AuthMode, origin: &str, email: &str, password: &str) -> AuthResult {
+    let client = CloudClient::new(origin.to_owned());
+    let previous_profile = Profile::load();
+    let previous_origin = previous_profile
+        .as_ref()
+        .and_then(|profile| profile.auth_origin.as_deref());
+    let previous_device_id = previous_profile
+        .as_ref()
+        .and_then(|profile| profile.device_id.as_deref());
+    cloud::reconcile_device_id_for_origin(origin, previous_origin, previous_device_id);
     let device = DeviceInfo {
-        // 独立文件缺失时回退 profile.json 里的镜像 device_id（消除「文件丢失但 profile 尚存
-        // did」这一最常见的幽灵触发链）。
-        device_id: cloud::load_device_id().or_else(|| Profile::load().and_then(|p| p.device_id)),
-        // 稳定硬件标识：即便上面两处 device_id 都取不到，服务端也能据此认领同一物理机、不新建。
-        hw_id: cloud::hardware_id(),
+        // 设备 id 按服务端 origin 分区；旧版全局 id 与其他服务的 profile 都不回退。
+        device_id: cloud::load_device_id_for_origin(origin),
+        // 原始 MachineGuid/machine-id 不出机，仅发送按 origin 派生的稳定伪名。
+        hw_id: cloud::hardware_id_for_origin(origin),
         name: cloud::device_name(),
         os: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -401,17 +436,48 @@ fn do_auth(mode: AuthMode, email: &str, password: &str) -> AuthResult {
 
     match client.login(&req) {
         Ok(resp) => {
-            if let Err(e) = cloud::save_device_id(&resp.device_id) {
+            if let Err(e) = cloud::save_device_id_for_origin(origin, &resp.device_id) {
                 // 写盘失败不阻断本次登录（内存态已生效），但记警告——下次重登会回退 profile
                 // 镜像 + hw_id 兜底，不会因此造出幽灵。
                 log::warn!("持久化 device_id 失败: {e}");
             }
-            Ok(Profile::from_auth(resp))
+            Ok(Profile::from_auth(resp, origin.to_owned()))
         }
         Err(CloudError::Api { code, .. }) if code == "user_not_found" => Err(AuthErr::UserNotFound),
         Err(CloudError::Api { code, .. }) if code == "invalid_credentials" => {
             Err(AuthErr::BadCredentials)
         }
         Err(e) => Err(AuthErr::Other(e.user_message())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 鉴权提交捕获不可变origin() {
+        let captured = capture_auth_origin("https://a.example.com").expect("捕获 A");
+        let later = capture_auth_origin("https://b.example.com").expect("捕获 B");
+        assert_eq!(captured, "https://a.example.com");
+        assert_ne!(captured, later);
+
+        // 编译期回归：后台鉴权入口必须显式接收 origin，不能自行读取全局地址。
+        let _requires_explicit_origin: fn(AuthMode, &str, &str, &str) -> AuthResult = do_auth;
+    }
+
+    #[test]
+    fn 鉴权worker启动失败恢复提交状态() {
+        let (_tx, rx) = mpsc::channel();
+        let mut state = LoginUiState::default();
+        state.submitting = true;
+        state.rx = Some(rx);
+        state.server_error = Some("old".to_owned());
+
+        rollback_auth_worker_start(&mut state);
+
+        assert!(!state.submitting);
+        assert!(state.rx.is_none());
+        assert_eq!(state.server_error.as_deref(), Some(AUTH_WORKER_START_ERROR));
     }
 }

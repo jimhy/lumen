@@ -11,6 +11,7 @@ mod db;
 mod error;
 mod handlers;
 mod hub;
+mod ssh_sync;
 mod state;
 // M6 P2P：极简 STUN 反射端（独立 UDP，客户端探公网映射端点做 QUIC 打洞）。
 mod stun;
@@ -99,6 +100,7 @@ fn build_router(state: AppState) -> Router {
             r::SYNC_HISTORY,
             get(handlers::pull_history).post(handlers::push_history),
         )
+        .route(r::SYNC_SSH, post(ssh_sync::sync_ssh))
         .route(r::HEARTBEAT, post(handlers::heartbeat))
         // M5.3 远程控制 WebSocket 中继（升级请求无 body，下方 DefaultBodyLimit 不影响它；
         // WS 帧大小另由 ws_handler 的 max_frame_size/max_message_size 收口）。

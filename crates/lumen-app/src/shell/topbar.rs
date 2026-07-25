@@ -1,5 +1,5 @@
 //! 顶栏（M3.5 / M3.8 / 问题1 修复 / R8 / F12 批1）：
-//! - 左端（LTR）：本地/远程视图 tab（M5.2）
+//! - 左端（LTR）：本地/远程/SSH 三种工作模式 tab
 //! - 右端（RTL）：关闭 / 最大化还原 / 最小化 / 头像
 //! - 中间剩余空白：拖动区（drag / 双击 / 右键语义不变）
 //! - 标题文字已删除（R8 海风哥点名去掉路径标题）
@@ -31,6 +31,7 @@
 
 use crate::i18n;
 use crate::profile::Profile;
+use crate::settings::ViewMode;
 
 use super::theme::Palette;
 
@@ -87,9 +88,8 @@ pub struct TopbarOutput {
     /// 按钮不可见（极端情况）时为 None，main 跳过本帧更新。
     pub maximize_btn_rect: Option<egui::Rect>,
     // ── 视图切换信号 ─────────────────────────────────────────────────
-    /// 切换本地/远程视图（点击顶栏「本地/远程」tab，M5.2）。
-    /// None = 未点击，Some(false) = 本地，Some(true) = 远程。
-    pub toggle_view_mode: Option<bool>,
+    /// 切换本地/远程/SSH 工作模式。
+    pub toggle_view_mode: Option<ViewMode>,
 }
 
 /// 顶栏额外状态（打包传入 [`show`]，避免参数列表超过 clippy 7 参数限制）。
@@ -97,8 +97,8 @@ pub struct ViewState {
     /// 头像菜单更新项：Some(版本号) = 有就绪更新（显示「更新到 vX」强调项），
     /// None = 无更新（显示「检查更新」）。
     pub update_version: Option<String>,
-    /// 当前视图（M5.2）：false = 本地，true = 远程。
-    pub current_view: bool,
+    /// 当前工作模式。
+    pub current_view: ViewMode,
     /// 登录态已过期需重新登录（token 过期）：头像叠红色感叹号角标 + 菜单出红字「登录过期」。
     /// main 据 `profile.token_expires_at` 判定（自动续期之外的兜底，如关闭 >7 天再开）。
     pub need_relogin: bool,
@@ -316,23 +316,47 @@ pub fn show(
                     }
                 }
 
-                // LTR 子布局：在余下区域左端放本地/远程视图 tab
+                // LTR 子布局：在余下区域左端放三种工作模式 tab
                 let mut left_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(remaining)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 left_ui.add_space(LEFT_GROUP_MARGIN);
-                if draw_view_tab(&mut left_ui, s.topbar_tab_local, !view.current_view, pal)
-                    .clicked()
+                if draw_view_tab(
+                    &mut left_ui,
+                    s.topbar_tab_local,
+                    view.current_view.is_local(),
+                    pal,
+                )
+                .clicked()
+                    && !view.current_view.is_local()
                 {
-                    out.toggle_view_mode = Some(false);
+                    out.toggle_view_mode = Some(ViewMode::Local);
                 }
                 left_ui.add_space(VIEW_BTN_GAP);
-                if draw_view_tab(&mut left_ui, s.topbar_tab_remote, view.current_view, pal)
-                    .clicked()
+                if draw_view_tab(
+                    &mut left_ui,
+                    s.topbar_tab_remote,
+                    view.current_view.is_remote(),
+                    pal,
+                )
+                .clicked()
+                    && !view.current_view.is_remote()
                 {
-                    out.toggle_view_mode = Some(true);
+                    out.toggle_view_mode = Some(ViewMode::Remote);
+                }
+                left_ui.add_space(VIEW_BTN_GAP);
+                if draw_view_tab(
+                    &mut left_ui,
+                    s.topbar_tab_ssh,
+                    view.current_view.is_ssh(),
+                    pal,
+                )
+                .clicked()
+                    && !view.current_view.is_ssh()
+                {
+                    out.toggle_view_mode = Some(ViewMode::Ssh);
                 }
             });
         });
@@ -342,7 +366,7 @@ pub fn show(
 // 注：原 R8.2 三个图标绘制函数（①侧栏 ②文件树 ③田字复位）已随
 // 按钮迁往 [`super::toolbar`]（F12 批1），此处不再保留副本。
 
-/// 本地/远程 tab 按钮（M5.2）：文字 pill。active = accent 字 + bg_highlight 底；
+/// 工作模式 tab 按钮：文字 pill。active = accent 字 + bg_highlight 底；
 /// hover = fg 字 + 半透底；常态 = fg_dim 字。返回点击 Response。
 fn draw_view_tab(ui: &mut egui::Ui, text: &str, active: bool, pal: &Palette) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, VIEW_BTN_H), egui::Sense::click());
@@ -549,7 +573,7 @@ mod topbar_layout_tests {
     fn test_view() -> ViewState {
         ViewState {
             update_version: None,
-            current_view: false,
+            current_view: ViewMode::Local,
             need_relogin: false,
         }
     }
@@ -603,10 +627,10 @@ mod topbar_layout_tests {
     }
 
     /// F12 批1 后左端哨兵：三视图按钮已迁工具栏，顶栏左端只剩
-    /// 本地/远程 tab——一帧的绘制图元里左端区域（x<250）应存在
-    /// 至少 2 个文字图元（「本地」「远程」）。
+    /// 本地/远程/SSH tab——一帧的绘制图元里左端区域（x<250）应存在
+    /// 至少 3 个文字图元。
     #[test]
-    fn 顶栏_左端本地远程tab图元存在() {
+    fn 顶栏_左端三种工作模式tab图元存在() {
         let ctx = egui::Context::default();
         let pal = test_palette();
         let full = ctx.run_ui(test_input(), |ui| {
@@ -622,8 +646,8 @@ mod topbar_layout_tests {
         }
         let texts: usize = full.shapes.iter().map(|cs| walk_text(&cs.shape)).sum();
         assert!(
-            texts >= 2,
-            "左端文字图元过少：{texts} 个——本地/远程 tab 没画到左端"
+            texts >= 3,
+            "左端文字图元过少：{texts} 个——三种工作模式 tab 没画到左端"
         );
     }
 }

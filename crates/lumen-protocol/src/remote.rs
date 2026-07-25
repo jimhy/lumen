@@ -393,6 +393,115 @@ pub enum RemoteFrame {
         /// 失败原因（失败时 `Some`；非 `None` 时盖过 `status`）。
         err: Option<FsErr>,
     },
+    /// v3 控制端 → 被控端：读取一个有界文本文件供 Lumen 内置编辑器使用。
+    EditFetchReq {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        path: EditPath,
+    },
+    /// v3 控制端 → 被控端：取消一个编辑读取任务。
+    EditFetchCancel {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+    },
+    /// v3 被控端 → 控制端：编辑文件首帧。revision 基于随后传输的精确原始字节。
+    EditFileBegin {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        total_len: u64,
+        revision: FileRevision,
+    },
+    /// v3 被控端 → 控制端：编辑文件内容块。
+    EditFileChunk {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        seq: u32,
+        data: EditChunk,
+    },
+    /// v3 控制端 → 被控端：确认一个编辑读取块，维持滑动窗口背压。
+    EditFileChunkAck {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        seq: u32,
+    },
+    /// v3 被控端 → 控制端：编辑文件读取完成。
+    EditFileEnd {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+    },
+    /// v3 控制端 → 被控端：开始条件保存。非 force 时目标必须仍等于 expected_revision。
+    EditPutBegin {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        path: EditPath,
+        total_len: u64,
+        expected_revision: FileRevision,
+        new_revision: FileRevision,
+        force: bool,
+    },
+    /// v3 被控端 → 控制端：条件检查通过且同目录安全临时文件已建立。
+    EditPutReady {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        current_revision: FileRevision,
+    },
+    /// v3 被控端 → 控制端：目标在编辑后已改变（None 表示被删除或类型改变）。
+    EditPutConflict {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        current_revision: Option<FileRevision>,
+    },
+    /// v3 控制端 → 被控端：待保存内容块。
+    EditPutChunk {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        seq: u32,
+        data: EditChunk,
+    },
+    /// v3 被控端 → 控制端：确认一个保存块已写入临时文件。
+    EditPutChunkAck {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        seq: u32,
+    },
+    /// v3 控制端 → 被控端：所有保存块已确认，开始最终校验与原子替换。
+    EditPutEnd {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+    },
+    /// v3 控制端 → 被控端：取消条件保存并删除临时文件。
+    EditPutCancel {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+    },
+    /// v3 被控端 → 控制端：保存成功及新 revision。
+    EditPutResult {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        revision: FileRevision,
+    },
+    /// v3 被控端 → 控制端：编辑读取或保存失败。revision 是失败时可安全观测到的当前版本。
+    EditError {
+        req_id: u64,
+        document_token: u64,
+        session_generation: u64,
+        revision: Option<FileRevision>,
+        error: EditFileError,
+    },
     /// 控制端 → 被控端：在 `dir` 下创建子目录 `name`（递归上传建目录结构；幂等）。
     MkDir {
         /// 关联请求号。
@@ -803,6 +912,90 @@ pub enum FsErr {
     Io,
 }
 
+/// v3 内置编辑器的内容版本。哈希覆盖精确原始字节（含 BOM 与原始换行）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileRevision {
+    pub len: u64,
+    pub sha256: [u8; 32],
+}
+
+/// v3 内置编辑传输错误。路径和内容不会进入该机器可读错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditFileError {
+    InvalidRequest,
+    NotFound,
+    PermissionDenied,
+    TooLarge,
+    NotRegular,
+    Symlink,
+    Busy,
+    ChangedDuringRead,
+    LengthMismatch,
+    Integrity,
+    Cancelled,
+    StaleSession,
+    Io,
+}
+
+/// 编辑协议中的敏感路径。JSON 仍是普通字符串，Debug 永远脱敏。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EditPath(String);
+
+impl EditPath {
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self(path.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for EditPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EditPath(<redacted>)")
+    }
+}
+
+/// 编辑协议中的原始字节块。JSON 走 base64，Debug 只展示长度。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EditChunk(#[serde(with = "b64")] Vec<u8>);
+
+impl EditChunk {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for EditChunk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EditChunk")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
 /// Put 撞名策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PutOverwrite {
@@ -841,6 +1034,8 @@ pub const FILE_CHUNK: usize = 256 * 1024;
 pub const FETCH_WINDOW: u32 = 8;
 /// 单文件 Fetch 字节上限（防控制端临时盘塞满；超出回 [`FsErr::TooLarge`]）。
 pub const FETCH_MAX_LEN: u64 = 2 * 1024 * 1024 * 1024;
+/// v3 内置编辑器单文档硬上限。双方都按声明长度和实际累计字节独立执行。
+pub const EDIT_MAX_LEN: u64 = 1024 * 1024;
 
 /// 递归列目录（[`RemoteFrame::ListDirRecursive`]）最大总项数（目录项 + 文件项），超限截断。
 /// 与 4 MiB 单帧上限自洽：10000 项 × ~140 B JSON ≈ 2 MB << 4 MiB。也封顶虚拟文件 descriptor 的
@@ -1282,6 +1477,121 @@ mod tests {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
             assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn v3_内置编辑帧经value往返且debug脱敏() {
+        let old = FileRevision {
+            len: 3,
+            sha256: [1; 32],
+        };
+        let new = FileRevision {
+            len: 4,
+            sha256: [2; 32],
+        };
+        let frames = vec![
+            RemoteFrame::EditFetchReq {
+                req_id: 20,
+                document_token: 7,
+                session_generation: 99,
+                path: EditPath::new("C:\\secret\\note.txt"),
+            },
+            RemoteFrame::EditFetchCancel {
+                req_id: 20,
+                document_token: 7,
+                session_generation: 99,
+            },
+            RemoteFrame::EditFileBegin {
+                req_id: 20,
+                document_token: 7,
+                session_generation: 99,
+                total_len: old.len,
+                revision: old,
+            },
+            RemoteFrame::EditFileChunk {
+                req_id: 20,
+                document_token: 7,
+                session_generation: 99,
+                seq: 0,
+                data: EditChunk::new(b"secret-content".to_vec()),
+            },
+            RemoteFrame::EditFileChunkAck {
+                req_id: 20,
+                document_token: 7,
+                session_generation: 99,
+                seq: 0,
+            },
+            RemoteFrame::EditFileEnd {
+                req_id: 20,
+                document_token: 7,
+                session_generation: 99,
+            },
+            RemoteFrame::EditPutBegin {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                path: EditPath::new("C:\\secret\\note.txt"),
+                total_len: new.len,
+                expected_revision: old,
+                new_revision: new,
+                force: false,
+            },
+            RemoteFrame::EditPutReady {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                current_revision: old,
+            },
+            RemoteFrame::EditPutConflict {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                current_revision: Some(old),
+            },
+            RemoteFrame::EditPutChunk {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                seq: 0,
+                data: EditChunk::new(b"new!".to_vec()),
+            },
+            RemoteFrame::EditPutChunkAck {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                seq: 0,
+            },
+            RemoteFrame::EditPutEnd {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+            },
+            RemoteFrame::EditPutCancel {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+            },
+            RemoteFrame::EditPutResult {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                revision: new,
+            },
+            RemoteFrame::EditError {
+                req_id: 21,
+                document_token: 7,
+                session_generation: 99,
+                revision: Some(old),
+                error: EditFileError::Integrity,
+            },
+        ];
+        for frame in frames {
+            let debug = format!("{frame:?}");
+            assert!(!debug.contains("secret-content"));
+            assert!(!debug.contains("C:\\secret"));
+            let value = frame.to_value().expect("to_value");
+            assert_eq!(RemoteFrame::from_value(&value).expect("from_value"), frame);
         }
     }
 

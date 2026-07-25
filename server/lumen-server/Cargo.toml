@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+sha2 = "0.11"
 # 纯跨平台依赖：Windows（本地测试）与 Linux（生产发布）均可编译。
 tokio = { version = "1", features = ["full"] }
 # ws feature：M5.3 远程控制 WebSocket 中继（axum::extract::ws）。

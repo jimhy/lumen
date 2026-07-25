@@ -334,6 +334,10 @@ pub struct Strings {
     pub remote_menu_paste: &'static str,
     /// part3c-2 #7：远程/本地树右键「复制」菜单
     pub remote_menu_copy: &'static str,
+    /// 远程/SSH 文件右键：在 Lumen 内置文本编辑器中编辑
+    pub filetree_menu_edit: &'static str,
+    /// SSH 删除没有回收站能力，明确提示永久删除
+    pub filetree_menu_delete_permanent: &'static str,
     /// part3c-2 #7：覆盖弹窗标题 / 提示（单参 `{}` = 冲突项数）
     pub remote_overwrite_prompt_fmt: &'static str,
     /// part3c-2 #7：覆盖弹窗「覆盖全部」按钮
@@ -366,6 +370,18 @@ pub struct Strings {
     pub local_copy_busy: &'static str,
     /// 复制本地文件写入系统剪贴板失败的提示 toast。
     pub local_copy_clipboard_failed: &'static str,
+    /// 系统声明存在文件但剪贴板正忙，暂时无法读取。
+    pub file_clipboard_read_failed: &'static str,
+    /// SSH 文件复制到系统文件剪贴板前的准备提示（`{}` = 文件名）。
+    pub ssh_clipboard_preparing_fmt: &'static str,
+    /// SSH 暂存完成、可从资源管理器粘贴。
+    pub ssh_clipboard_ready: &'static str,
+    /// SSH 文件剪贴板准备失败（`{}` = 简短错误）。
+    pub ssh_clipboard_prepare_failed_fmt: &'static str,
+    /// 准备期间用户复制了其他内容，取消覆盖系统剪贴板。
+    pub ssh_clipboard_changed: &'static str,
+    /// 暂存下载完成但 CF_HDROP 写入失败。
+    pub ssh_clipboard_write_failed: &'static str,
     // 新建对话框
     /// "新建文件夹" 对话框标题
     pub filetree_create_dir_title: &'static str,
@@ -405,6 +421,38 @@ pub struct Strings {
     pub filetree_menu_copy_rel: &'static str,
     /// "删除（移入回收站）"
     pub filetree_menu_delete: &'static str,
+
+    // ── 内置远端文本编辑器 ─────────────────────────────────────────
+    pub text_editor_hide: &'static str,
+    pub text_editor_restore: &'static str,
+    pub text_editor_find_hint: &'static str,
+    pub text_editor_completion_title: &'static str,
+    pub text_editor_completion_keys: &'static str,
+    pub text_editor_completion_hint: &'static str,
+    pub text_editor_completion_snippet: &'static str,
+    pub text_editor_completion_keyword: &'static str,
+    pub text_editor_completion_builtin: &'static str,
+    pub text_editor_completion_document: &'static str,
+    /// `{0}` 行数，`{1}` UTF-8 缓冲字节数。
+    pub text_editor_stats_fmt: &'static str,
+    pub text_editor_remote_changed_title: &'static str,
+    pub text_editor_remote_changed_body: &'static str,
+    pub text_editor_keep_editing: &'static str,
+    pub text_editor_reload: &'static str,
+    pub text_editor_overwrite: &'static str,
+    pub text_editor_unsaved_title: &'static str,
+    pub text_editor_unsaved_body: &'static str,
+    pub text_editor_dont_save: &'static str,
+    pub text_editor_discard: &'static str,
+    /// 单参 `{}`：MiB 上限。
+    pub text_editor_save_too_large_fmt: &'static str,
+    /// 单参 `{}`：MiB 上限。
+    pub text_editor_open_too_large_fmt: &'static str,
+    pub text_editor_binary_error: &'static str,
+    pub text_editor_utf8_only_error: &'static str,
+    pub text_editor_mixed_eol_error: &'static str,
+    pub text_editor_source_invalidated: &'static str,
+    pub text_editor_closed_account_change: &'static str,
 
     // ── main.rs toast ────────────────────────────────────────────────
     /// 背景图加载失败 toast，单参 `{}`：错误文本
@@ -485,6 +533,10 @@ pub struct Strings {
     pub toolbar_remote_list_show_tip: &'static str,
     /// 隐藏远程设备栏 tooltip
     pub toolbar_remote_list_hide_tip: &'static str,
+    /// 显示 SSH 服务器栏 tooltip
+    pub toolbar_ssh_server_list_show_tip: &'static str,
+    /// 隐藏 SSH 服务器栏 tooltip
+    pub toolbar_ssh_server_list_hide_tip: &'static str,
     /// 显示/隐藏文件树 tooltip（展开态）
     pub topbar_filetree_show_tip: &'static str,
     /// 显示/隐藏文件树 tooltip（隐藏态）
@@ -495,6 +547,118 @@ pub struct Strings {
     pub topbar_tab_local: &'static str,
     /// 顶栏「远程」tab（M5.2）
     pub topbar_tab_remote: &'static str,
+    /// 顶栏「SSH」tab
+    pub topbar_tab_ssh: &'static str,
+    /// SSH 模式尚未选择服务器时的占位提示
+    pub ssh_select_server: &'static str,
+    /// SSH 会话栏尚无已打开会话
+    pub ssh_no_sessions: &'static str,
+    /// SSH 会话栏新增一个独立 Shell
+    pub ssh_new_session: &'static str,
+    /// SSH 服务器列表与配置表单
+    pub ssh_title: &'static str,
+    pub ssh_search_hint: &'static str,
+    pub ssh_new_profile: &'static str,
+    pub ssh_new_group: &'static str,
+    pub ssh_ungrouped: &'static str,
+    pub ssh_empty_group: &'static str,
+    pub ssh_no_search_results: &'static str,
+    pub ssh_edit: &'static str,
+    pub ssh_delete: &'static str,
+    pub ssh_connect: &'static str,
+    pub ssh_rename_group: &'static str,
+    pub ssh_delete_group: &'static str,
+    pub ssh_create_group_title: &'static str,
+    pub ssh_rename_group_title: &'static str,
+    pub ssh_delete_group_title: &'static str,
+    pub ssh_delete_group_message: &'static str,
+    pub ssh_delete_profile_title: &'static str,
+    pub ssh_delete_profile_message: &'static str,
+    pub ssh_group_name: &'static str,
+    pub ssh_create_profile_title: &'static str,
+    pub ssh_edit_profile_title: &'static str,
+    pub ssh_profile_name: &'static str,
+    pub ssh_host: &'static str,
+    pub ssh_port: &'static str,
+    pub ssh_username: &'static str,
+    pub ssh_auth_method: &'static str,
+    pub ssh_auth_password: &'static str,
+    pub ssh_auth_private_key: &'static str,
+    pub ssh_auth_agent: &'static str,
+    pub ssh_password_required_hint: &'static str,
+    pub ssh_password_saved_hint: &'static str,
+    pub ssh_private_key_required_hint: &'static str,
+    pub ssh_private_key_saved_hint: &'static str,
+    pub ssh_private_key_invalid_hint: &'static str,
+    pub ssh_group: &'static str,
+    pub ssh_initial_directory: &'static str,
+    pub ssh_connect_timeout: &'static str,
+    pub ssh_keep_alive: &'static str,
+    pub ssh_keep_alive_disabled: &'static str,
+    pub ssh_monitor_enabled: &'static str,
+    pub ssh_seconds: &'static str,
+    pub ssh_save: &'static str,
+    pub ssh_create: &'static str,
+    pub ssh_test_connection: &'static str,
+    pub ssh_test_connecting: &'static str,
+    pub ssh_test_success: &'static str,
+    pub ssh_test_failed: &'static str,
+    pub ssh_test_host_key_unknown: &'static str,
+    pub ssh_test_host_key_changed: &'static str,
+    pub ssh_test_trust_and_retry: &'static str,
+    pub ssh_cancel: &'static str,
+    pub ssh_confirm_delete: &'static str,
+    /// SSH 连接、凭据、主机密钥与监控界面
+    pub ssh_disconnect: &'static str,
+    pub ssh_status_credentials: &'static str,
+    pub ssh_status_connecting: &'static str,
+    pub ssh_status_host_key: &'static str,
+    pub ssh_status_connected: &'static str,
+    pub ssh_status_disconnecting: &'static str,
+    pub ssh_status_disconnected: &'static str,
+    pub ssh_status_error: &'static str,
+    pub ssh_status_host_key_changed: &'static str,
+    pub ssh_password_title: &'static str,
+    pub ssh_private_key_title: &'static str,
+    pub ssh_password_prompt: &'static str,
+    pub ssh_private_key_file: &'static str,
+    pub ssh_choose_private_key: &'static str,
+    pub ssh_key_passphrase: &'static str,
+    pub ssh_credentials_memory_only: &'static str,
+    pub ssh_host_key_unknown_title: &'static str,
+    pub ssh_host_key_unknown_message: &'static str,
+    pub ssh_host_key_algorithm: &'static str,
+    pub ssh_host_key_fingerprint: &'static str,
+    pub ssh_host_key_accept: &'static str,
+    pub ssh_host_key_changed_title: &'static str,
+    pub ssh_host_key_changed_message: &'static str,
+    pub ssh_host_key_expected: &'static str,
+    pub ssh_host_key_presented: &'static str,
+    pub ssh_monitor_title: &'static str,
+    pub ssh_monitor_cpu: &'static str,
+    pub ssh_monitor_memory: &'static str,
+    pub ssh_monitor_load: &'static str,
+    pub ssh_monitor_disk: &'static str,
+    pub ssh_monitor_network: &'static str,
+    pub ssh_monitor_uptime: &'static str,
+    pub ssh_monitor_waiting: &'static str,
+    pub ssh_monitor_system: &'static str,
+    pub ssh_monitor_timezone: &'static str,
+    pub ssh_monitor_kernel: &'static str,
+    pub ssh_monitor_used: &'static str,
+    pub ssh_monitor_cached: &'static str,
+    pub ssh_monitor_available: &'static str,
+    pub ssh_monitor_total: &'static str,
+    pub ssh_monitor_upload: &'static str,
+    pub ssh_monitor_download: &'static str,
+    pub ssh_monitor_speed: &'static str,
+    pub ssh_monitor_traffic: &'static str,
+    pub ssh_monitor_filesystem: &'static str,
+    pub ssh_monitor_read: &'static str,
+    pub ssh_monitor_write: &'static str,
+    pub ssh_monitor_processes: &'static str,
+    pub ssh_monitor_command: &'static str,
+    pub ssh_monitor_no_processes: &'static str,
     /// 远程设备列表标题（M5.2）
     pub remote_list_title: &'static str,
     /// 设备在线
