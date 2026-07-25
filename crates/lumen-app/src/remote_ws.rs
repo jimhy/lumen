@@ -82,10 +82,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(25);
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// 带 Bearer token 的 WebSocket 握手绝不跟随重定向。
 const WEBSOCKET_MAX_REDIRECTS: u8 = 0;
-/// 断线自动重挂（会话宽限恢复）：放弃前的总窗口。窗口内 WS 重连 / 对端重新上线后凭
-/// 服务端持久化的配对信任（`device_pairs`，免码直连）自动重建会话；超窗才真正拆会话。
-/// 120s ≈ 覆盖系统睡眠边缘、Wi-Fi 省电抖动、路由器重启等常见瞬断场景。
-const REATTACH_WINDOW: Duration = Duration::from_secs(120);
 /// 断线自动重挂：两次 `RequestControl` 重试的最小间隔（对端未上线时服务端回
 /// `ControlDenied{Offline}`，按此节流重试，等它回来）。实际节拍受主循环事件驱动影响
 /// （最小化时退化为约设备列表轮询周期一试），只慢不快，无风暴风险。
@@ -139,14 +135,12 @@ pub struct ActiveSession {
 
 /// 断线自动重挂态（仅控制端）：WS 瞬断 / 对端掉线后**不拆会话**，凭服务端持久化的
 /// 配对信任免码自动重建（`RequestControl` 直连 → `SessionStarted` → 重订阅重建镜像）。
-/// 期间会话/镜像/订阅意图全部保留（画面冻结 + 状态栏「重连中」），[`REATTACH_WINDOW`]
-/// 内恢复则用户无感；超窗或遭非 Offline 拒绝才走真正的拆会话。
+/// 期间会话/镜像/订阅意图全部保留（画面冻结 + 状态栏「重连中」），不因断网时长
+/// 自动关闭；只有用户主动结束，或服务端明确返回非 Offline 拒绝才拆会话。
 #[derive(Debug)]
 struct Reattach {
     /// 目标（被控端）设备 id（取自 [`ActiveSession::peer_device_id`]）。
     target: String,
-    /// 进入重挂态时刻（超 [`REATTACH_WINDOW`] 放弃）。
-    since: Instant,
     /// 上次发 `RequestControl` 的时刻（`None`=尚未试过，WS 一连上立即首试）。
     last_try: Option<Instant>,
 }
@@ -2209,6 +2203,56 @@ impl RemoteWs {
     /// 取走待消费通知（main 弹 toast 用）。
     pub fn take_notices(&mut self) -> Vec<Notice> {
         std::mem::take(&mut self.notices)
+    }
+
+    /// 当前由本机发起的控制会话目标；用于把“重启后继续控制”的最小意图持久化。
+    /// 只返回公开设备 id/显示名，不含 token、配对码或任何终端内容。
+    pub fn controller_peer(&self) -> Option<(&str, &str)> {
+        self.session
+            .as_ref()
+            .filter(|session| session.role == Role::Controller)
+            .map(|session| {
+                (
+                    session.peer_device_id.as_str(),
+                    session.peer_name.as_str(),
+                )
+            })
+    }
+
+    /// 客户端重启后恢复上次控制目标。先恢复为“重连中”占位会话；WS 上线后复用
+    /// 已持久化的设备配对信任自动发送 `RequestControl`，成功后由
+    /// `SessionStarted` 重建会话列表和终端镜像。
+    pub fn restore_controller_session(&mut self, target: String, peer_name: String) -> bool {
+        let target = target.trim();
+        if self.session.is_some()
+            || self.reattach.is_some()
+            || target.is_empty()
+            || target.len() > 128
+            || target.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let peer_name = peer_name.trim();
+        let peer_name = if peer_name.is_empty()
+            || peer_name.len() > 256
+            || peer_name.chars().any(char::is_control)
+        {
+            target.to_owned()
+        } else {
+            peer_name.to_owned()
+        };
+        self.session = Some(ActiveSession {
+            peer_device_id: target.to_owned(),
+            peer_name,
+            role: Role::Controller,
+        });
+        self.reattach = Some(Reattach {
+            target: target.to_owned(),
+            last_try: None,
+        });
+        self.notices.push(Notice::SessionReconnecting);
+        self.tick_reattach();
+        true
     }
 
     /// 控制端：发起控制 `target` 设备。
@@ -6953,7 +6997,7 @@ impl RemoteWs {
     }
 
     /// 若当前是**控制端**活跃会话，进入（或保持）断线重挂态并返回 `true`；否则 `false`。
-    /// 已在重挂中再次触发时保持原 `since`（放弃窗口从首断算起），不重复通知。
+    /// 已在重挂中再次触发时保持原目标与重试节拍，不重复通知。
     /// 被控端不重挂：本地 PTY 会话不受网络影响，被控横幅随会话拆除，控制端重挂成功后
     /// 会随新 `SessionStarted` 自动回来。
     fn begin_reattach(&mut self) -> bool {
@@ -6973,7 +7017,6 @@ impl RemoteWs {
         self.advance_edit_generation(true);
         self.reattach = Some(Reattach {
             target,
-            since: Instant::now(),
             last_try: None,
         });
         self.notices.push(Notice::SessionReconnecting);
@@ -6998,19 +7041,15 @@ impl RemoteWs {
         }
     }
 
-    /// 驱动断线重挂：超 [`REATTACH_WINDOW`] 放弃拆会话；WS 在线且到退避点则发一次
-    /// `RequestControl`（服务端查 `device_pairs` 信任免码直连，成功走 `SessionStarted`
-    /// 重挂臂）。由 [`Self::poll`] 每帧与 [`WsEvent::Connected`] 驱动——`ControlFlow::Wait`
-    /// 下最小化时退化为约设备列表轮询周期一试，只慢不快。返回是否有动作（重绘用）。
+    /// 驱动断线重挂：WS 在线且到退避点则发一次 `RequestControl`（服务端查
+    /// `device_pairs` 信任免码直连，成功走 `SessionStarted` 重挂臂）。网络中断无论
+    /// 持续多久都不自动拆会话；由 [`Self::poll`] 每帧与 [`WsEvent::Connected`] 驱动。
+    /// `ControlFlow::Wait` 下最小化时退化为约设备列表轮询周期一试，只慢不快。
+    /// 返回是否有动作（重绘用）。
     fn tick_reattach(&mut self) -> bool {
         let Some(ra) = &self.reattach else {
             return false;
         };
-        if ra.since.elapsed() >= REATTACH_WINDOW {
-            // 超窗放弃：对端一直没回来（关机/网络长断），拆会话并按对端掉线通知。
-            self.teardown_session_state(EndReason::PeerDisconnected);
-            return true;
-        }
         if !self.ws_up || ra.last_try.is_some_and(|t| t.elapsed() < REATTACH_RETRY) {
             return false;
         }
@@ -7756,25 +7795,39 @@ mod tests {
     }
 
     #[test]
-    fn 重挂超窗_放弃拆会话() {
+    fn 长时间断网不会自动关闭重挂会话() {
         let (mut ws, _rx) = reattaching_ws();
         ws.take_notices();
-        // 构造「已过窗」的进入时刻。单调钟起点过近（刚开机的 CI）时无法构造，跳过——
-        // 该分支逻辑简单且其余运行会覆盖。
-        let Some(past) = Instant::now().checked_sub(REATTACH_WINDOW + Duration::from_secs(1))
-        else {
-            return;
-        };
-        if let Some(ra) = &mut ws.reattach {
-            ra.since = past;
+        for _ in 0..10_000 {
+            assert!(!ws.tick_reattach(), "WS 离线时只等待，不应拆会话");
         }
-        assert!(ws.tick_reattach(), "超窗应触发拆除动作");
-        assert!(ws.reattach.is_none());
-        assert!(ws.session.is_none(), "超窗应放弃并拆会话");
-        assert!(matches!(
-            ws.take_notices()[..],
-            [Notice::SessionEnded(EndReason::PeerDisconnected)]
+        assert!(ws.reattach.is_some());
+        assert!(ws.session.is_some(), "断网时长不应关闭控制会话");
+        assert!(ws.take_notices().is_empty());
+    }
+
+    #[test]
+    fn 客户端重启恢复目标并在ws上线后自动重连() {
+        let mut ws = RemoteWs::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        assert!(ws.restore_controller_session(
+            "dev-peer".to_owned(),
+            "远程电脑".to_owned()
         ));
+        assert_eq!(ws.controller_peer(), Some(("dev-peer", "远程电脑")));
+        assert!(ws.reattach.is_some());
+        assert!(rx.try_recv().is_err(), "WS 尚未上线时不应发送控制请求");
+
+        ws.apply(WsEvent::Connected);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RemoteC2S::RequestControl { target }) if target == "dev-peer"
+        ));
+        assert!(
+            !ws.restore_controller_session("other".to_owned(), "其它".to_owned()),
+            "已有恢复会话时不得覆盖目标"
+        );
     }
 
     #[test]

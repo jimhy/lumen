@@ -48,6 +48,12 @@ pub struct Profile {
     /// M5：token 过期 Unix 秒（0 = 无）。
     #[serde(default)]
     pub token_expires_at: i64,
+    /// 本机上次主动控制的设备 id。只用于客户端重启后恢复控制意图；不上传云端。
+    #[serde(default)]
+    pub remote_restore_device_id: Option<String>,
+    /// 上次控制目标的显示名，仅供重连中占位展示；服务端重连成功后会刷新。
+    #[serde(default)]
+    pub remote_restore_device_name: Option<String>,
 }
 
 impl fmt::Debug for Profile {
@@ -65,6 +71,13 @@ impl fmt::Debug for Profile {
             )
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("token_expires_at", &self.token_expires_at)
+            .field(
+                "remote_restore_target",
+                &self
+                    .remote_restore_device_id
+                    .as_ref()
+                    .map(|_| "[configured]"),
+            )
             .finish()
     }
 }
@@ -95,7 +108,41 @@ impl Profile {
             auth_origin,
             token: Some(resp.token),
             token_expires_at: resp.expires_at,
+            remote_restore_device_id: None,
+            remote_restore_device_name: None,
         }
+    }
+
+    /// 返回可用于重启恢复的控制目标。两个字段必须同时通过本地安全规整。
+    pub fn remote_restore_target(&self) -> Option<(&str, &str)> {
+        self.remote_restore_device_id
+            .as_deref()
+            .zip(self.remote_restore_device_name.as_deref())
+    }
+
+    /// 记住本机成功建立的主动控制会话。仅持久化公开设备身份，不保存配对码、
+    /// token、终端内容或文件数据。
+    pub fn remember_remote_restore_target(&mut self, device_id: &str, device_name: &str) -> bool {
+        let mut next_id = Some(device_id.to_owned());
+        let mut next_name = Some(device_name.to_owned());
+        sanitize_remote_restore(&mut next_id, &mut next_name);
+        if next_id.is_none() {
+            return false;
+        }
+        let changed = self.remote_restore_device_id != next_id
+            || self.remote_restore_device_name != next_name;
+        self.remote_restore_device_id = next_id;
+        self.remote_restore_device_name = next_name;
+        changed
+    }
+
+    /// 用户主动结束、会话被明确替换或本机变为被控端时，取消下次启动自动恢复。
+    pub fn clear_remote_restore_target(&mut self) -> bool {
+        let changed =
+            self.remote_restore_device_id.is_some() || self.remote_restore_device_name.is_some();
+        self.remote_restore_device_id = None;
+        self.remote_restore_device_name = None;
+        changed
     }
 
     /// 把 v1.0.15 及更早版本的登录档案一次性绑定到当前服务端。
@@ -226,8 +273,41 @@ impl Profile {
             // 为旧版缺字段并自动迁移。
             crate::cloud::canonical_server_origin(&trimmed).unwrap_or(trimmed)
         });
+        sanitize_remote_restore(
+            &mut self.remote_restore_device_id,
+            &mut self.remote_restore_device_name,
+        );
         if self.display_name.is_empty() {
             self.display_name = display_name_of(&self.email);
+        }
+    }
+}
+
+fn sanitize_remote_restore(device_id: &mut Option<String>, device_name: &mut Option<String>) {
+    let valid = device_id
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && !value.chars().any(char::is_control)
+        });
+    let name = device_name
+        .take()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && !value.chars().any(char::is_control)
+        });
+    match (valid, name) {
+        (Some(id), Some(name)) => {
+            *device_id = Some(id);
+            *device_name = Some(name);
+        }
+        _ => {
+            *device_id = None;
+            *device_name = None;
         }
     }
 }
@@ -325,6 +405,34 @@ mod tests {
         assert!(!debug.contains("private.example"));
         assert!(debug.contains("[REDACTED]"));
         assert!(debug.contains("[configured]"));
+    }
+
+    #[test]
+    fn 远程控制恢复目标可持久化且非法半记录会清空() {
+        let mut profile = Profile {
+            email: "user@example.com".to_owned(),
+            ..Default::default()
+        };
+        assert!(profile.remember_remote_restore_target(" device-id ", " 远程电脑 "));
+        assert_eq!(
+            profile.remote_restore_target(),
+            Some(("device-id", "远程电脑"))
+        );
+
+        let path = temp_path("remote_restore");
+        profile.save_to(&path).expect("保存恢复目标");
+        let loaded = Profile::load_from(&path).expect("加载恢复目标");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            loaded.remote_restore_target(),
+            Some(("device-id", "远程电脑"))
+        );
+
+        let mut invalid = loaded;
+        invalid.remote_restore_device_name = None;
+        invalid.sanitize();
+        assert_eq!(invalid.remote_restore_target(), None);
+        assert!(!invalid.clear_remote_restore_target());
     }
 
     #[test]
