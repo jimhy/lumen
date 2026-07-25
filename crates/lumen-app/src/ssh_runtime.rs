@@ -315,7 +315,7 @@ pub struct DrainOutcome {
     pub connected_profiles: Vec<String>,
     /// 当前服务器表单的独立连接测试状态发生变化。
     pub connection_test_changed: bool,
-    /// 任一会话的连接态发生变化；用于刷新 SSH 会话栏中的状态点。
+    /// 任一会话的连接态或 cwd 发生变化；用于刷新 SSH 会话栏中的状态点和默认名称。
     pub sessions_changed: bool,
     /// 本批 SFTP 操作结果；主线程消费后更新编辑器、打开本地副本或显示提示。
     pub file_events: Vec<SshFileRuntimeEvent>,
@@ -356,9 +356,10 @@ impl EndpointIdentity {
 
 struct RuntimeSession {
     profile_id: String,
-    profile_session_number: usize,
     auth_method: AuthMethod,
     profile_name: String,
+    /// 用户手动设置的会话名。`None` 时名称跟随当前 Linux cwd 的尾目录名。
+    custom_title: Option<String>,
     endpoint: String,
     endpoint_identity: EndpointIdentity,
     terminal: Terminal,
@@ -429,12 +430,12 @@ struct EditorVersion {
 }
 
 impl RuntimeSession {
-    fn new(profile: &SshProfile, profile_session_number: usize) -> Self {
+    fn new(profile: &SshProfile) -> Self {
         Self {
             profile_id: profile.id.clone(),
-            profile_session_number,
             auth_method: profile.auth_method,
             profile_name: profile.name.clone(),
+            custom_title: None,
             endpoint: endpoint(profile),
             endpoint_identity: EndpointIdentity::from_profile(profile),
             terminal: Terminal::new(DEFAULT_ROWS, DEFAULT_COLUMNS, SSH_SCROLLBACK),
@@ -468,6 +469,12 @@ impl RuntimeSession {
             search_error: None,
             latest_search_token: None,
         }
+    }
+
+    fn display_name(&self) -> String {
+        self.custom_title
+            .clone()
+            .unwrap_or_else(|| linux_basename(&self.file_tree_root).to_owned())
     }
 
     fn refresh_metadata(&mut self, profile: &SshProfile) {
@@ -843,6 +850,19 @@ impl SshRuntime {
         true
     }
 
+    /// 设置一个已打开 SSH 会话的自定义名称。
+    ///
+    /// 非空名称经首尾去空白后固定，不再随 cwd 变化；空白名称清除
+    /// 自定义值，立即恢复为当前 cwd 尾目录名并继续自动跟随。
+    pub fn rename_session(&mut self, session_id: SshSessionId, name: &str) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        let name = name.trim();
+        session.custom_title = (!name.is_empty()).then(|| name.to_owned());
+        true
+    }
+
     /// 关闭会话但保留服务器配置。若关闭当前会话，选择相邻会话。
     pub fn close_session(&mut self, session_id: SshSessionId) -> bool {
         let Some(index) = self
@@ -876,10 +896,7 @@ impl SshRuntime {
                     session_id: *session_id,
                     profile_id: session.profile_id.clone(),
                     profile_name: session.profile_name.clone(),
-                    display_name: format!(
-                        "{} · {}",
-                        session.profile_name, session.profile_session_number
-                    ),
+                    display_name: session.display_name(),
                     endpoint: session.endpoint.clone(),
                     state: session.state.clone(),
                     active: self.active_session_id.as_ref() == Some(session_id),
@@ -1433,6 +1450,7 @@ impl SshRuntime {
             let before_metrics_error = session.metrics_error.clone();
             let before_unknown = session.unknown_host_key.clone();
             let before_changed = session.changed_host_key.clone();
+            let before_file_tree_root = session.file_tree_root.clone();
             let mut terminal_changed = false;
             let mut directory_changed = false;
             let mut events = Vec::new();
@@ -1500,7 +1518,11 @@ impl SshRuntime {
                 terminal_changed |= apply_event(session, event);
             }
 
-            outcome.sessions_changed |= before_state != session.state;
+            outcome.sessions_changed |= session_view_changed(
+                &before_state,
+                &before_file_tree_root,
+                session,
+            );
 
             if active_id == Some(session_id) {
                 outcome.active_terminal_changed |= terminal_changed;
@@ -1692,23 +1714,19 @@ impl SshRuntime {
             .next_session_id
             .checked_add(1)
             .expect("SSH session id space exhausted");
-        let profile_session_number = self
-            .sessions
-            .values()
-            .filter(|session| session.profile_id == profile.id)
-            .map(|session| session.profile_session_number)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .expect("SSH profile session number space exhausted");
         self.session_order.push(session_id);
-        self.sessions.insert(
-            session_id,
-            RuntimeSession::new(profile, profile_session_number),
-        );
+        self.sessions.insert(session_id, RuntimeSession::new(profile));
         self.active_session_id = Some(session_id);
         session_id
     }
+}
+
+fn session_view_changed(
+    before_state: &ConnectionState,
+    before_file_tree_root: &str,
+    session: &RuntimeSession,
+) -> bool {
+    before_state != &session.state || before_file_tree_root != session.file_tree_root
 }
 
 fn ssh_file_tree_root(profile: &SshProfile) -> String {
@@ -2817,7 +2835,7 @@ mod tests {
     #[test]
     fn completed_text_read_is_applied_before_disconnect_clears_pending_requests() {
         let p = profile(AuthMethod::Agent);
-        let mut session = RuntimeSession::new(&p, 1);
+        let mut session = RuntimeSession::new(&p);
         session.state = ConnectionState::Connected;
         session.pending_file_requests.insert(
             9,
@@ -3084,10 +3102,81 @@ mod tests {
         let views = runtime.session_views();
         assert_eq!(views[0].profile_id, p.id);
         assert_eq!(views[1].profile_id, p.id);
-        assert_eq!(views[0].display_name, "dev · 1");
-        assert_eq!(views[1].display_name, "dev · 2");
+        assert_eq!(views[0].display_name, "/");
+        assert_eq!(views[1].display_name, "/");
         assert_eq!(views[0].session_id, first_session_id);
         assert_eq!(views[1].session_id, second_session_id);
+    }
+
+    #[test]
+    fn ssh_session_title_follows_cwd_until_user_renames_it() {
+        let mut p = profile(AuthMethod::Agent);
+        p.initial_directory = Some("/home/alice/workspace".to_owned());
+        let mut runtime = SshRuntime::default();
+        let (session_id, _) = runtime.select_for_connect(&p);
+
+        assert_eq!(runtime.session_views()[0].display_name, "workspace");
+
+        {
+            let session = runtime.sessions.get_mut(&session_id).expect("session");
+            assert!(apply_event(
+                session,
+                Event::Data(b"\x1b]9;9;/srv/project\x07".to_vec())
+            ));
+        }
+        assert_eq!(runtime.session_views()[0].display_name, "project");
+
+        assert!(runtime.rename_session(session_id, "  production shell  "));
+        assert_eq!(runtime.session_views()[0].display_name, "production shell");
+
+        {
+            let session = runtime.sessions.get_mut(&session_id).expect("session");
+            assert!(apply_event(
+                session,
+                Event::Data(b"\x1b]9;9;/opt/services/api\x07".to_vec())
+            ));
+        }
+        assert_eq!(
+            runtime.session_views()[0].display_name,
+            "production shell",
+            "用户改名后 cwd 变化不得覆盖自定义标题"
+        );
+
+        assert!(runtime.rename_session(session_id, " \t "));
+        assert_eq!(
+            runtime.session_views()[0].display_name,
+            "api",
+            "空白名称应清除自定义标题并恢复当前 cwd"
+        );
+
+        {
+            let session = runtime.sessions.get_mut(&session_id).expect("session");
+            assert!(apply_event(
+                session,
+                Event::Data(b"\x1b]9;9;/\x07".to_vec())
+            ));
+        }
+        assert_eq!(runtime.session_views()[0].display_name, "/");
+        assert!(!runtime.rename_session(u64::MAX, "missing"));
+    }
+
+    #[test]
+    fn cwd_change_is_reported_as_a_session_view_change() {
+        let p = profile(AuthMethod::Agent);
+        let mut session = RuntimeSession::new(&p);
+        let before_state = session.state.clone();
+        let before_file_tree_root = session.file_tree_root.clone();
+
+        assert!(apply_event(
+            &mut session,
+            Event::Data(b"\x1b]9;9;/srv/background\x07".to_vec())
+        ));
+        assert!(session_view_changed(
+            &before_state,
+            &before_file_tree_root,
+            &session
+        ));
+        assert_eq!(session.display_name(), "background");
     }
 
     #[test]
@@ -3271,7 +3360,7 @@ mod tests {
     #[test]
     fn terminal_cwd_report_replaces_only_that_sessions_file_tree_root() {
         let p = profile(AuthMethod::Agent);
-        let mut session = RuntimeSession::new(&p, 1);
+        let mut session = RuntimeSession::new(&p);
         session.state = ConnectionState::Connected;
         session.file_tree_root = "/old".to_owned();
         session.open_directories.insert("/old".to_owned());
@@ -3381,7 +3470,7 @@ mod tests {
     #[test]
     fn directory_tree_drops_stale_replies_and_only_accepts_exact_children() {
         let p = profile(AuthMethod::Agent);
-        let mut session = RuntimeSession::new(&p, 1);
+        let mut session = RuntimeSession::new(&p);
         session.open_directories.insert("/".to_owned());
         session.pending_directories.insert(10, "/".to_owned());
         session.pending_directories.insert(11, "/".to_owned());
@@ -3431,7 +3520,7 @@ mod tests {
     #[test]
     fn disconnect_clears_directory_requests_without_affecting_terminal_error_semantics() {
         let p = profile(AuthMethod::Agent);
-        let mut session = RuntimeSession::new(&p, 1);
+        let mut session = RuntimeSession::new(&p);
         session.state = ConnectionState::Connected;
         session
             .pending_directories

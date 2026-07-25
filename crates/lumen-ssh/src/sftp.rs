@@ -51,6 +51,7 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const PROGRESS_GRANULARITY_BYTES: u64 = 256 * 1024;
 const RELIABLE_EVENT_BACKLOG_CAPACITY: usize = COMMAND_CAPACITY + MAX_CONCURRENT_OPERATIONS;
 const POSIX_RENAME_EXTENSION: &str = "posix-rename@openssh.com";
+const MAX_LOCAL_BACKUP_CANDIDATES: u32 = 1024;
 
 pub(super) struct FileSession {
     standard: SftpSession,
@@ -1223,11 +1224,7 @@ async fn download_regular(
     cancelled: &AtomicBool,
     progress: &Sender<FileEvent>,
 ) -> Result<(), FileError> {
-    if !overwrite
-        && tokio::fs::try_exists(local_path)
-            .await
-            .map_err(|_| FileError::LocalIo)?
-    {
+    if !overwrite && local_path_exists_no_follow(local_path).await? {
         return Err(FileError::Conflict);
     }
     let metadata = sftp
@@ -1278,13 +1275,11 @@ async fn download_regular(
         local.sync_all().await.map_err(|_| FileError::LocalIo)?;
         drop(local);
         check_cancelled(cancelled)?;
-        tokio::fs::rename(&temporary, local_path)
-            .await
-            .map_err(|_| FileError::LocalIo)
+        commit_local_download(&temporary, local_path, overwrite, token).await
     }
     .await;
     if let Err(error) = result {
-        let _ = tokio::fs::remove_file(temporary).await;
+        let _ = remove_local_path_no_follow(&temporary).await;
         return Err(error);
     }
     Ok(())
@@ -1299,11 +1294,7 @@ async fn download_directory(
     cancelled: &AtomicBool,
     progress: &Sender<FileEvent>,
 ) -> Result<(), FileError> {
-    if !overwrite
-        && tokio::fs::try_exists(local_path)
-            .await
-            .map_err(|_| FileError::LocalIo)?
-    {
+    if !overwrite && local_path_exists_no_follow(local_path).await? {
         return Err(FileError::Conflict);
     }
     let temporary = temporary_local_path(local_path, token)?;
@@ -1359,31 +1350,11 @@ async fn download_directory(
             }
         }
         check_cancelled(cancelled)?;
-        if overwrite
-            && tokio::fs::try_exists(local_path)
-                .await
-                .map_err(|_| FileError::LocalIo)?
-        {
-            let metadata = tokio::fs::symlink_metadata(local_path)
-                .await
-                .map_err(|_| FileError::LocalIo)?;
-            if metadata.is_dir() {
-                tokio::fs::remove_dir_all(local_path)
-                    .await
-                    .map_err(|_| FileError::LocalIo)?;
-            } else {
-                tokio::fs::remove_file(local_path)
-                    .await
-                    .map_err(|_| FileError::LocalIo)?;
-            }
-        }
-        tokio::fs::rename(&temporary, local_path)
-            .await
-            .map_err(|_| FileError::LocalIo)
+        commit_local_download(&temporary, local_path, overwrite, token).await
     }
     .await;
     if let Err(error) = result {
-        let _ = tokio::fs::remove_dir_all(temporary).await;
+        let _ = remove_local_path_no_follow(&temporary).await;
         return Err(error);
     }
     Ok(())
@@ -1790,6 +1761,79 @@ fn temporary_local_path(path: &Path, token: u64) -> Result<PathBuf, FileError> {
     Ok(path.with_file_name(format!(".{name}.lumen-{token:x}.tmp")))
 }
 
+fn backup_local_path(path: &Path, token: u64, candidate: u32) -> Result<PathBuf, FileError> {
+    validate_local_path(path)?;
+    let parent = path.parent().ok_or(FileError::InvalidRequest)?;
+    Ok(parent.join(format!(".lumen-{token:x}-{candidate:x}.bak")))
+}
+
+async fn local_path_exists_no_follow(path: &Path) -> Result<bool, FileError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(FileError::LocalIo),
+    }
+}
+
+async fn unused_local_backup_path(path: &Path, token: u64) -> Result<PathBuf, FileError> {
+    for candidate in 0..MAX_LOCAL_BACKUP_CANDIDATES {
+        let backup = backup_local_path(path, token, candidate)?;
+        if !local_path_exists_no_follow(&backup).await? {
+            return Ok(backup);
+        }
+    }
+    Err(FileError::LocalIo)
+}
+
+async fn remove_local_path_no_follow(path: &Path) -> Result<(), FileError> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(FileError::LocalIo),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        tokio::fs::remove_dir_all(path)
+            .await
+            .map_err(|_| FileError::LocalIo)
+    } else {
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(|_| FileError::LocalIo)
+    }
+}
+
+/// Commits a completed local download without exposing a delete-before-rename
+/// window. Existing targets are first moved to a unique sibling backup. If
+/// installing the staging entry fails, the original target is restored before
+/// the error is returned.
+async fn commit_local_download(
+    staging: &Path,
+    target: &Path,
+    overwrite: bool,
+    token: u64,
+) -> Result<(), FileError> {
+    if !local_path_exists_no_follow(target).await? {
+        return tokio::fs::rename(staging, target)
+            .await
+            .map_err(|_| FileError::LocalIo);
+    }
+    if !overwrite {
+        return Err(FileError::Conflict);
+    }
+
+    let backup = unused_local_backup_path(target, token).await?;
+    tokio::fs::rename(target, &backup)
+        .await
+        .map_err(|_| FileError::LocalIo)?;
+    if tokio::fs::rename(staging, target).await.is_err() {
+        tokio::fs::rename(&backup, target)
+            .await
+            .map_err(|_| FileError::LocalIo)?;
+        return Err(FileError::LocalIo);
+    }
+    remove_local_path_no_follow(&backup).await
+}
+
 fn directory_entry(name: String, path: String, metadata: Metadata) -> DirectoryEntry {
     let kind = if metadata.is_dir() {
         DirectoryEntryKind::Directory
@@ -1896,6 +1940,38 @@ fn emit_progress(
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            loop {
+                let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "lumen-ssh-sftp-commit-{}-{serial}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create test directory {path:?}: {error}"),
+                }
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn remote_path_boundary_rejects_escape_controls_and_relative_paths() {
@@ -2107,6 +2183,92 @@ mod tests {
         assert_eq!(
             temporary_remote_path("/file.txt", 1),
             Ok("/.file.txt.lumen-1.tmp".to_owned())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_download_commit_replaces_files_and_directories_via_backup() {
+        let root = TestDirectory::new();
+
+        let file_target = root.path().join("file.txt");
+        let file_staging = root.path().join(".file.txt.tmp");
+        tokio::fs::write(&file_target, b"old")
+            .await
+            .expect("write old file");
+        tokio::fs::write(&file_staging, b"new")
+            .await
+            .expect("write staged file");
+        commit_local_download(&file_staging, &file_target, true, 41)
+            .await
+            .expect("replace file");
+        assert_eq!(
+            tokio::fs::read(&file_target).await.expect("read new file"),
+            b"new"
+        );
+        assert!(
+            !local_path_exists_no_follow(&backup_local_path(&file_target, 41, 0).unwrap())
+                .await
+                .unwrap()
+        );
+
+        let directory_target = root.path().join("directory");
+        let directory_staging = root.path().join(".directory.tmp");
+        tokio::fs::create_dir(&directory_target)
+            .await
+            .expect("create old directory");
+        tokio::fs::write(directory_target.join("old.txt"), b"old")
+            .await
+            .expect("write old directory entry");
+        tokio::fs::create_dir(&directory_staging)
+            .await
+            .expect("create staged directory");
+        tokio::fs::write(directory_staging.join("new.txt"), b"new")
+            .await
+            .expect("write staged directory entry");
+        commit_local_download(&directory_staging, &directory_target, true, 42)
+            .await
+            .expect("replace directory");
+        assert_eq!(
+            tokio::fs::read(directory_target.join("new.txt"))
+                .await
+                .expect("read new directory entry"),
+            b"new"
+        );
+        assert!(
+            !local_path_exists_no_follow(&directory_target.join("old.txt"))
+                .await
+                .unwrap()
+        );
+        assert!(!local_path_exists_no_follow(
+            &backup_local_path(&directory_target, 42, 0).unwrap()
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_download_commit_restores_original_when_install_rename_fails() {
+        let root = TestDirectory::new();
+        let target = root.path().join("file.txt");
+        let missing_staging = root.path().join(".missing.tmp");
+        tokio::fs::write(&target, b"original")
+            .await
+            .expect("write original");
+
+        assert_eq!(
+            commit_local_download(&missing_staging, &target, true, 43).await,
+            Err(FileError::LocalIo)
+        );
+        assert_eq!(
+            tokio::fs::read(&target)
+                .await
+                .expect("original target restored"),
+            b"original"
+        );
+        assert!(
+            !local_path_exists_no_follow(&backup_local_path(&target, 43, 0).unwrap())
+                .await
+                .unwrap()
         );
     }
 

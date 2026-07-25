@@ -90,6 +90,11 @@ pub struct ShellState {
     pub pane_renaming: Option<(u64, String)>,
     /// 窗格重命名刚开始，下一帧把焦点交给标题栏编辑框。
     pane_rename_focus: bool,
+    /// SSH 会话栏进行中的行内重命名。独立于本地 tab id，避免两种
+    /// 会话 id 碰撞以及本地 tab 孤儿清理误删。
+    pub ssh_session_renaming: Option<(crate::ssh_runtime::SshSessionId, String)>,
+    /// SSH 会话重命名刚开始，下一帧把焦点交给编辑框。
+    ssh_session_rename_focus: bool,
     /// 文件树（树根/展开/可见性等跨帧状态）。
     pub filetree: filetree::FileTreeState,
     /// 设置页（开关/分类/字体编辑缓冲等跨帧状态）。
@@ -309,6 +314,10 @@ pub enum SshRuntimeAction {
     },
     CloseSession {
         session_id: crate::ssh_runtime::SshSessionId,
+    },
+    RenameSession {
+        session_id: crate::ssh_runtime::SshSessionId,
+        name: String,
     },
     Disconnect,
     TrustHostKey {
@@ -633,6 +642,8 @@ pub struct ShellOutput {
     pub pane_rename: Option<(u64, String)>,
     /// 窗格重命名编辑本帧以**键盘**结束（语义同 rename_ended_by_key）。
     pub pane_rename_ended_by_key: bool,
+    /// SSH 会话重命名编辑本帧以**键盘**结束（语义同 rename_ended_by_key）。
+    pub ssh_session_rename_ended_by_key: bool,
     /// 点击了「新建会话」。
     pub new_session: bool,
     /// 文件树：激活了目录且 shell 空闲，请求向焦点窗格注入 cd。
@@ -821,6 +832,7 @@ pub fn show(
         rename_ended_by_key: false,
         pane_rename: None,
         pane_rename_ended_by_key: false,
+        ssh_session_rename_ended_by_key: false,
         new_session: false,
         cd_dir: None,
         open_file: None,
@@ -904,15 +916,33 @@ pub fn show(
         st.pane_renaming = None;
         out.pane_rename_ended_by_key = true;
     }
+    if st
+        .ssh_session_renaming
+        .as_ref()
+        .is_some_and(|(id, _)| !input.ssh_sessions.iter().any(|session| session.session_id == *id))
+    {
+        st.ssh_session_renaming = None;
+        out.ssh_session_rename_ended_by_key = true;
+    }
 
     // —— 顶栏（先于侧栏加入面板布局，横贯整窗）：标题 + 头像菜单 ——
-    // 标题与窗口标题同源（激活 tab 的 display_title，恒非空），
-    // 无激活条目（防御）时退回应用名。
-    let active_title = input
-        .tabs
-        .iter()
-        .find(|e| e.active)
-        .map_or("Lumen", |e| e.name.as_str());
+    // 标题与窗口标题同源：本地/远程取激活 tab，SSH 取激活运行时
+    // 会话（自定义名优先、否则 cwd 尾目录）；无条目时使用模式标题。
+    let active_title = if is_ssh_view {
+        input
+            .ssh_sessions
+            .iter()
+            .find(|session| session.active)
+            .map_or(crate::i18n::strings().topbar_tab_ssh, |session| {
+                session.display_name.as_str()
+            })
+    } else {
+        input
+            .tabs
+            .iter()
+            .find(|e| e.active)
+            .map_or("Lumen", |e| e.name.as_str())
+    };
     let tb = topbar::show(
         root,
         active_title,
@@ -1152,10 +1182,13 @@ pub fn show(
                     .inner_margin(egui::Margin::symmetric(8, 10)),
             )
             .show_inside(root, |ui| {
+                let selected_profile_id =
+                    st.ssh_ui.selected_profile_id().map(str::to_owned);
                 ssh_session_sidebar_ui(
                     ui,
                     input.ssh_sessions,
-                    st.ssh_ui.selected_profile_id(),
+                    selected_profile_id.as_deref(),
+                    st,
                     pal,
                     &mut out,
                 );
@@ -2569,6 +2602,7 @@ fn ssh_session_sidebar_ui(
     ui: &mut egui::Ui,
     sessions: &[crate::ssh_runtime::SshSessionView],
     selected_profile_id: Option<&str>,
+    st: &mut ShellState,
     pal: &theme::Palette,
     out: &mut ShellOutput,
 ) {
@@ -2664,6 +2698,85 @@ fn ssh_session_sidebar_ui(
                     egui::pos2(rect.right() - CLOSE_SIZE * 0.55, rect.center().y),
                     egui::vec2(CLOSE_SIZE, CLOSE_SIZE),
                 );
+                let text_left = rect.left() + 18.0;
+                let text_right = close_rect.left() - 4.0;
+                let name_rect = egui::Rect::from_min_max(
+                    egui::pos2(text_left, rect.top() + 7.0),
+                    egui::pos2(text_right, rect.center().y + 1.0),
+                );
+                let endpoint_rect = egui::Rect::from_min_max(
+                    egui::pos2(text_left, rect.center().y + 2.0),
+                    egui::pos2(text_right, rect.bottom() - 5.0),
+                );
+                let (_, status_color) = ssh_status(session.state.clone(), pal);
+
+                let is_renaming = st
+                    .ssh_session_renaming
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == session.session_id);
+                if is_renaming {
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        if session.active {
+                            pal.selection
+                        } else {
+                            pal.bg_highlight
+                        },
+                    );
+                    ui.painter().circle_filled(
+                        egui::pos2(rect.left() + 8.0, rect.center().y),
+                        3.0,
+                        status_color,
+                    );
+
+                    let mut finished = false;
+                    let mut submitted = None;
+                    if let Some((_, buffer)) = st.ssh_session_renaming.as_mut() {
+                        let edit = ui.put(
+                            name_rect,
+                            egui::TextEdit::singleline(buffer)
+                                .desired_width(name_rect.width()),
+                        );
+                        if st.ssh_session_rename_focus {
+                            edit.request_focus();
+                            st.ssh_session_rename_focus = false;
+                        }
+                        if edit.lost_focus() {
+                            let enter =
+                                ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            let escape =
+                                ui.input(|input| input.key_pressed(egui::Key::Escape));
+                            if enter {
+                                submitted = Some(buffer.trim().to_owned());
+                            }
+                            out.ssh_session_rename_ended_by_key = enter || escape;
+                            finished = true;
+                        }
+                    }
+                    ui.put(
+                        endpoint_rect,
+                        egui::Label::new(
+                            egui::RichText::new(&session.endpoint)
+                                .monospace()
+                                .size(10.0)
+                                .color(pal.fg_dim),
+                        )
+                        .truncate()
+                        .selectable(false),
+                    );
+                    if finished {
+                        st.ssh_session_renaming = None;
+                        if let Some(name) = submitted {
+                            out.ssh_runtime_action = Some(SshRuntimeAction::RenameSession {
+                                session_id: session.session_id,
+                                name,
+                            });
+                        }
+                    }
+                    continue;
+                }
+
                 let close_response = ui.interact(
                     close_rect,
                     ui.id().with(("ssh_session_close", session.session_id)),
@@ -2680,21 +2793,10 @@ fn ssh_session_sidebar_ui(
                     ui.painter().rect_filled(rect, 2.0, background);
                 }
 
-                let (_, status_color) = ssh_status(session.state.clone(), pal);
                 ui.painter().circle_filled(
                     egui::pos2(rect.left() + 8.0, rect.center().y),
                     3.0,
                     status_color,
-                );
-                let text_left = rect.left() + 18.0;
-                let text_right = close_rect.left() - 4.0;
-                let name_rect = egui::Rect::from_min_max(
-                    egui::pos2(text_left, rect.top() + 7.0),
-                    egui::pos2(text_right, rect.center().y + 1.0),
-                );
-                let endpoint_rect = egui::Rect::from_min_max(
-                    egui::pos2(text_left, rect.center().y + 2.0),
-                    egui::pos2(text_right, rect.bottom() - 5.0),
                 );
                 ui.put(
                     name_rect,
@@ -2745,10 +2847,33 @@ fn ssh_session_sidebar_ui(
                     stroke,
                 );
 
-                if close_response.on_hover_text(strings.menu_close).clicked() {
+                response.context_menu(|ui| {
+                    if ui.button(strings.menu_rename).clicked() {
+                        st.ssh_session_renaming =
+                            Some((session.session_id, session.display_name.clone()));
+                        st.ssh_session_rename_focus = true;
+                        ui.close();
+                    }
+                    if ui.button(strings.menu_close).clicked() {
+                        out.ssh_runtime_action = Some(SshRuntimeAction::CloseSession {
+                            session_id: session.session_id,
+                        });
+                        ui.close();
+                    }
+                });
+
+                if close_response
+                    .clone()
+                    .on_hover_text(strings.menu_close)
+                    .clicked()
+                {
                     out.ssh_runtime_action = Some(SshRuntimeAction::CloseSession {
                         session_id: session.session_id,
                     });
+                } else if response.double_clicked() {
+                    st.ssh_session_renaming =
+                        Some((session.session_id, session.display_name.clone()));
+                    st.ssh_session_rename_focus = true;
                 } else if response.clicked() {
                     out.ssh_runtime_action = Some(SshRuntimeAction::ActivateSession {
                         session_id: session.session_id,
