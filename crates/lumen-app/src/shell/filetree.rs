@@ -348,6 +348,40 @@ impl FileTreeState {
         });
     }
 
+    /// 打开远程「重命名」对话框（shell 在远程菜单请求时调）。输入框预填原名，
+    /// 提交后经 [`RemoteFileTreeOutput::remote_rename`] 回 main 走 `Rename` 协议。
+    pub(crate) fn open_remote_rename(&mut self, path: String, name: String, is_dir: bool) {
+        self.remote_dialog = Some(RemoteDialog::Rename {
+            target: RemoteDialogTarget::Remote,
+            path,
+            old_name: name.clone(),
+            is_dir,
+            name,
+            focus: true,
+            error: None,
+        });
+    }
+
+    /// 打开 SSH「重命名」对话框；提交后经 [`RemoteFileTreeOutput::ssh_rename`] 回 main
+    /// 走 SFTP rename（同目录改名）。
+    pub(crate) fn open_ssh_rename(
+        &mut self,
+        session_id: crate::ssh_runtime::SshSessionId,
+        path: String,
+        name: String,
+        is_dir: bool,
+    ) {
+        self.remote_dialog = Some(RemoteDialog::Rename {
+            target: RemoteDialogTarget::Ssh(session_id),
+            path,
+            old_name: name.clone(),
+            is_dir,
+            name,
+            focus: true,
+            error: None,
+        });
+    }
+
     /// 打开远程「删除确认」对话框（shell 在远程菜单请求时调）。
     pub(crate) fn open_remote_delete(&mut self, path: String, name: String, is_dir: bool) {
         self.remote_dialog = Some(RemoteDialog::ConfirmDelete {
@@ -922,6 +956,7 @@ pub(crate) enum SharedTreeMenuAction {
     Reveal,
     CopyAbsolutePath,
     CopyRelativePath,
+    Rename,
     Delete,
 }
 
@@ -943,6 +978,8 @@ pub(crate) struct SharedTreeMenuSpec {
     pub can_reveal: bool,
     pub can_edit: bool,
     pub can_delete: bool,
+    /// 该后端是否支持重命名（远程控制树已接 `Rename` 协议；本地 / SSH 树尚未接后端，置 false 即隐藏）。
+    pub can_rename: bool,
     /// SSH 服务器没有本机回收站语义，必须明确显示永久删除。
     pub permanent_delete: bool,
 }
@@ -1003,8 +1040,19 @@ pub(crate) fn shared_tree_menu_entries(spec: SharedTreeMenuSpec) -> Vec<SharedTr
             enabled: true,
         });
     }
-    if !spec.is_root && spec.can_delete {
+    // 重命名与删除同组（都改的是这一项本身）。根节点不可改名（换根走别的入口）。
+    let can_rename = !spec.is_root && spec.can_rename;
+    let can_delete = !spec.is_root && spec.can_delete;
+    if can_rename || can_delete {
         entries.push(Separator);
+    }
+    if can_rename {
+        entries.push(Item {
+            action: Action::Rename,
+            enabled: true,
+        });
+    }
+    if can_delete {
         entries.push(Item {
             action: Action::Delete,
             enabled: true,
@@ -1036,6 +1084,7 @@ pub(crate) fn shared_tree_context_menu(
             SharedTreeMenuAction::Reveal => strings.filetree_menu_reveal,
             SharedTreeMenuAction::CopyAbsolutePath => strings.filetree_menu_copy_abs,
             SharedTreeMenuAction::CopyRelativePath => strings.filetree_menu_copy_rel,
+            SharedTreeMenuAction::Rename => strings.menu_rename,
             SharedTreeMenuAction::Delete if spec.permanent_delete => {
                 strings.filetree_menu_delete_permanent
             }
@@ -2256,18 +2305,24 @@ pub struct RemoteFileTreeOutput {
     pub new_dir_req: Option<String>,
     /// 菜单「新建文件」请求：在此远程目录下新建。
     pub new_file_req: Option<String>,
+    /// 菜单「重命名」请求：(path, name, is_dir)（shell 据此开改名对话框，输入框预填原名）。
+    pub rename_req: Option<(String, String, bool)>,
     /// 菜单「删除」请求：(path, name, is_dir)（shell 据此开删除确认对话框）。
     pub delete_req: Option<(String, String, bool)>,
     /// 要写入系统剪贴板的文本（复制绝对/相对路径；相对路径已在树侧按 root 算好）。
     pub copy_text: Option<String>,
     /// 远程新建对话框**确认**：(dir, name, is_dir) → main 调 remote_make_dir/file。
     pub remote_create: Option<(String, String, bool)>,
+    /// 远程改名对话框**确认**：(path, 新名) → main 调 `remote_ws.remote_rename`。
+    pub remote_rename: Option<(String, String)>,
     /// 远程删除确认：(path, is_dir) → main 调 remote_delete。
     pub remote_delete: Option<(String, bool)>,
     /// SSH 新建对话框确认：(会话、目录、名称、是否目录)。
     pub ssh_create: Option<(crate::ssh_runtime::SshSessionId, String, String, bool)>,
     /// SSH 永久删除确认：(会话、路径、是否目录)。
     pub ssh_delete: Option<(crate::ssh_runtime::SshSessionId, String, bool)>,
+    /// SSH 改名对话框确认：(会话、原路径、新名、是否目录) → main 调 `ssh_runtime.rename_entry`。
+    pub ssh_rename: Option<(crate::ssh_runtime::SshSessionId, String, String, bool)>,
     /// 远程对话框本帧关闭（main 把键盘焦点交还）。
     pub dialog_closed: bool,
     /// 菜单「进入文件夹」：被控端目录绝对路径——main 据此向远程会话注入 `cd '<path>'`
@@ -2296,6 +2351,27 @@ enum RemoteDialog {
         name: String,
         is_dir: bool,
     },
+    /// 重命名：把远程 `path` 改名为同目录下的新名（输入框预填 `name` 原名）。
+    /// 远程控制树走 `Rename` 协议、SSH 树走 SFTP rename，两者共用此对话框。
+    Rename {
+        target: RemoteDialogTarget,
+        path: String,
+        old_name: String,
+        /// 目录 / 文件（SSH 侧校验「树里确有这一项」要按类型查，故一路带下来）。
+        is_dir: bool,
+        name: String,
+        focus: bool,
+        error: Option<String>,
+    },
+}
+
+/// 对话框提交时用哪套命名规则校验：远程控制的被控端可能是 Windows 也可能是 Linux
+/// （按不透明路径形态推断），SSH 服务器一律按 Unix 规则。
+fn dialog_name_rules(target: RemoteDialogTarget, path: &str) -> NameRules {
+    match target {
+        RemoteDialogTarget::Remote => NameRules::infer_from_path(path),
+        RemoteDialogTarget::Ssh(_) => NameRules::Unix,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2365,6 +2441,8 @@ enum RemoteMenuAction {
     NewDir(String),
     /// 新建文件：在此远程目录下（开对话框）。
     NewFile(String),
+    /// 重命名：(path, name, is_dir)（开改名对话框，预填原名）。
+    Rename(String, String, bool),
     /// 删除：(path, name, is_dir)（开确认对话框）。
     Delete(String, String, bool),
     /// 复制路径文本到系统剪贴板（绝对/相对已在树侧算好）。
@@ -2430,6 +2508,11 @@ fn remote_tree_menu_action(
         SharedTreeMenuAction::CopyRelativePath => {
             Some(RemoteMenuAction::CopyText(rel_remote_path(path, root)))
         }
+        SharedTreeMenuAction::Rename => Some(RemoteMenuAction::Rename(
+            path.to_owned(),
+            name.to_owned(),
+            is_directory,
+        )),
         SharedTreeMenuAction::Delete => Some(RemoteMenuAction::Delete(
             path.to_owned(),
             name.to_owned(),
@@ -2574,6 +2657,7 @@ fn remote_panel_ui(
                                                     can_reveal: false,
                                                     can_edit: false,
                                                     can_delete: true,
+                                                    can_rename: true,
                                                     permanent_delete: false,
                                                 },
                                             ) else {
@@ -2618,6 +2702,7 @@ fn remote_panel_ui(
                                                     can_reveal: false,
                                                     can_edit: true,
                                                     can_delete: true,
+                                                    can_rename: true,
                                                     permanent_delete: false,
                                                 },
                                             ) else {
@@ -2742,6 +2827,9 @@ fn remote_panel_ui(
         Some(RemoteMenuAction::BusyCd) => out.busy_hint = true,
         Some(RemoteMenuAction::NewDir(dir)) => out.new_dir_req = Some(dir),
         Some(RemoteMenuAction::NewFile(dir)) => out.new_file_req = Some(dir),
+        Some(RemoteMenuAction::Rename(path, name, is_dir)) => {
+            out.rename_req = Some((path, name, is_dir));
+        }
         Some(RemoteMenuAction::Delete(path, name, is_dir)) => {
             out.delete_req = Some((path, name, is_dir));
         }
@@ -2845,17 +2933,14 @@ pub(crate) fn remote_dialog_ui(
                     });
                 });
             if confirmed {
-                let submitted_name = match target {
-                    RemoteDialogTarget::Remote => name.trim().to_owned(),
-                    // 空格（包括结尾空格）是合法 Linux 文件名的一部分，SSH 目标不得
-                    // 沿用 Windows 对话框的 trim 语义，否则创建结果会和用户输入不一致。
-                    RemoteDialogTarget::Ssh(_) => name.clone(),
+                // 规则按**目标机器**的系统定：Windows 目标 trim（尾空格建出来会对不上），
+                // Unix 目标不 trim（空格是合法文件名的一部分，trim 会与用户输入不一致）。
+                let rules = dialog_name_rules(*target, dir);
+                let submitted_name = match rules {
+                    NameRules::Windows => name.trim().to_owned(),
+                    NameRules::Unix => name.clone(),
                 };
-                let validation = match target {
-                    RemoteDialogTarget::Remote => validate_entry_name(&submitted_name),
-                    RemoteDialogTarget::Ssh(_) => validate_linux_entry_name(&submitted_name),
-                };
-                match validation {
+                match validate_entry_name_for(rules, &submitted_name) {
                     Err(msg) => {
                         *error = Some(msg.to_owned());
                         *focus = true;
@@ -2944,6 +3029,98 @@ pub(crate) fn remote_dialog_ui(
                 close = true;
             }
         }
+        RemoteDialog::Rename {
+            target,
+            path,
+            old_name,
+            is_dir,
+            name,
+            focus,
+            error,
+        } => {
+            let mut confirmed = false;
+            let modal = egui::Modal::new(egui::Id::new("lumen_remote_rename"))
+                .backdrop_color(egui::Color32::from_black_alpha(120))
+                .frame(frame)
+                .show(ctx, |ui| {
+                    ui.set_width(280.0);
+                    ui.label(
+                        egui::RichText::new(crate::i18n::fmt1(
+                            s.filetree_rename_title_fmt,
+                            old_name.as_str(),
+                        ))
+                        .size(14.0)
+                        .strong()
+                        .color(pal.fg),
+                    );
+                    ui.add_space(8.0);
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text(s.filetree_create_name_hint)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if *focus {
+                        edit.request_focus();
+                        *focus = false;
+                    }
+                    let submitted =
+                        edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if let Some(err) = error {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(err.as_str())
+                                .size(11.0)
+                                .color(pal.error),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let ok_btn = egui::Button::new(
+                            egui::RichText::new(s.menu_rename).color(pal.accent_fg),
+                        )
+                        .fill(pal.accent);
+                        if ui.add(ok_btn).clicked() || submitted {
+                            confirmed = true;
+                        }
+                        if ui.button(s.filetree_cancel_btn).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if confirmed {
+                // 同新建：按目标机器的系统定 trim 与校验规则。
+                let rules = dialog_name_rules(*target, path);
+                let new_name = match rules {
+                    NameRules::Windows => name.trim().to_owned(),
+                    NameRules::Unix => name.clone(),
+                };
+                if new_name == *old_name {
+                    close = true; // 名字没变：等价取消，不发协议。
+                } else {
+                    match validate_entry_name_for(rules, &new_name) {
+                        Err(msg) => {
+                            *error = Some(msg.to_owned());
+                            *focus = true;
+                        }
+                        Ok(()) => {
+                            match target {
+                                RemoteDialogTarget::Remote => {
+                                    out.remote_rename = Some((path.clone(), new_name));
+                                }
+                                RemoteDialogTarget::Ssh(session_id) => {
+                                    out.ssh_rename =
+                                        Some((*session_id, path.clone(), new_name, *is_dir));
+                                }
+                            }
+                            close = true;
+                        }
+                    }
+                }
+            }
+            if modal.should_close() {
+                close = true;
+            }
+        }
     }
     if close {
         out.dialog_closed = true;
@@ -2998,11 +3175,57 @@ pub(crate) fn shared_tree_placeholder_row(
     });
 }
 
+/// 目标文件系统的命名规则。**按文件所在那台机器的系统判定，不是按本机**——远程控制的被控端
+/// 可能是 Linux、SSH 服务器基本都是 Linux，用 Windows 规则去卡它们会误拒 `a:b`、`报表*.txt`
+/// 这类合法名；反过来用 Unix 规则放行 `CON`、尾部空格又会在 Windows 上建出对不上的名字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameRules {
+    /// Windows：禁 `\/:*?"<>|`、保留设备名、尾点尾空格。
+    Windows,
+    /// Unix（Linux / macOS）：只禁 `/` 与控制字符，长度 ≤255 字节。
+    Unix,
+}
+
+impl NameRules {
+    /// **本机**规则（被控端 / SSH 服务端等「亲自落盘的一方」用这个做最终裁决）。
+    pub(crate) const fn native() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+
+    /// 按对端路径形态推断（控制端只拿得到不透明路径时的兜底）：`C:\…` / `\\host\share` →
+    /// Windows；`/…` → Unix。判不出（空路径等）按 Unix 宽松规则，把最终裁决交给对端。
+    pub(crate) fn infer_from_path(path: &str) -> Self {
+        let bytes = path.as_bytes();
+        let drive_prefixed = bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|c| *c == b'\\' || *c == b'/');
+        if drive_prefixed || path.starts_with("\\\\") {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// 按目标系统规则校验新建 / 重命名的名字。返回值的 `&'static str` 是当前语言的错误文案。
+pub(crate) fn validate_entry_name_for(rules: NameRules, name: &str) -> Result<(), &'static str> {
+    match rules {
+        NameRules::Windows => validate_entry_name(name),
+        NameRules::Unix => validate_linux_entry_name(name),
+    }
+}
+
 /// 新建文件/文件夹的名字校验（Windows 文件名规则 + 注入防御）。
 ///
 /// 返回值的 `&'static str` 是当前语言的错误文案（由 i18n 表提供）。
 ///
 /// part3c-2 片5：被控端 Put/MkDir 写盘前复用此校验拒绝非法 / 穿越名字（`pub(crate)`）。
+/// **调用方一般应走 [`validate_entry_name_for`]**，由目标系统决定规则。
 pub(crate) fn validate_entry_name(name: &str) -> Result<(), &'static str> {
     let s = crate::i18n::strings();
     if name.is_empty() {
@@ -3251,6 +3474,7 @@ mod tests {
             can_reveal: false,
             can_edit: true,
             can_delete: true,
+            can_rename: false,
             permanent_delete: false,
         };
         let expected = vec![
@@ -3299,6 +3523,92 @@ mod tests {
     }
 
     #[test]
+    fn 命名规则按对端系统分流而非本机() {
+        // 路径形态推断：盘符 / UNC → Windows；POSIX 绝对路径 → Unix。
+        assert_eq!(NameRules::infer_from_path(r"C:\work"), NameRules::Windows);
+        assert_eq!(NameRules::infer_from_path("D:/work"), NameRules::Windows);
+        assert_eq!(NameRules::infer_from_path(r"\\nas\share"), NameRules::Windows);
+        assert_eq!(NameRules::infer_from_path("/home/hf"), NameRules::Unix);
+        assert_eq!(NameRules::infer_from_path("/"), NameRules::Unix);
+        // 判不出时按 Unix 宽松处理，最终裁决交给对端。
+        assert_eq!(NameRules::infer_from_path(""), NameRules::Unix);
+
+        // 同一个名字，两套规则结论相反：`a:b`、`报表*.txt`、`CON`、尾空格在 Linux 上都合法。
+        for linux_ok in ["a:b", "报表*.txt", "CON", "name ", "q?.log"] {
+            assert!(
+                validate_entry_name_for(NameRules::Unix, linux_ok).is_ok(),
+                "{linux_ok} 在 Linux 上应放行"
+            );
+            assert!(
+                validate_entry_name_for(NameRules::Windows, linux_ok).is_err(),
+                "{linux_ok} 在 Windows 上应拒绝"
+            );
+        }
+        // 两套规则共同的底线：空名、`.`/`..`、含 `/`、控制字符。
+        for bad in ["", ".", "..", "a/b", "a\nb"] {
+            assert!(validate_entry_name_for(NameRules::Unix, bad).is_err());
+            assert!(validate_entry_name_for(NameRules::Windows, bad).is_err());
+        }
+        // 普通名字两边都放行。
+        assert!(validate_entry_name_for(NameRules::Unix, "笔记.md").is_ok());
+        assert!(validate_entry_name_for(NameRules::Windows, "笔记.md").is_ok());
+    }
+
+    #[test]
+    fn 支持重命名的后端在删除前多出重命名项() {
+        use SharedTreeMenuAction as Action;
+        use SharedTreeMenuEntry::Action as Item;
+
+        let spec = SharedTreeMenuSpec {
+            is_directory: false,
+            is_root: false,
+            can_paste: false,
+            can_reveal: false,
+            can_edit: true,
+            can_delete: true,
+            can_rename: true,
+            permanent_delete: false,
+        };
+        let entries = shared_tree_menu_entries(spec);
+        let rename_at = entries
+            .iter()
+            .position(|e| {
+                *e == Item {
+                    action: Action::Rename,
+                    enabled: true,
+                }
+            })
+            .expect("支持重命名的后端必须出重命名项");
+        let delete_at = entries
+            .iter()
+            .position(|e| {
+                *e == Item {
+                    action: Action::Delete,
+                    enabled: true,
+                }
+            })
+            .expect("删除项仍在");
+        assert!(rename_at < delete_at, "重命名排在删除之前");
+
+        // 根节点不可改名（换根走别的入口），且不支持重命名的后端不出该项。
+        for hidden in [
+            SharedTreeMenuSpec {
+                is_root: true,
+                ..spec
+            },
+            SharedTreeMenuSpec {
+                can_rename: false,
+                ..spec
+            },
+        ] {
+            assert!(!shared_tree_menu_entries(hidden).contains(&Item {
+                action: Action::Rename,
+                enabled: true,
+            }));
+        }
+    }
+
+    #[test]
     fn shared_directory_menu_keeps_paste_visible_but_disabled_without_source() {
         use SharedTreeMenuAction as Action;
         use SharedTreeMenuEntry::Action as Item;
@@ -3310,6 +3620,7 @@ mod tests {
             can_reveal: false,
             can_edit: false,
             can_delete: true,
+            can_rename: false,
             permanent_delete: false,
         });
         assert!(entries.contains(&Item {

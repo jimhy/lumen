@@ -193,6 +193,7 @@ pub static STRINGS: Strings = Strings {
     filetree_create_name_hint: "名称",
     filetree_create_btn: "创建",
     filetree_cancel_btn: "取消",
+    filetree_rename_title_fmt: "重命名「{}」",
     filetree_delete_title: "删除",
     filetree_delete_what_dir: "文件夹（含其中全部内容）",
     filetree_delete_what_file: "文件",

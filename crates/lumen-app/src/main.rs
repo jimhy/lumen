@@ -279,6 +279,10 @@ type MirrorSig = (
     Option<u32>,
 );
 
+/// part3d 被控端「控制端接管的窗格网格」：`(订阅 tab_id, 各窗格 session_id → (行, 列))`。
+/// 订阅期间该会话的网格按**控制电脑**算（`SubViewport`），本机窗口矩形不再改它。
+type ControllerGrids = (session::TabId, HashMap<session::SessionId, (usize, usize)>);
+
 /// part3d Phase 3c 多窗格镜像第 `i` 个窗格的离屏纹理保留 id：自 `MIRROR_OFFSCREEN_ID-1` 递减，
 /// 避开自增会话 id（小）与单 mirror 的 `MIRROR_OFFSCREEN_ID`（`u64::MAX`）。`i` 上限 = `MAX_PANES`。
 const fn mirror_pane_offscreen_id(i: usize) -> session::SessionId {
@@ -683,12 +687,21 @@ fn remote_icon_hash(bm: &lumen_protocol::remote::IconBitmap) -> u64 {
     h.finish()
 }
 
-/// 控制端何时拥有订阅 tab 的网格尺寸。
+/// 被控端：从「控制端接管表」（`App::remote_pane_viewports`）里查某窗格的目标网格。
 ///
-/// 未锁定时，本机窗口继续拥有当前 tab，控制端只接管后台 tab；锁定后
-/// 本机 Shell 停止布局，控制端必须接管当前 tab 才能保持既有远控会话可用。
-fn controller_owns_sub_viewport(tab_index: usize, active_tab: usize, app_locked: bool) -> bool {
-    tab_index != active_tab || app_locked
+/// 订阅期间会话的绝对网格恒由控制端拥有（渲染内容大小按控制电脑算），故此处命中即
+/// **覆盖**本机窗口矩形算出的尺寸。`None` = 未被接管（未被控 / 非订阅会话 / 该窗格还
+/// 没出现在控制端上报的清单里），调用方回退按本机矩形算。
+fn controller_owned_pane_grid(
+    owned: Option<&ControllerGrids>,
+    tab_id: session::TabId,
+    session_id: session::SessionId,
+) -> Option<(usize, usize)> {
+    let (owned_tab, sizes) = owned?;
+    if *owned_tab != tab_id {
+        return None;
+    }
+    sizes.get(&session_id).copied()
 }
 
 /// 三种工作模式的全局快捷键。只接受精确的 Ctrl+Shift 组合，避免
@@ -1106,6 +1119,15 @@ struct AppState {
     /// M5.3 被控端远程视口覆盖 `(行, 列)`：被控期间焦点窗格按此 resize（SSH 式跟随
     /// 控制端视图尺寸），覆盖自身窗口尺寸；非被控时 None（恢复窗口尺寸）。
     remote_viewport: Option<(usize, usize)>,
+    /// M5.3 part3d 被控端「控制端接管的窗格网格」`(订阅 tab_id, 各窗格 session_id → (行, 列))`。
+    ///
+    /// 控制端每帧按**自己**镜像区各格像素 + **自己**的 cell 尺寸算目标网格发 `SubViewport`，被控端
+    /// **不分前后台**都按此 resize，并在本机 resize 循环里持续沿用——渲染内容大小按控制电脑算，
+    /// 控制端 1:1 无裁切、无留白。若不在本机循环沿用，前台 tab 下一帧就会被本机窗口矩形算出的
+    /// 尺寸覆盖回去（两端抢 resize、镜像退回「按被控端排版」）。
+    ///
+    /// 断开 / 不再被控 / 换订阅目标 / 控制端切走远程视图即清空（下一帧本机循环按窗格矩形重算恢复）。
+    remote_pane_viewports: Option<ControllerGrids>,
     /// M5.3 part4b 控制端镜像区物理像素矩形 `(x, y, w, h)`：仅控制中+远程视图时为
     /// Some（每帧由终端区矩形换算），供鼠标命中→镜像选区的像素↔单元格换算。
     mirror_rect_px: Option<(f32, f32, f32, f32)>,
@@ -1949,36 +1971,37 @@ impl AppState {
                     );
                 }
             }
-            // part3d Phase 3 尺寸同步：通常只让控制端接管被控端后台 tab，避免与本地前台布局
-            // 同时抢 resize。应用锁定时本地 Shell 不再布局当前 tab，因此当前 tab 也必须临时由
-            // 控制端接管，保证既有远控会话的多窗格操作不受锁屏影响。
+            // part3d Phase 3 尺寸同步：订阅期间该会话的绝对网格**恒由控制端拥有**（SSH 式），
+            // 被控端前台后台一律跟随——渲染内容大小按控制电脑算，控制端 1:1 无裁切无留白。
+            // 尺寸同时记进 `remote_pane_viewports`，本机 resize 循环据此沿用（否则前台 tab
+            // 下一帧就被本机窗口矩形算出的尺寸覆盖回去，两端抢 resize）。
             if let Some((vp_tab, sizes)) = self.remote_ws.take_sub_viewport() {
                 if let Some(ti) = self.tabs.iter().position(|t| t.id == vp_tab) {
-                    if controller_owns_sub_viewport(
-                        ti,
-                        self.active_tab,
-                        self.app_lock.is_locked(),
-                    ) {
-                        let mut resized_any = false;
-                        for (sid, rows, cols) in sizes {
-                            if let Some(pane) = self.tabs[ti].panes.iter_mut().find(|p| p.id == sid)
-                            {
-                                let (r, c) = (usize::from(rows).max(1), usize::from(cols).max(1));
-                                let g = pane.term.grid();
-                                if (g.rows(), g.cols()) != (r, c) {
-                                    pane.term.resize(r, c);
-                                    resized_any = true;
-                                    if let Err(e) = pane.pty.resize(rows.max(1), cols.max(1)) {
-                                        log::warn!("订阅会话窗格 {sid} PTY resize 失败: {e:#}");
-                                    }
+                    let mut resized_any = false;
+                    let mut owned: HashMap<session::SessionId, (usize, usize)> =
+                        HashMap::with_capacity(sizes.len());
+                    for (sid, rows, cols) in sizes {
+                        let (r, c) = (usize::from(rows).max(1), usize::from(cols).max(1));
+                        owned.insert(sid, (r, c));
+                        if let Some(pane) = self.tabs[ti].panes.iter_mut().find(|p| p.id == sid) {
+                            let g = pane.term.grid();
+                            if (g.rows(), g.cols()) != (r, c) {
+                                pane.term.resize(r, c);
+                                resized_any = true;
+                                if let Err(e) = pane.pty.resize(rows.max(1), cols.max(1)) {
+                                    log::warn!("订阅会话窗格 {sid} PTY resize 失败: {e:#}");
                                 }
                             }
                         }
-                        if resized_any {
-                            // 强制下一次镜像快照携带新几何，避免控制端短暂沿用旧尺寸。
-                            self.mirror_src = None;
-                        }
                     }
+                    // 空清单 = 控制端释放接管（切走远程视图）：清表，下一帧本机按窗格矩形重算。
+                    self.remote_pane_viewports = (!owned.is_empty()).then_some((vp_tab, owned));
+                    if resized_any {
+                        // 强制下一次镜像快照携带新几何，避免控制端短暂沿用旧尺寸。
+                        self.mirror_src = None;
+                    }
+                    // 接管尺寸变 / 释放接管都要让本机重排一帧（被控端可能正空闲不重绘）。
+                    self.window.request_redraw();
                 }
             }
             // part3d Phase 3 布局比例**双向**同步（被控端侧）：①应用控制端发来的比例到目标 tab 布局
@@ -2203,6 +2226,15 @@ impl AppState {
             // 断开/不再被控：恢复窗口尺寸（下一帧 resize 循环按矩形重算）。
             self.window.request_redraw();
         }
+        // 控制端接管的窗格网格：不再被控 或 订阅目标已换 / 取消时释放，本机 resize
+        // 循环下一帧按窗格矩形重算，被控端立即回到自己窗口的排版。
+        if let Some((owned_tab, _)) = self.remote_pane_viewports.as_ref() {
+            let still_owned = controlled && self.remote_ws.sub_target() == Some(*owned_tab);
+            if !still_owned {
+                self.remote_pane_viewports = None;
+                self.window.request_redraw();
+            }
+        }
         if changed || applied {
             self.window.request_redraw();
         }
@@ -2404,6 +2436,18 @@ impl AppState {
     /// 被控端而非本地执行（bug3：切回「本地」视图则本地输入、不转发、不画镜像）。
     fn is_mirror_active(&self) -> bool {
         self.remote_ws.is_controlling() && self.settings.layout.view_mode.is_remote()
+    }
+
+    /// 被控端：查该窗格的网格是否由控制端接管（`SubViewport` 记入 `remote_pane_viewports`），
+    /// 是则返回控制端要求的 `(行, 列)`。仅**当前订阅**会话的窗格算数——tab_id 不匹配（本机其他
+    /// 会话）或窗格不在控制端上报的清单里（订阅后新开的窗格，控制端下一帧才带上）返回 `None`，
+    /// 由调用方回退到本机窗格矩形计算。
+    fn controller_owned_grid(
+        &self,
+        tab_id: session::TabId,
+        session_id: session::SessionId,
+    ) -> Option<(usize, usize)> {
+        controller_owned_pane_grid(self.remote_pane_viewports.as_ref(), tab_id, session_id)
     }
 
     /// 当前工作模式和覆盖层是否允许把键盘/IME 焦点交给终端。
@@ -4187,9 +4231,11 @@ impl AppState {
                 }
                 self.window.request_redraw();
             }
-            SshFileTreeIntent::CreateEntry { .. } | SshFileTreeIntent::Delete { .. } => {
-                // The shell intercepts these two intents and opens the shared
-                // create/permanent-delete confirmation modal before they reach main.
+            SshFileTreeIntent::CreateEntry { .. }
+            | SshFileTreeIntent::Delete { .. }
+            | SshFileTreeIntent::Rename { .. } => {
+                // The shell intercepts these intents and opens the shared
+                // create/rename/permanent-delete modal before they reach main.
             }
         }
     }
@@ -8922,6 +8968,7 @@ impl App {
             filetree_hovered: false,
             filetree_focused: false,
             remote_viewport: None,
+            remote_pane_viewports: None,
             mirror_texture: None,
             mirror_pane_textures: Vec::new(),
             egui_state,
@@ -12919,8 +12966,9 @@ impl ApplicationHandler<PtyWake> for App {
                             ));
                         }
                     }
-                    // 多窗格：据各格内容矩形像素 + 控制端 cell 算 grid_size_for → SubViewport（去重）。
-                    // 单窗格走 mirror（hist 系统），不在此同步尺寸。
+                    // 据各格内容矩形像素 + **控制端** cell 算 grid_size_for → SubViewport（去重）：
+                    // 订阅期间被控端窗格网格恒按控制端算（前台后台都跟随），故控制端 1:1 无裁切无留白。
+                    // `mirror_panes` 覆盖单/多窗格（SubscriptionStarted 统一走 per-pane），空 tab 才不发。
                     if let Some(tab_id) = state.remote_ws.subscribed_tab() {
                         if !state.remote_ws.mirror_panes().is_empty() {
                             let sizes: Vec<(session::SessionId, u16, u16)> = state
@@ -12981,6 +13029,9 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     state.mirror_rect_px = None;
                     state.mirror_pane_rects_px.clear();
+                    // 不再渲染镜像（切到本机 / SSH 视图）：释放对被控端窗格网格的接管，
+                    // 让被控端立刻回到按自身窗口排版；切回远程视图下一帧自然重新接管。
+                    state.remote_ws.release_sub_viewport();
                 }
                 // 远程控制一次性通知 → toast（弹窗在 egui 帧后 push，需请求重绘）。
                 let remote_notices = state.remote_ws.take_notices();
@@ -13238,7 +13289,7 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // —— M5.3 part3d Phase 3c：镜像分隔条拖动 → 调控制端镜像比例布局（同本地 API，但
                 // 作用于 remote_ws 镜像布局而非 tab）。下一帧 mirror_pane_rects 随比例变 →
-                // SubViewport 让**后台**被控端 resize 到此比例（1:1）；镜像布局不落盘（临时态）。
+                // SubViewport 让被控端 resize 到此比例（1:1）；镜像布局不落盘（临时态）。
                 // 区域用镜像 area（= term_rect，与 shell 多窗格块算 rects 同源）。
                 if let Some(kind) = shell_out.mirror_divider_reset {
                     if let Some(ml) = state.remote_ws.mirror_layout_mut() {
@@ -13946,6 +13997,11 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.window.request_redraw();
                 }
+                // 远程菜单：重命名确认 → 发协议（被控端同目录改名，结果回来刷新父目录）。
+                if let Some((path, new_name)) = shell_out.remote_rename {
+                    state.remote_ws.remote_rename(path, new_name);
+                    state.window.request_redraw();
+                }
                 // 远程菜单：删除确认 → 发协议（被控端移入回收站，结果回来刷新父目录）。
                 if let Some((path, is_dir)) = shell_out.remote_delete {
                     state.remote_ws.remote_delete(path, is_dir);
@@ -13966,6 +14022,20 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some((session_id, path, is_dir)) = shell_out.ssh_delete {
                     if let Err(error) =
                         state.ssh_runtime.delete_entry(session_id, path, is_dir)
+                    {
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, error);
+                    }
+                    state.window.request_redraw();
+                }
+                // SSH 菜单：重命名确认 → SFTP rename（同目录；撞名由服务端回 Conflict）。
+                if let Some((session_id, path, new_name, is_dir)) = shell_out.ssh_rename {
+                    if let Err(error) =
+                        state
+                            .ssh_runtime
+                            .rename_entry(session_id, path, is_dir, &new_name)
                     {
                         state
                             .shell_state
@@ -14310,10 +14380,18 @@ impl ApplicationHandler<PtyWake> for App {
                         };
                         #[cfg(not(feature = "input-editor"))]
                         let footer_px_for_resize: f32 = 0.0;
-                        // M5.3 SSH 式视口跟随：被控期间焦点窗格用控制端请求的远程
-                        // 视口尺寸（覆盖窗口矩形算出的尺寸），其余窗格/非被控按矩形。
-                        let (rows, cols) = match state.remote_viewport {
-                            Some(dims) if i == state.tabs[state.active_tab].focused => dims,
+                        // M5.3 SSH 式视口跟随（优先级从高到低）：
+                        // ① 被订阅会话的窗格 → 控制端接管的网格（`SubViewport`，按**控制电脑**
+                        //    的镜像格像素 + 字号算出）。本机窗口矩形在订阅期间不再改它的网格，
+                        //    否则前台 tab 每帧都被本机尺寸夺回、两端抢 resize。
+                        // ② 单窗格远程视口（`ViewportResize`，焦点窗格）。
+                        // ③ 非被控 / 未接管 → 本机窗格矩形算。
+                        let sid_now = state.tabs[state.active_tab].panes[i].id;
+                        let owned_dims =
+                            state.controller_owned_grid(state.tabs[state.active_tab].id, sid_now);
+                        let (rows, cols) = match (owned_dims, state.remote_viewport) {
+                            (Some(dims), _) => dims,
+                            (None, Some(dims)) if i == state.tabs[state.active_tab].focused => dims,
                             _ => state.renderer.grid_size_for_with_footer(
                                 tw,
                                 th,
@@ -14790,7 +14868,7 @@ impl ApplicationHandler<PtyWake> for App {
 mod tests {
     use super::{
         canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
-        controller_owns_sub_viewport, drain_order, estimate_restored_pane_px, load_icon,
+        controller_owned_pane_grid, drain_order, estimate_restored_pane_px, load_icon,
         maximized_overflow, profile_auth_token, profile_origin_requires_reauth,
         profile_server_origin, scroll_to_bottom_action,
         should_apply_ssh_sync_event, should_continue_ssh_sync,
@@ -14808,10 +14886,21 @@ mod tests {
     use super::{local_copy_item, unique_copy_name, CopyStats};
 
     #[test]
-    fn 锁屏期间控制端接管当前订阅页尺寸() {
-        assert!(controller_owns_sub_viewport(1, 0, false));
-        assert!(!controller_owns_sub_viewport(0, 0, false));
-        assert!(controller_owns_sub_viewport(0, 0, true));
+    fn 订阅会话窗格网格由控制端接管_其余回退本机() {
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert(7_u64, (40_usize, 120_usize));
+        let owned = (3_u64, sizes);
+        // 订阅会话内、控制端上报过的窗格：用控制端算出的网格（前台后台一视同仁）。
+        assert_eq!(
+            controller_owned_pane_grid(Some(&owned), 3, 7),
+            Some((40, 120))
+        );
+        // 本机其他会话：不受远控接管，按自身窗口矩形算。
+        assert_eq!(controller_owned_pane_grid(Some(&owned), 4, 7), None);
+        // 订阅后新开、控制端还没上报的窗格：本帧先按本机矩形算。
+        assert_eq!(controller_owned_pane_grid(Some(&owned), 3, 8), None);
+        // 未被控 / 已断开：接管表为空。
+        assert_eq!(controller_owned_pane_grid(None, 3, 7), None);
     }
 
     #[test]

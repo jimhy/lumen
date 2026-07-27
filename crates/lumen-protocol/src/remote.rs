@@ -539,6 +539,27 @@ pub enum RemoteFrame {
         /// 失败原因。
         err: Option<FsErr>,
     },
+    /// 控制端 → 被控端：把 `path` 重命名为**同目录下**的 `new_name`（远程菜单「重命名」）。
+    /// 被控端校验新名（同 [`MkFile`](RemoteFrame::MkFile) 的名字规则）+ 断言仍落在原父目录内
+    /// （不允许借新名做路径穿越 / 跨目录移动），并拒绝覆盖已存在的同名项。
+    Rename {
+        /// 关联请求号。
+        req_id: u64,
+        /// 被重命名项的被控端完整路径（不透明，先前 ListDir 枚举所得）。
+        path: String,
+        /// 新名字（**仅名字**，不含分隔符；被控端校验）。
+        new_name: String,
+    },
+    /// 被控端 → 控制端：[`Rename`](RemoteFrame::Rename) 结果（成功 `err=None`）。
+    RenameResult {
+        /// 关联请求号。
+        req_id: u64,
+        /// 重命名后的被控端完整路径（`err=Some` 时为空串）。
+        path: String,
+        /// 失败原因（名字非法 / 穿越 → [`FsErr::PermissionDenied`]；同名已存在与其余 IO 一样
+        /// 归 [`FsErr::Io`]，与 [`MkFile`](RemoteFrame::MkFile) 撞名的粗粒度口径一致）。
+        err: Option<FsErr>,
+    },
     /// 控制端 → 被控端：删除 `path`（远程菜单「删除」）。`is_dir` 决定递归删目录 / 删单文件。
     Delete {
         /// 关联请求号。
@@ -685,9 +706,10 @@ pub enum RemoteFrame {
     },
     /// 控制端 → 被控端：订阅会话各窗格的**目标网格尺寸**（控制端按自己均分布局 + 字号算出）。
     /// 被控端据此 resize 该会话的窗格，使镜像在控制端 **1:1 无裁切**地忠实显示（part3d Phase 3
-    /// 尺寸同步）。**所有权规则**：仅当该会话在被控端为**后台 tab** 时生效（控制端定尺寸）；被控端
-    /// 把它切到**前台**时由被控端窗口尺寸接管（控制端那期间回到裁剪/留白的忠实显示），避免两端抢
-    /// resize。控制端尺寸变化（窗口 resize / 切订阅）才发，去重。
+    /// 尺寸同步）。**所有权规则**：订阅期间该会话的绝对网格**恒由控制端拥有**（SSH 式），被控端
+    /// **前台后台一律跟随**、其间自身窗口尺寸不再改该会话窗格网格——「渲染内容大小按控制电脑算」；
+    /// 断开 / 取消订阅后被控端立即回到按自身窗口矩形重算。控制端尺寸变化（窗口 resize / 改字号 /
+    /// 拖镜像分隔条 / 切订阅）才发，去重。
     SubViewport {
         /// 目标会话 id。
         tab_id: TabId,
@@ -699,8 +721,8 @@ pub enum RemoteFrame {
     /// **前台后台均应用**——proportions 不抢绝对网格，故对被控端前台无侵扰，各端按自己窗口×权重出格）。
     ///
     /// 与 [`SubViewport`](RemoteFrame::SubViewport) **互补且正交**：`SubViewport` 同步**绝对网格**
-    /// （仅后台 tab，为控制端 1:1 无裁切）；`SubLayout` 同步**相对比例**（双向、不分前后台，解决「控制端
-    /// 拖了前台 tab 不生效」与「两端比例不一致」）。前者改 grid、后者改 weights，二者不冲突。
+    /// （订阅期间控制端单向拥有，为控制端 1:1 无裁切）；`SubLayout` 同步**相对比例**（双向、不分前后台，
+    /// 解决「两端比例不一致」）。前者改 grid、后者改 weights，二者不冲突。
     ///
     /// **回声免疫**：收发两端各自维护「已发/已应用基线」（`RemoteWs::sub_layout_baseline`），收到即把
     /// 基线更新为该权重——故「应用对端的比例」不会再被本端变更检测当成本地改动回发，连续拖动无回声打架。
@@ -1242,6 +1264,31 @@ mod tests {
                 tab_id: 7,
                 row_weights: vec![0.3, 0.7],
                 col_weights: vec![vec![0.5, 0.5], vec![0.4, 0.6]],
+            },
+        ] {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn 远程重命名帧经value往返() {
+        for frame in [
+            RemoteFrame::Rename {
+                req_id: 9,
+                path: "D:\\work\\旧名.txt".into(),
+                new_name: "新名.txt".into(),
+            },
+            RemoteFrame::RenameResult {
+                req_id: 9,
+                path: "D:\\work\\新名.txt".into(),
+                err: None,
+            },
+            RemoteFrame::RenameResult {
+                req_id: 10,
+                path: String::new(),
+                err: Some(FsErr::PermissionDenied),
             },
         ] {
             let v = frame.to_value().expect("to_value");

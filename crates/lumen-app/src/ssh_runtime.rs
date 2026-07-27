@@ -1260,6 +1260,53 @@ impl SshRuntime {
         Ok(())
     }
 
+    /// 同目录重命名（右键「重命名」）。与 [`Self::move_entry`] 共用 SFTP `rename`，区别是目标
+    /// 目录不变、只换名字；服务端撞名回 `Conflict`（不覆盖）。目录改名后其子树缓存整体失效
+    /// （子项路径前缀全变），故 `invalidate_subtree` 传原路径。
+    pub fn rename_entry(
+        &mut self,
+        session_id: SshSessionId,
+        path: String,
+        is_directory: bool,
+        new_name: &str,
+    ) -> Result<(), String> {
+        validate_linux_entry_name(new_name)?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| "SSH session no longer exists".to_owned())?;
+        if path == session.file_tree_root || !known_tree_path(session, &path, is_directory) {
+            return Err("The SSH file selection is stale".to_owned());
+        }
+        if new_name == linux_basename(&path) {
+            return Ok(()); // 名字没变：不发命令（UI 已挡，此为双保险）。
+        }
+        let parent = linux_parent(&path)
+            .ok_or_else(|| "The SSH source path is invalid".to_owned())?
+            .to_owned();
+        let destination = join_linux_path(&parent, new_name);
+        let token = allocate_file_token(session)?;
+        send_file_command(
+            session,
+            FileCommand::Rename {
+                token,
+                from: path.clone(),
+                to: destination,
+            },
+        )?;
+        session.selected_file = None;
+        session.pending_file_requests.insert(
+            token,
+            PendingFileRequest::Operation {
+                action: SshFileAction::Rename,
+                refresh_directories: vec![parent],
+                invalidate_subtree: Some(path),
+                local_path: None,
+            },
+        );
+        Ok(())
+    }
+
     pub fn move_entry(
         &mut self,
         session_id: SshSessionId,

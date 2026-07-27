@@ -88,6 +88,13 @@ pub enum SshFileTreeIntent {
         name: String,
         is_directory: bool,
     },
+    /// 右键「重命名」：shell 据此开改名对话框（预填原名），确认后走 SFTP rename（同目录）。
+    Rename {
+        session_id: crate::ssh_runtime::SshSessionId,
+        path: String,
+        name: String,
+        is_directory: bool,
+    },
     Search {
         session_id: crate::ssh_runtime::SshSessionId,
         query: String,
@@ -755,6 +762,8 @@ fn add_ltree_entry(
         can_reveal: false,
         can_edit: !is_directory,
         can_delete: true,
+        // 同目录改名走 SFTP rename（服务端原子操作，撞名回 Conflict、不覆盖）。
+        can_rename: true,
         permanent_delete: true,
     };
     if !is_directory {
@@ -884,6 +893,8 @@ fn show_context_menu(
                 can_reveal: false,
                 can_edit: !is_directory,
                 can_delete: true,
+                // 同上：同目录改名走 SFTP rename。
+                can_rename: true,
                 permanent_delete: true,
             },
         ) else {
@@ -946,6 +957,14 @@ fn apply_menu_action(
         }
         SharedTreeMenuAction::Delete => {
             output.intents.push(SshFileTreeIntent::Delete {
+                session_id,
+                path: entry.path.to_owned(),
+                name: entry.name.to_owned(),
+                is_directory,
+            });
+        }
+        SharedTreeMenuAction::Rename => {
+            output.intents.push(SshFileTreeIntent::Rename {
                 session_id,
                 path: entry.path.to_owned(),
                 name: entry.name.to_owned(),

@@ -395,6 +395,8 @@ pub struct Strings {
     pub filetree_create_btn: &'static str,
     /// "取消" 按钮
     pub filetree_cancel_btn: &'static str,
+    /// 重命名对话框标题，单参 `{}`：原名
+    pub filetree_rename_title_fmt: &'static str,
     // 删除确认对话框
     /// "删除" 对话框标题
     pub filetree_delete_title: &'static str,

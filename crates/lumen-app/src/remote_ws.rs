@@ -1979,7 +1979,7 @@ impl RemoteWs {
 
     /// 控制端：可变镜像布局——main 据 shell 回传的 `mirror_divider_drag` / `mirror_divider_reset`
     /// 调 [`PaneLayout::drag_col_to`] / [`PaneLayout::reset_rows`] 等改比例（与本地窗格分隔条同一
-    /// 套 API），下一帧 `pane_rects` 变 → `SubViewport` 让后台被控端 resize 到此比例。
+    /// 套 API），下一帧 `pane_rects` 变 → `SubViewport` 让被控端 resize 到此比例。
     pub fn mirror_layout_mut(&mut self) -> Option<&mut MirrorLayout> {
         self.mirror_layout.as_mut()
     }
@@ -2012,8 +2012,9 @@ impl RemoteWs {
         true
     }
 
-    /// 控制端：发订阅会话各窗格目标尺寸给被控端（Phase 3 尺寸同步；与上次相同则不发）。被控端据此
-    /// resize 该会话窗格使镜像 1:1 忠实显示（仅其在被控端为后台 tab 时生效，见 `SubViewport` 规则）。
+    /// 控制端：发订阅会话各窗格目标尺寸给被控端（Phase 3 尺寸同步；与上次相同则不发）。尺寸按
+    /// **控制端**镜像格像素 + **控制端**字号算出，被控端据此 resize 该会话窗格（前台后台一律跟随，
+    /// 见 `SubViewport` 所有权规则），使镜像在控制端 1:1 无裁切无留白。
     pub fn send_sub_viewport(&mut self, tab_id: TabId, panes: PaneSizes) {
         if !self.is_controlling() {
             return;
@@ -2038,7 +2039,26 @@ impl RemoteWs {
         });
     }
 
-    /// 被控端：取走控制端请求的订阅会话各窗格目标尺寸（main 在该会话为后台 tab 时 resize 其窗格）。
+    /// 控制端：**释放**尺寸接管——控制端不再渲染镜像（切到本机/SSH 视图）时发一次空清单
+    /// [`RemoteFrame::SubViewport`]，被控端据此清空接管表、立刻回到按自身窗口矩形排版；不发的话
+    /// 被控端会被永久钉在控制端最后一次算出的网格上（前台 tab 尤其困惑）。已释放（或从未接管）
+    /// 时为无操作，不刷链路。切回镜像视图下一帧自然重发接管尺寸。
+    pub fn release_sub_viewport(&mut self) {
+        if !self.is_controlling() {
+            return;
+        }
+        let Some((tab_id, _)) = self.last_sub_viewport.take() else {
+            return;
+        };
+        self.send_frame(&RemoteFrame::SubViewport {
+            tab_id,
+            panes: Vec::new(),
+        });
+    }
+
+    /// 被控端：取走控制端请求的订阅会话各窗格目标尺寸（main 无条件 resize 其窗格并记入接管表，
+    /// 本机 resize 循环随后沿用该网格，订阅期间不再被自身窗口矩形夺回）。空清单 = 控制端释放
+    /// 接管（见 [`Self::release_sub_viewport`]），被控端据此回到按自身窗口矩形算。
     pub fn take_sub_viewport(&mut self) -> Option<SubViewportReq> {
         self.pending_sub_viewport.take()
     }
@@ -2367,9 +2387,9 @@ impl RemoteWs {
         }
     }
 
-    // part3d：控制端 SSH 式视口跟随已移除（多会话模型下被控端焦点不动、订阅会话可为后台
-    // tab，不强制其 resize）。被控端侧 `ViewportResize` 收处理 + `take_viewport` 暂保留休眠，
-    // 留待 Phase 3/4 若需「订阅=被控端焦点 tab」时的 1:1 满屏渲染再启用。
+    // part3d：整 tab 粒度的 `ViewportResize`（老单窗格 SSH 式跟随）控制端不再发——尺寸跟随统一
+    // 走 per-pane 的 `SubViewport`（按控制端各镜像格像素算，覆盖单/多窗格）。被控端侧
+    // `ViewportResize` 收处理 + `take_viewport` 保留为旧版对端兜底。
 
     /// 被控端：取走待应用的远程视口尺寸（main 把焦点窗格 resize 到它）。
     pub fn take_viewport(&mut self) -> Option<(u16, u16)> {
@@ -2664,6 +2684,22 @@ impl RemoteWs {
         let req_id = self.next_req_id();
         self.inflight_remote_fsop.insert(req_id, dir.clone());
         self.send_frame(&RemoteFrame::MkFile { req_id, dir, name });
+    }
+
+    /// 控制端：远程菜单「重命名」——把被控端 `path` 改名为同目录下的 `new_name`（`Rename` 协议）。
+    /// 完成后刷新其**父目录**（改名前后同一父目录，一次刷新即反映）。
+    pub fn remote_rename(&mut self, path: String, new_name: String) {
+        if !self.is_controlling() || path.trim().is_empty() || new_name.trim().is_empty() {
+            return;
+        }
+        let req_id = self.next_req_id();
+        self.inflight_remote_fsop
+            .insert(req_id, parent_remote_dir(&path));
+        self.send_frame(&RemoteFrame::Rename {
+            req_id,
+            path,
+            new_name,
+        });
     }
 
     /// 控制端：远程菜单「删除」——删被控端 `path`（`is_dir` 递归）。完成后刷新其**父目录**。
@@ -4700,7 +4736,15 @@ impl RemoteWs {
     /// ② canonical 子树断言——`dir` 必须 `canonicalize` 成功，且 `dir.join(name)` 的父目录
     /// canonical 必须 `starts_with(dir_canonical)`（拒 `name` 含未被 ① 拦下的穿越组件 / symlink 逃逸）。
     fn put_resolve_target(dir: &str, name: &str) -> Result<PathBuf, FsErr> {
-        if crate::shell::filetree::validate_entry_name(name).is_err() {
+        // 被控端是**亲自落盘的一方**：按本机系统规则裁决（Windows 被控端卡设备名/尾点，
+        // Linux 被控端放行 `a:b` 这类 Windows 非法但 Linux 合法的名字）。控制端那侧只做
+        // 按路径形态推断的预校验，最终以这里为准。
+        if crate::shell::filetree::validate_entry_name_for(
+            crate::shell::filetree::NameRules::native(),
+            name,
+        )
+        .is_err()
+        {
             return Err(FsErr::PermissionDenied);
         }
         let dir_path = Path::new(dir);
@@ -4955,6 +4999,71 @@ impl RemoteWs {
                 path: target.display().to_string(),
                 err: None,
             });
+        }
+    }
+
+    /// 被控端：处理 `Rename`——把 `path` 改名为**同目录下**的 `new_name`。
+    ///
+    /// 复用 `put_resolve_target(父目录, new_name)` 做名字校验 + 子树断言（拒 `..` / 分隔符等借新名
+    /// 穿越或跨目录移动）。已存在同名项则拒绝（不覆盖，与 `MkFile` 的 `create_new` 同口径）；被改的
+    /// `path` 本身是先前 ListDir 枚举出的被控端真实路径（威胁模型同 `handle_delete`，不额外沙箱）。
+    fn handle_rename(&mut self, req_id: u64, path: String, new_name: String) {
+        let src = Path::new(&path);
+        let parent = match src.parent().filter(|_| !path.trim().is_empty()) {
+            // 根目录（无父）不可改名：按拒绝类错误回。
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => {
+                self.send_frame(&RemoteFrame::RenameResult {
+                    req_id,
+                    path: String::new(),
+                    err: Some(FsErr::PermissionDenied),
+                });
+                return;
+            }
+        };
+        let target = match Self::put_resolve_target(&parent.display().to_string(), &new_name) {
+            Ok(t) => t,
+            Err(err) => {
+                self.send_frame(&RemoteFrame::RenameResult {
+                    req_id,
+                    path: String::new(),
+                    err: Some(err),
+                });
+                return;
+            }
+        };
+        // 撞名不覆盖（`fs::rename` 在 Unix 上会静默覆盖目标文件，Windows 上报错——显式拦截统一两端
+        // 行为）。仅当目标确实是另一个项时拒绝：只改大小写（同一项）在不区分大小写的盘上放行。
+        if target.exists() && target != src {
+            let same_item = target
+                .canonicalize()
+                .ok()
+                .zip(src.canonicalize().ok())
+                .is_some_and(|(a, b)| a == b);
+            if !same_item {
+                log::warn!("Rename 目标已存在，拒绝覆盖: {}", target.display());
+                self.send_frame(&RemoteFrame::RenameResult {
+                    req_id,
+                    path: String::new(),
+                    err: Some(FsErr::Io),
+                });
+                return;
+            }
+        }
+        match std::fs::rename(src, &target) {
+            Ok(()) => self.send_frame(&RemoteFrame::RenameResult {
+                req_id,
+                path: target.display().to_string(),
+                err: None,
+            }),
+            Err(e) => {
+                log::warn!("Rename 失败 {path} → {}: {e}", target.display());
+                self.send_frame(&RemoteFrame::RenameResult {
+                    req_id,
+                    path: String::new(),
+                    err: Some(io_err_to_fs(&e)),
+                });
+            }
         }
     }
 
@@ -6697,6 +6806,22 @@ impl RemoteWs {
                     self.finish_remote_fsop(req_id, err);
                 }
             }
+            RemoteFrame::Rename {
+                req_id,
+                path,
+                new_name,
+            } => {
+                // 仅被控端：同目录改名（校验新名 + 拒穿越 / 拒覆盖）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_rename(req_id, path, new_name);
+                }
+            }
+            RemoteFrame::RenameResult { req_id, err, .. } => {
+                // 仅控制端：改名完成 → 刷新父目录（新名出现、旧名消失）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.finish_remote_fsop(req_id, err);
+                }
+            }
             // ── part3d 多会话 × 多窗格镜像（Phase 1 MVP：列表 + 订阅，单 mirror 只读）──────
             RemoteFrame::TabListSnapshot { tabs } => {
                 // 仅控制端：整组替换远程会话列表（被控端按 K6 去重后才发，低频）。订阅会话若已不在
@@ -6902,8 +7027,8 @@ impl RemoteWs {
                 }
             }
             RemoteFrame::SubViewport { tab_id, panes } => {
-                // 仅被控端：记下控制端请求的各窗格目标尺寸；main 在该会话为后台 tab 时 resize 其窗格
-                // （Phase 3 尺寸同步；前台由被控端窗口接管）。只留最新一份。
+                // 仅被控端：记下控制端请求的各窗格目标尺寸；main 一律 resize 其窗格（Phase 3 尺寸
+                // 同步；订阅期间网格恒由控制端拥有，前台后台都跟随）。只留最新一份。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
                     self.pending_sub_viewport = Some((
                         tab_id,

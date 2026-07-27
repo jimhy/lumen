@@ -200,6 +200,7 @@ pub static STRINGS: Strings = Strings {
     filetree_create_name_hint: "名稱",
     filetree_create_btn: "建立",
     filetree_cancel_btn: "取消",
+    filetree_rename_title_fmt: "重新命名「{}」",
     filetree_delete_title: "刪除",
     filetree_delete_what_dir: "資料夾（含其中全部內容）",
     filetree_delete_what_file: "檔案",

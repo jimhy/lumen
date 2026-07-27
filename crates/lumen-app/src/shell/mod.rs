@@ -374,7 +374,7 @@ pub struct MirrorPaneView {
 /// M5.3 part3d Phase 3c：多窗格镜像整体输入（各窗格 + 比例布局 + 结构）。
 ///
 /// **比例布局双向同步**（海风哥需求反转）：`layout` 初始复刻被控端 `row_weights`/`col_weights`，
-/// 控制端可拖分隔条改比例（产 `mirror_divider_*` 回 main → 改镜像布局 → `SubViewport` 让后台被控端
+/// 控制端可拖分隔条改比例（产 `mirror_divider_*` 回 main → 改镜像布局 → `SubViewport` 让被控端
 /// resize），被控端前台拖分隔条经 `SubscriptionStarted` 回送时控制端采纳。**焦点仍不同步**——
 /// 各格标题栏一致、不高亮；控制端自己的窗格选中留待 Phase 4。
 pub struct MirrorMultiInput {
@@ -603,7 +603,7 @@ pub struct ShellOutput {
     pub divider_rects: Vec<egui::Rect>,
     /// M5.3 part3d Phase 3c：**镜像**分隔条拖动中：(分隔条, 指针位置（逻辑点）)。语义同
     /// [`Self::divider_drag`]，但作用于控制端镜像布局而非本地 tab——main 调
-    /// `remote_ws.mirror_layout_mut()` 改比例，下一帧矩形变 → `SubViewport` 让后台被控端 resize。
+    /// `remote_ws.mirror_layout_mut()` 改比例，下一帧矩形变 → `SubViewport` 让被控端 resize。
     /// 多窗格镜像激活时本地分隔条交互被抑制，二者不同帧并存。
     pub mirror_divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
     /// M5.3 part3d Phase 3c：镜像分隔条拖动本帧结束（镜像布局不落盘，main 仅可停止重绘节流）。
@@ -686,12 +686,16 @@ pub struct ShellOutput {
     pub filetree_dialog_closed: bool,
     /// 远程文件树：新建确认 (远程目录, 名字, 是否目录) → main 调 `remote_ws.remote_make_dir/file`。
     pub remote_create: Option<(String, String, bool)>,
+    /// 远程文件树：改名确认 (远程 path, 新名) → main 调 `remote_ws.remote_rename`。
+    pub remote_rename: Option<(String, String)>,
     /// 远程文件树：删除确认 (远程 path, 是否目录) → main 调 `remote_ws.remote_delete`。
     pub remote_delete: Option<(String, bool)>,
     /// SSH 文件树：新建确认 (会话, 目录, 名字, 是否目录)。
     pub ssh_create: Option<(crate::ssh_runtime::SshSessionId, String, String, bool)>,
     /// SSH 文件树：永久删除确认 (会话, path, 是否目录)。
     pub ssh_delete: Option<(crate::ssh_runtime::SshSessionId, String, bool)>,
+    /// SSH 文件树：改名确认 (会话, 原 path, 新名, 是否目录) → main 调 `ssh_runtime.rename_entry`。
+    pub ssh_rename: Option<(crate::ssh_runtime::SshSessionId, String, String, bool)>,
     /// 远程文件树：菜单「进入文件夹」目标目录（被控端绝对路径）→ main 注入 `cd` 到远程会话。
     pub remote_cd: Option<String>,
     /// 内置文本编辑器请求读取远端文件。
@@ -859,9 +863,11 @@ pub fn show(
         copy_text: None,
         filetree_dialog_closed: false,
         remote_create: None,
+        remote_rename: None,
         remote_delete: None,
         ssh_create: None,
         ssh_delete: None,
+        ssh_rename: None,
         remote_cd: None,
         text_editor_load: None,
         text_editor_save: None,
@@ -1326,15 +1332,25 @@ pub fn show(
                 } => st
                     .filetree
                     .open_ssh_delete(session_id, path, name, is_directory),
+                ssh_filetree::SshFileTreeIntent::Rename {
+                    session_id,
+                    path,
+                    name,
+                    is_directory,
+                } => st
+                    .filetree
+                    .open_ssh_rename(session_id, path, name, is_directory),
                 other => out.ssh_filetree_intents.push(other),
             }
         }
         let mut dialog_out = filetree::RemoteFileTreeOutput::default();
         filetree::remote_dialog_ui(root.ctx(), &mut st.filetree, pal, &mut dialog_out);
         out.remote_create = dialog_out.remote_create;
+        out.remote_rename = dialog_out.remote_rename;
         out.remote_delete = dialog_out.remote_delete;
         out.ssh_create = dialog_out.ssh_create;
         out.ssh_delete = dialog_out.ssh_delete;
+        out.ssh_rename = dialog_out.ssh_rename;
         if dialog_out.dialog_closed {
             out.filetree_dialog_closed = true;
         }
@@ -1373,6 +1389,9 @@ pub fn show(
         if let Some(dir) = rout.new_file_req.take() {
             st.filetree.open_remote_create(dir, false);
         }
+        if let Some((path, name, is_dir)) = rout.rename_req.take() {
+            st.filetree.open_remote_rename(path, name, is_dir);
+        }
         if let Some((path, name, is_dir)) = rout.delete_req.take() {
             st.filetree.open_remote_delete(path, name, is_dir);
         }
@@ -1396,9 +1415,11 @@ pub fn show(
         // 远程菜单：复制路径文本 → 系统剪贴板（复用本地 copy_text 路径）；新建/删除确认 → main 发协议。
         out.copy_text = rout.copy_text;
         out.remote_create = rout.remote_create;
+        out.remote_rename = rout.remote_rename;
         out.remote_delete = rout.remote_delete;
         out.ssh_create = rout.ssh_create;
         out.ssh_delete = rout.ssh_delete;
+        out.ssh_rename = rout.ssh_rename;
         // 菜单「进入文件夹」→ main 往远程会话注入 cd。
         out.remote_cd = rout.cd_dir;
         if rout.busy_hint {

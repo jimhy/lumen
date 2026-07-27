@@ -198,6 +198,7 @@ pub static STRINGS: Strings = Strings {
     filetree_create_name_hint: "Name",
     filetree_create_btn: "Create",
     filetree_cancel_btn: "Cancel",
+    filetree_rename_title_fmt: "Rename \"{}\"",
     filetree_delete_title: "Delete",
     filetree_delete_what_dir: "folder (and all its contents)",
     filetree_delete_what_file: "file",
