@@ -23,6 +23,7 @@ pub use sftp::{
 pub use transport::{
     Command, CommandSendError, ConnectionConfig, ConnectionMode, DirectoryEntry,
     DirectoryEntryKind, DirectoryError, DisconnectReason, Event, EventError, EventErrorKind,
-    EventReceiveError, KeepaliveConfig, MetricsConfig, QueueConfig, SshConnection, StartError,
-    TerminalSize,
+    EventReceiveError, KeepaliveConfig, KillOutcome, KillStatus, ManageAction, ManageError,
+    ManageOutcome, ManageRequest, MetricsConfig, PortEntry, ProcessEntry, QueueConfig,
+    SshConnection, StartError, TerminalSize,
 };

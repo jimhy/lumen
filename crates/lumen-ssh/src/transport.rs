@@ -35,6 +35,13 @@ use crate::sftp::{
 mod directory;
 pub use directory::{DirectoryEntry, DirectoryEntryKind, DirectoryError};
 
+#[path = "manage.rs"]
+mod manage;
+pub use manage::{
+    KillOutcome, KillStatus, ManageAction, ManageError, ManageOutcome, ManageRequest, PortEntry,
+    ProcessEntry,
+};
+
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMANDS_PER_TICK: usize = 64;
 const MAX_MONITOR_OUTPUT_BYTES: usize = 64 * 1024;
@@ -315,6 +322,10 @@ pub enum Command {
     CancelDirectory {
         token: u64,
     },
+    /// Process management (kill / port lookup / name search) over short-lived
+    /// exec channels. Routed to the independent lane like directory listings,
+    /// and answered through [`SshConnection::drain_directory`].
+    Manage(ManageRequest),
     Disconnect,
 }
 
@@ -337,6 +348,11 @@ impl fmt::Debug for Command {
             Self::CancelDirectory { token } => formatter
                 .debug_struct("CancelDirectory")
                 .field("token", token)
+                .finish(),
+            Self::Manage(request) => formatter
+                .debug_struct("Manage")
+                .field("token", &request.token)
+                .field("action", &request.action)
                 .finish(),
             Self::Disconnect => formatter.write_str("Disconnect"),
         }
@@ -384,6 +400,12 @@ pub enum Event {
     DirectoryError {
         token: u64,
         error: DirectoryError,
+    },
+    /// Bounded result of a process management request on the independent
+    /// lane. Like directory results, it never affects terminal state.
+    ManageResult {
+        token: u64,
+        result: Result<ManageOutcome, manage::ManageError>,
     },
     Error(EventError),
     Disconnected {
@@ -453,6 +475,11 @@ impl fmt::Debug for Event {
                 .debug_struct("DirectoryError")
                 .field("token", token)
                 .field("error", error)
+                .finish(),
+            Self::ManageResult { token, result } => formatter
+                .debug_struct("ManageResult")
+                .field("token", token)
+                .field("ok", &result.is_ok())
                 .finish(),
             Self::Error(error) => formatter.debug_tuple("Error").field(error).finish(),
             Self::Disconnected { reason } => formatter
@@ -593,7 +620,9 @@ impl SshConnection {
     /// Enqueues a command without blocking the calling thread.
     pub fn send(&self, command: Command) -> Result<(), CommandSendError> {
         match command {
-            command @ (Command::ListDirectory { .. } | Command::CancelDirectory { .. }) => {
+            command @ (Command::ListDirectory { .. }
+            | Command::CancelDirectory { .. }
+            | Command::Manage(_)) => {
                 try_send_directory_command(&self.directory_command_tx, command)
             }
             command => try_send_command(&self.command_tx, command, self.maximum_input_bytes),
@@ -721,6 +750,9 @@ fn try_send_directory_command(
             return Err(CommandSendError::InvalidDirectoryRequest);
         }
         Command::CancelDirectory { .. } => {}
+        Command::Manage(request) => {
+            manage::validate(request).map_err(|_| CommandSendError::InvalidDirectoryRequest)?;
+        }
         Command::Input(_) | Command::Resize(_) | Command::Disconnect => {
             return Err(CommandSendError::InvalidDirectoryRequest);
         }
@@ -1248,6 +1280,11 @@ async fn drive_shell(
     let mut sftp_start: Option<SftpStartFuture<'_>> = Some(Box::pin(sftp::open(session)));
     let mut file_lanes = Some(file_lanes);
     let mut _file_service = None;
+    let (manage_done_tx, mut manage_done_rx) = mpsc::channel::<(
+        u64,
+        Result<ManageOutcome, manage::ManageError>,
+    )>(manage::MAX_CONCURRENT_REQUESTS);
+    let mut manage_in_flight = 0_usize;
 
     loop {
         if directory_start.is_none() {
@@ -1337,6 +1374,15 @@ async fn drive_shell(
                     emit_directory_event(&directory_lanes.event_tx, event);
                 }
             }
+            completed = manage_done_rx.recv(), if manage_in_flight > 0 => {
+                if let Some((token, result)) = completed {
+                    manage_in_flight = manage_in_flight.saturating_sub(1);
+                    emit_directory_event(
+                        &directory_lanes.event_tx,
+                        Event::ManageResult { token, result },
+                    );
+                }
+            }
             _ = command_tick.tick() => {
                 sink.flush()?;
                 if cancelled.load(Ordering::Acquire) {
@@ -1372,7 +1418,9 @@ async fn drive_shell(
                             resize
                                 .map_err(|_| Failure::channel("could not resize the SSH shell"))?;
                         }
-                        Ok(Command::ListDirectory { .. } | Command::CancelDirectory { .. }) => {
+                        Ok(Command::ListDirectory { .. }
+                        | Command::CancelDirectory { .. }
+                        | Command::Manage(_)) => {
                             // `SshConnection::send` routes these to the independent lane.
                         }
                         Ok(Command::Disconnect) => return Ok(DisconnectReason::Requested),
@@ -1425,6 +1473,50 @@ async fn drive_shell(
                         Ok(Command::CancelDirectory { token }) => {
                             if let Some(request) = directory_cancellations.get(&token) {
                                 request.store(true, Ordering::Release);
+                            }
+                        }
+                        Ok(Command::Manage(request)) => {
+                            let error = if manage::validate(&request).is_err() {
+                                Some(manage::ManageError::InvalidRequest)
+                            } else if manage_in_flight >= manage::MAX_CONCURRENT_REQUESTS {
+                                // 并发上限内静默排队没有意义（都是秒级短命令），
+                                // 直接回 Busy，让 UI 重试即可。
+                                Some(manage::ManageError::Busy)
+                            } else {
+                                None
+                            };
+                            if let Some(error) = error {
+                                emit_directory_event(
+                                    &directory_lanes.event_tx,
+                                    Event::ManageResult {
+                                        token: request.token,
+                                        result: Err(error),
+                                    },
+                                );
+                                continue;
+                            }
+                            let token = request.token;
+                            let action = request.action.clone();
+                            match manage::open_and_exec(session, &request, Arc::clone(&cancelled))
+                                .await
+                            {
+                                Ok(channel) => {
+                                    manage_in_flight += 1;
+                                    let sender = manage_done_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = manage::finish(channel, &action).await;
+                                        let _ = sender.send((token, result)).await;
+                                    });
+                                }
+                                Err(error) => {
+                                    emit_directory_event(
+                                        &directory_lanes.event_tx,
+                                        Event::ManageResult {
+                                            token,
+                                            result: Err(error),
+                                        },
+                                    );
+                                }
                             }
                         }
                         Ok(Command::Input(_) | Command::Resize(_) | Command::Disconnect) => {

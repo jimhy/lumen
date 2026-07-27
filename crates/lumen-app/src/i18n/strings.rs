@@ -674,6 +674,44 @@ pub struct Strings {
     pub ssh_monitor_processes: &'static str,
     pub ssh_monitor_command: &'static str,
     pub ssh_monitor_no_processes: &'static str,
+    /// 进程卡名称搜索框占位提示
+    pub ssh_monitor_search_hint: &'static str,
+    /// 进程卡端口查询框占位提示
+    pub ssh_monitor_port_hint: &'static str,
+    /// 端口查询按钮
+    pub ssh_monitor_port_query: &'static str,
+    /// 清除搜索/查询结果
+    pub ssh_monitor_clear: &'static str,
+    /// 搜索进行中
+    pub ssh_monitor_searching: &'static str,
+    /// 远端查询失败
+    pub ssh_monitor_search_failed: &'static str,
+    /// 名称搜索无匹配
+    pub ssh_monitor_no_match: &'static str,
+    /// 端口无监听进程
+    pub ssh_monitor_port_none: &'static str,
+    /// 无权限看到进程归属
+    pub ssh_monitor_port_unknown: &'static str,
+    /// 终止进程按钮
+    pub ssh_monitor_kill: &'static str,
+    /// 强制终止（SIGKILL）按钮
+    pub ssh_monitor_kill_force: &'static str,
+    /// 取消终止确认
+    pub ssh_monitor_kill_cancel: &'static str,
+    /// 终止确认语（后接 PID）
+    pub ssh_monitor_kill_confirm: &'static str,
+    /// 已发送终止信号（后接 PID）
+    pub ssh_monitor_kill_sent: &'static str,
+    /// 权限不足（后接 PID）
+    pub ssh_monitor_kill_denied: &'static str,
+    /// 进程已不存在（后接 PID）
+    pub ssh_monitor_kill_missing: &'static str,
+    /// 终止命令执行失败（后接 PID）
+    pub ssh_monitor_kill_failed: &'static str,
+    /// SSH 状态栏：收起监控面板按钮
+    pub ssh_statusbar_monitor_hide: &'static str,
+    /// SSH 状态栏：展开监控面板按钮
+    pub ssh_statusbar_monitor_show: &'static str,
     /// 远程设备列表标题（M5.2）
     pub remote_list_title: &'static str,
     /// 设备在线
@@ -843,8 +881,12 @@ pub struct Strings {
     pub update_modal_notes_label: &'static str,
     /// 弹窗「安装包已下载就绪」提示行（Warp 式静默预下载完成）
     pub update_modal_ready_hint: &'static str,
+    /// 弹窗提示行（非 Windows：自动安装是 Windows 专属，引导手动下载）
+    pub update_modal_manual_hint: &'static str,
     /// 立即更新按钮
     pub update_btn_install: &'static str,
+    /// 前往下载按钮（非 Windows 更新弹窗主 CTA）
+    pub update_btn_download: &'static str,
     /// 稍后按钮
     pub update_btn_later: &'static str,
     /// 跳过此版本按钮

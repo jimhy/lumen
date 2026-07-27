@@ -57,6 +57,154 @@ pub enum ServerConnBadge {
     Error,
 }
 
+/// SSH 模式底部状态栏的产出。
+#[derive(Default)]
+pub struct SshStatusBarOutput {
+    /// 点击了监控面板收起/展开切换。
+    pub toggle_monitor: bool,
+}
+
+/// 绘制 SSH 模式的底部状态栏。
+///
+/// # 内容（左→右）
+/// - 左：连接态 ● 圆点 + 状态文字（颜色语义与 SSH 顶栏一致，由调用方传入）+ endpoint
+/// - 中：当前会话名（cwd 尾目录或自定义名，hover 看 endpoint）
+/// - 右：监控面板收起/展开切换按钮（与本地状态栏经典按钮同一视觉语言）
+///
+/// * `status` - 连接态 (文字, 颜色)；`None` 表示无会话（显示「选择服务器」提示）。
+/// * `endpoint` - `user@host:port`，无会话时 None。
+/// * `session_title` - 当前会话显示名，无会话时 None。
+/// * `monitor_collapsed` - 监控面板当前是否收起（决定按钮文字）。
+pub fn show_ssh(
+    root: &mut egui::Ui,
+    status: Option<(&'static str, egui::Color32)>,
+    endpoint: Option<&str>,
+    session_title: Option<&str>,
+    monitor_collapsed: bool,
+    pal: &Palette,
+) -> SshStatusBarOutput {
+    let mut out = SshStatusBarOutput::default();
+    let s = crate::i18n::strings();
+
+    let panel_rect = root.available_rect_before_wrap();
+
+    // 顶边 1px 描边（与全 app 面板描边一致）
+    {
+        use egui::emath::GuiRounding as _;
+        let ppp = root.pixels_per_point();
+        let r = root.available_rect_before_wrap().round_to_pixels(ppp);
+        let hw = 0.5 / ppp;
+        root.painter().line_segment(
+            [
+                egui::pos2(r.min.x, r.min.y + hw),
+                egui::pos2(r.max.x, r.min.y + hw),
+            ],
+            egui::Stroke::new(1.0 / ppp, pal.panel_outline),
+        );
+    }
+
+    root.horizontal(|ui| {
+        ui.add_space(8.0);
+
+        // ── 左：连接态 ● + 状态文字 + endpoint ─────────────────────
+        if let Some((status_text, status_color)) = status {
+            let (dot_rect, _) =
+                ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
+            ui.painter()
+                .circle_filled(dot_rect.center(), 3.0, status_color);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(status_text)
+                        .size(11.0)
+                        .color(status_color),
+                )
+                .selectable(false),
+            );
+            if let Some(endpoint) = endpoint {
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(endpoint).size(11.0).color(pal.fg_dim))
+                        .selectable(false),
+                );
+            }
+        } else {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(s.ssh_select_server)
+                        .size(11.0)
+                        .color(pal.fg_dim),
+                )
+                .selectable(false),
+            );
+        }
+
+        ui.add_space(12.0);
+
+        // ── 中：会话名（截断显示，hover endpoint）──────────────────
+        let btn_text = if monitor_collapsed {
+            s.ssh_statusbar_monitor_show
+        } else {
+            s.ssh_statusbar_monitor_hide
+        };
+        let btn_text_w: f32 = btn_text
+            .chars()
+            .map(|c| if c.is_ascii() { 7.0_f32 } else { 12.0_f32 })
+            .sum();
+        let btn_w_approx = btn_text_w + 12.0 + 8.0;
+        let title_w = (ui.available_width() - btn_w_approx - 8.0).max(10.0);
+        let (mid_rect, mid_resp) = ui.allocate_exact_size(
+            egui::vec2(title_w, ui.available_height()),
+            egui::Sense::hover(),
+        );
+        if let Some(title) = session_title {
+            ui.painter().text(
+                egui::pos2(mid_rect.min.x, mid_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                title,
+                egui::FontId::proportional(11.0),
+                pal.fg_dim,
+            );
+            if let Some(endpoint) = endpoint {
+                mid_resp.on_hover_text(endpoint);
+            }
+        }
+
+        // ── 右：监控面板收起/展开切换（与本地经典按钮同一几何）─────
+        let btn_h = 18.0_f32;
+        let btn_w = btn_text_w + 12.0;
+        let (cell_rect, _) = ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::hover());
+        let btn_rect = egui::Rect::from_center_size(
+            egui::pos2(cell_rect.center().x, panel_rect.center().y),
+            egui::vec2(btn_w, btn_h),
+        );
+        let resp = ui.interact(
+            btn_rect,
+            ui.id().with("ssh_statusbar_monitor_btn"),
+            egui::Sense::click(),
+        );
+        if ui.is_rect_visible(btn_rect) {
+            let painter = ui.painter();
+            if resp.hovered() {
+                painter.rect_filled(btn_rect, egui::CornerRadius::same(4), pal.bg_highlight);
+            }
+            painter.text(
+                btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                btn_text,
+                egui::FontId::proportional(11.0),
+                if resp.hovered() { pal.fg } else { pal.fg_dim },
+            );
+        }
+        if resp.clicked() {
+            out.toggle_monitor = true;
+        }
+
+        ui.add_space(8.0);
+    });
+
+    out
+}
+
 /// 绘制底部状态栏。
 ///
 /// # Arguments

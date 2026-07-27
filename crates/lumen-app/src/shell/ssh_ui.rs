@@ -638,6 +638,14 @@ pub struct SshUiState {
     dialog: Option<Dialog>,
     dragged_profile_id: Option<ProfileId>,
     drop_target: Option<DropTarget>,
+    /// 监控面板收起（右侧只剩一条展开手柄）。应用级偏好，跨会话共享。
+    monitor_collapsed: bool,
+    /// 进程卡「按名称搜索」输入框文本。
+    process_query: String,
+    /// 进程卡「按端口查询」输入框文本。
+    port_query: String,
+    /// 等待二次确认的待终止 PID。
+    kill_confirm: Option<u32>,
 }
 
 impl SshUiState {
@@ -661,6 +669,38 @@ impl SshUiState {
     pub fn close_for_app_lock(&mut self) {
         self.dialog = None;
         self.cancel_drag();
+    }
+
+    pub fn monitor_collapsed(&self) -> bool {
+        self.monitor_collapsed
+    }
+
+    pub fn toggle_monitor_collapsed(&mut self) {
+        self.monitor_collapsed = !self.monitor_collapsed;
+    }
+
+    pub fn process_query(&self) -> &str {
+        &self.process_query
+    }
+
+    pub fn process_query_mut(&mut self) -> &mut String {
+        &mut self.process_query
+    }
+
+    pub fn port_query(&self) -> &str {
+        &self.port_query
+    }
+
+    pub fn port_query_mut(&mut self) -> &mut String {
+        &mut self.port_query
+    }
+
+    pub fn kill_confirm(&self) -> Option<u32> {
+        self.kill_confirm
+    }
+
+    pub fn set_kill_confirm(&mut self, pid: Option<u32>) {
+        self.kill_confirm = pid;
     }
 
     fn cancel_drag(&mut self) {
@@ -1211,6 +1251,9 @@ fn draw_profile_rows(
             let name = text_ui.add(
                 egui::Label::new(RichText::new(&profile.name).color(pal.fg))
                     .truncate()
+                    // egui 0.34 的 selectable 默认会把 click_and_drag 并回
+                    // sense，吞掉行的双击并允许拖选文字——必须显式关掉。
+                    .selectable(false)
                     .sense(egui::Sense::hover()),
             );
             if name.hovered() {
@@ -1220,6 +1263,7 @@ fn draw_profile_rows(
             let endpoint_label = text_ui.add(
                 egui::Label::new(RichText::new(&endpoint).small().color(pal.fg_dim))
                     .truncate()
+                    .selectable(false)
                     .sense(egui::Sense::hover()),
             );
             if endpoint_label.hovered() {

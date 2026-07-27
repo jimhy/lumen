@@ -12,8 +12,8 @@ use std::time::Duration;
 use lumen_ssh::{
     Command, ConnectionConfig, ConnectionMode, Credential, DirectoryEntry, DirectoryEntryKind,
     DirectoryError, DisconnectReason, Event, EventErrorKind, FileCommand, FileError, FileEvent,
-    FileOperation, FileVersion, HostKeyIdentity, KeepaliveConfig, MetricsConfig, ServerMetrics,
-    SshConnection, TerminalSize,
+    FileOperation, FileVersion, HostKeyIdentity, KeepaliveConfig, KillStatus, ManageAction,
+    ManageOutcome, ManageRequest, MetricsConfig, ServerMetrics, SshConnection, TerminalSize,
 };
 use lumen_term::Terminal;
 
@@ -91,6 +91,59 @@ pub struct RuntimeView {
     pub metrics_error: Option<String>,
     pub unknown_host_key: Option<UnknownHostKey>,
     pub changed_host_key: Option<ChangedHostKey>,
+    pub process_search: Option<ProcessSearchView>,
+    pub port_lookup: Option<PortLookupView>,
+    pub kill_feedback: Option<KillFeedbackView>,
+}
+
+/// 进程名称搜索的展示状态（结果来自远端一次性 exec，不进入监控采样）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessSearchView {
+    pub query: String,
+    pub loading: bool,
+    pub error: bool,
+    pub results: Vec<SshProcessEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SshProcessEntry {
+    pub pid: u32,
+    pub cpu_percent: f32,
+    pub memory_percent: f32,
+    pub command: String,
+}
+
+/// 端口占用查询的展示状态。`pid: None` 表示远端工具对其它用户的进程
+/// 不可见（无权限），不是「没有进程」。
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortLookupView {
+    pub port: u16,
+    pub loading: bool,
+    pub error: bool,
+    pub entries: Vec<SshPortEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshPortEntry {
+    pub protocol: String,
+    pub local_address: String,
+    pub pid: Option<u32>,
+    pub command: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KillFeedbackView {
+    pub pid: u32,
+    pub status: SshKillStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshKillStatus {
+    Signalled,
+    PermissionDenied,
+    NoSuchProcess,
+    /// 传输/通道层失败（未送达信号），与「权限不足」区分。
+    Failed,
 }
 
 /// 系统监控面板使用的结构化快照与短期趋势。原始采样只保存在内存，
@@ -395,6 +448,39 @@ struct RuntimeSession {
     search_truncated: bool,
     search_error: Option<String>,
     latest_search_token: Option<u64>,
+    next_manage_token: u64,
+    pending_manage: HashMap<u64, PendingManage>,
+    process_search: Option<ProcessSearchState>,
+    port_lookup: Option<PortLookupState>,
+    kill_feedback: Option<KillFeedbackState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingManage {
+    Kill { pid: u32 },
+    QueryPort,
+    QueryProcess,
+}
+
+struct ProcessSearchState {
+    query: String,
+    loading: bool,
+    error: bool,
+    results: Vec<lumen_ssh::ProcessEntry>,
+}
+
+struct PortLookupState {
+    port: u16,
+    loading: bool,
+    error: bool,
+    entries: Vec<lumen_ssh::PortEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct KillFeedbackState {
+    pid: u32,
+    /// `None` 表示通道层失败（信号未送达）。
+    status: Option<KillStatus>,
 }
 
 #[derive(Clone)]
@@ -470,6 +556,11 @@ impl RuntimeSession {
             search_truncated: false,
             search_error: None,
             latest_search_token: None,
+            next_manage_token: 1,
+            pending_manage: HashMap::new(),
+            process_search: None,
+            port_lookup: None,
+            kill_feedback: None,
         }
     }
 
@@ -1523,6 +1614,114 @@ impl SshRuntime {
         before != session.terminal.grid().display_offset()
     }
 
+    /// 结束远端一个进程（`force` = SIGKILL，否则 SIGTERM）。结果异步到达，
+    /// 经 [`RuntimeView::kill_feedback`] 呈现；下一轮监控采样会反映进程消失。
+    pub fn kill_process(
+        &mut self,
+        session_id: SshSessionId,
+        pid: u32,
+        force: bool,
+    ) -> Result<(), String> {
+        let session = self.send_manage(
+            session_id,
+            PendingManage::Kill { pid },
+            ManageAction::Kill { pid, force },
+        )?;
+        session.kill_feedback = None;
+        Ok(())
+    }
+
+    /// 查询远端 TCP/UDP 端口的监听进程。
+    pub fn query_port(&mut self, session_id: SshSessionId, port: u16) -> Result<(), String> {
+        let session = self.send_manage(
+            session_id,
+            PendingManage::QueryPort,
+            ManageAction::QueryPort { port },
+        )?;
+        session.port_lookup = Some(PortLookupState {
+            port,
+            loading: true,
+            error: false,
+            entries: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// 按名称（命令行子串、忽略大小写）搜索远端进程。
+    pub fn search_processes(
+        &mut self,
+        session_id: SshSessionId,
+        query: &str,
+    ) -> Result<(), String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("SSH process search query is empty".to_owned());
+        }
+        let session = self.send_manage(
+            session_id,
+            PendingManage::QueryProcess,
+            ManageAction::QueryProcess {
+                query: query.to_owned(),
+            },
+        )?;
+        session.process_search = Some(ProcessSearchState {
+            query: query.to_owned(),
+            loading: true,
+            error: false,
+            results: Vec::new(),
+        });
+        Ok(())
+    }
+
+    pub fn clear_process_search(&mut self, session_id: SshSessionId) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        session.process_search.take().is_some()
+    }
+
+    pub fn clear_port_lookup(&mut self, session_id: SshSessionId) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        session.port_lookup.take().is_some()
+    }
+
+    pub fn dismiss_kill_feedback(&mut self, session_id: SshSessionId) -> bool {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return false;
+        };
+        session.kill_feedback.take().is_some()
+    }
+
+    fn send_manage(
+        &mut self,
+        session_id: SshSessionId,
+        pending: PendingManage,
+        action: ManageAction,
+    ) -> Result<&mut RuntimeSession, String> {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| "SSH session no longer exists".to_owned())?;
+        if session.state != ConnectionState::Connected {
+            return Err("SSH session is not connected".to_owned());
+        }
+        let token = session.next_manage_token;
+        session.next_manage_token = session.next_manage_token.wrapping_add(1).max(1);
+        let request = ManageRequest { token, action };
+        let result = session
+            .connection
+            .as_ref()
+            .ok_or_else(|| "SSH connection is closed".to_owned())?
+            .send(Command::Manage(request));
+        if let Err(error) = result {
+            return Err(error.to_string());
+        }
+        session.pending_manage.insert(token, pending);
+        Ok(session)
+    }
+
     pub fn drain(&mut self) -> DrainOutcome {
         let active_id = self.active_session_id;
         let mut outcome = DrainOutcome {
@@ -1739,6 +1938,48 @@ impl SshRuntime {
                     presented_algorithm: presented.algorithm.clone(),
                     presented_sha256_fingerprint: presented.sha256_fingerprint.clone(),
                 }),
+            process_search: session
+                .process_search
+                .as_ref()
+                .map(|search| ProcessSearchView {
+                    query: search.query.clone(),
+                    loading: search.loading,
+                    error: search.error,
+                    results: search
+                        .results
+                        .iter()
+                        .map(|entry| SshProcessEntry {
+                            pid: entry.pid,
+                            cpu_percent: entry.cpu_percent,
+                            memory_percent: entry.memory_percent,
+                            command: entry.command.clone(),
+                        })
+                        .collect(),
+                }),
+            port_lookup: session.port_lookup.as_ref().map(|lookup| PortLookupView {
+                port: lookup.port,
+                loading: lookup.loading,
+                error: lookup.error,
+                entries: lookup
+                    .entries
+                    .iter()
+                    .map(|entry| SshPortEntry {
+                        protocol: entry.protocol.clone(),
+                        local_address: entry.local_address.clone(),
+                        pid: entry.pid,
+                        command: entry.command.clone(),
+                    })
+                    .collect(),
+            }),
+            kill_feedback: session.kill_feedback.map(|feedback| KillFeedbackView {
+                pid: feedback.pid,
+                status: match feedback.status {
+                    Some(KillStatus::Signalled) => SshKillStatus::Signalled,
+                    Some(KillStatus::PermissionDenied) => SshKillStatus::PermissionDenied,
+                    Some(KillStatus::NoSuchProcess) => SshKillStatus::NoSuchProcess,
+                    None => SshKillStatus::Failed,
+                },
+            }),
         })
     }
 
@@ -2157,6 +2398,51 @@ fn apply_directory_event(session: &mut RuntimeSession, event: Event) -> bool {
             }
             true
         }
+        Event::ManageResult { token, result } => {
+            let Some(pending) = session.pending_manage.remove(&token) else {
+                return false;
+            };
+            match (pending, result) {
+                (PendingManage::Kill { pid }, Ok(ManageOutcome::Kill(outcome))) => {
+                    session.kill_feedback = Some(KillFeedbackState {
+                        pid,
+                        status: Some(outcome.status),
+                    });
+                }
+                (PendingManage::Kill { .. }, Ok(_)) => return false,
+                (PendingManage::Kill { pid }, Err(_)) => {
+                    // 通道层失败（信号未送达），与远端回执的权限/不存在区分。
+                    session.kill_feedback = Some(KillFeedbackState { pid, status: None });
+                }
+                (PendingManage::QueryPort, Ok(ManageOutcome::Ports(entries))) => {
+                    if let Some(lookup) = &mut session.port_lookup {
+                        lookup.loading = false;
+                        lookup.entries = entries;
+                    }
+                }
+                (PendingManage::QueryPort, Ok(_)) => return false,
+                (PendingManage::QueryPort, Err(_)) => {
+                    if let Some(lookup) = &mut session.port_lookup {
+                        lookup.loading = false;
+                        lookup.error = true;
+                    }
+                }
+                (PendingManage::QueryProcess, Ok(ManageOutcome::Processes(results))) => {
+                    if let Some(search) = &mut session.process_search {
+                        search.loading = false;
+                        search.results = results;
+                    }
+                }
+                (PendingManage::QueryProcess, Ok(_)) => return false,
+                (PendingManage::QueryProcess, Err(_)) => {
+                    if let Some(search) = &mut session.process_search {
+                        search.loading = false;
+                        search.error = true;
+                    }
+                }
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -2548,7 +2834,8 @@ fn apply_connection_test_event(attempt: &mut ConnectionTestAttempt, event: Event
         | Event::Metrics(_)
         | Event::MetricsError { .. }
         | Event::DirectoryListing { .. }
-        | Event::DirectoryError { .. } => {
+        | Event::DirectoryError { .. }
+        | Event::ManageResult { .. } => {
             attempt.state = ConnectionTestState::Error {
                 message: "SSH connection test received an unexpected shell event".to_owned(),
             };
@@ -2698,6 +2985,11 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
             // handled by `apply_directory_event`.
             false
         }
+        Event::ManageResult { .. } => {
+            // Manage results share the independent lane with directory
+            // events and are handled by `apply_directory_event`.
+            false
+        }
         Event::Error(error) => {
             session.state = ConnectionState::Error;
             session.detail = Some(error.message);
@@ -2709,6 +3001,10 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
             cancel_file_requests(session);
             session.search_loading = false;
             session.latest_search_token = None;
+            session.pending_manage.clear();
+            session.process_search = None;
+            session.port_lookup = None;
+            session.kill_feedback = None;
             session.shell_idle = false;
             session.cwd_report_scan_tail.clear();
             session.connection.take();

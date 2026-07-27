@@ -1,15 +1,17 @@
-//! F3 热更（自动更新）：启动查 GitHub 的 latest Release，有新版则提示 +
-//! 下载 Inno Setup 安装包 + 拉起安装器（Lumen 优雅退出，安装器覆盖安装
-//! 并重启）。**只走 GitHub、不发 Gitee**（海风哥 2026-06-13 拍板），
-//! 不依赖自建服务端（方案见需求池 F3）。
+//! F3 热更（自动更新）：启动查 GitHub 的 latest Release。Windows 有新版则
+//! 提示 + 下载 Inno Setup 安装包 + 拉起安装器（Lumen 优雅退出，安装器覆盖
+//! 安装并重启）；Linux/macOS 同样真实检查，但只提示版本与更新日志、引导
+//! 前往下载页手动更新（自动安装链路是 Windows 专属）。**只走 GitHub、不发
+//! Gitee**（海风哥 2026-06-13 拍板），不依赖自建服务端（方案见需求池 F3）。
 //!
 //! 本模块为**纯逻辑 + HTTP**（不含 winit/egui）：线程编排、事件唤醒、
 //! toast、UI 在 `main.rs` / `settings_ui.rs`。版本解析、Release JSON
 //! 解析、版本比较均可单测；网络请求用 [`ureq`]（同步，后台线程内阻塞）。
 //!
 //! # 前置
-//! [`GITHUB_REPO`]（`jimhy/lumen`）须发布带 `.exe` 安装包资产的 Release。
-//! 仓库/Release 不存在时检查静默失败（无更新），不影响正常使用。
+//! [`GITHUB_REPO`]（`jimhy/lumen`）须发布带可下载资产的 Release（Windows
+//! `.exe` / Linux `.tar.gz`/`.deb`）。仓库/Release 不存在时检查静默失败
+//! （无更新），不影响正常使用。
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -60,10 +62,7 @@ fn parse_leading_u32(s: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// 当前运行版本（编译期 `CARGO_PKG_VERSION`）。
-/// 仅 Windows 更新检查用（非 Windows [`check_for_update`] 直接返回 UpToDate，
-/// 无需比对版本），故 windows-only，避免非 Windows 上「函数从未使用」告警。
-#[cfg(windows)]
+/// 当前运行版本（编译期 `CARGO_PKG_VERSION`）。全平台更新检查共用。
 pub fn current_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version {
         major: 0,
@@ -118,15 +117,64 @@ pub fn should_auto_check(last: Option<u64>, now: u64, min_interval_ms: u64) -> b
     }
 }
 
-/// 从 GitHub Release JSON 解析出版本、日志与 `.exe` 安装包地址。
+/// 各平台优先匹配的资产文件名后缀（按优先级排序）。Windows 自动安装要
+/// Inno Setup `.exe`；Linux 引导手动下载优先通用 `.tar.gz` 其次 `.deb`；
+/// macOS 预留 `.dmg`/`.pkg`。匹配不到时回退第一个资产（见 [`select_asset_url`]）。
+#[cfg(target_os = "windows")]
+fn platform_asset_suffixes() -> &'static [&'static str] {
+    &[".exe"]
+}
+
+#[cfg(target_os = "linux")]
+fn platform_asset_suffixes() -> &'static [&'static str] {
+    &[".tar.gz", ".deb"]
+}
+
+#[cfg(target_os = "macos")]
+fn platform_asset_suffixes() -> &'static [&'static str] {
+    &[".dmg", ".pkg"]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn platform_asset_suffixes() -> &'static [&'static str] {
+    &[]
+}
+
+/// 从 Release 资产列表按平台后缀优先级挑一个下载地址；都不匹配回退第一个
+/// 有下载地址的资产。纯函数便于单测（GitHub assets JSON 数组 → URL）。
+fn select_asset_url(
+    assets: &[serde_json::Value],
+    suffixes: &[&str],
+) -> Option<String> {
+    let url_of = |asset: &serde_json::Value| {
+        asset
+            .get("browser_download_url")
+            .and_then(|u| u.as_str())
+            .map(str::to_owned)
+    };
+    let name_of = |asset: &serde_json::Value| {
+        asset
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::to_ascii_lowercase)
+    };
+    for suffix in suffixes {
+        if let Some(url) = assets
+            .iter()
+            .find(|a| name_of(a).is_some_and(|n| n.ends_with(suffix)))
+            .and_then(url_of)
+        {
+            return Some(url);
+        }
+    }
+    assets.first().and_then(url_of)
+}
+
+/// 从 GitHub Release JSON 解析出版本、日志与当前平台的安装包地址。
 ///
 /// GitHub Release 结构含 `tag_name` / `body` / `assets[]`（每项有 `name` +
-/// `browser_download_url`）。无 `.exe` 资产时回退取第一个资产；完全无资产
-/// 或无 tag 返回 None。
-/// 仅 Windows 更新检查（[`fetch_release`]）+ 单测用；非 Windows 非测试构建
-/// 用不到（[`check_for_update`] 直接返回 UpToDate），故 `any(windows, test)`
-/// 门控，避免 Linux/macOS release 构建「函数从未使用」告警。
-#[cfg(any(windows, test))]
+/// `browser_download_url`）。资产按 [`platform_asset_suffixes`] 优先匹配，
+/// 回退第一个；完全无资产或无 tag 返回 None。
 pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let tag = v.get("tag_name")?.as_str()?.to_owned();
@@ -136,21 +184,10 @@ pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
         .and_then(|b| b.as_str())
         .unwrap_or("")
         .to_owned();
-    let assets = v.get("assets").and_then(|a| a.as_array());
-    let download_url = assets.and_then(|arr| {
-        // 优先 .exe（Inno Setup 安装包）；否则取第一个有下载地址的资产。
-        let pick = arr
-            .iter()
-            .find(|a| {
-                a.get("name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| n.to_ascii_lowercase().ends_with(".exe"))
-            })
-            .or_else(|| arr.first());
-        pick.and_then(|a| a.get("browser_download_url"))
-            .and_then(|u| u.as_str())
-            .map(|s| s.to_owned())
-    });
+    let download_url = v
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| select_asset_url(arr, platform_asset_suffixes()));
     Some(ParsedRelease {
         version,
         tag,
@@ -160,8 +197,6 @@ pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
 }
 
 /// [`parse_release_json`] 的中间结果（下载地址可能缺失）。
-/// 与 [`parse_release_json`] 同门控（仅 Windows + 测试）。
-#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRelease {
     pub version: Version,
@@ -170,8 +205,7 @@ pub struct ParsedRelease {
     pub download_url: Option<String>,
 }
 
-/// GitHub latest Release API URL。仅 Windows 更新检查用（见 [`check_for_update`]）。
-#[cfg(windows)]
+/// GitHub latest Release API URL。
 fn latest_release_url(repo: &str) -> String {
     format!("https://api.github.com/repos/{repo}/releases/latest")
 }
@@ -190,8 +224,6 @@ fn with_proxy(builder: ureq::AgentBuilder, proxy: Option<&str>) -> ureq::AgentBu
 
 /// 请求并解析 GitHub 的 latest Release。失败（网络/HTTP 非 2xx/解析）返回
 /// `Err`。在后台线程内调用（阻塞）。`proxy` 为生效的网络代理（None=直连）。
-/// 仅 Windows 更新检查用（非 Windows [`check_for_update`] 直接返回 UpToDate）。
-#[cfg(windows)]
 fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> {
     let url = latest_release_url(repo);
     let agent = with_proxy(
@@ -222,11 +254,6 @@ fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> 
 }
 
 /// 更新检查结果。
-///
-/// 非 Windows 上 [`check_for_update`] 只构造 `UpToDate`，`Newer`/`Failed` 仅
-/// 在 `main.rs` 被模式匹配、从不构造 → 「variant never constructed」告警；但
-/// 两变体又必须保留（否则 main.rs 的 match 编译不过），故非 Windows 抑制该告警。
-#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     /// 有新版本。
@@ -241,32 +268,23 @@ pub enum CheckResult {
 /// 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。
 /// 在后台线程内调用（阻塞）。
 ///
-/// 非 Windows：自动更新分发的是 Windows Inno Setup `.exe` 安装包（见
-/// [`launch_installer`]），Linux/macOS 无从应用（走源码构建 / 平台包管理器）。
-/// 故一律返回 [`CheckResult::UpToDate`]，从源头掐断「弹更新提示 → 下载 .exe →
-/// 拉起安装器失败」的坏链路，整条更新 UI 流程在非 Windows 上永不触发。
+/// 全平台真实检查（2026-07-27 修复：非 Windows 曾直接短路 UpToDate，把
+/// 「本平台不自动安装」谎报成「已是最新」）。Windows 拿到 [`CheckResult::Newer`]
+/// 后走静默下载 + 安装器；Linux/macOS 由 UI 层引导前往下载页手动更新。
 pub fn check_for_update(proxy: Option<&str>) -> CheckResult {
-    #[cfg(not(windows))]
-    {
-        let _ = proxy;
-        CheckResult::UpToDate
-    }
-    #[cfg(windows)]
-    {
-        let current = current_version();
-        match fetch_release(GITHUB_REPO, proxy) {
-            Ok(info) if info.version > current => {
-                log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
-                CheckResult::Newer(info)
-            }
-            Ok(info) => {
-                log::debug!("F3：已是最新版 {current}（GitHub 上 {}）", info.version);
-                CheckResult::UpToDate
-            }
-            Err(e) => {
-                log::debug!("F3：{e}");
-                CheckResult::Failed
-            }
+    let current = current_version();
+    match fetch_release(GITHUB_REPO, proxy) {
+        Ok(info) if info.version > current => {
+            log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
+            CheckResult::Newer(info)
+        }
+        Ok(info) => {
+            log::debug!("F3：已是最新版 {current}（GitHub 上 {}）", info.version);
+            CheckResult::UpToDate
+        }
+        Err(e) => {
+            log::debug!("F3：{e}");
+            CheckResult::Failed
         }
     }
 }
@@ -410,6 +428,47 @@ mod tests {
     }
 
     #[test]
+    fn 资产选择_按平台后缀优先() {
+        let assets: Vec<serde_json::Value> = serde_json::from_str(r#"[
+            {"name": "Lumen-Setup-1.0.21.exe", "browser_download_url": "https://x/setup.exe"},
+            {"name": "lumen-app_1.0.21-1_amd64.deb", "browser_download_url": "https://x/app.deb"},
+            {"name": "Lumen-1.0.21-linux-x86_64.tar.gz", "browser_download_url": "https://x/app.tar.gz"}
+        ]"#)
+        .unwrap();
+        // Windows：.exe 优先。
+        assert_eq!(
+            select_asset_url(&assets, &[".exe"]).as_deref(),
+            Some("https://x/setup.exe")
+        );
+        // Linux：.tar.gz 优先于 .deb（与平台后缀顺序一致）。
+        assert_eq!(
+            select_asset_url(&assets, &[".tar.gz", ".deb"]).as_deref(),
+            Some("https://x/app.tar.gz")
+        );
+        assert_eq!(
+            select_asset_url(&assets, &[".deb"]).as_deref(),
+            Some("https://x/app.deb")
+        );
+        // 无匹配回退第一个。
+        assert_eq!(
+            select_asset_url(&assets, &[".dmg"]).as_deref(),
+            Some("https://x/setup.exe")
+        );
+    }
+
+    #[test]
+    fn 资产选择_大小写不敏感() {
+        let assets: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name": "Lumen-Setup.EXE", "browser_download_url": "https://x/setup.exe"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            select_asset_url(&assets, &[".exe"]).as_deref(),
+            Some("https://x/setup.exe")
+        );
+    }
+
+    #[test]
     fn release_json_无tag返回none() {
         assert!(parse_release_json(r#"{"body":"x"}"#).is_none());
         assert!(parse_release_json("not json").is_none());
@@ -438,8 +497,7 @@ mod tests {
         assert!(should_auto_check(Some(1_000_000), 5_000_000, 3_600_000));
     }
 
-    // latest_release_url 仅 Windows 编译（非 Windows 更新检查直接返回 UpToDate）。
-    #[cfg(windows)]
+    // latest_release_url 全平台编译（非 Windows 也真实检查更新）。
     #[test]
     fn latest_release_url_格式() {
         assert_eq!(

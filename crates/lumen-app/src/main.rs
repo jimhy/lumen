@@ -283,6 +283,29 @@ type MirrorSig = (
 /// 订阅期间该会话的网格按**控制电脑**算（`SubViewport`），本机窗口矩形不再改它。
 type ControllerGrids = (session::TabId, HashMap<session::SessionId, (usize, usize)>);
 
+/// 远程文件树根的 cwd 解析：优先 OSC 9;9 上报（Windows shell 集成注入）；
+/// unix 本地 shell 无注入（`session::shell_integration_args` 仅 Windows 返回
+/// 非空），退回读 shell 进程实时 cwd（与本地文件树输入同源，见 RedrawRequested
+/// 的 active_cwd 兜底）。缺了它，Linux 被控端的 `term.cwd()` 恒为 None，
+/// `RootChanged` 一帧都发不出，控制端远程树永远停在「等待 shell 上报路径」。
+fn remote_root_cwd(tab: &session::Tab) -> Option<String> {
+    let osc = tab.cwd_path();
+    #[cfg(unix)]
+    {
+        osc.or_else(|| {
+            tab.focused_pane()
+                .pty
+                .shell_pid()
+                .and_then(os_cwd::shell_cwd)
+                .map(|path| path.display().to_string())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        osc
+    }
+}
+
 /// part3d Phase 3c 多窗格镜像第 `i` 个窗格的离屏纹理保留 id：自 `MIRROR_OFFSCREEN_ID-1` 递减，
 /// 避开自增会话 id（小）与单 mirror 的 `MIRROR_OFFSCREEN_ID`（`u64::MAX`）。`i` 上限 = `MAX_PANES`。
 const fn mirror_pane_offscreen_id(i: usize) -> session::SessionId {
@@ -645,6 +668,8 @@ fn estimate_restored_pane_px(
 enum UpdateAction {
     /// 立即下载并安装。
     Install,
+    /// 前往下载页（非 Windows：自动安装是 Windows 专属，引导手动更新）。
+    OpenDownload,
     /// 稍后（本次运行不再弹）。
     Later,
     /// 跳过此版本（持久化 skip_version）。
@@ -2168,7 +2193,7 @@ impl AppState {
                 .sub_target()
                 .and_then(|sid| self.tabs.iter().find(|t| t.id == sid))
                 .or_else(|| self.tabs.get(self.active_tab))
-                .and_then(|t| t.cwd_path())
+                .and_then(remote_root_cwd)
             {
                 self.remote_ws.send_root_changed(cwd);
             }
@@ -3834,6 +3859,49 @@ impl AppState {
                 self.ssh_runtime.disconnect_active();
                 self.terminal_focused = false;
                 self.window.request_redraw();
+            }
+            SshRuntimeAction::KillProcess {
+                session_id,
+                pid,
+                force,
+            } => {
+                if let Err(error) = self.ssh_runtime.kill_process(session_id, pid, force) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::QueryPort { session_id, port } => {
+                if let Err(error) = self.ssh_runtime.query_port(session_id, port) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::SearchProcesses { session_id, query } => {
+                if let Err(error) = self.ssh_runtime.search_processes(session_id, &query) {
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, error);
+                }
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::ClearProcessSearch { session_id } => {
+                if self.ssh_runtime.clear_process_search(session_id) {
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::ClearPortLookup { session_id } => {
+                if self.ssh_runtime.clear_port_lookup(session_id) {
+                    self.window.request_redraw();
+                }
+            }
+            SshRuntimeAction::DismissKillFeedback { session_id } => {
+                if self.ssh_runtime.dismiss_kill_feedback(session_id) {
+                    self.window.request_redraw();
+                }
             }
             SshRuntimeAction::DismissHostKey { session_id } => {
                 self.ssh_runtime.dismiss_unknown_host_key(session_id);
@@ -6556,16 +6624,26 @@ impl AppState {
                     {
                         continue;
                     }
-                    // 新版本：记录并**后台静默下载**（Warp 式）——下载完成
-                    // （DownloadDone）才弹窗安装。启动时给一条轻提示让用户知道
+                    // 新版本：Windows 记录并**后台静默下载**（Warp 式）——下载完成
+                    // （DownloadDone）才弹窗安装；启动时给一条轻提示让用户知道
                     // 在后台下载（每个新版本仅一次，定时复查被上面的去重挡住）。
-                    self.shell_state.toast.push(
-                        shell::toast::ToastKind::Info,
-                        i18n::strings().update_toast_downloading.to_owned(),
-                    );
-                    self.update_ready = None;
-                    self.update_dismissed = false;
-                    self.spawn_update_download(&info);
+                    // 非 Windows 不自动安装（安装链路是 Inno Setup 专属）：直接
+                    // toast 发现新版本并即刻允许弹窗，引导前往下载页手动更新。
+                    if cfg!(windows) {
+                        self.shell_state.toast.push(
+                            shell::toast::ToastKind::Info,
+                            i18n::strings().update_toast_downloading.to_owned(),
+                        );
+                        self.update_ready = None;
+                        self.update_dismissed = false;
+                        self.spawn_update_download(&info);
+                    } else {
+                        self.shell_state.toast.push(
+                            shell::toast::ToastKind::Info,
+                            i18n::fmt1(i18n::strings().update_toast_available_fmt, info.version),
+                        );
+                        self.update_dismissed = false;
+                    }
                     self.update_available = Some(info);
                 }
                 update::UpdateMsg::UpToDate => self.shell_state.toast.push(
@@ -9576,7 +9654,7 @@ impl ApplicationHandler<PtyWake> for App {
                     .sub_target()
                     .and_then(|sid| state.tabs.iter().find(|t| t.id == sid))
                     .or_else(|| state.tabs.get(state.active_tab))
-                    .and_then(|t| t.cwd_path())
+                    .and_then(remote_root_cwd)
                 {
                     state.remote_ws.send_root_changed(cwd);
                 }
@@ -12091,17 +12169,13 @@ impl ApplicationHandler<PtyWake> for App {
                     maximized: tab.maximized,
                     tabs: &entries,
                     profile: state.profile.as_ref(),
-                    // 头像菜单更新项：有就绪更新时给版本号（显示「更新到 vX」）。
+                    // 头像菜单更新项：有可用更新时给版本号（显示「更新到 vX」）。
+                    // Windows 等静默下载就绪才显示；非 Windows 无下载链路，检查到即显示。
                     update_version: state
-                        .update_ready
-                        .is_some()
-                        .then(|| {
-                            state
-                                .update_available
-                                .as_ref()
-                                .map(|u| u.version.to_string())
-                        })
-                        .flatten(),
+                        .update_available
+                        .as_ref()
+                        .filter(|_| !cfg!(windows) || state.update_ready.is_some())
+                        .map(|u| u.version.to_string()),
                     // 登录态过期判定（自动续期之外的兜底）：本地时钟判过期，或服务端实际拒绝
                     // （list_devices 401 / 列表里已无本机 did）。后者修「token 被服务端失效但
                     // 本地 exp 未到 → 不提示、静默显绿却隐身、用户只能手动两台都重登」的痛点。
@@ -12251,14 +12325,16 @@ impl ApplicationHandler<PtyWake> for App {
                         );
                         (pos, text)
                     });
-                // F3：安装包已就绪（静默下载完成）且未「稍后」时弹窗——点
-                // 「立即更新」直接拉起已下好的安装器（Warp 式预下载）。
-                let update_modal: Option<update::UpdateInfo> =
-                    if state.update_ready.is_some() && !state.update_dismissed {
-                        state.update_available.clone()
-                    } else {
-                        None
-                    };
+                // F3：Windows 安装包已就绪（静默下载完成）且未「稍后」时弹窗——点
+                // 「立即更新」直接拉起已下好的安装器（Warp 式预下载）。非 Windows
+                // 无下载链路：检查到新版且未「稍后」即弹窗，引导前往下载页。
+                let update_modal: Option<update::UpdateInfo> = if !state.update_dismissed
+                    && (state.update_ready.is_some() || !cfg!(windows))
+                {
+                    state.update_available.clone()
+                } else {
+                    None
+                };
                 let mut update_action: Option<UpdateAction> = None;
                 // 边缘 resize 光标反馈（窗口外缘 → 对应方向；None=不在边缘）：本帧
                 // 在 run_ui 闭包末用 egui set_cursor_icon 注入（走 egui 光标缓存、
@@ -12525,9 +12601,13 @@ impl ApplicationHandler<PtyWake> for App {
                                 );
                                 ui.add_space(3.0);
                                 ui.label(
-                                    egui::RichText::new(s.update_modal_ready_hint)
-                                        .size(12.0)
-                                        .color(p.fg_dim),
+                                    egui::RichText::new(if cfg!(windows) {
+                                        s.update_modal_ready_hint
+                                    } else {
+                                        s.update_modal_manual_hint
+                                    })
+                                    .size(12.0)
+                                    .color(p.fg_dim),
                                 );
                                 ui.add_space(14.0);
                                 // —— 更新内容：小标题 + 带边框可滚动卡片 ——
@@ -12556,17 +12636,25 @@ impl ApplicationHandler<PtyWake> for App {
                                         });
                                     ui.add_space(16.0);
                                 }
-                                // —— 按钮行：主 CTA 立即更新 / 稍后（左），跳过此版本（右弱化）——
+                                // —— 按钮行：主 CTA 立即更新（非 Windows=前往下载）/ 稍后（左），跳过此版本（右弱化）——
                                 ui.horizontal(|ui| {
                                     let install = egui::Button::new(
-                                        egui::RichText::new(s.update_btn_install)
-                                            .strong()
-                                            .color(p.accent_fg),
+                                        egui::RichText::new(if cfg!(windows) {
+                                            s.update_btn_install
+                                        } else {
+                                            s.update_btn_download
+                                        })
+                                        .strong()
+                                        .color(p.accent_fg),
                                     )
                                     .fill(p.accent)
                                     .min_size(egui::vec2(104.0, 32.0));
                                     if ui.add(install).clicked() {
-                                        update_action = Some(UpdateAction::Install);
+                                        update_action = Some(if cfg!(windows) {
+                                            UpdateAction::Install
+                                        } else {
+                                            UpdateAction::OpenDownload
+                                        });
                                     }
                                     ui.add_space(8.0);
                                     if ui
@@ -12686,6 +12774,13 @@ impl ApplicationHandler<PtyWake> for App {
                                 }
                             }
                         }
+                    }
+                    Some(UpdateAction::OpenDownload) => {
+                        // 非 Windows：打开资产下载地址（浏览器），用户手动下载安装。
+                        if let Some(info) = state.update_available.as_ref() {
+                            links::open(&links::LinkTarget::Url(info.download_url.clone()));
+                        }
+                        state.update_dismissed = true;
                     }
                     Some(UpdateAction::Skip) => {
                         if let Some(tag) = state.update_available.as_ref().map(|i| i.tag.clone()) {
