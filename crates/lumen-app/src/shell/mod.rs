@@ -4476,7 +4476,7 @@ fn ssh_monitor_process_card(
             ssh_monitor_result_header(ui, &format!("「{}」", search.query), pal, || {
                 out.ssh_runtime_action = Some(SshRuntimeAction::ClearProcessSearch { session_id });
             });
-            if search.loading {
+            if search.loading && search.results.is_empty() {
                 ui.label(
                     egui::RichText::new(strings.ssh_monitor_searching)
                         .small()
@@ -4962,7 +4962,7 @@ fn ssh_process_window(
             );
             return;
         };
-        if search.loading {
+        if search.loading && search.results.is_empty() {
             ui.label(
                 egui::RichText::new(strings.ssh_monitor_searching)
                     .small()
@@ -4978,14 +4978,24 @@ fn ssh_process_window(
             );
             return;
         }
-        ui.label(
-            egui::RichText::new(crate::i18n::fmt1(
-                strings.ssh_process_count_fmt,
-                search.results.len()
-            ))
-            .small()
-            .color(pal.fg_dim),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(crate::i18n::fmt1(
+                    strings.ssh_process_count_fmt,
+                    search.results.len()
+                ))
+                .small()
+                .color(pal.fg_dim),
+            );
+            // 自动刷新期间旧列表保持显示，仅以小字提示（不再整屏闪烁）。
+            if search.loading {
+                ui.label(
+                    egui::RichText::new(strings.ssh_process_refreshing)
+                        .small()
+                        .color(pal.info),
+                );
+            }
+        });
         ui.add_space(3.0);
         // ── 全部进程表格：CPU/内存表头点击切换排序维度；行自绘撑满宽度 ──
         let sort_memory = st.ssh_ui.process_sort_memory();

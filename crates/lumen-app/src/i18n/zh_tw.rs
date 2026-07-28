@@ -456,6 +456,7 @@ pub static STRINGS: Strings = Strings {
     ssh_process_empty_hint: "點「重新整理」載入程序列表",
     ssh_process_count_fmt: "共 {} 條",
     ssh_process_sort_tip: "點擊切換排序維度",
+    ssh_process_refreshing: "重新整理中…",
     toolbar_ssh_monitor_hide_tip: "隱藏伺服器監控面板",
     toolbar_ssh_monitor_show_tip: "顯示伺服器監控面板",
     remote_list_title: "裝置",

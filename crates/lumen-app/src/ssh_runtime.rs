@@ -1662,12 +1662,22 @@ impl SshRuntime {
                 query: query.to_owned(),
             },
         )?;
-        session.process_search = Some(ProcessSearchState {
-            query: query.to_owned(),
-            loading: true,
-            error: false,
-            results: Vec::new(),
-        });
+        // stale-while-revalidate：同 query 的自动刷新保留旧列表，只在返回时
+        // 替换——清空重建会让 UI 每次刷新都闪「搜索中」占位（海风哥反馈）。
+        match &mut session.process_search {
+            Some(existing) if existing.query == query => {
+                existing.loading = true;
+                existing.error = false;
+            }
+            _ => {
+                session.process_search = Some(ProcessSearchState {
+                    query: query.to_owned(),
+                    loading: true,
+                    error: false,
+                    results: Vec::new(),
+                });
+            }
+        }
         Ok(())
     }
 

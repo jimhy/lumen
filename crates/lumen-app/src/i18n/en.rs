@@ -456,6 +456,7 @@ pub static STRINGS: Strings = Strings {
     ssh_process_empty_hint: "Click Refresh to load the process list",
     ssh_process_count_fmt: "{} entries",
     ssh_process_sort_tip: "Click to switch sort key",
+    ssh_process_refreshing: "Refreshing…",
     toolbar_ssh_monitor_hide_tip: "Hide server monitor panel",
     toolbar_ssh_monitor_show_tip: "Show server monitor panel",
     remote_list_title: "Devices",
