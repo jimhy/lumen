@@ -3324,15 +3324,21 @@ impl AppState {
         // 会话，不能在会话栏留下永远无法继续的空 Shell。
         self.discard_ssh_credential_dialog();
         self.terminal_focused = false;
-        self.shell_state.ssh_credentials = Some(shell::SshCredentialDialog::open(
-            session_id,
-            profile.id.clone(),
-            profile.name.clone(),
-            profile.host.clone(),
-            profile.port,
-            profile.username.clone(),
-            kind,
-        ));
+        // 上一次失败原因（认证失败等）带进对话框内显示（红字）——错误
+        // 文本属于这里，不该只挤在顶栏（海风哥：密码错误文本位置不对）。
+        let error_text = self.ssh_runtime.session_error_detail(session_id);
+        self.shell_state.ssh_credentials = Some(
+            shell::SshCredentialDialog::open(
+                session_id,
+                profile.id.clone(),
+                profile.name.clone(),
+                profile.host.clone(),
+                profile.port,
+                profile.username.clone(),
+                kind,
+            )
+            .with_error_text(error_text),
+        );
     }
 
     fn discard_ssh_credential_dialog(&mut self) {

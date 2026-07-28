@@ -139,6 +139,8 @@ pub struct SshCredentialDialog {
     password: String,
     private_key_path: Option<std::path::PathBuf>,
     key_passphrase: String,
+    /// 上一次尝试的失败原因（认证失败/连接失败重弹时带入），对话框内红字显示。
+    error_text: Option<String>,
 }
 
 impl SshCredentialDialog {
@@ -162,7 +164,17 @@ impl SshCredentialDialog {
             password: String::new(),
             private_key_path: None,
             key_passphrase: String::new(),
+            error_text: None,
         }
+    }
+
+    pub(crate) fn with_error_text(mut self, error_text: Option<String>) -> Self {
+        self.error_text = error_text.filter(|text| !text.is_empty());
+        self
+    }
+
+    pub(crate) fn error_text(&self) -> Option<&str> {
+        self.error_text.as_deref()
     }
 
     pub(crate) const fn session_id(&self) -> crate::ssh_runtime::SshSessionId {
@@ -3562,8 +3574,13 @@ fn ssh_workspace(
         .circle_filled(status_dot.center(), 3.0, status_color);
     header_ui.label(egui::RichText::new(status_text).small().color(status_color));
     if let Some(detail) = &view.detail {
+        // 长错误文本（如认证失败详情）截断保护：截断+hover 全文，防把
+        // 右侧按钮挤出/压变形（header 固定 48px 高、宽度有限）。
         header_ui
-            .label(egui::RichText::new(detail).small().color(pal.fg_dim))
+            .add(
+                egui::Label::new(egui::RichText::new(detail).small().color(pal.fg_dim))
+                    .truncate(),
+            )
             .on_hover_text(detail);
     }
     if matches!(
@@ -5686,6 +5703,16 @@ fn ssh_runtime_modals(
                     }
                 }
                 ui.add_space(8.0);
+                // 上一次失败原因（认证失败/连接失败）红字显示在对话框内——
+                // 用户重输时知道为什么（海风哥：密码错误文本位置不对）。
+                if let Some(error_text) = dialog.error_text() {
+                    ui.label(
+                        egui::RichText::new(error_text)
+                            .small()
+                            .color(pal.error),
+                    );
+                    ui.add_space(6.0);
+                }
                 ui.label(
                     egui::RichText::new(strings.ssh_credentials_memory_only)
                         .small()

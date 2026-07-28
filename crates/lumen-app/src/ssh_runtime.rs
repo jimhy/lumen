@@ -668,6 +668,17 @@ impl SshRuntime {
         self.sessions.contains_key(&session_id)
     }
 
+    /// 指定会话的错误详情（Error 态的最近一条失败原因，如认证失败）。
+    /// 凭据对话框重弹时据此显示「密码错误」行——错误文本属于对话框，
+    /// 不该只出现在顶栏（海风哥 2026-07-28 反馈）。
+    #[must_use]
+    pub fn session_error_detail(&self, session_id: SshSessionId) -> Option<String> {
+        let session = self.sessions.get(&session_id)?;
+        (session.state == ConnectionState::Error)
+            .then(|| session.detail.clone())
+            .flatten()
+    }
+
     fn invalidate_editor_session(&mut self, session_id: SshSessionId) {
         if !self.pending_editor_invalidations.contains(&session_id) {
             self.pending_editor_invalidations.push(session_id);
