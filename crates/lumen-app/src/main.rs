@@ -3924,16 +3924,6 @@ impl AppState {
                 }
                 self.window.request_redraw();
             }
-            SshRuntimeAction::ClearProcessSearch { session_id } => {
-                if self.ssh_runtime.clear_process_search(session_id) {
-                    self.window.request_redraw();
-                }
-            }
-            SshRuntimeAction::ClearPortLookup { session_id } => {
-                if self.ssh_runtime.clear_port_lookup(session_id) {
-                    self.window.request_redraw();
-                }
-            }
             SshRuntimeAction::DismissKillFeedback { session_id } => {
                 if self.ssh_runtime.dismiss_kill_feedback(session_id) {
                     self.window.request_redraw();

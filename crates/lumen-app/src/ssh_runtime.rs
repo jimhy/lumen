@@ -1643,7 +1643,8 @@ impl SshRuntime {
         Ok(())
     }
 
-    /// 查询远端 TCP/UDP 端口的监听进程。
+    /// 查询远端 TCP/UDP 端口的监听进程。与进程搜索互斥（搜索框内容
+    /// 决定显示哪一类结果，海风哥 2026-07-28：清空即恢复全量，无清除按钮）。
     pub fn query_port(&mut self, session_id: SshSessionId, port: u16) -> Result<(), String> {
         let session = self.send_manage(
             session_id,
@@ -1656,6 +1657,7 @@ impl SshRuntime {
             error: false,
             entries: Vec::new(),
         });
+        session.process_search = None;
         Ok(())
     }
 
@@ -1690,21 +1692,8 @@ impl SshRuntime {
                 });
             }
         }
+        session.port_lookup = None;
         Ok(())
-    }
-
-    pub fn clear_process_search(&mut self, session_id: SshSessionId) -> bool {
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return false;
-        };
-        session.process_search.take().is_some()
-    }
-
-    pub fn clear_port_lookup(&mut self, session_id: SshSessionId) -> bool {
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return false;
-        };
-        session.port_lookup.take().is_some()
     }
 
     pub fn dismiss_kill_feedback(&mut self, session_id: SshSessionId) -> bool {

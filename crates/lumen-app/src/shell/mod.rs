@@ -351,12 +351,6 @@ pub enum SshRuntimeAction {
         session_id: crate::ssh_runtime::SshSessionId,
         query: String,
     },
-    ClearProcessSearch {
-        session_id: crate::ssh_runtime::SshSessionId,
-    },
-    ClearPortLookup {
-        session_id: crate::ssh_runtime::SshSessionId,
-    },
     DismissKillFeedback {
         session_id: crate::ssh_runtime::SshSessionId,
     },
@@ -4442,6 +4436,38 @@ fn ssh_search_target(text: &str) -> Option<SshSearchTarget> {
     Some(SshSearchTarget::Processes(text.to_owned()))
 }
 
+/// 实时搜索防抖提交（面板进程卡与详情弹窗共用，海风哥：每输入一个字符
+/// 就搜，清空即恢复全量，无清除按钮）：文本静止 400ms 且与上次提交不同，
+/// 按统一语法（`:端口` / 进程名 / 空=全量）发起远端查询。
+fn ssh_live_search_tick(
+    st: &mut ShellState,
+    out: &mut ShellOutput,
+    session_id: crate::ssh_runtime::SshSessionId,
+) {
+    let Some(text) = st
+        .ssh_ui
+        .process_query_pending_submit(std::time::Duration::from_millis(400))
+    else {
+        return;
+    };
+    match ssh_search_target(&text) {
+        Some(SshSearchTarget::Port(port)) => {
+            out.ssh_runtime_action = Some(SshRuntimeAction::QueryPort { session_id, port });
+        }
+        Some(SshSearchTarget::Processes(query)) => {
+            out.ssh_runtime_action =
+                Some(SshRuntimeAction::SearchProcesses { session_id, query });
+        }
+        None => {
+            // 非法端口（`:8` 输入途中或 `:abc`）：不发查询也不标记已提交，
+            // 文本合法化后防抖仍会提交。
+            return;
+        }
+    }
+    st.ssh_ui.mark_process_query_submitted(text);
+    st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+}
+
 fn ssh_monitor_process_card(
     ui: &mut egui::Ui,
     view: &crate::ssh_runtime::RuntimeView,
@@ -4469,7 +4495,10 @@ fn ssh_monitor_process_card(
         // ── 终止结果反馈条（有则显示，可关闭）──────────────────────
         ssh_kill_feedback_bar(ui, view, pal, out);
 
-        // ── 名称搜索（远端一次性 exec，回车提交）＋ 详情弹窗入口 ──────
+        // ── 统一搜索框（实时搜索：静止 400ms 自动提交；空 = 全量）──────
+        ssh_live_search_tick(st, out, session_id);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(250));
         ui.horizontal(|ui| {
             let search_response = ui.add(
                 egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
@@ -4477,6 +4506,9 @@ fn ssh_monitor_process_card(
                     .font(egui::FontId::monospace(12.0))
                     .desired_width(ui.available_width() - 46.0),
             );
+            if search_response.changed() {
+                st.ssh_ui.mark_process_query_dirty();
+            }
             if ui
                 .add(egui::Button::new(
                     egui::RichText::new(strings.ssh_monitor_detail).small(),
@@ -4484,7 +4516,7 @@ fn ssh_monitor_process_card(
                 .clicked()
             {
                 // 详情弹窗：以统一搜索框内容打开（空 = 全量进程列表，
-                // `:端口` = 端口占用结果）。
+                // `:端口` = 端口占用结果）；同步已提交文本防防抖重复提交。
                 st.ssh_ui.set_process_window_open(true);
                 st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
                 match ssh_search_target(st.ssh_ui.process_query()) {
@@ -4498,22 +4530,7 @@ fn ssh_monitor_process_card(
                     }
                     None => {}
                 }
-            }
-            if search_response.lost_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-            {
-                // 统一搜索框：`:8080` = 查端口占用，其它 = 按进程名搜索。
-                match ssh_search_target(st.ssh_ui.process_query()) {
-                    Some(SshSearchTarget::Port(port)) => {
-                        out.ssh_runtime_action =
-                            Some(SshRuntimeAction::QueryPort { session_id, port });
-                    }
-                    Some(SshSearchTarget::Processes(query)) if !query.is_empty() => {
-                        out.ssh_runtime_action =
-                            Some(SshRuntimeAction::SearchProcesses { session_id, query });
-                    }
-                    _ => {}
-                }
+                st.ssh_ui.sync_process_query_submitted();
             }
         });
         ui.add_space(5.0);
@@ -4523,9 +4540,7 @@ fn ssh_monitor_process_card(
 
         // ── 结果区：名称搜索结果 > 端口查询结果 > 资源占用 Top ─────
         if let Some(search) = &view.process_search {
-            ssh_monitor_result_header(ui, &format!("「{}」", search.query), pal, || {
-                out.ssh_runtime_action = Some(SshRuntimeAction::ClearProcessSearch { session_id });
-            });
+            ssh_monitor_result_header(ui, &format!("「{}」", search.query), pal);
             if search.loading && search.results.is_empty() {
                 ui.label(
                     egui::RichText::new(strings.ssh_monitor_searching)
@@ -4580,9 +4595,7 @@ fn ssh_monitor_process_card(
         }
 
         if let Some(lookup) = &view.port_lookup {
-            ssh_monitor_result_header(ui, &format!(":{}", lookup.port), pal, || {
-                out.ssh_runtime_action = Some(SshRuntimeAction::ClearPortLookup { session_id });
-            });
+            ssh_monitor_result_header(ui, &format!(":{}", lookup.port), pal);
             if lookup.loading {
                 ui.label(
                     egui::RichText::new(strings.ssh_monitor_searching)
@@ -4702,13 +4715,9 @@ const SSH_PROC_NUM_W: f32 = 36.0;
 /// 进程行 × 按钮列宽。
 const SSH_PROC_KILL_W: f32 = 20.0;
 
-/// 结果区标题行：左标签 + 右侧「清除」按钮。
-fn ssh_monitor_result_header(
-    ui: &mut egui::Ui,
-    title: &str,
-    pal: &theme::Palette,
-    on_clear: impl FnOnce(),
-) {
+/// 结果区标题行（搜索词/端口号的当前查询标识；实时搜索下无清除按钮——
+/// 清空搜索框即恢复全量，见 ssh_live_search_tick）。
+fn ssh_monitor_result_header(ui: &mut egui::Ui, title: &str, pal: &theme::Palette) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(title)
@@ -4716,16 +4725,6 @@ fn ssh_monitor_result_header(
                 .small()
                 .color(pal.fg_dim),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new(crate::i18n::strings().ssh_monitor_clear).small(),
-                ))
-                .clicked()
-            {
-                on_clear();
-            }
-        });
     });
     ui.add_space(2.0);
 }
@@ -5064,6 +5063,7 @@ fn ssh_process_window(
     ))
     .id(egui::Id::new(("ssh_process_window", session_id)))
     .default_size([640.0, 440.0])
+    .min_size([520.0, 320.0])
     .resizable(true)
     .collapsible(false)
     .open(&mut open)
@@ -5105,7 +5105,8 @@ fn ssh_process_window(
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
 
-        // ── 操作行：搜索框 + 搜索 + 刷新（空词 = 全量）─────────────
+        // ── 操作行：统一搜索框（实时搜索）+ 刷新（空词 = 全量）────────
+        ssh_live_search_tick(st, out, session_id);
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
@@ -5113,20 +5114,16 @@ fn ssh_process_window(
                     .font(egui::FontId::monospace(13.0))
                     .desired_width(260.0),
             );
-            let submit = ui
+            if response.changed() {
+                st.ssh_ui.mark_process_query_dirty();
+            }
+            if ui
                 .add(egui::Button::new(
-                    egui::RichText::new(strings.ssh_process_search_btn).small(),
+                    egui::RichText::new(strings.ssh_process_refresh).small(),
                 ))
                 .clicked()
-                || ui
-                    .add(egui::Button::new(
-                        egui::RichText::new(strings.ssh_process_refresh).small(),
-                    ))
-                    .clicked()
-                || (response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-            if submit {
-                // 统一搜索框：`:8080` = 查端口占用，其它 = 进程名（空 = 全量）。
+            {
+                // 刷新 = 立即以当前搜索框内容重查（不等防抖）。
                 match ssh_search_target(st.ssh_ui.process_query()) {
                     Some(SshSearchTarget::Port(port)) => {
                         out.ssh_runtime_action =
@@ -5138,6 +5135,8 @@ fn ssh_process_window(
                     }
                     None => {}
                 }
+                st.ssh_ui
+                    .mark_process_query_submitted(st.ssh_ui.process_query().trim().to_owned());
                 st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
             }
         });
@@ -5148,9 +5147,7 @@ fn ssh_process_window(
 
         // ── 端口查询结果（`:端口` 搜索）优先于进程树 ──────────────
         if let Some(lookup) = &view.port_lookup {
-            ssh_monitor_result_header(ui, &format!(":{}", lookup.port), pal, || {
-                out.ssh_runtime_action = Some(SshRuntimeAction::ClearPortLookup { session_id });
-            });
+            ssh_monitor_result_header(ui, &format!(":{}", lookup.port), pal);
             if lookup.loading && lookup.entries.is_empty() {
                 ui.label(
                     egui::RichText::new(strings.ssh_monitor_searching)
@@ -5265,7 +5262,11 @@ fn ssh_process_window(
                 egui::FontId::monospace(13.0),
                 pal.fg_dim,
             );
-            let cmd_w = (ui.available_width() - KILL_W).max(40.0);
+            // 内容宽度永远留 8px 余量：egui 窗口每帧会把尺寸提升到「至少
+            // 装下上一帧内容」（resize.rs: desired = max(desired, last_content)），
+            // 内容贴满会形成「窗口变大→内容更宽→窗口更大」正反馈（海风哥：
+            // 弹窗一直往右扩、调不了）。内容适应容器，容器不迎合内容。
+            let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
             let (cmd_rect, _) =
                 ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
             ui.painter().text(
@@ -5375,7 +5376,7 @@ fn ssh_process_window(
                                 port_response.on_hover_text(full);
                             }
                         }
-                        let cmd_w = (ui.available_width() - KILL_W).max(40.0);
+                        let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
                         let (cmd_rect, cmd_response) = ui.allocate_exact_size(
                             egui::vec2(cmd_w, 20.0),
                             egui::Sense::hover(),

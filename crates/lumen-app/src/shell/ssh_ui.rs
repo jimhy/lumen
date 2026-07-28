@@ -671,6 +671,10 @@ pub struct SshUiState {    search: String,
     expanded_pids: HashSet<u32>,
     /// 进程卡「统一搜索框」文本（进程名，或 `:端口` 查询端口占用）。
     process_query: String,
+    /// 搜索框文本最后一次修改时间（实时搜索防抖：静止 400ms 后提交）。
+    process_query_dirty_at: Option<std::time::Instant>,
+    /// 最近一次实际提交到远端的搜索框文本（避免重复提交）。
+    process_query_submitted: String,
     /// 等待二次确认的待终止 PID。
     kill_confirm: Option<u32>,
 }
@@ -784,6 +788,33 @@ impl SshUiState {
 
     pub fn process_query_mut(&mut self) -> &mut String {
         &mut self.process_query
+    }
+
+    /// 输入框内容变化时打点（实时搜索防抖计时起点）。
+    pub fn mark_process_query_dirty(&mut self) {
+        self.process_query_dirty_at = Some(std::time::Instant::now());
+    }
+
+    /// 实时搜索防抖判定：文本静止 `quiet` 时长且与已提交文本不同 → 返回
+    /// 待提交的当前文本（调用方提交后应调 [`Self::mark_process_query_submitted`]）。
+    pub fn process_query_pending_submit(&self, quiet: std::time::Duration) -> Option<String> {
+        let dirty_at = self.process_query_dirty_at?;
+        if dirty_at.elapsed() < quiet {
+            return None;
+        }
+        let current = self.process_query.trim().to_owned();
+        (current != self.process_query_submitted).then_some(current)
+    }
+
+    pub fn mark_process_query_submitted(&mut self, text: String) {
+        self.process_query_submitted = text;
+        self.process_query_dirty_at = None;
+    }
+
+    /// 打开详情弹窗时同步已提交文本（避免弹窗打开瞬间被防抖重复提交一次）。
+    pub fn sync_process_query_submitted(&mut self) {
+        self.process_query_submitted = self.process_query.trim().to_owned();
+        self.process_query_dirty_at = None;
     }
 
     pub fn pid_expanded(&self, pid: u32) -> bool {

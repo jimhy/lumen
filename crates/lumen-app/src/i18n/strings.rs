@@ -686,8 +686,6 @@ pub struct Strings {
     pub ssh_monitor_no_processes: &'static str,
     /// 进程卡统一搜索框占位提示（进程名，或 :端口）
     pub ssh_monitor_search_hint: &'static str,
-    /// 清除搜索/查询结果
-    pub ssh_monitor_clear: &'static str,
     /// 搜索进行中
     pub ssh_monitor_searching: &'static str,
     /// 远端查询失败
@@ -724,8 +722,6 @@ pub struct Strings {
     pub ssh_process_ports: &'static str,
     /// 进程详情弹窗标题
     pub ssh_process_window_title: &'static str,
-    /// 详情弹窗搜索按钮
-    pub ssh_process_search_btn: &'static str,
     /// 详情弹窗刷新按钮
     pub ssh_process_refresh: &'static str,
     /// 详情弹窗未加载时的占位提示
