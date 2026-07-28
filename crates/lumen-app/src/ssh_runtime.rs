@@ -899,7 +899,15 @@ impl SshRuntime {
     }
 
     pub fn disconnect_active(&mut self) {
-        let Some(session) = self.active_session_mut() else {
+        let Some(session_id) = self.active_session_id else {
+            return;
+        };
+        self.disconnect_session(session_id);
+    }
+
+    /// 断开指定会话的连接（右键菜单按会话断开；未连接时静默无操作）。
+    pub fn disconnect_session(&mut self, session_id: SshSessionId) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
         if let Some(connection) = &session.connection {

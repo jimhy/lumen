@@ -321,6 +321,14 @@ pub enum SshRuntimeAction {
         name: String,
     },
     Disconnect,
+    /// 断开指定会话（会话右键菜单）。
+    DisconnectSession {
+        session_id: crate::ssh_runtime::SshSessionId,
+    },
+    /// 重新连接指定（已断开/失败的）会话：header「连接」按钮与右键菜单。
+    ReconnectSession {
+        session_id: crate::ssh_runtime::SshSessionId,
+    },
     TrustHostKey {
         session_id: crate::ssh_runtime::SshSessionId,
         profile_id: String,
@@ -2937,6 +2945,30 @@ fn ssh_session_sidebar_ui(
                 );
 
                 response.context_menu(|ui| {
+                    use crate::ssh_runtime::ConnectionState;
+                    // 连接状态决定首项：连接中/已连接 →「断开」；断开/失败 →「连接」。
+                    if matches!(
+                        session.state,
+                        ConnectionState::Connecting
+                            | ConnectionState::Connected
+                            | ConnectionState::Disconnecting
+                    ) && ui.button(strings.ssh_disconnect).clicked()
+                    {
+                        out.ssh_runtime_action = Some(SshRuntimeAction::DisconnectSession {
+                            session_id: session.session_id,
+                        });
+                        ui.close();
+                    }
+                    if matches!(
+                        session.state,
+                        ConnectionState::Disconnected | ConnectionState::Error
+                    ) && ui.button(strings.ssh_connect).clicked()
+                    {
+                        out.ssh_runtime_action = Some(SshRuntimeAction::ReconnectSession {
+                            session_id: session.session_id,
+                        });
+                        ui.close();
+                    }
                     if ui.button(strings.menu_rename).clicked() {
                         st.ssh_session_renaming =
                             Some((session.session_id, session.display_name.clone()));
@@ -3553,6 +3585,15 @@ fn ssh_workspace(
                 .clicked()
             {
                 out.ssh_runtime_action = Some(SshRuntimeAction::Disconnect);
+            }
+        });
+    } else if matches!(view.state, ConnectionState::Disconnected | ConnectionState::Error) {
+        // 断开/失败后同一位置变为「连接」按钮（海风哥）：重新走凭据→连接链路。
+        header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(strings.ssh_connect).clicked() {
+                out.ssh_runtime_action = Some(SshRuntimeAction::ReconnectSession {
+                    session_id: view.session_id,
+                });
             }
         });
     }

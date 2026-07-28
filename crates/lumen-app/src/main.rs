@@ -3872,6 +3872,30 @@ impl AppState {
                 self.terminal_focused = false;
                 self.window.request_redraw();
             }
+            SshRuntimeAction::DisconnectSession { session_id } => {
+                let disconnected_active = self
+                    .ssh_runtime
+                    .active_view()
+                    .is_some_and(|view| view.session_id == session_id);
+                self.ssh_runtime.disconnect_session(session_id);
+                if disconnected_active {
+                    self.terminal_focused = false;
+                }
+                self.window.request_redraw();
+            }
+            SshRuntimeAction::ReconnectSession { session_id } => {
+                let profile_id = self
+                    .ssh_runtime
+                    .session_views()
+                    .into_iter()
+                    .find(|view| view.session_id == session_id)
+                    .map(|view| view.profile_id);
+                if let Some(profile_id) = profile_id {
+                    self.continue_ssh_profile_connect(session_id, &profile_id);
+                }
+                self.terminal_focused = self.ssh_runtime.active_accepts_input();
+                self.window.request_redraw();
+            }
             SshRuntimeAction::KillProcess {
                 session_id,
                 pid,
