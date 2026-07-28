@@ -1659,8 +1659,10 @@ impl SshRuntime {
         Ok(())
     }
 
-    /// 查询远端 TCP/UDP 端口的监听进程。与进程搜索互斥（搜索框内容
-    /// 决定显示哪一类结果，海风哥 2026-07-28：清空即恢复全量，无清除按钮）。
+    /// 查询远端 TCP/UDP 端口的监听进程。保留 process_search 不动（端口
+    /// 结果行按进程表格样式渲染时需要它匹配 CPU/MEM/端口列）；反向地，
+    /// 进程名搜索（[`Self::search_processes`]）会清掉端口查询结果——
+    /// 显示永远跟着搜索框当前内容走。
     pub fn query_port(&mut self, session_id: SshSessionId, port: u16) -> Result<(), String> {
         let session = self.send_manage(
             session_id,
@@ -1709,6 +1711,11 @@ impl SshRuntime {
                 });
             }
         }
+        // 显示跟着搜索框内容走：进程名搜索时清掉端口查询结果——否则
+        // port_lookup 永远优先遮挡进程搜索结果（海风哥：搜 docker 显示的
+        // 不是 docker 结果）。反向（`:端口` 查询）保留 process_search 不动，
+        // 端口行需要它匹配 CPU/MEM/端口列。
+        session.port_lookup = None;
         Ok(())
     }
 
