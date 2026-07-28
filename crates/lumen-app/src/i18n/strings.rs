@@ -734,6 +734,8 @@ pub struct Strings {
     pub ssh_process_empty_hint: &'static str,
     /// 详情弹窗进程计数（fmt1 占位）
     pub ssh_process_count_fmt: &'static str,
+    /// 详情弹窗 CPU/MEM 表头排序切换提示
+    pub ssh_process_sort_tip: &'static str,
     /// 工具栏：隐藏服务器监控面板提示
     pub toolbar_ssh_monitor_hide_tip: &'static str,
     /// 工具栏：显示服务器监控面板提示

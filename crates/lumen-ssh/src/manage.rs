@@ -169,9 +169,10 @@ pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageErr
         }
         ManageAction::QueryProcess { query } => {
             let encoded = encode_octal(query.as_bytes());
-            // 全量列表预取略多于截断上限，给 rust 端 CPU 降序截取留余量。
+            // 全量列表预取给 CPU/MEM 双维度并集截断留余量（最长命令行的
+            // 极端环境由 96KB 输出上限兜底截断，parse 逐行容错）。
             let head = if query.is_empty() {
-                MAX_ALL_PROCESSES + 40
+                MAX_ALL_PROCESSES * 3
             } else {
                 MAX_SEARCH_RESULTS
             };
@@ -306,14 +307,36 @@ pub fn parse_outcome(action: &ManageAction, output: &str) -> Result<ManageOutcom
         ManageAction::QueryProcess { query } => {
             let mut entries = parse_process_entries(output);
             if query.is_empty() {
-                // 全量列表（详情弹窗）：CPU 降序截断到上限。
-                entries.sort_by(|left, right| {
+                // 全量列表（详情弹窗）：取 CPU top 与内存 top 的并集——UI 按
+                // 两个维度排序截 Top10，单按 CPU 截断会漏掉低 CPU 高内存进程。
+                let mut by_cpu: Vec<usize> = (0..entries.len()).collect();
+                by_cpu.sort_by(|&a, &b| {
+                    entries[b]
+                        .cpu_percent
+                        .partial_cmp(&entries[a].cpu_percent)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut by_memory = by_cpu.clone();
+                by_memory.sort_by(|&a, &b| {
+                    entries[b]
+                        .memory_percent
+                        .partial_cmp(&entries[a].memory_percent)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut keep = std::collections::HashSet::new();
+                keep.extend(by_cpu.into_iter().take(MAX_ALL_PROCESSES));
+                keep.extend(by_memory.into_iter().take(MAX_ALL_PROCESSES));
+                let mut union: Vec<ProcessEntry> = keep
+                    .into_iter()
+                    .map(|index| entries[index].clone())
+                    .collect();
+                union.sort_by(|left, right| {
                     right
                         .cpu_percent
                         .partial_cmp(&left.cpu_percent)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                entries.truncate(MAX_ALL_PROCESSES);
+                entries = union;
             }
             Ok(ManageOutcome::Processes(entries))
         }
@@ -376,7 +399,7 @@ fn parse_process_field(raw: &str) -> (Option<u32>, String) {
 fn parse_process_entries(output: &str) -> Vec<ProcessEntry> {
     output
         .lines()
-        .take(MAX_ALL_PROCESSES + 40)
+        .take(MAX_ALL_PROCESSES * 3)
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse::<u32>().ok()?;

@@ -663,6 +663,8 @@ pub struct SshUiState {    search: String,
     monitor_prefs_dirty: bool,
     /// 进程详情弹窗是否打开。
     process_window_open: bool,
+    /// 进程详情弹窗排序维度：true = 内存降序，false = CPU 降序（默认）。
+    process_sort_memory: bool,
     /// 进程卡「按名称搜索」输入框文本。
     process_query: String,
     /// 进程卡「按端口查询」输入框文本。
@@ -756,6 +758,14 @@ impl SshUiState {
 
     pub fn set_process_window_open(&mut self, open: bool) {
         self.process_window_open = open;
+    }
+
+    pub fn process_sort_memory(&self) -> bool {
+        self.process_sort_memory
+    }
+
+    pub fn set_process_sort_memory(&mut self, memory: bool) {
+        self.process_sort_memory = memory;
     }
 
     pub fn process_query(&self) -> &str {

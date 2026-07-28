@@ -4147,13 +4147,23 @@ fn ssh_monitor_cpu_card(
                                     .color(pal.fg_dim),
                             );
                             let value = core.usage_percent.unwrap_or(0.0);
+                            // 百分比文字放条外右侧——填充变长会盖住条内文字
+                            // （海风哥：CPU 进度条长了看不到数字）。
+                            let bar_w = (ui.available_width() - 42.0).max(20.0);
                             ui.add(
                                 egui::ProgressBar::new((value / 100.0).clamp(0.0, 1.0))
-                                    .desired_width(ui.available_width())
+                                    .desired_width(bar_w)
                                     .desired_height(9.0)
-                                    .fill(pal.info)
-                                    .text(format!("{value:.1}%")),
+                                    .fill(pal.info),
                             );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{value:.1}%"))
+                                        .monospace()
+                                        .small()
+                                        .color(pal.fg),
+                                );
+                            });
                         });
                     }
                 });
@@ -4893,20 +4903,21 @@ fn ssh_process_window(
     .collapsible(false)
     .open(&mut open)
     .show(ctx, |ui| {
-        // 与监控面板同款字号放大（Small 10pt → 12pt）。
+        // 与监控面板同款字号放大，详情弹窗再提一档（Small → 13pt，海风哥
+        // 两轮反馈详情界面字小）。
         let small_family = ui.style().text_styles[&egui::TextStyle::Small]
             .family
             .clone();
         ui.style_mut()
             .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::new(12.0, small_family));
+            .insert(egui::TextStyle::Small, egui::FontId::new(13.0, small_family));
 
         // ── 操作行：搜索框 + 搜索 + 刷新（空词 = 全量）─────────────
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
                     .hint_text(strings.ssh_monitor_search_hint)
-                    .font(egui::FontId::monospace(12.0))
+                    .font(egui::FontId::monospace(13.0))
                     .desired_width(260.0),
             );
             let submit = ui
@@ -4966,68 +4977,142 @@ fn ssh_process_window(
             .color(pal.fg_dim),
         );
         ui.add_space(3.0);
+        // ── Top10 表格：CPU/内存表头点击切换排序维度；行自绘撑满宽度 ──
+        let sort_memory = st.ssh_ui.process_sort_memory();
+        let mut entries: Vec<&crate::ssh_runtime::SshProcessEntry> = search.results.iter().collect();
+        entries.sort_by(|left, right| {
+            let key = |entry: &&crate::ssh_runtime::SshProcessEntry| {
+                if sort_memory {
+                    entry.memory_percent
+                } else {
+                    entry.cpu_percent
+                }
+            };
+            key(right)
+                .partial_cmp(&key(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries.truncate(10);
+
+        const PID_W: f32 = 72.0;
+        const NUM_W: f32 = 64.0;
+        const KILL_W: f32 = 26.0;
+        // 表头（与数据行同几何）。CPU/MEM 列可点击切换排序维度，当前维度带 ▼。
+        ui.horizontal(|ui| {
+            let (pid_rect, _) = ui.allocate_exact_size(egui::vec2(PID_W, 18.0), egui::Sense::hover());
+            ui.painter().text(
+                pid_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                "PID",
+                egui::FontId::monospace(13.0),
+                pal.fg_dim,
+            );
+            for (text, active, memory) in [
+                ("CPU", !sort_memory, false),
+                ("MEM", sort_memory, true),
+            ] {
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(NUM_W, 18.0), egui::Sense::click());
+                let label = if active {
+                    format!("{text} ▼")
+                } else {
+                    text.to_owned()
+                };
+                ui.painter().text(
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::monospace(13.0),
+                    if active { pal.info } else { pal.fg_dim },
+                );
+                if response.on_hover_text(strings.ssh_process_sort_tip).clicked() {
+                    st.ssh_ui.set_process_sort_memory(memory);
+                }
+            }
+            let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
+            let (cmd_rect, _) =
+                ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
+            ui.painter().text(
+                cmd_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                strings.ssh_monitor_command,
+                egui::FontId::monospace(13.0),
+                pal.fg_dim,
+            );
+        });
+        ui.separator();
+
         egui::ScrollArea::vertical()
             .id_salt(("ssh_process_window_scroll", session_id))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new(("ssh_process_window_grid", session_id))
-                    .num_columns(5)
-                    .striped(true)
-                    .spacing(egui::vec2(12.0, 4.0))
-                    .show(ui, |ui| {
-                        for text in ["PID", "CPU", "MEM", strings.ssh_monitor_command, ""] {
-                            ui.label(
-                                egui::RichText::new(text)
-                                    .monospace()
-                                    .small()
-                                    .color(pal.fg_dim),
+                for entry in entries {
+                    ui.horizontal(|ui| {
+                        let (pid_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(PID_W, 20.0), egui::Sense::hover());
+                        ui.painter().text(
+                            pid_rect.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            entry.pid.to_string(),
+                            egui::FontId::monospace(13.0),
+                            pal.fg,
+                        );
+                        for value in [entry.cpu_percent, entry.memory_percent] {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(NUM_W, 20.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                format!("{value:.1}"),
+                                egui::FontId::monospace(13.0),
+                                pal.fg,
                             );
                         }
-                        ui.end_row();
-                        for entry in &search.results {
-                            ui.label(
-                                egui::RichText::new(entry.pid.to_string())
-                                    .monospace()
-                                    .small()
-                                    .color(pal.fg),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{:.1}", entry.cpu_percent))
-                                    .monospace()
-                                    .small()
-                                    .color(pal.fg),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{:.1}", entry.memory_percent))
-                                    .monospace()
-                                    .small()
-                                    .color(pal.fg),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&entry.command)
-                                        .monospace()
-                                        .small()
-                                        .color(pal.fg),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&entry.command);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("×").size(14.0).color(pal.fg_dim),
-                                    )
-                                    .frame(false),
-                                )
-                                .on_hover_text(strings.ssh_monitor_kill)
-                                .clicked()
-                            {
-                                st.ssh_ui.set_kill_confirm(Some(entry.pid));
-                            }
-                            ui.end_row();
+                        let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
+                        let (cmd_rect, cmd_response) = ui.allocate_exact_size(
+                            egui::vec2(cmd_w, 20.0),
+                            egui::Sense::hover(),
+                        );
+                        // 命令按剩余宽度截断（painter 裁切），hover 看全文。
+                        let painter = ui.painter_at(cmd_rect);
+                        painter.text(
+                            cmd_rect.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            &entry.command,
+                            egui::FontId::monospace(13.0),
+                            pal.fg,
+                        );
+                        if cmd_response.hovered() {
+                            cmd_response.on_hover_text(&entry.command);
+                        }
+                        let (kill_rect, kill_response) = ui.allocate_exact_size(
+                            egui::vec2(KILL_W, 20.0),
+                            egui::Sense::click(),
+                        );
+                        if kill_response.hovered() {
+                            ui.painter().rect_filled(kill_rect, 3.0, pal.bg_highlight);
+                        }
+                        ui.painter().text(
+                            kill_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "×",
+                            egui::FontId::proportional(14.0),
+                            if kill_response.hovered() {
+                                pal.error
+                            } else {
+                                pal.fg_dim
+                            },
+                        );
+                        if kill_response
+                            .on_hover_text(strings.ssh_monitor_kill)
+                            .clicked()
+                        {
+                            st.ssh_ui.set_kill_confirm(Some(entry.pid));
                         }
                     });
+                }
             });
     });
     if !open {
