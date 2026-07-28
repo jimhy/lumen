@@ -665,6 +665,8 @@ pub struct SshUiState {    search: String,
     process_window_open: bool,
     /// 进程详情弹窗排序维度：true = 内存降序，false = CPU 降序（默认）。
     process_sort_memory: bool,
+    /// 进程详情弹窗上次发起远端查询的时间（打开期间每 3 秒自动刷新）。
+    process_query_last_at: Option<std::time::Instant>,
     /// 进程卡「按名称搜索」输入框文本。
     process_query: String,
     /// 进程卡「按端口查询」输入框文本。
@@ -766,6 +768,14 @@ impl SshUiState {
 
     pub fn set_process_sort_memory(&mut self, memory: bool) {
         self.process_sort_memory = memory;
+    }
+
+    pub fn process_query_last_at(&self) -> Option<std::time::Instant> {
+        self.process_query_last_at
+    }
+
+    pub fn set_process_query_last_at(&mut self, at: std::time::Instant) {
+        self.process_query_last_at = Some(at);
     }
 
     pub fn process_query(&self) -> &str {

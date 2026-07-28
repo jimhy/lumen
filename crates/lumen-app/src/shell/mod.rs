@@ -3480,7 +3480,6 @@ fn ssh_workspace(
 
     const HEADER_HEIGHT: f32 = 48.0;
     const MONITOR_WIDTH: f32 = 280.0;
-    const MONITOR_COLLAPSED_WIDTH: f32 = 24.0;
     const GAP: f32 = 1.0;
     let header = egui::Rect::from_min_max(
         area.min,
@@ -3490,16 +3489,12 @@ fn ssh_workspace(
         egui::pos2(area.min.x, (header.max.y + GAP).min(area.max.y)),
         area.max,
     );
-    let monitor_collapsed = st.ssh_ui.monitor_collapsed();
-    let show_monitor = body.width() >= 680.0;
+    // 收起 = 完全不显示面板（终端吃满全宽）；显隐开关在工具栏最右端与
+    // 底部状态栏，面板上不再有箭头按钮（海风哥 2026-07-28 定稿）。
+    let show_monitor = body.width() >= 680.0 && !st.ssh_ui.monitor_collapsed();
     let monitor = show_monitor.then(|| {
-        let width = if monitor_collapsed {
-            MONITOR_COLLAPSED_WIDTH
-        } else {
-            MONITOR_WIDTH
-        };
         egui::Rect::from_min_max(
-            egui::pos2((body.max.x - width).max(body.min.x), body.min.y),
+            egui::pos2((body.max.x - MONITOR_WIDTH).max(body.min.x), body.min.y),
             body.max,
         )
     });
@@ -3584,66 +3579,15 @@ fn ssh_workspace(
     }
 
     if let Some(monitor_rect) = monitor {
+        // 监控面板只有「显示」一种渲染态：显隐开关统一在工具栏最右端与
+        // 底部状态栏（海风哥：面板上的箭头按钮去掉）。
         ui.painter().rect_filled(monitor_rect, 0.0, pal.bg_panel);
-        if monitor_collapsed {
-            // 收起态：整条窄条都是展开热区，顶部画一个左向 chevron。
-            let response = ui
-                .interact(
-                    monitor_rect,
-                    ui.id().with(("ssh_monitor_expand", view.session_id)),
-                    egui::Sense::click(),
-                )
-                .on_hover_text(strings.ssh_statusbar_monitor_show);
-            if response.hovered() {
-                ui.painter()
-                    .rect_filled(monitor_rect, 0.0, pal.bg_highlight);
-            }
-            let chevron = egui::Rect::from_center_size(
-                egui::pos2(monitor_rect.center().x, monitor_rect.min.y + 15.0),
-                egui::vec2(10.0, 10.0),
-            );
-            paint_ssh_monitor_chevron(ui.painter(), chevron, true, pal.fg_dim);
-            if response.clicked() {
-                st.ssh_ui.toggle_monitor_collapsed();
-            }
-        } else {
-            {
-                let mut monitor_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(monitor_rect.shrink2(egui::vec2(7.0, 8.0)))
-                        .layout(egui::Layout::top_down(egui::Align::Min)),
-                );
-                ssh_monitor_ui(&mut monitor_ui, view, st, pal, out);
-            }
-            // 展开态：右上角收起按钮（右向 chevron）。
-            let button_rect = egui::Rect::from_min_size(
-                egui::pos2(monitor_rect.max.x - 24.0, monitor_rect.min.y + 7.0),
-                egui::vec2(16.0, 16.0),
-            );
-            let response = ui
-                .interact(
-                    button_rect,
-                    ui.id().with(("ssh_monitor_collapse", view.session_id)),
-                    egui::Sense::click(),
-                )
-                .on_hover_text(strings.ssh_statusbar_monitor_hide);
-            if response.hovered() {
-                ui.painter().rect_filled(button_rect, 3.0, pal.bg_highlight);
-            }
-            paint_ssh_monitor_chevron(
-                ui.painter(),
-                button_rect.shrink(3.0),
-                false,
-                if response.hovered() {
-                    pal.fg
-                } else {
-                    pal.fg_dim
-                },
-            );
-            if response.clicked() {
-                st.ssh_ui.toggle_monitor_collapsed();
-            }
-        }
+        let mut monitor_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(monitor_rect.shrink2(egui::vec2(7.0, 8.0)))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        ssh_monitor_ui(&mut monitor_ui, view, st, pal, out);
     }
 
     // ── 进程详情弹窗（监控面板「详情」按钮打开）───────────────────
@@ -4480,6 +4424,7 @@ fn ssh_monitor_process_card(
                 // 详情弹窗：以当前搜索词打开（空 = 全量进程列表）。
                 let query = st.ssh_ui.process_query().trim().to_owned();
                 st.ssh_ui.set_process_window_open(true);
+                st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
                 out.ssh_runtime_action = Some(SshRuntimeAction::SearchProcesses {
                     session_id,
                     query,
@@ -4550,7 +4495,26 @@ fn ssh_monitor_process_card(
                         .color(pal.fg_dim),
                 );
             } else {
-                for entry in &search.results {
+                // 搜索结果：Top10（当前排序维度，海风哥：进程管理列表只留
+                // 占用最高的 10 条），表头 CPU/MEM 可点击切换。
+                let sort_memory = st.ssh_ui.process_sort_memory();
+                let mut entries: Vec<&crate::ssh_runtime::SshProcessEntry> =
+                    search.results.iter().collect();
+                entries.sort_by(|left, right| {
+                    let key = |entry: &&crate::ssh_runtime::SshProcessEntry| {
+                        if sort_memory {
+                            entry.memory_percent
+                        } else {
+                            entry.cpu_percent
+                        }
+                    };
+                    key(right)
+                        .partial_cmp(&key(left))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                entries.truncate(10);
+                ssh_process_sort_header(ui, st, pal);
+                for entry in entries {
                     ssh_monitor_process_row(
                         ui,
                         entry.pid,
@@ -4611,26 +4575,21 @@ fn ssh_monitor_process_card(
         }
         ui.horizontal(|ui| {
             ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("CPU")
-                    .monospace()
-                    .small()
-                    .color(pal.fg_dim),
-            );
-            ui.add_space(22.0);
-            ui.label(
-                egui::RichText::new("MEM")
-                    .monospace()
-                    .small()
-                    .color(pal.fg_dim),
-            );
-            ui.add_space(20.0);
-            ui.label(
-                egui::RichText::new(strings.ssh_monitor_command)
-                    .monospace()
-                    .small()
-                    .color(pal.fg_dim),
-            );
+            ssh_process_sort_header(ui, st, pal);
+        });
+        let sort_memory = st.ssh_ui.process_sort_memory();
+        let mut processes: Vec<&lumen_ssh::ProcessMetrics> = processes.iter().collect();
+        processes.sort_by(|left, right| {
+            let key = |entry: &&lumen_ssh::ProcessMetrics| {
+                if sort_memory {
+                    entry.memory_usage_percent
+                } else {
+                    entry.cpu_usage_percent
+                }
+            };
+            key(right)
+                .partial_cmp(&key(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         for process in processes {
             ssh_monitor_process_row(
@@ -4644,6 +4603,38 @@ fn ssh_monitor_process_card(
             );
         }
     });
+}
+
+/// 进程列表排序表头（进程卡两处列表共用）：CPU/MEM 点击切换排序维度，
+/// 当前维度 ▼ 高亮。
+fn ssh_process_sort_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme::Palette) {
+    let strings = crate::i18n::strings();
+    let sort_memory = st.ssh_ui.process_sort_memory();
+    for (text, active, memory) in [("CPU", !sort_memory, false), ("MEM", sort_memory, true)] {
+        let label = if active {
+            format!("{text} ▼")
+        } else {
+            text.to_owned()
+        };
+        let color = if active { pal.info } else { pal.fg_dim };
+        if ui
+            .add(
+                egui::Button::new(egui::RichText::new(label).monospace().small().color(color))
+                    .frame(false),
+            )
+            .on_hover_text(strings.ssh_process_sort_tip)
+            .clicked()
+        {
+            st.ssh_ui.set_process_sort_memory(memory);
+        }
+    }
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(strings.ssh_monitor_command)
+            .monospace()
+            .small()
+            .color(pal.fg_dim),
+    );
 }
 
 /// 结果区标题行：左标签 + 右侧「清除」按钮。
@@ -4912,6 +4903,24 @@ fn ssh_process_window(
             .text_styles
             .insert(egui::TextStyle::Small, egui::FontId::new(13.0, small_family));
 
+        // 打开期间每 3 秒自动重查：进程是活数据，一次性查询会让用户看到
+        // 永远不变的列表（海风哥反馈）。loading 中不重发，返回即更新。
+        let stale = st
+            .ssh_ui
+            .process_query_last_at()
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(3));
+        let loading = view
+            .process_search
+            .as_ref()
+            .is_some_and(|search| search.loading);
+        if stale && !loading {
+            let query = st.ssh_ui.process_query().trim().to_owned();
+            out.ssh_runtime_action = Some(SshRuntimeAction::SearchProcesses { session_id, query });
+            st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+        }
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+
         // ── 操作行：搜索框 + 搜索 + 刷新（空词 = 全量）─────────────
         ui.horizontal(|ui| {
             let response = ui.add(
@@ -4936,6 +4945,7 @@ fn ssh_process_window(
                 let query = st.ssh_ui.process_query().trim().to_owned();
                 out.ssh_runtime_action =
                     Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
             }
         });
         ui.add_space(6.0);
@@ -4977,7 +4987,7 @@ fn ssh_process_window(
             .color(pal.fg_dim),
         );
         ui.add_space(3.0);
-        // ── Top10 表格：CPU/内存表头点击切换排序维度；行自绘撑满宽度 ──
+        // ── 全部进程表格：CPU/内存表头点击切换排序维度；行自绘撑满宽度 ──
         let sort_memory = st.ssh_ui.process_sort_memory();
         let mut entries: Vec<&crate::ssh_runtime::SshProcessEntry> = search.results.iter().collect();
         entries.sort_by(|left, right| {
@@ -4992,7 +5002,6 @@ fn ssh_process_window(
                 .partial_cmp(&key(left))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        entries.truncate(10);
 
         const PID_W: f32 = 72.0;
         const NUM_W: f32 = 64.0;

@@ -134,6 +134,23 @@ pub fn show(
                 let s = i18n::strings();
                 ui.add_space(RIGHT_MARGIN);
 
+                // SSH 视图专属：显示/隐藏服务器监控面板。放在右端按钮组的
+                // 最右侧（海风哥：与 ＋/田字格 同侧、全栏最右）。
+                if view.ssh_view {
+                    let (mon_rect, mon_resp) =
+                        ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
+                    draw_icon_monitor(ui, mon_rect, view.ssh_monitor_visible, pal);
+                    let tip = if view.ssh_monitor_visible {
+                        s.toolbar_ssh_monitor_hide_tip
+                    } else {
+                        s.toolbar_ssh_monitor_show_tip
+                    };
+                    if mon_resp.on_hover_text(tip).clicked() {
+                        out.toggle_ssh_monitor = Some(!view.ssh_monitor_visible);
+                    }
+                    ui.add_space(BTN_GAP);
+                }
+
                 if view.text_editor_hidden {
                     let (editor_rect, editor_resp) =
                         ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
@@ -242,23 +259,6 @@ pub fn show(
                         };
                         if ft_resp.on_hover_text(tip).clicked() {
                             out.toggle_filetree = Some(!view.filetree_visible);
-                        }
-                    }
-
-                    // ③ SSH 视图专属：显示/隐藏服务器监控面板。位于面板开关组
-                    // 末尾（同栏最右，海风哥指定位置）。
-                    if view.ssh_view {
-                        ui.add_space(BTN_GAP);
-                        let (mon_rect, mon_resp) =
-                            ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
-                        draw_icon_monitor(ui, mon_rect, view.ssh_monitor_visible, pal);
-                        let tip = if view.ssh_monitor_visible {
-                            s.toolbar_ssh_monitor_hide_tip
-                        } else {
-                            s.toolbar_ssh_monitor_show_tip
-                        };
-                        if mon_resp.on_hover_text(tip).clicked() {
-                            out.toggle_ssh_monitor = Some(!view.ssh_monitor_visible);
                         }
                     }
                 });
@@ -710,13 +710,11 @@ mod toolbar_layout_tests {
             remote >= local + 2,
             "远程视图应比本地视图多绘制设备栏图标：local={local}, remote={remote}"
         );
-        // SSH 视图在面板开关组末尾多一个监控面板开关（柱状图标：1 条基线
-        // 计入线段数，3 根柱子是 rect_filled 不计）——契约更新于监控开关
-        // 加入后（此前断言 ssh == remote 的完全同布局）。
+        // 监控开关已挪到右端按钮组最右（2026-07-28 海风哥定稿），其笔画
+        // 不在左端 x<200 统计范围内——左端布局恢复 ssh == remote 契约。
         assert_eq!(
-            ssh,
-            remote + 1,
-            "SSH 视图应比远程视图多监控开关的 1 条基线：ssh={ssh}, remote={remote}"
+            ssh, remote,
+            "SSH 服务器栏按钮应与远程设备栏按钮占用完全一致的布局：ssh={ssh}, remote={remote}"
         );
     }
 
@@ -818,14 +816,20 @@ mod toolbar_layout_tests {
             .map(|shape| count(&shape.shape, &|x| x > 1000.0))
             .sum::<usize>();
         assert!(left >= 5, "SSH 模式必须保留会话栏与文件树按钮");
-        assert_eq!(right, 0, "SSH 模式不得绘制本地新增/复位窗格按钮");
+        // SSH 模式右端不再有本地新增/复位窗格按钮；但监控面板开关合法地
+        // 占据右端按钮组最右（2026-07-28 定稿），其柱状图标贡献 1 条基线。
+        assert_eq!(right, 1, "右端应只剩监控开关的 1 条基线：right={right}");
     }
 
     #[test]
     fn 工具栏_隐藏编辑器按钮单击产出恢复动作() {
         let ctx = egui::Context::default();
         let pal = test_palette();
-        let pos = egui::pos2(1200.0 - RIGHT_MARGIN - BTN_W / 2.0, HEIGHT / 2.0);
+        // 右端按钮组（SSH 视图）：最右是监控开关，编辑器恢复按钮在其左一位。
+        let pos = egui::pos2(
+            1200.0 - RIGHT_MARGIN - BTN_W - BTN_GAP - BTN_W / 2.0,
+            HEIGHT / 2.0,
+        );
         let render = |events: Vec<egui::Event>| {
             let mut input = test_input();
             input.events = events;

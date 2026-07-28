@@ -454,7 +454,7 @@ pub static STRINGS: Strings = Strings {
     ssh_process_search_btn: "Search",
     ssh_process_refresh: "Refresh",
     ssh_process_empty_hint: "Click Refresh to load the process list",
-    ssh_process_count_fmt: "{} entries · top 10 shown",
+    ssh_process_count_fmt: "{} entries",
     ssh_process_sort_tip: "Click to switch sort key",
     toolbar_ssh_monitor_hide_tip: "Hide server monitor panel",
     toolbar_ssh_monitor_show_tip: "Show server monitor panel",
