@@ -449,7 +449,6 @@ pub static STRINGS: Strings = Strings {
     ssh_process_empty_hint: "点「刷新」加载进程列表",
     ssh_process_count_fmt: "共 {} 条",
     ssh_process_sort_tip: "点击切换排序维度",
-    ssh_process_refreshing: "刷新中…",
     toolbar_ssh_monitor_hide_tip: "隐藏服务器监控面板",
     toolbar_ssh_monitor_show_tip: "显示服务器监控面板",
     remote_list_title: "设备",

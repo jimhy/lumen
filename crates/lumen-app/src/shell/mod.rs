@@ -4987,14 +4987,8 @@ fn ssh_process_window(
                 .small()
                 .color(pal.fg_dim),
             );
-            // 自动刷新期间旧列表保持显示，仅以小字提示（不再整屏闪烁）。
-            if search.loading {
-                ui.label(
-                    egui::RichText::new(strings.ssh_process_refreshing)
-                        .small()
-                        .color(pal.info),
-                );
-            }
+            // 自动刷新完全静默（海风哥：连「刷新中…」提示也不要）——
+            // 旧列表保持显示，数据返回时原位替换。
         });
         ui.add_space(3.0);
         // ── 全部进程表格：CPU/内存表头点击切换排序维度；行自绘撑满宽度 ──
