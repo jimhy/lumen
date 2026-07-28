@@ -233,45 +233,47 @@ fn lock_card(
         && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
     ui.add_space(4.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let label = if st.password_visible {
-            s.lock_screen_hide_password
-        } else {
-            s.lock_screen_show_password
-        };
-        if ui.add_enabled(editable, egui::Button::new(label)).clicked() {
-            st.password_visible = !st.password_visible;
-            edit.request_focus();
-        }
-    });
-
-    ui.add_space(12.0);
-    if input.storage_error {
-        status_label(ui, s.lock_screen_storage_error, pal.error);
-    } else if retrying {
-        status_label(
-            ui,
-            &i18n::fmt1(
-                s.lock_screen_retry_fmt,
-                retry_seconds(input.retry_remaining),
-            ),
-            pal.error,
-        );
-        // 秒级倒计时需要持续刷新，不依赖外部业务事件唤醒。
-        ui.ctx().request_repaint_after(Duration::from_millis(200));
-    } else if input.busy {
-        ui.horizontal(|ui| {
+    // 错误/状态行与显隐按钮同一行（左状态、右按钮）：错误文字贴密码输入框
+    // 正下方、且不为布局增加高度——此前错误行独立占行，出现时把内容（含
+    // 错误行自己与解锁按钮）挤出卡片下缘，错误文字显示到背景框外面
+    // （海风哥 2026-07-28：密码错误文字应在密码框下面，不要在窗口底下）。
+    ui.horizontal(|ui| {
+        if input.storage_error {
+            status_label(ui, s.lock_screen_storage_error, pal.error);
+        } else if retrying {
+            status_label(
+                ui,
+                &i18n::fmt1(
+                    s.lock_screen_retry_fmt,
+                    retry_seconds(input.retry_remaining),
+                ),
+                pal.error,
+            );
+            // 秒级倒计时需要持续刷新，不依赖外部业务事件唤醒。
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        } else if input.busy {
             ui.spinner();
             ui.label(
                 egui::RichText::new(s.lock_screen_verifying)
                     .size(11.5)
                     .color(pal.fg_dim),
             );
+            ui.ctx().request_repaint();
+        } else if st.error == Some(LockUiError::WrongPassword) {
+            status_label(ui, s.lock_screen_wrong_password, pal.error);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = if st.password_visible {
+                s.lock_screen_hide_password
+            } else {
+                s.lock_screen_show_password
+            };
+            if ui.add_enabled(editable, egui::Button::new(label)).clicked() {
+                st.password_visible = !st.password_visible;
+                edit.request_focus();
+            }
         });
-        ui.ctx().request_repaint();
-    } else if st.error == Some(LockUiError::WrongPassword) {
-        status_label(ui, s.lock_screen_wrong_password, pal.error);
-    }
+    });
 
     if input.caps_lock {
         ui.add_space(6.0);
