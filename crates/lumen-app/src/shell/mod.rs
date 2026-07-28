@@ -4512,46 +4512,6 @@ fn ssh_monitor_process_card(
         // ── 终止结果反馈条（有则显示，可关闭）──────────────────────
         ssh_kill_feedback_bar(ui, view, pal, out);
 
-        // ── 统一搜索框（实时搜索：静止 400ms 自动提交；空 = 全量）──────
-        ssh_live_search_tick(st, out, session_id);
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(250));
-        ui.horizontal(|ui| {
-            let search_response = ui.add(
-                egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
-                    .hint_text(strings.ssh_monitor_search_hint)
-                    .font(egui::FontId::monospace(12.0))
-                    .desired_width(ui.available_width() - 46.0),
-            );
-            if search_response.changed() {
-                st.ssh_ui.mark_process_query_dirty();
-            }
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new(strings.ssh_monitor_detail).small(),
-                ))
-                .clicked()
-            {
-                // 详情弹窗：以统一搜索框内容打开（空 = 全量进程列表，
-                // `:端口` = 端口占用结果）；同步已提交文本防防抖重复提交。
-                st.ssh_ui.set_process_window_open(true);
-                st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
-                match ssh_search_target(st.ssh_ui.process_query()) {
-                    Some(SshSearchTarget::Port(port)) => {
-                        out.ssh_runtime_action =
-                            Some(SshRuntimeAction::QueryPort { session_id, port });
-                    }
-                    Some(SshSearchTarget::Processes(query)) => {
-                        out.ssh_runtime_action =
-                            Some(SshRuntimeAction::SearchProcesses { session_id, query });
-                    }
-                    None => {}
-                }
-                st.ssh_ui.sync_process_query_submitted();
-            }
-        });
-        ui.add_space(5.0);
-
         // ── 终止确认条（点击行内 × 后出现，固定在结果区上方）───────
         ssh_kill_confirm_bar(ui, st, pal, out, session_id);
 
@@ -4595,13 +4555,13 @@ fn ssh_monitor_process_card(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 entries.truncate(10);
-                ssh_process_sort_header(ui, st, pal);
+                ssh_process_sort_header(ui, st, pal, out, session_id);
                 for entry in entries {
                     ssh_monitor_process_row(
                         ui,
                         entry.pid,
-                        entry.cpu_percent,
-                        entry.memory_percent,
+                        Some(entry.cpu_percent),
+                        Some(entry.memory_percent),
                         &entry.command,
                         st,
                         pal,
@@ -4632,8 +4592,41 @@ fn ssh_monitor_process_card(
                         .color(pal.fg_dim),
                 );
             } else {
+                // 端口查询结果：与详情弹窗同款进程行样式（CPU/MEM 从进程
+                // 数据按 pid 匹配，无数据/无权限显示 -）。
                 for entry in &lookup.entries {
-                    ssh_monitor_port_row(ui, entry, st, pal);
+                    let proc_entry = entry.pid.and_then(|pid| {
+                        view.process_search
+                            .as_ref()?
+                            .results
+                            .iter()
+                            .find(|process| process.pid == pid)
+                    });
+                    if entry.pid.is_none() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {} — {}",
+                                entry.protocol,
+                                entry.local_address,
+                                strings.ssh_monitor_port_unknown
+                            ))
+                            .monospace()
+                            .small()
+                            .color(pal.fg_dim),
+                        );
+                        continue;
+                    }
+                    ssh_monitor_process_row(
+                        ui,
+                        entry.pid.unwrap_or(0),
+                        proc_entry.map(|process| process.cpu_percent),
+                        proc_entry.map(|process| process.memory_percent),
+                        proc_entry.map_or(entry.command.as_str(), |process| {
+                            process.command.as_str()
+                        }),
+                        st,
+                        pal,
+                    );
                 }
             }
             return;
@@ -4653,7 +4646,7 @@ fn ssh_monitor_process_card(
             );
             return;
         }
-        ssh_process_sort_header(ui, st, pal);
+        ssh_process_sort_header(ui, st, pal, out, session_id);
         let sort_memory = st.ssh_ui.process_sort_memory();
         let mut processes: Vec<&lumen_ssh::ProcessMetrics> = processes.iter().collect();
         processes.sort_by(|left, right| {
@@ -4672,8 +4665,8 @@ fn ssh_monitor_process_card(
             ssh_monitor_process_row(
                 ui,
                 process.pid,
-                process.cpu_usage_percent,
-                process.memory_usage_percent,
+                Some(process.cpu_usage_percent),
+                Some(process.memory_usage_percent),
                 &process.command,
                 st,
                 pal,
@@ -4683,16 +4676,23 @@ fn ssh_monitor_process_card(
 }
 
 /// 进程列表排序表头（进程卡两处列表共用）：CPU/MEM 点击切换排序维度，
-/// 当前维度 ▼ 高亮。列几何与 [`ssh_monitor_process_row`] 严格一致（同宽
-/// 同间距），否则表头与数据行错位（海风哥截图反馈）。
-fn ssh_process_sort_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme::Palette) {
+/// 当前维度 ▼ 高亮；右端「详情」按钮打开进程详情弹窗（实时搜索/进程树/
+/// 端口列/杀进程的全部功能集中在弹窗，海风哥 2026-07-28：面板卡不再
+/// 内嵌搜索框）。列几何与 [`ssh_monitor_process_row`] 严格一致。
+fn ssh_process_sort_header(
+    ui: &mut egui::Ui,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+    session_id: crate::ssh_runtime::SshSessionId,
+) {
     let strings = crate::i18n::strings();
     let sort_memory = st.ssh_ui.process_sort_memory();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (text, active, memory) in [("CPU", !sort_memory, false), ("MEM", sort_memory, true)] {
             let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, 16.0), egui::Sense::click());
+                ui.allocate_exact_size(egui::vec2(SSH_CARD_NUM_W, 16.0), egui::Sense::click());
             if response.hovered() {
                 ui.painter().rect_filled(rect, 3.0, pal.bg_highlight);
             }
@@ -4724,13 +4724,38 @@ fn ssh_process_sort_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme::
             egui::FontId::monospace(12.0),
             pal.fg_dim,
         );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new(strings.ssh_monitor_detail).small(),
+                ))
+                .clicked()
+            {
+                // 详情弹窗：以统一搜索框内容打开（空 = 全量进程列表，
+                // `:端口` = 端口占用结果）；同步已提交文本防防抖重复提交。
+                st.ssh_ui.set_process_window_open(true);
+                st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+                match ssh_search_target(st.ssh_ui.process_query()) {
+                    Some(SshSearchTarget::Port(port)) => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::QueryPort { session_id, port });
+                    }
+                    Some(SshSearchTarget::Processes(query)) => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                    }
+                    None => {}
+                }
+                st.ssh_ui.sync_process_query_submitted();
+            }
+        });
     });
 }
 
 /// 进程行数字列宽（表头与数据行共用）。
-const SSH_PROC_NUM_W: f32 = 36.0;
+const SSH_CARD_NUM_W: f32 = 36.0;
 /// 进程行 × 按钮列宽。
-const SSH_PROC_KILL_W: f32 = 20.0;
+const SSH_CARD_KILL_W: f32 = 20.0;
 
 /// 结果区标题行（搜索词/端口号的当前查询标识；实时搜索下无清除按钮——
 /// 清空搜索框即恢复全量，见 ssh_live_search_tick）。
@@ -4746,13 +4771,14 @@ fn ssh_monitor_result_header(ui: &mut egui::Ui, title: &str, pal: &theme::Palett
     ui.add_space(2.0);
 }
 
-/// 一行进程：CPU / MEM（固定宽）/ 命令+PID（吃满剩余宽，hover 全文）/ ×。
-/// 命令列不再写死宽度——面板有多宽就填多宽（海风哥截图反馈右侧大片空白）。
+/// 一行进程：CPU / MEM（固定宽，无数据显示 -）/ 命令+PID（吃满剩余宽，
+/// hover 全文）/ ×。命令列不再写死宽度——面板有多宽就填多宽（海风哥截图
+/// 反馈右侧大片空白）。
 fn ssh_monitor_process_row(
     ui: &mut egui::Ui,
     pid: u32,
-    cpu_percent: f32,
-    memory_percent: f32,
+    cpu_percent: Option<f32>,
+    memory_percent: Option<f32>,
     command: &str,
     st: &mut ShellState,
     pal: &theme::Palette,
@@ -4762,16 +4788,16 @@ fn ssh_monitor_process_row(
         ui.spacing_mut().item_spacing.x = 4.0;
         for value in [cpu_percent, memory_percent] {
             let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, ROW_H), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(SSH_CARD_NUM_W, ROW_H), egui::Sense::hover());
             ui.painter().text(
                 rect.left_center(),
                 egui::Align2::LEFT_CENTER,
-                format!("{value:.1}"),
+                value.map_or_else(|| "-".to_owned(), |v| format!("{v:.1}")),
                 egui::FontId::monospace(12.0),
                 pal.fg,
             );
         }
-        let cmd_w = (ui.available_width() - SSH_PROC_KILL_W).max(30.0);
+        let cmd_w = (ui.available_width() - SSH_CARD_KILL_W).max(30.0);
         let (cmd_rect, cmd_response) =
             ui.allocate_exact_size(egui::vec2(cmd_w, ROW_H), egui::Sense::hover());
         let painter = ui.painter_at(cmd_rect);
@@ -4793,7 +4819,7 @@ fn ssh_monitor_process_row(
             cmd_response.on_hover_text(command);
         }
         let (kill_rect, kill_response) =
-            ui.allocate_exact_size(egui::vec2(SSH_PROC_KILL_W, ROW_H), egui::Sense::click());
+            ui.allocate_exact_size(egui::vec2(SSH_CARD_KILL_W, ROW_H), egui::Sense::click());
         if kill_response.hovered() {
             ui.painter().rect_filled(kill_rect, 3.0, pal.bg_highlight);
         }
@@ -4815,48 +4841,6 @@ fn ssh_monitor_process_row(
             st.ssh_ui.set_kill_confirm(Some(pid));
         }
     });
-    ui.add_space(2.0);
-}
-
-/// 一行端口占用：协议+本地地址（右端终止按钮），副行 PID+命令。
-fn ssh_monitor_port_row(
-    ui: &mut egui::Ui,
-    entry: &crate::ssh_runtime::SshPortEntry,
-    st: &mut ShellState,
-    pal: &theme::Palette,
-) {
-    let strings = crate::i18n::strings();
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!("{} {}", entry.protocol, entry.local_address))
-                .monospace()
-                .small()
-                .color(pal.fg),
-        );
-        if let Some(pid) = entry.pid {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let kill = ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("×").size(14.0).color(pal.fg_dim))
-                            .frame(false),
-                    )
-                    .on_hover_text(strings.ssh_monitor_kill);
-                if kill.clicked() {
-                    st.ssh_ui.set_kill_confirm(Some(pid));
-                }
-            });
-        }
-    });
-    let detail = match entry.pid {
-        Some(pid) => format!("PID {pid} {}", entry.command),
-        None => strings.ssh_monitor_port_unknown.to_owned(),
-    };
-    ui.label(
-        egui::RichText::new(detail)
-            .monospace()
-            .small()
-            .color(pal.fg_dim),
-    );
     ui.add_space(2.0);
 }
 
@@ -4974,6 +4958,205 @@ struct ProcTreeRow<'a> {
     entry: &'a crate::ssh_runtime::SshProcessEntry,
     depth: usize,
     has_children: bool,
+}
+
+// 进程表格列几何（表头/树行/平铺行/端口结果行四处共用，保证逐列对齐）。
+const SSH_PROC_CHEV_W: f32 = 16.0;
+const SSH_PROC_PID_W: f32 = 64.0;
+const SSH_PROC_NUM_W: f32 = 56.0;
+const SSH_PROC_PORT_W: f32 = 92.0;
+const SSH_PROC_KILL_W: f32 = 26.0;
+
+/// 进程表格表头（详情弹窗进程列表与端口结果共用）：PID / CPU▼ / MEM▼ /
+/// 端口 / 命令。CPU/MEM 点击切换排序维度，当前维度 ▼ 高亮。
+fn ssh_process_window_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme::Palette) {
+    let strings = crate::i18n::strings();
+    let sort_memory = st.ssh_ui.process_sort_memory();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (_, _) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_CHEV_W, 18.0), egui::Sense::hover());
+        let (pid_rect, _) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_PID_W, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            pid_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            "PID",
+            egui::FontId::monospace(13.0),
+            pal.fg_dim,
+        );
+        for (text, active, memory) in [
+            ("CPU", !sort_memory, false),
+            ("MEM", sort_memory, true),
+        ] {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, 18.0), egui::Sense::click());
+            let label = if active {
+                format!("{text} ▼")
+            } else {
+                text.to_owned()
+            };
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::monospace(13.0),
+                if active { pal.info } else { pal.fg_dim },
+            );
+            if response
+                .on_hover_text(strings.ssh_process_sort_tip)
+                .clicked()
+            {
+                st.ssh_ui.set_process_sort_memory(memory);
+            }
+        }
+        let (port_rect, _) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_PORT_W, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            port_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            strings.ssh_process_ports,
+            egui::FontId::monospace(13.0),
+            pal.fg_dim,
+        );
+        // 内容宽度永远留 8px 余量：egui 窗口每帧会把尺寸提升到「至少
+        // 装下上一帧内容」（resize.rs: desired = max(desired, last_content)），
+        // 内容贴满会形成「窗口变大→内容更宽→窗口更大」正反馈（海风哥：
+        // 弹窗一直往右扩、调不了）。内容适应容器，容器不迎合内容。
+        let cmd_w = (ui.available_width() - SSH_PROC_KILL_W - 8.0).max(40.0);
+        let (cmd_rect, _) =
+            ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            cmd_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            strings.ssh_monitor_command,
+            egui::FontId::monospace(13.0),
+            pal.fg_dim,
+        );
+    });
+    ui.separator();
+}
+
+/// 一行进程表格的展示数据（树行/平铺行/端口结果行共用渲染）。
+struct ProcGridCells<'a> {
+    indent: f32,
+    pid: Option<u32>,
+    cpu: Option<f32>,
+    mem: Option<f32>,
+    ports_text: String,
+    ports_hover: Option<String>,
+    command: &'a str,
+    has_children: bool,
+}
+
+/// 进程表格行渲染：缩进+chevron（父进程）/ PID / CPU / MEM / 端口（截断
+/// …，hover 全部）/ 命令（按剩余宽截断，hover 全文）/ ×（仅已知 PID）。
+fn ssh_process_grid_row(
+    ui: &mut egui::Ui,
+    cells: ProcGridCells<'_>,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+) {
+    let strings = crate::i18n::strings();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (chev_rect, chev_response) = ui.allocate_exact_size(
+            egui::vec2(SSH_PROC_CHEV_W + cells.indent, 20.0),
+            egui::Sense::click(),
+        );
+        if cells.has_children {
+            let pid = cells.pid.unwrap_or(0);
+            let expanded = st.ssh_ui.pid_expanded(pid);
+            let chev = egui::Rect::from_center_size(
+                egui::pos2(chev_rect.max.x - 8.0, chev_rect.center().y),
+                egui::vec2(10.0, 10.0),
+            );
+            if expanded {
+                paint_ssh_monitor_chevron_down(ui.painter(), chev, pal.fg_dim);
+            } else {
+                paint_ssh_monitor_chevron(ui.painter(), chev, false, pal.fg_dim);
+            }
+            if chev_response.clicked() {
+                st.ssh_ui.toggle_pid_expanded(pid);
+            }
+        }
+        let (pid_rect, _) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_PID_W, 20.0), egui::Sense::hover());
+        ui.painter().text(
+            pid_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            cells
+                .pid
+                .map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
+            egui::FontId::monospace(13.0),
+            pal.fg,
+        );
+        for value in [cells.cpu, cells.mem] {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, 20.0), egui::Sense::hover());
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                value.map_or_else(|| "-".to_owned(), |v| format!("{v:.1}")),
+                egui::FontId::monospace(13.0),
+                pal.fg,
+            );
+        }
+        let (port_rect, port_response) = ui.allocate_exact_size(
+            egui::vec2(SSH_PROC_PORT_W, 20.0),
+            egui::Sense::hover(),
+        );
+        ui.painter_at(port_rect).text(
+            port_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            &cells.ports_text,
+            egui::FontId::monospace(12.0),
+            pal.fg,
+        );
+        if let Some(full) = &cells.ports_hover {
+            if port_response.hovered() {
+                port_response.on_hover_text(full);
+            }
+        }
+        let cmd_w = (ui.available_width() - SSH_PROC_KILL_W - 8.0).max(40.0);
+        let (cmd_rect, cmd_response) =
+            ui.allocate_exact_size(egui::vec2(cmd_w, 20.0), egui::Sense::hover());
+        let painter = ui.painter_at(cmd_rect);
+        painter.text(
+            cmd_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            cells.command,
+            egui::FontId::monospace(13.0),
+            pal.fg,
+        );
+        if cmd_response.hovered() {
+            cmd_response.on_hover_text(cells.command);
+        }
+        let (kill_rect, kill_response) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_KILL_W, 20.0), egui::Sense::click());
+        if let Some(pid) = cells.pid {
+            if kill_response.hovered() {
+                ui.painter().rect_filled(kill_rect, 3.0, pal.bg_highlight);
+            }
+            ui.painter().text(
+                kill_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(14.0),
+                if kill_response.hovered() {
+                    pal.error
+                } else {
+                    pal.fg_dim
+                },
+            );
+            if kill_response
+                .on_hover_text(strings.ssh_monitor_kill)
+                .clicked()
+            {
+                st.ssh_ui.set_kill_confirm(Some(pid));
+            }
+        }
+    });
 }
 
 /// 按父子关系建树并输出当前可见行：每层按当前排序维度降序；折叠节点
@@ -5162,7 +5345,9 @@ fn ssh_process_window(
         ssh_kill_feedback_bar(ui, view, pal, out);
         ssh_kill_confirm_bar(ui, st, pal, out, session_id);
 
-        // ── 端口查询结果（`:端口` 搜索）优先于进程树 ──────────────
+        // ── 端口查询结果（`:端口` 搜索）优先于进程树：按进程表格样式渲染
+        // （海风哥截图定稿：PID/CPU/MEM/端口/命令列），CPU/MEM/端口列从
+        // 进程数据按 pid 匹配，无数据（未拉全量/进程已退/无权限）显示 -。
         if let Some(lookup) = &view.port_lookup {
             ssh_monitor_result_header(ui, &format!(":{}", lookup.port), pal);
             if lookup.loading && lookup.entries.is_empty() {
@@ -5184,9 +5369,51 @@ fn ssh_process_window(
                         .color(pal.fg_dim),
                 );
             } else {
-                for entry in &lookup.entries {
-                    ssh_monitor_port_row(ui, entry, st, pal);
-                }
+                ssh_process_window_header(ui, st, pal);
+                egui::ScrollArea::vertical()
+                    .id_salt(("ssh_process_window_port_scroll", session_id))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in &lookup.entries {
+                            let proc_entry = entry.pid.and_then(|pid| {
+                                view.process_search
+                                    .as_ref()?
+                                    .results
+                                    .iter()
+                                    .find(|process| process.pid == pid)
+                            });
+                            let (ports_text, ports_hover) = match proc_entry {
+                                Some(process) => format_ports_column(&process.ports),
+                                None => (
+                                    entry
+                                        .local_address
+                                        .rsplit(':')
+                                        .next()
+                                        .unwrap_or("-")
+                                        .to_owned(),
+                                    None,
+                                ),
+                            };
+                            ssh_process_grid_row(
+                                ui,
+                                ProcGridCells {
+                                    indent: 0.0,
+                                    pid: entry.pid,
+                                    cpu: proc_entry.map(|process| process.cpu_percent),
+                                    mem: proc_entry.map(|process| process.memory_percent),
+                                    ports_text,
+                                    ports_hover,
+                                    command: proc_entry.map_or(
+                                        entry.command.as_str(),
+                                        |process| process.command.as_str(),
+                                    ),
+                                    has_children: false,
+                                },
+                                st,
+                                pal,
+                            );
+                        }
+                    });
             }
             return;
         }
@@ -5231,70 +5458,7 @@ fn ssh_process_window(
         ui.add_space(3.0);
         let sort_memory = st.ssh_ui.process_sort_memory();
 
-        const CHEV_W: f32 = 16.0;
-        const PID_W: f32 = 64.0;
-        const NUM_W: f32 = 56.0;
-        const PORT_W: f32 = 92.0;
-        const KILL_W: f32 = 26.0;
-        // 表头（与数据行同几何）。CPU/MEM 列可点击切换排序维度，当前维度带 ▼。
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let (_, _) = ui.allocate_exact_size(egui::vec2(CHEV_W, 18.0), egui::Sense::hover());
-            let (pid_rect, _) = ui.allocate_exact_size(egui::vec2(PID_W, 18.0), egui::Sense::hover());
-            ui.painter().text(
-                pid_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                "PID",
-                egui::FontId::monospace(13.0),
-                pal.fg_dim,
-            );
-            for (text, active, memory) in [
-                ("CPU", !sort_memory, false),
-                ("MEM", sort_memory, true),
-            ] {
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::vec2(NUM_W, 18.0), egui::Sense::click());
-                let label = if active {
-                    format!("{text} ▼")
-                } else {
-                    text.to_owned()
-                };
-                ui.painter().text(
-                    rect.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::monospace(13.0),
-                    if active { pal.info } else { pal.fg_dim },
-                );
-                if response.on_hover_text(strings.ssh_process_sort_tip).clicked() {
-                    st.ssh_ui.set_process_sort_memory(memory);
-                }
-            }
-            let (port_rect, _) =
-                ui.allocate_exact_size(egui::vec2(PORT_W, 18.0), egui::Sense::hover());
-            ui.painter().text(
-                port_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                strings.ssh_process_ports,
-                egui::FontId::monospace(13.0),
-                pal.fg_dim,
-            );
-            // 内容宽度永远留 8px 余量：egui 窗口每帧会把尺寸提升到「至少
-            // 装下上一帧内容」（resize.rs: desired = max(desired, last_content)），
-            // 内容贴满会形成「窗口变大→内容更宽→窗口更大」正反馈（海风哥：
-            // 弹窗一直往右扩、调不了）。内容适应容器，容器不迎合内容。
-            let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
-            let (cmd_rect, _) =
-                ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
-            ui.painter().text(
-                cmd_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                strings.ssh_monitor_command,
-                egui::FontId::monospace(13.0),
-                pal.fg_dim,
-            );
-        });
-        ui.separator();
+        ssh_process_window_header(ui, st, pal);
 
         // 全量（空 query）按父子关系建树；搜索（非空 query）平铺展示匹配项。
         let rows: Vec<ProcTreeRow> = if search.query.is_empty() {
@@ -5328,113 +5492,22 @@ fn ssh_process_window(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for row in &rows {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        // 缩进 + 折叠 chevron（仅父进程；任务管理器式分组）。
-                        let indent = row.depth as f32 * 14.0;
-                        let (chev_rect, chev_response) = ui.allocate_exact_size(
-                            egui::vec2(CHEV_W + indent, 20.0),
-                            egui::Sense::click(),
-                        );
-                        if row.has_children {
-                            let expanded = st.ssh_ui.pid_expanded(row.entry.pid);
-                            let chev = egui::Rect::from_center_size(
-                                egui::pos2(chev_rect.max.x - 8.0, chev_rect.center().y),
-                                egui::vec2(10.0, 10.0),
-                            );
-                            if expanded {
-                                paint_ssh_monitor_chevron_down(ui.painter(), chev, pal.fg_dim);
-                            } else {
-                                paint_ssh_monitor_chevron(ui.painter(), chev, false, pal.fg_dim);
-                            }
-                            if chev_response.clicked() {
-                                st.ssh_ui.toggle_pid_expanded(row.entry.pid);
-                            }
-                        }
-                        let (pid_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(PID_W, 20.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().text(
-                            pid_rect.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            row.entry.pid.to_string(),
-                            egui::FontId::monospace(13.0),
-                            pal.fg,
-                        );
-                        for value in [row.entry.cpu_percent, row.entry.memory_percent] {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(NUM_W, 20.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                rect.left_center(),
-                                egui::Align2::LEFT_CENTER,
-                                format!("{value:.1}"),
-                                egui::FontId::monospace(13.0),
-                                pal.fg,
-                            );
-                        }
-                        // 端口列：超宽截断为 …，hover 显示全部端口。
-                        let (port_text, port_hover) = format_ports_column(&row.entry.ports);
-                        let (port_rect, port_response) = ui.allocate_exact_size(
-                            egui::vec2(PORT_W, 20.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter_at(port_rect).text(
-                            port_rect.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            port_text,
-                            egui::FontId::monospace(12.0),
-                            pal.fg,
-                        );
-                        if let Some(full) = port_hover {
-                            if port_response.hovered() {
-                                port_response.on_hover_text(full);
-                            }
-                        }
-                        let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
-                        let (cmd_rect, cmd_response) = ui.allocate_exact_size(
-                            egui::vec2(cmd_w, 20.0),
-                            egui::Sense::hover(),
-                        );
-                        // 命令按剩余宽度截断（painter 裁切），hover 看全文。
-                        let painter = ui.painter_at(cmd_rect);
-                        painter.text(
-                            cmd_rect.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            &row.entry.command,
-                            egui::FontId::monospace(13.0),
-                            pal.fg,
-                        );
-                        if cmd_response.hovered() {
-                            cmd_response.on_hover_text(&row.entry.command);
-                        }
-                        let (kill_rect, kill_response) = ui.allocate_exact_size(
-                            egui::vec2(KILL_W, 20.0),
-                            egui::Sense::click(),
-                        );
-                        if kill_response.hovered() {
-                            ui.painter().rect_filled(kill_rect, 3.0, pal.bg_highlight);
-                        }
-                        ui.painter().text(
-                            kill_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "×",
-                            egui::FontId::proportional(14.0),
-                            if kill_response.hovered() {
-                                pal.error
-                            } else {
-                                pal.fg_dim
-                            },
-                        );
-                        if kill_response
-                            .on_hover_text(strings.ssh_monitor_kill)
-                            .clicked()
-                        {
-                            st.ssh_ui.set_kill_confirm(Some(row.entry.pid));
-                        }
-                    });
+                    let (ports_text, ports_hover) = format_ports_column(&row.entry.ports);
+                    ssh_process_grid_row(
+                        ui,
+                        ProcGridCells {
+                            indent: row.depth as f32 * 14.0,
+                            pid: Some(row.entry.pid),
+                            cpu: Some(row.entry.cpu_percent),
+                            mem: Some(row.entry.memory_percent),
+                            ports_text,
+                            ports_hover,
+                            command: &row.entry.command,
+                            has_children: row.has_children,
+                        },
+                        st,
+                        pal,
+                    );
                 }
             });
     });

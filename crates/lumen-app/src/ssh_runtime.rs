@@ -454,6 +454,10 @@ struct RuntimeSession {
     latest_search_token: Option<u64>,
     next_manage_token: u64,
     pending_manage: HashMap<u64, PendingManage>,
+    /// 最近一次进程/端口查询的 token：实时搜索会并发多个查询，响应乱序
+    /// 返回时必须只接受最新一次——否则陈旧响应覆盖新结果（海风哥：搜
+    /// docker 与 docker-p 内容错乱）。目录泳道的 latest_*_token 同模式。
+    latest_manage_query_token: Option<u64>,
     process_search: Option<ProcessSearchState>,
     port_lookup: Option<PortLookupState>,
     kill_feedback: Option<KillFeedbackState>,
@@ -562,6 +566,7 @@ impl RuntimeSession {
             latest_search_token: None,
             next_manage_token: 1,
             pending_manage: HashMap::new(),
+            latest_manage_query_token: None,
             process_search: None,
             port_lookup: None,
             kill_feedback: None,
@@ -1668,7 +1673,8 @@ impl SshRuntime {
             error: false,
             entries: Vec::new(),
         });
-        session.process_search = None;
+        // 保留 process_search：端口结果行按进程表格样式渲染时需要从进程
+        // 数据匹配 CPU/MEM/端口列（海风哥 2026-07-28 截图定稿）。
         Ok(())
     }
 
@@ -1703,7 +1709,6 @@ impl SshRuntime {
                 });
             }
         }
-        session.port_lookup = None;
         Ok(())
     }
 
@@ -1739,6 +1744,10 @@ impl SshRuntime {
             return Err(error.to_string());
         }
         session.pending_manage.insert(token, pending);
+        // Kill 不参与 latest 校验（它不回写列表状态，无覆盖问题）。
+        if !matches!(pending, PendingManage::Kill { .. }) {
+            session.latest_manage_query_token = Some(token);
+        }
         Ok(session)
     }
 
@@ -2437,6 +2446,10 @@ fn apply_directory_event(session: &mut RuntimeSession, event: Event) -> bool {
                     session.kill_feedback = Some(KillFeedbackState { pid, status: None });
                 }
                 (PendingManage::QueryPort, Ok(ManageOutcome::Ports(entries))) => {
+                    // 实时搜索并发查询：只接受最新一次的响应，陈旧响应丢弃。
+                    if session.latest_manage_query_token != Some(token) {
+                        return false;
+                    }
                     if let Some(lookup) = &mut session.port_lookup {
                         lookup.loading = false;
                         lookup.entries = entries;
@@ -2444,12 +2457,18 @@ fn apply_directory_event(session: &mut RuntimeSession, event: Event) -> bool {
                 }
                 (PendingManage::QueryPort, Ok(_)) => return false,
                 (PendingManage::QueryPort, Err(_)) => {
+                    if session.latest_manage_query_token != Some(token) {
+                        return false;
+                    }
                     if let Some(lookup) = &mut session.port_lookup {
                         lookup.loading = false;
                         lookup.error = true;
                     }
                 }
                 (PendingManage::QueryProcess, Ok(ManageOutcome::Processes(results))) => {
+                    if session.latest_manage_query_token != Some(token) {
+                        return false;
+                    }
                     if let Some(search) = &mut session.process_search {
                         search.loading = false;
                         search.results = results;
@@ -2457,6 +2476,9 @@ fn apply_directory_event(session: &mut RuntimeSession, event: Event) -> bool {
                 }
                 (PendingManage::QueryProcess, Ok(_)) => return false,
                 (PendingManage::QueryProcess, Err(_)) => {
+                    if session.latest_manage_query_token != Some(token) {
+                        return false;
+                    }
                     if let Some(search) = &mut session.process_search {
                         search.loading = false;
                         search.error = true;
@@ -3024,6 +3046,7 @@ fn apply_event(session: &mut RuntimeSession, event: Event) -> bool {
             session.search_loading = false;
             session.latest_search_token = None;
             session.pending_manage.clear();
+            session.latest_manage_query_token = None;
             session.process_search = None;
             session.port_lookup = None;
             session.kill_feedback = None;
