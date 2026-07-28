@@ -4421,6 +4421,27 @@ fn ssh_monitor_disk_card(
     });
 }
 
+/// 统一搜索框提交解析（海风哥 2026-07-28 定稿）：`:8080` = 端口占用查询；
+/// 其它非空文本 = 进程名搜索；空文本 = 全量进程列表（仅详情弹窗提交，
+/// 面板卡忽略空提交）。`:abc` / `:0` 等非法端口一律不提交。
+enum SshSearchTarget {
+    Processes(String),
+    Port(u16),
+}
+
+fn ssh_search_target(text: &str) -> Option<SshSearchTarget> {
+    let text = text.trim();
+    if let Some(port_text) = text.strip_prefix(':') {
+        return port_text
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .map(SshSearchTarget::Port);
+    }
+    Some(SshSearchTarget::Processes(text.to_owned()))
+}
+
 fn ssh_monitor_process_card(
     ui: &mut egui::Ui,
     view: &crate::ssh_runtime::RuntimeView,
@@ -4462,48 +4483,36 @@ fn ssh_monitor_process_card(
                 ))
                 .clicked()
             {
-                // 详情弹窗：以当前搜索词打开（空 = 全量进程列表）。
-                let query = st.ssh_ui.process_query().trim().to_owned();
+                // 详情弹窗：以统一搜索框内容打开（空 = 全量进程列表，
+                // `:端口` = 端口占用结果）。
                 st.ssh_ui.set_process_window_open(true);
                 st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
-                out.ssh_runtime_action = Some(SshRuntimeAction::SearchProcesses {
-                    session_id,
-                    query,
-                });
+                match ssh_search_target(st.ssh_ui.process_query()) {
+                    Some(SshSearchTarget::Port(port)) => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::QueryPort { session_id, port });
+                    }
+                    Some(SshSearchTarget::Processes(query)) => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                    }
+                    None => {}
+                }
             }
             if search_response.lost_focus()
                 && ui.input(|input| input.key_pressed(egui::Key::Enter))
             {
-                let query = st.ssh_ui.process_query().trim().to_owned();
-                if !query.is_empty() {
-                    out.ssh_runtime_action =
-                        Some(SshRuntimeAction::SearchProcesses { session_id, query });
-                }
-            }
-        });
-        ui.add_space(4.0);
-
-        // ── 端口查询（回车或按钮提交）────────────────────────────
-        ui.horizontal(|ui| {
-            let port_response = ui.add(
-                egui::TextEdit::singleline(st.ssh_ui.port_query_mut())
-                    .hint_text(strings.ssh_monitor_port_hint)
-                    .font(egui::FontId::monospace(12.0))
-                    .desired_width(72.0),
-            );
-            let submitted = ui
-                .add(egui::Button::new(
-                    egui::RichText::new(strings.ssh_monitor_port_query).small(),
-                ))
-                .clicked()
-                || (port_response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-            if submitted {
-                if let Ok(port) = st.ssh_ui.port_query().trim().parse::<u16>() {
-                    if port > 0 {
+                // 统一搜索框：`:8080` = 查端口占用，其它 = 按进程名搜索。
+                match ssh_search_target(st.ssh_ui.process_query()) {
+                    Some(SshSearchTarget::Port(port)) => {
                         out.ssh_runtime_action =
                             Some(SshRuntimeAction::QueryPort { session_id, port });
                     }
+                    Some(SshSearchTarget::Processes(query)) if !query.is_empty() => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                    }
+                    _ => {}
                 }
             }
         });
@@ -4944,6 +4953,101 @@ fn ssh_kill_confirm_bar(
 
 /// 进程详情弹窗：全量/搜索进程列表 + 终止操作。数据源与监控面板进程卡
 /// 共用 `view.process_search`（空搜索词 = 全量列表，CPU 降序上限 200）。
+/// 进程树可见行（任务管理器式父子分组）。
+struct ProcTreeRow<'a> {
+    entry: &'a crate::ssh_runtime::SshProcessEntry,
+    depth: usize,
+    has_children: bool,
+}
+
+/// 按父子关系建树并输出当前可见行：每层按当前排序维度降序；折叠节点
+/// 不输出其子树。父不在结果集（被 top 并集截断）的进程作为顶层节点。
+fn build_proc_tree<'a>(
+    entries: &'a [crate::ssh_runtime::SshProcessEntry],
+    sort_memory: bool,
+    expanded: &std::collections::HashSet<u32>,
+) -> Vec<ProcTreeRow<'a>> {
+    use std::collections::HashMap;
+    let key = |entry: &crate::ssh_runtime::SshProcessEntry| {
+        if sort_memory {
+            entry.memory_percent
+        } else {
+            entry.cpu_percent
+        }
+    };
+    let by_pid: HashMap<u32, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.pid, index))
+        .collect();
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.ppid != 0 && by_pid.contains_key(&entry.ppid) {
+            children.entry(entry.ppid).or_default().push(index);
+        } else {
+            roots.push(index);
+        }
+    }
+    let by_key = |indices: &mut Vec<usize>| {
+        indices.sort_by(|&a, &b| {
+            key(&entries[b])
+                .partial_cmp(&key(&entries[a]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    };
+    by_key(&mut roots);
+    let mut rows = Vec::with_capacity(entries.len());
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for &root in roots.iter().rev() {
+        stack.push((root, 0));
+    }
+    while let Some((index, depth)) = stack.pop() {
+        let entry = &entries[index];
+        let kids = children.get(&entry.pid);
+        let has_children = kids.is_some_and(|list| !list.is_empty());
+        rows.push(ProcTreeRow {
+            entry,
+            depth,
+            has_children,
+        });
+        if has_children && expanded.contains(&entry.pid) {
+            let mut sorted = kids.cloned().unwrap_or_default();
+            by_key(&mut sorted);
+            for &kid in sorted.iter().rev() {
+                stack.push((kid, depth + 1));
+            }
+        }
+    }
+    rows
+}
+
+/// 端口列文本：`(显示文本, 截断时的 hover 全文)`。空 = `-`（无监听或无权限）。
+fn format_ports_column(ports: &[u16]) -> (String, Option<String>) {
+    if ports.is_empty() {
+        return ("-".to_owned(), None);
+    }
+    let full = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if full.len() <= 13 {
+        return (full, None);
+    }
+    let mut shown = String::new();
+    for port in ports {
+        if shown.len() + 7 > 13 {
+            break;
+        }
+        if !shown.is_empty() {
+            shown.push_str(", ");
+        }
+        shown.push_str(&port.to_string());
+    }
+    (format!("{shown}…"), Some(full))
+}
+
 fn ssh_process_window(
     ctx: &egui::Context,
     view: &crate::ssh_runtime::RuntimeView,
@@ -4975,6 +5079,7 @@ fn ssh_process_window(
 
         // 打开期间每 3 秒自动重查：进程是活数据，一次性查询会让用户看到
         // 永远不变的列表（海风哥反馈）。loading 中不重发，返回即更新。
+        // 查询类型跟随统一搜索框：`:端口` 刷端口占用，否则刷进程列表。
         let stale = st
             .ssh_ui
             .process_query_last_at()
@@ -4982,10 +5087,19 @@ fn ssh_process_window(
         let loading = view
             .process_search
             .as_ref()
-            .is_some_and(|search| search.loading);
+            .is_some_and(|search| search.loading)
+            || view.port_lookup.as_ref().is_some_and(|lookup| lookup.loading);
         if stale && !loading {
-            let query = st.ssh_ui.process_query().trim().to_owned();
-            out.ssh_runtime_action = Some(SshRuntimeAction::SearchProcesses { session_id, query });
+            match ssh_search_target(st.ssh_ui.process_query()) {
+                Some(SshSearchTarget::Port(port)) => {
+                    out.ssh_runtime_action = Some(SshRuntimeAction::QueryPort { session_id, port });
+                }
+                Some(SshSearchTarget::Processes(query)) => {
+                    out.ssh_runtime_action =
+                        Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                }
+                None => {}
+            }
             st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
         }
         ui.ctx()
@@ -5012,9 +5126,18 @@ fn ssh_process_window(
                 || (response.lost_focus()
                     && ui.input(|input| input.key_pressed(egui::Key::Enter)));
             if submit {
-                let query = st.ssh_ui.process_query().trim().to_owned();
-                out.ssh_runtime_action =
-                    Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                // 统一搜索框：`:8080` = 查端口占用，其它 = 进程名（空 = 全量）。
+                match ssh_search_target(st.ssh_ui.process_query()) {
+                    Some(SshSearchTarget::Port(port)) => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::QueryPort { session_id, port });
+                    }
+                    Some(SshSearchTarget::Processes(query)) => {
+                        out.ssh_runtime_action =
+                            Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                    }
+                    None => {}
+                }
                 st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
             }
         });
@@ -5023,7 +5146,38 @@ fn ssh_process_window(
         ssh_kill_feedback_bar(ui, view, pal, out);
         ssh_kill_confirm_bar(ui, st, pal, out, session_id);
 
-        // ── 进程表格 ────────────────────────────────────────────
+        // ── 端口查询结果（`:端口` 搜索）优先于进程树 ──────────────
+        if let Some(lookup) = &view.port_lookup {
+            ssh_monitor_result_header(ui, &format!(":{}", lookup.port), pal, || {
+                out.ssh_runtime_action = Some(SshRuntimeAction::ClearPortLookup { session_id });
+            });
+            if lookup.loading && lookup.entries.is_empty() {
+                ui.label(
+                    egui::RichText::new(strings.ssh_monitor_searching)
+                        .small()
+                        .color(pal.fg_dim),
+                );
+            } else if lookup.error {
+                ui.label(
+                    egui::RichText::new(strings.ssh_monitor_search_failed)
+                        .small()
+                        .color(pal.error),
+                );
+            } else if lookup.entries.is_empty() {
+                ui.label(
+                    egui::RichText::new(strings.ssh_monitor_port_none)
+                        .small()
+                        .color(pal.fg_dim),
+                );
+            } else {
+                for entry in &lookup.entries {
+                    ssh_monitor_port_row(ui, entry, st, pal);
+                }
+            }
+            return;
+        }
+
+        // ── 进程表格（全量=树形，搜索=平铺）────────────────────────
         let Some(search) = &view.process_search else {
             ui.label(
                 egui::RichText::new(strings.ssh_process_empty_hint)
@@ -5061,27 +5215,17 @@ fn ssh_process_window(
             // 旧列表保持显示，数据返回时原位替换。
         });
         ui.add_space(3.0);
-        // ── 全部进程表格：CPU/内存表头点击切换排序维度；行自绘撑满宽度 ──
         let sort_memory = st.ssh_ui.process_sort_memory();
-        let mut entries: Vec<&crate::ssh_runtime::SshProcessEntry> = search.results.iter().collect();
-        entries.sort_by(|left, right| {
-            let key = |entry: &&crate::ssh_runtime::SshProcessEntry| {
-                if sort_memory {
-                    entry.memory_percent
-                } else {
-                    entry.cpu_percent
-                }
-            };
-            key(right)
-                .partial_cmp(&key(left))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
-        const PID_W: f32 = 72.0;
-        const NUM_W: f32 = 64.0;
+        const CHEV_W: f32 = 16.0;
+        const PID_W: f32 = 64.0;
+        const NUM_W: f32 = 56.0;
+        const PORT_W: f32 = 92.0;
         const KILL_W: f32 = 26.0;
         // 表头（与数据行同几何）。CPU/MEM 列可点击切换排序维度，当前维度带 ▼。
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (_, _) = ui.allocate_exact_size(egui::vec2(CHEV_W, 18.0), egui::Sense::hover());
             let (pid_rect, _) = ui.allocate_exact_size(egui::vec2(PID_W, 18.0), egui::Sense::hover());
             ui.painter().text(
                 pid_rect.left_center(),
@@ -5112,7 +5256,16 @@ fn ssh_process_window(
                     st.ssh_ui.set_process_sort_memory(memory);
                 }
             }
-            let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
+            let (port_rect, _) =
+                ui.allocate_exact_size(egui::vec2(PORT_W, 18.0), egui::Sense::hover());
+            ui.painter().text(
+                port_rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                strings.ssh_process_ports,
+                egui::FontId::monospace(13.0),
+                pal.fg_dim,
+            );
+            let cmd_w = (ui.available_width() - KILL_W).max(40.0);
             let (cmd_rect, _) =
                 ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
             ui.painter().text(
@@ -5125,22 +5278,73 @@ fn ssh_process_window(
         });
         ui.separator();
 
+        // 全量（空 query）按父子关系建树；搜索（非空 query）平铺展示匹配项。
+        let rows: Vec<ProcTreeRow> = if search.query.is_empty() {
+            build_proc_tree(&search.results, sort_memory, &st.ssh_ui.expanded_snapshot())
+        } else {
+            let mut flat: Vec<&crate::ssh_runtime::SshProcessEntry> =
+                search.results.iter().collect();
+            flat.sort_by(|left, right| {
+                let key = |entry: &&crate::ssh_runtime::SshProcessEntry| {
+                    if sort_memory {
+                        entry.memory_percent
+                    } else {
+                        entry.cpu_percent
+                    }
+                };
+                key(right)
+                    .partial_cmp(&key(left))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            flat.into_iter()
+                .map(|entry| ProcTreeRow {
+                    entry,
+                    depth: 0,
+                    has_children: false,
+                })
+                .collect()
+        };
+
         egui::ScrollArea::vertical()
             .id_salt(("ssh_process_window_scroll", session_id))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for entry in entries {
+                for row in &rows {
                     ui.horizontal(|ui| {
-                        let (pid_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(PID_W, 20.0), egui::Sense::hover());
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        // 缩进 + 折叠 chevron（仅父进程；任务管理器式分组）。
+                        let indent = row.depth as f32 * 14.0;
+                        let (chev_rect, chev_response) = ui.allocate_exact_size(
+                            egui::vec2(CHEV_W + indent, 20.0),
+                            egui::Sense::click(),
+                        );
+                        if row.has_children {
+                            let expanded = st.ssh_ui.pid_expanded(row.entry.pid);
+                            let chev = egui::Rect::from_center_size(
+                                egui::pos2(chev_rect.max.x - 8.0, chev_rect.center().y),
+                                egui::vec2(10.0, 10.0),
+                            );
+                            if expanded {
+                                paint_ssh_monitor_chevron_down(ui.painter(), chev, pal.fg_dim);
+                            } else {
+                                paint_ssh_monitor_chevron(ui.painter(), chev, false, pal.fg_dim);
+                            }
+                            if chev_response.clicked() {
+                                st.ssh_ui.toggle_pid_expanded(row.entry.pid);
+                            }
+                        }
+                        let (pid_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(PID_W, 20.0),
+                            egui::Sense::hover(),
+                        );
                         ui.painter().text(
                             pid_rect.left_center(),
                             egui::Align2::LEFT_CENTER,
-                            entry.pid.to_string(),
+                            row.entry.pid.to_string(),
                             egui::FontId::monospace(13.0),
                             pal.fg,
                         );
-                        for value in [entry.cpu_percent, entry.memory_percent] {
+                        for value in [row.entry.cpu_percent, row.entry.memory_percent] {
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(NUM_W, 20.0),
                                 egui::Sense::hover(),
@@ -5153,7 +5357,25 @@ fn ssh_process_window(
                                 pal.fg,
                             );
                         }
-                        let cmd_w = (ui.available_width() - KILL_W - 8.0).max(40.0);
+                        // 端口列：超宽截断为 …，hover 显示全部端口。
+                        let (port_text, port_hover) = format_ports_column(&row.entry.ports);
+                        let (port_rect, port_response) = ui.allocate_exact_size(
+                            egui::vec2(PORT_W, 20.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter_at(port_rect).text(
+                            port_rect.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            port_text,
+                            egui::FontId::monospace(12.0),
+                            pal.fg,
+                        );
+                        if let Some(full) = port_hover {
+                            if port_response.hovered() {
+                                port_response.on_hover_text(full);
+                            }
+                        }
+                        let cmd_w = (ui.available_width() - KILL_W).max(40.0);
                         let (cmd_rect, cmd_response) = ui.allocate_exact_size(
                             egui::vec2(cmd_w, 20.0),
                             egui::Sense::hover(),
@@ -5163,12 +5385,12 @@ fn ssh_process_window(
                         painter.text(
                             cmd_rect.left_center(),
                             egui::Align2::LEFT_CENTER,
-                            &entry.command,
+                            &row.entry.command,
                             egui::FontId::monospace(13.0),
                             pal.fg,
                         );
                         if cmd_response.hovered() {
-                            cmd_response.on_hover_text(&entry.command);
+                            cmd_response.on_hover_text(&row.entry.command);
                         }
                         let (kill_rect, kill_response) = ui.allocate_exact_size(
                             egui::vec2(KILL_W, 20.0),
@@ -5192,7 +5414,7 @@ fn ssh_process_window(
                             .on_hover_text(strings.ssh_monitor_kill)
                             .clicked()
                         {
-                            st.ssh_ui.set_kill_confirm(Some(entry.pid));
+                            st.ssh_ui.set_kill_confirm(Some(row.entry.pid));
                         }
                     });
                 }
@@ -5567,6 +5789,41 @@ fn ssh_runtime_modals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 统一搜索框_冒号前缀解析为端口() {
+        let Some(SshSearchTarget::Port(8080)) = ssh_search_target(":8080") else {
+            panic!(":8080 应解析为端口查询");
+        };
+        let Some(SshSearchTarget::Port(22)) = ssh_search_target(" :22 ") else {
+            panic!("前后空白的 :22 应解析为端口查询");
+        };
+    }
+
+    #[test]
+    fn 统一搜索框_非法端口不提交() {
+        assert!(ssh_search_target(":").is_none());
+        assert!(ssh_search_target(":abc").is_none());
+        assert!(ssh_search_target(":0").is_none());
+        assert!(ssh_search_target(":65536").is_none());
+    }
+
+    #[test]
+    fn 统一搜索框_进程名与空文本() {
+        let Some(SshSearchTarget::Processes(query)) = ssh_search_target("nginx") else {
+            panic!("nginx 应解析为进程名搜索");
+        };
+        assert_eq!(query, "nginx");
+        let Some(SshSearchTarget::Processes(empty)) = ssh_search_target("  ") else {
+            panic!("空文本应解析为全量进程查询");
+        };
+        assert!(empty.is_empty());
+        // 进程名里带冒号（非前缀）不当端口。
+        let Some(SshSearchTarget::Processes(query)) = ssh_search_target("java:prod") else {
+            panic!("非前缀冒号应按进程名处理");
+        };
+        assert_eq!(query, "java:prod");
+    }
 
     #[test]
     fn 密码输入框不会保留可撤销的旧明文() {

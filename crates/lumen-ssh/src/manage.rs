@@ -23,10 +23,10 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 4;
 pub const MAX_QUERY_CHARS: usize = 64;
 /// 名称搜索的结果上限（弹窗全量列表放宽到 [`MAX_ALL_PROCESSES`]）。
 const MAX_SEARCH_RESULTS: usize = 40;
-/// 详情弹窗全量进程列表的条目上限（按 CPU 降序截断）。
+/// 详情弹窗全量进程列表的条目上限（CPU/MEM top 并集各取此数）。
 const MAX_ALL_PROCESSES: usize = 200;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-const MAX_OUTPUT_BYTES: usize = 96 * 1024;
+const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_RESULTS: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,9 +92,13 @@ pub struct PortEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessEntry {
     pub pid: u32,
+    /// 父进程 PID（任务管理器式父子分组；孤儿进程与 pid 1 的 ppid 为 0）。
+    pub ppid: u32,
     pub cpu_percent: f32,
     pub memory_percent: f32,
     pub command: String,
+    /// 该进程监听的 TCP/UDP 端口（升序去重；无权限/无监听时为空）。
+    pub ports: Vec<u16>,
 }
 
 pub fn validate(request: &ManageRequest) -> Result<(), ManageError> {
@@ -131,25 +135,34 @@ const KILL_SCRIPT: &str =
     "if kill -$LUMEN_SIG $LUMEN_PID 2>/dev/null; then printf 'signalled\\n'; \
 elif kill -0 $LUMEN_PID 2>/dev/null; then printf 'denied\\n'; else printf 'missing\\n'; fi";
 
-/// `ss` is universal on iproute2 systems; `netstat` is the fallback. Both
-/// emit `proto<TAB>local_address<TAB>process` so the parser sees one shape.
-/// Without root, process columns of other users come back empty — that is
-/// reported as `pid: None`, not as an error.
+/// `ss` 优先（不用 `-H`，兼容老 iproute2），`netstat` 兜底，BusyBox
+/// `netstat` 不支持 `-p` 时二次兜底为无进程列。输出统一为
+/// `proto<TAB>local_address<TAB>process`。末尾 sentinel 让客户端区分
+/// 「执行成功但无匹配」与「工具链失败」——此前所有失败都静默映射成
+/// 「未发现监听」，用户无法分辨（海风哥：Linux 端搜端口无效）。
 const PORT_SCRIPT: &str = "if command -v ss >/dev/null 2>&1; then \
-ss -H -lntup 2>/dev/null | grep -E \"[:.]${LUMEN_PORT}[[:space:]]\" | \
-awk '{printf \"%s\\t%s\\t%s\\n\", $1, $5, $7}'; \
+ss -lntup 2>/dev/null | awk -v p=\"${LUMEN_PORT}\" \
+'$0 ~ (\"[:.]\" p \"[[:space:]]\") { printf \"%s\\t%s\\t%s\\n\", $1, $5, (NF >= 7 ? $7 : \"-\") }'; \
 elif command -v netstat >/dev/null 2>&1; then \
-netstat -tulnp 2>/dev/null | grep -E \"[:.]${LUMEN_PORT}[[:space:]]\" | \
-awk '{printf \"%s\\t%s\\t%s\\n\", $1, $4, $7}'; fi";
+out=$(netstat -tulnp 2>/dev/null) || out=$(netstat -tuln 2>/dev/null); \
+printf '%s\\n' \"$out\" | awk -v p=\"${LUMEN_PORT}\" \
+'$0 ~ (\"[:.]\" p \"[[:space:]]\") { printf \"%s\\t%s\\t%s\\n\", $1, $4, (NF >= 7 ? $7 : \"-\") }'; \
+else printf 'LUMEN_NO_TOOL\\n'; fi; \
+printf 'LUMEN_END\\n'";
 
 /// The query arrives octal-encoded in `$1` (see the directory lane). An empty
 /// query skips the grep stage entirely and yields the full process list (the
 /// details window). The `grep -v grep` stage drops the pipeline's own
 /// processes, whose command lines literally contain the word "grep".
+/// 进程字段含 ppid（任务管理器式父子分组）；`===LUMEN_SS===` 段附全量
+/// 监听 socket（详情弹窗「端口号」列的数据源，无 ss 的系统该段为空）。
 const PROCESS_SCRIPT: &str = "q=$(printf '%bX' \"$1\"); q=${q%X}; \
+echo '===LUMEN_PS==='; \
 if [ -n \"$q\" ]; then \
-ps -eo pid=,pcpu=,pmem=,args= 2>/dev/null | grep -i -F -- \"$q\" | grep -v grep; \
-else ps -eo pid=,pcpu=,pmem=,args= 2>/dev/null; fi";
+ps -eo pid=,ppid=,pcpu=,pmem=,args= 2>/dev/null | grep -i -F -- \"$q\" | grep -v grep; \
+else ps -eo pid=,ppid=,pcpu=,pmem=,args= 2>/dev/null; fi; \
+echo '===LUMEN_SS==='; \
+ss -lntup 2>/dev/null";
 
 pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageError> {
     validate(request)?;
@@ -169,10 +182,11 @@ pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageErr
         }
         ManageAction::QueryProcess { query } => {
             let encoded = encode_octal(query.as_bytes());
-            // 全量列表预取给 CPU/MEM 双维度并集截断留余量（最长命令行的
-            // 极端环境由 96KB 输出上限兜底截断，parse 逐行容错）。
+            // 全量列表预取给 CPU/MEM 双维度并集截断留余量；ss 段（监听
+            // socket，「端口号」列数据源）另留 200 行（最长命令行的极端
+            // 环境由输出字节上限兜底截断，parse 逐行容错）。
             let head = if query.is_empty() {
-                MAX_ALL_PROCESSES * 3
+                MAX_ALL_PROCESSES * 3 + 200
             } else {
                 MAX_SEARCH_RESULTS
             };
@@ -303,7 +317,16 @@ pub fn parse_outcome(action: &ManageAction, output: &str) -> Result<ManageOutcom
             };
             Ok(ManageOutcome::Kill(KillOutcome { pid: *pid, status }))
         }
-        ManageAction::QueryPort { .. } => Ok(ManageOutcome::Ports(parse_port_entries(output))),
+        ManageAction::QueryPort { .. } => {
+            // sentinel 缺席 = 工具链失败（ss/netstat 全缺或脚本未执行完），
+            // 与「执行成功但无匹配」严格区分。
+            if output.lines().any(|line| line.trim() == "LUMEN_NO_TOOL")
+                || !output.lines().any(|line| line.trim() == "LUMEN_END")
+            {
+                return Err(ManageError::CommandFailed);
+            }
+            Ok(ManageOutcome::Ports(parse_port_entries(output)))
+        }
         ManageAction::QueryProcess { query } => {
             let mut entries = parse_process_entries(output);
             if query.is_empty() {
@@ -372,13 +395,7 @@ fn parse_process_field(raw: &str) -> (Option<u32>, String) {
     if raw.is_empty() || raw == "-" {
         return (None, String::new());
     }
-    if let Some(position) = raw.find("pid=") {
-        let pid = raw[position + 4..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .ok();
+    if raw.contains("pid=") {
         let command = raw
             .find("((\"")
             .and_then(|start| {
@@ -386,7 +403,7 @@ fn parse_process_field(raw: &str) -> (Option<u32>, String) {
                 rest.find('"').map(|end| rest[..end].to_owned())
             })
             .unwrap_or_default();
-        return (pid, command);
+        return (extract_pid(raw), command);
     }
     if let Some((pid_text, command)) = raw.split_once('/') {
         if let Ok(pid) = pid_text.parse::<u32>() {
@@ -396,27 +413,80 @@ fn parse_process_field(raw: &str) -> (Option<u32>, String) {
     (None, raw.to_owned())
 }
 
+/// 解析 `===LUMEN_PS===` / `===LUMEN_SS===` 两段输出：ps 段（含 ppid）
+/// 逐行容错；ss 段聚合成 `pid → [监听端口]` 后并入各进程条目（无 ss /
+/// 无权限时对应进程端口列自然为空）。
 fn parse_process_entries(output: &str) -> Vec<ProcessEntry> {
-    output
+    let ps_body = output
+        .split("===LUMEN_SS===")
+        .next()
+        .unwrap_or("")
+        .split("===LUMEN_PS===")
+        .nth(1)
+        .unwrap_or("");
+    let ss_body = output.split("===LUMEN_SS===").nth(1).unwrap_or("");
+
+    let mut listening: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
+    for line in ss_body.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        let local = fields[4];
+        let Some(port) = local.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(pid) = fields.get(6).and_then(|raw| extract_pid(raw)) else {
+            continue;
+        };
+        let ports = listening.entry(pid).or_default();
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    for ports in listening.values_mut() {
+        ports.sort_unstable();
+    }
+
+    ps_body
         .lines()
         .take(MAX_ALL_PROCESSES * 3)
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse::<u32>().ok()?;
+            let ppid = fields.next()?.parse::<u32>().ok()?;
             let cpu_percent = fields.next()?.parse::<f32>().ok()?;
             let memory_percent = fields.next()?.parse::<f32>().ok()?;
             let command = fields.collect::<Vec<_>>().join(" ");
             if command.is_empty() {
                 return None;
             }
+            let ports = listening.get(&pid).cloned().unwrap_or_default();
             Some(ProcessEntry {
                 pid,
+                ppid,
                 cpu_percent,
                 memory_percent,
                 command: command.chars().take(160).collect(),
+                ports,
             })
         })
         .collect()
+}
+
+/// 从 `users:(("sshd",pid=901,fd=3))` 或 `901/sshd` 提取 PID。
+fn extract_pid(raw: &str) -> Option<u32> {
+    if let Some(position) = raw.find("pid=") {
+        return raw[position + 4..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok();
+    }
+    raw.split('/')
+        .next()
+        .and_then(|text| text.parse::<u32>().ok())
 }
 
 #[cfg(test)]
@@ -522,8 +592,11 @@ mod tests {
         let netstat_row = "udp\t127.0.0.53:53\t412/systemd-resolve\n";
         let hidden_row = "tcp\t[::]:8080\t-\n";
         let action = ManageAction::QueryPort { port: 22 };
-        let outcome =
-            parse_outcome(&action, &format!("{ss_row}{netstat_row}{hidden_row}")).unwrap();
+        let outcome = parse_outcome(
+            &action,
+            &format!("{ss_row}{netstat_row}{hidden_row}LUMEN_END\n"),
+        )
+        .unwrap();
         let ManageOutcome::Ports(entries) = outcome else {
             panic!("port query must yield port entries");
         };
@@ -538,8 +611,22 @@ mod tests {
     }
 
     #[test]
-    fn process_entries_parse_ps_rows() {
-        let output = "  901 0.3 1.2 /usr/sbin/sshd -D\n  42 150.0 12.5 worker --flag=a,b\n";
+    fn port_query_missing_sentinel_is_failure_not_empty() {
+        let action = ManageAction::QueryPort { port: 22 };
+        // 无 LUMEN_END（工具链失败/脚本未执行完）必须报错，不能伪装成
+        // 「未发现监听该端口的进程」。
+        assert!(parse_outcome(&action, "").is_err());
+        assert!(parse_outcome(&action, "LUMEN_NO_TOOL\nLUMEN_END\n").is_err());
+        let ok = parse_outcome(&action, "LUMEN_END\n").unwrap();
+        let ManageOutcome::Ports(entries) = ok else {
+            panic!("port query must yield port entries");
+        };
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn process_entries_parse_ps_rows_with_ppid_and_ports() {
+        let output = "===LUMEN_PS===\n  901 1 0.3 1.2 /usr/sbin/sshd -D\n  42 901 150.0 12.5 worker --flag=a,b\n===LUMEN_SS===\nNetid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\ntcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=901,fd=3))\ntcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:*\ntcp LISTEN 0 100 [::]:9090 [::]:* users:((\"worker\",pid=42,fd=7))\n";
         let action = ManageAction::QueryProcess {
             query: "sshd".to_owned(),
         };
@@ -549,8 +636,12 @@ mod tests {
         };
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].pid, 901);
+        assert_eq!(entries[0].ppid, 1);
         assert_eq!(entries[0].command, "/usr/sbin/sshd -D");
+        assert_eq!(entries[0].ports, vec![22]);
+        assert_eq!(entries[1].ppid, 901);
         assert_eq!(entries[1].cpu_percent, 150.0);
         assert_eq!(entries[1].command, "worker --flag=a,b");
+        assert_eq!(entries[1].ports, vec![9090]);
     }
 }

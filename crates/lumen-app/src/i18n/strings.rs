@@ -684,12 +684,8 @@ pub struct Strings {
     pub ssh_monitor_processes: &'static str,
     pub ssh_monitor_command: &'static str,
     pub ssh_monitor_no_processes: &'static str,
-    /// 进程卡名称搜索框占位提示
+    /// 进程卡统一搜索框占位提示（进程名，或 :端口）
     pub ssh_monitor_search_hint: &'static str,
-    /// 进程卡端口查询框占位提示
-    pub ssh_monitor_port_hint: &'static str,
-    /// 端口查询按钮
-    pub ssh_monitor_port_query: &'static str,
     /// 清除搜索/查询结果
     pub ssh_monitor_clear: &'static str,
     /// 搜索进行中
@@ -724,6 +720,8 @@ pub struct Strings {
     pub ssh_statusbar_monitor_show: &'static str,
     /// 进程卡「详情」按钮（打开进程详情弹窗）
     pub ssh_monitor_detail: &'static str,
+    /// 详情弹窗「端口号」列标题
+    pub ssh_process_ports: &'static str,
     /// 进程详情弹窗标题
     pub ssh_process_window_title: &'static str,
     /// 详情弹窗搜索按钮

@@ -108,9 +108,13 @@ pub struct ProcessSearchView {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SshProcessEntry {
     pub pid: u32,
+    /// 父进程 PID（任务管理器式父子分组）。
+    pub ppid: u32,
     pub cpu_percent: f32,
     pub memory_percent: f32,
     pub command: String,
+    /// 该进程监听的端口（升序去重；无权限/无监听时为空）。
+    pub ports: Vec<u16>,
 }
 
 /// 端口占用查询的展示状态。`pid: None` 表示远端工具对其它用户的进程
@@ -1966,9 +1970,11 @@ impl SshRuntime {
                         .iter()
                         .map(|entry| SshProcessEntry {
                             pid: entry.pid,
+                            ppid: entry.ppid,
                             cpu_percent: entry.cpu_percent,
                             memory_percent: entry.memory_percent,
                             command: entry.command.clone(),
+                            ports: entry.ports.clone(),
                         })
                         .collect(),
                 }),

@@ -667,10 +667,10 @@ pub struct SshUiState {    search: String,
     process_sort_memory: bool,
     /// 进程详情弹窗上次发起远端查询的时间（打开期间每 3 秒自动刷新）。
     process_query_last_at: Option<std::time::Instant>,
-    /// 进程卡「按名称搜索」输入框文本。
+    /// 进程详情弹窗树形展示中已展开的父进程 PID（默认全部折叠）。
+    expanded_pids: HashSet<u32>,
+    /// 进程卡「统一搜索框」文本（进程名，或 `:端口` 查询端口占用）。
     process_query: String,
-    /// 进程卡「按端口查询」输入框文本。
-    port_query: String,
     /// 等待二次确认的待终止 PID。
     kill_confirm: Option<u32>,
 }
@@ -786,12 +786,19 @@ impl SshUiState {
         &mut self.process_query
     }
 
-    pub fn port_query(&self) -> &str {
-        &self.port_query
+    pub fn pid_expanded(&self, pid: u32) -> bool {
+        self.expanded_pids.contains(&pid)
     }
 
-    pub fn port_query_mut(&mut self) -> &mut String {
-        &mut self.port_query
+    /// 树形构建用的展开集合快照（避免借用跨越 UI 调用）。
+    pub fn expanded_snapshot(&self) -> HashSet<u32> {
+        self.expanded_pids.clone()
+    }
+
+    pub fn toggle_pid_expanded(&mut self, pid: u32) {
+        if !self.expanded_pids.remove(&pid) {
+            self.expanded_pids.insert(pid);
+        }
     }
 
     pub fn kill_confirm(&self) -> Option<u32> {
