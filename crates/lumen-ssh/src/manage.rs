@@ -21,8 +21,12 @@ use super::StrictHostKeyHandler;
 
 pub const MAX_CONCURRENT_REQUESTS: usize = 4;
 pub const MAX_QUERY_CHARS: usize = 64;
+/// 名称搜索的结果上限（弹窗全量列表放宽到 [`MAX_ALL_PROCESSES`]）。
+const MAX_SEARCH_RESULTS: usize = 40;
+/// 详情弹窗全量进程列表的条目上限（按 CPU 降序截断）。
+const MAX_ALL_PROCESSES: usize = 200;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 96 * 1024;
 const MAX_RESULTS: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,8 +114,8 @@ pub fn validate(request: &ManageRequest) -> Result<(), ManageError> {
             }
         }
         ManageAction::QueryProcess { query } => {
-            if query.is_empty()
-                || query.chars().count() > MAX_QUERY_CHARS
+            // 空 query 是合法的：表示详情弹窗的「全量进程列表」。
+            if query.chars().count() > MAX_QUERY_CHARS
                 || query.chars().any(char::is_control)
             {
                 return Err(ManageError::InvalidRequest);
@@ -138,11 +142,14 @@ elif command -v netstat >/dev/null 2>&1; then \
 netstat -tulnp 2>/dev/null | grep -E \"[:.]${LUMEN_PORT}[[:space:]]\" | \
 awk '{printf \"%s\\t%s\\t%s\\n\", $1, $4, $7}'; fi";
 
-/// The query arrives octal-encoded in `$1` (see the directory lane). The
-/// `grep -v grep` stage drops the pipeline's own processes, whose command
-/// lines literally contain the word "grep".
-const PROCESS_SCRIPT: &str = "q=$(printf '%bX' \"$1\"); q=${q%X}; [ -n \"$q\" ] || exit 0; \
-ps -eo pid=,pcpu=,pmem=,args= 2>/dev/null | grep -i -F -- \"$q\" | grep -v grep";
+/// The query arrives octal-encoded in `$1` (see the directory lane). An empty
+/// query skips the grep stage entirely and yields the full process list (the
+/// details window). The `grep -v grep` stage drops the pipeline's own
+/// processes, whose command lines literally contain the word "grep".
+const PROCESS_SCRIPT: &str = "q=$(printf '%bX' \"$1\"); q=${q%X}; \
+if [ -n \"$q\" ]; then \
+ps -eo pid=,pcpu=,pmem=,args= 2>/dev/null | grep -i -F -- \"$q\" | grep -v grep; \
+else ps -eo pid=,pcpu=,pmem=,args= 2>/dev/null; fi";
 
 pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageError> {
     validate(request)?;
@@ -162,8 +169,14 @@ pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageErr
         }
         ManageAction::QueryProcess { query } => {
             let encoded = encode_octal(query.as_bytes());
+            // 全量列表预取略多于截断上限，给 rust 端 CPU 降序截取留余量。
+            let head = if query.is_empty() {
+                MAX_ALL_PROCESSES + 40
+            } else {
+                MAX_SEARCH_RESULTS
+            };
             format!(
-                "LC_ALL=C /bin/sh -c {} lumen-manage '{encoded}' | head -n {MAX_RESULTS}",
+                "LC_ALL=C /bin/sh -c {} lumen-manage '{encoded}' | head -n {head}",
                 shell_quote(PROCESS_SCRIPT)
             )
         }
@@ -290,8 +303,19 @@ pub fn parse_outcome(action: &ManageAction, output: &str) -> Result<ManageOutcom
             Ok(ManageOutcome::Kill(KillOutcome { pid: *pid, status }))
         }
         ManageAction::QueryPort { .. } => Ok(ManageOutcome::Ports(parse_port_entries(output))),
-        ManageAction::QueryProcess { .. } => {
-            Ok(ManageOutcome::Processes(parse_process_entries(output)))
+        ManageAction::QueryProcess { query } => {
+            let mut entries = parse_process_entries(output);
+            if query.is_empty() {
+                // 全量列表（详情弹窗）：CPU 降序截断到上限。
+                entries.sort_by(|left, right| {
+                    right
+                        .cpu_percent
+                        .partial_cmp(&left.cpu_percent)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                entries.truncate(MAX_ALL_PROCESSES);
+            }
+            Ok(ManageOutcome::Processes(entries))
         }
     }
 }
@@ -352,7 +376,7 @@ fn parse_process_field(raw: &str) -> (Option<u32>, String) {
 fn parse_process_entries(output: &str) -> Vec<ProcessEntry> {
     output
         .lines()
-        .take(MAX_RESULTS)
+        .take(MAX_ALL_PROCESSES + 40)
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse::<u32>().ok()?;
@@ -396,8 +420,13 @@ mod tests {
     }
 
     #[test]
-    fn process_query_rejects_empty_control_and_long() {
-        for query in ["", "bad\nname", &"x".repeat(MAX_QUERY_CHARS + 1)] {
+    fn process_query_rejects_control_and_long_but_allows_empty() {
+        // 空串 = 详情弹窗的全量进程列表，合法。
+        let all = request(ManageAction::QueryProcess {
+            query: String::new(),
+        });
+        assert_eq!(validate(&all), Ok(()));
+        for query in ["bad\nname", &"x".repeat(MAX_QUERY_CHARS + 1)] {
             let search = request(ManageAction::QueryProcess {
                 query: query.to_owned(),
             });

@@ -628,10 +628,27 @@ struct DropTarget {
     index: usize,
 }
 
+/// 监控卡片稳定 id（折叠状态持久化到 settings 的合法值全集，单一来源）。
+pub const SSH_CARD_SYSTEM: &str = "system";
+pub const SSH_CARD_CPU: &str = "cpu";
+pub const SSH_CARD_MEMORY: &str = "memory";
+pub const SSH_CARD_NETWORK: &str = "network";
+pub const SSH_CARD_DISK: &str = "disk";
+pub const SSH_CARD_PROCESSES: &str = "processes";
+
+/// 全部合法监控卡片 id（settings 恢复时过滤未知值用）。
+pub const SSH_MONITOR_CARD_IDS: &[&str] = &[
+    SSH_CARD_SYSTEM,
+    SSH_CARD_CPU,
+    SSH_CARD_MEMORY,
+    SSH_CARD_NETWORK,
+    SSH_CARD_DISK,
+    SSH_CARD_PROCESSES,
+];
+
 /// SSH 页面跨帧状态。
 #[derive(Debug, Default)]
-pub struct SshUiState {
-    search: String,
+pub struct SshUiState {    search: String,
     selected_profile_id: Option<ProfileId>,
     collapsed_groups: HashSet<GroupId>,
     ungrouped_collapsed: bool,
@@ -640,6 +657,12 @@ pub struct SshUiState {
     drop_target: Option<DropTarget>,
     /// 监控面板收起（右侧只剩一条展开手柄）。应用级偏好，跨会话共享。
     monitor_collapsed: bool,
+    /// 监控面板各卡片的折叠状态（key = 卡片稳定 id）。
+    collapsed_monitor_cards: HashSet<&'static str>,
+    /// 监控显隐偏好自上次持久化后被修改过（main 据此写 settings）。
+    monitor_prefs_dirty: bool,
+    /// 进程详情弹窗是否打开。
+    process_window_open: bool,
     /// 进程卡「按名称搜索」输入框文本。
     process_query: String,
     /// 进程卡「按端口查询」输入框文本。
@@ -677,6 +700,62 @@ impl SshUiState {
 
     pub fn toggle_monitor_collapsed(&mut self) {
         self.monitor_collapsed = !self.monitor_collapsed;
+        self.monitor_prefs_dirty = true;
+    }
+
+    pub fn set_monitor_collapsed(&mut self, collapsed: bool) {
+        if self.monitor_collapsed != collapsed {
+            self.monitor_collapsed = collapsed;
+            self.monitor_prefs_dirty = true;
+        }
+    }
+
+    pub fn monitor_card_collapsed(&self, card_id: &'static str) -> bool {
+        self.collapsed_monitor_cards.contains(card_id)
+    }
+
+    pub fn toggle_monitor_card(&mut self, card_id: &'static str) {
+        if !self.collapsed_monitor_cards.remove(card_id) {
+            self.collapsed_monitor_cards.insert(card_id);
+        }
+        self.monitor_prefs_dirty = true;
+    }
+
+    /// 启动时从 settings 恢复监控显隐偏好（一次性灌入，不置脏）。
+    pub fn load_monitor_prefs(&mut self, collapsed: bool, cards: &[String]) {
+        self.monitor_collapsed = collapsed;
+        self.collapsed_monitor_cards = cards
+            .iter()
+            .map(String::as_str)
+            // 卡片 id 均为编译期常量；settings 里的未知 id 无法转为
+            // &'static str，直接丢弃（无害，等价未折叠）。
+            .filter_map(|id| SSH_MONITOR_CARD_IDS.iter().copied().find(|known| *known == id))
+            .collect();
+        self.monitor_prefs_dirty = false;
+    }
+
+    /// 导出卡片折叠状态供 settings 持久化。
+    pub fn collapsed_monitor_cards_vec(&self) -> Vec<String> {
+        let mut cards: Vec<String> = self
+            .collapsed_monitor_cards
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        cards.sort_unstable();
+        cards
+    }
+
+    /// 监控显隐偏好是否有未持久化的修改（main 消费后写盘）。
+    pub fn take_monitor_prefs_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.monitor_prefs_dirty)
+    }
+
+    pub fn process_window_open(&self) -> bool {
+        self.process_window_open
+    }
+
+    pub fn set_process_window_open(&mut self, open: bool) {
+        self.process_window_open = open;
     }
 
     pub fn process_query(&self) -> &str {

@@ -1647,16 +1647,14 @@ impl SshRuntime {
         Ok(())
     }
 
-    /// 按名称（命令行子串、忽略大小写）搜索远端进程。
+    /// 按名称（命令行子串、忽略大小写）搜索远端进程；`query` 为空时返回
+    /// 全量进程列表（CPU 降序、上限 200 条，供详情弹窗使用）。
     pub fn search_processes(
         &mut self,
         session_id: SshSessionId,
         query: &str,
     ) -> Result<(), String> {
         let query = query.trim();
-        if query.is_empty() {
-            return Err("SSH process search query is empty".to_owned());
-        }
         let session = self.send_manage(
             session_id,
             PendingManage::QueryProcess,

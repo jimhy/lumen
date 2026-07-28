@@ -629,6 +629,16 @@ pub struct Strings {
     pub ssh_status_connecting: &'static str,
     pub ssh_status_host_key: &'static str,
     pub ssh_status_connected: &'static str,
+    /// 凭据提交已过期（弹窗期间配置被同步/编辑变更）
+    pub ssh_cred_toast_stale: &'static str,
+    /// 密码为空
+    pub ssh_cred_toast_empty_password: &'static str,
+    /// profile id 不合法，无法构造凭据引用
+    pub ssh_cred_toast_invalid_id: &'static str,
+    /// 写入系统凭据管理器失败（带 Win32 错误码）
+    pub ssh_cred_toast_write_failed_fmt: &'static str,
+    /// 凭据已写入但保存配置绑定失败
+    pub ssh_cred_toast_commit_failed: &'static str,
     pub ssh_status_disconnecting: &'static str,
     pub ssh_status_disconnected: &'static str,
     pub ssh_status_error: &'static str,
@@ -712,6 +722,22 @@ pub struct Strings {
     pub ssh_statusbar_monitor_hide: &'static str,
     /// SSH 状态栏：展开监控面板按钮
     pub ssh_statusbar_monitor_show: &'static str,
+    /// 进程卡「详情」按钮（打开进程详情弹窗）
+    pub ssh_monitor_detail: &'static str,
+    /// 进程详情弹窗标题
+    pub ssh_process_window_title: &'static str,
+    /// 详情弹窗搜索按钮
+    pub ssh_process_search_btn: &'static str,
+    /// 详情弹窗刷新按钮
+    pub ssh_process_refresh: &'static str,
+    /// 详情弹窗未加载时的占位提示
+    pub ssh_process_empty_hint: &'static str,
+    /// 详情弹窗进程计数（fmt1 占位）
+    pub ssh_process_count_fmt: &'static str,
+    /// 工具栏：隐藏服务器监控面板提示
+    pub toolbar_ssh_monitor_hide_tip: &'static str,
+    /// 工具栏：显示服务器监控面板提示
+    pub toolbar_ssh_monitor_show_tip: &'static str,
     /// 远程设备列表标题（M5.2）
     pub remote_list_title: &'static str,
     /// 设备在线

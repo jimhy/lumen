@@ -584,6 +584,10 @@ pub struct ShellOutput {
     pub toggle_ssh_server_list: Option<bool>,
     /// 工具栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
     pub toggle_filetree: Option<bool>,
+    /// SSH 监控面板/卡片显隐偏好有未持久化的修改（三入口：工具栏开关、
+    /// 状态栏按钮、面板手柄 + 卡片 chevron）：main 把 `SshUiState` 当前
+    /// 状态写进 settings.layout 并落盘。
+    pub ssh_monitor_prefs_changed: bool,
     /// 本地/远程/SSH 工作模式切换：main 写 settings.layout.view_mode + 存盘。
     pub toggle_view_mode: Option<crate::settings::ViewMode>,
     /// SSH 服务器列表 UI 的增删改、拖放与连接动作；main 串行施加到
@@ -832,6 +836,7 @@ pub fn show(
         toggle_remote_list: None,
         toggle_ssh_server_list: None,
         toggle_filetree: None,
+        ssh_monitor_prefs_changed: false,
         toggle_view_mode: None,
         ssh_actions: Vec::new(),
         ssh_runtime_action: None,
@@ -1069,6 +1074,7 @@ pub fn show(
             ssh_server_list_visible: app_settings.layout.ssh_server_list_visible,
             sidebar_visible: app_settings.layout.sidebar_visible,
             filetree_visible: st.filetree.visible,
+            ssh_monitor_visible: !st.ssh_ui.monitor_collapsed(),
         },
     );
     if tbar.new_pane {
@@ -1094,6 +1100,10 @@ pub fn show(
         // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
         st.filetree.visible = v;
         out.toggle_filetree = Some(v);
+    }
+    if let Some(v) = tbar.toggle_ssh_monitor {
+        // SSH 监控面板 toggle：与状态栏/面板手柄同状态源（ssh_ui）。
+        st.ssh_ui.set_monitor_collapsed(!v);
     }
 
     // 左侧会话栏（问题7：sidebar_visible 控制是否渲染）。
@@ -2613,6 +2623,9 @@ pub fn show(
 
     // —— 系统提示浮层（最后绘制 = 叠在一切覆盖层之上）——
     toast::show(root.ctx(), &mut st.toast, pal);
+    // SSH 监控显隐偏好（面板收起/卡片折叠）有修改则上报 main 持久化——
+    // 工具栏开关、状态栏按钮、面板手柄、卡片 chevron 四入口统一在此汇总。
+    out.ssh_monitor_prefs_changed = st.ssh_ui.take_monitor_prefs_dirty();
     out
 }
 
@@ -3632,6 +3645,11 @@ fn ssh_workspace(
             }
         }
     }
+
+    // ── 进程详情弹窗（监控面板「详情」按钮打开）───────────────────
+    if st.ssh_ui.process_window_open() {
+        ssh_process_window(ui.ctx(), view, st, pal, out);
+    }
 }
 
 /// 画一个 ‹/› 形 chevron（监控面板收起/展开按钮用）。
@@ -3684,6 +3702,14 @@ fn ssh_monitor_ui(
     out: &mut ShellOutput,
 ) {
     let strings = crate::i18n::strings();
+    // 监控面板文字整体调大（海风哥：small 10pt 看不清，进程卡尤其小）——
+    // Small 提到 12pt，对 .small() 的 proportional/monospace 文本一处生效。
+    let small_family = ui.style().text_styles[&egui::TextStyle::Small]
+        .family
+        .clone();
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::new(12.0, small_family));
     egui::ScrollArea::vertical()
         .id_salt(("ssh_monitor_scroll", view.session_id))
         .auto_shrink([false, false])
@@ -3699,20 +3725,24 @@ fn ssh_monitor_ui(
 
             let Some(monitor) = &view.monitor else {
                 ssh_monitor_card(ui, pal, |ui| {
-                    ssh_monitor_card_header(
+                    let collapsed = ssh_monitor_card_header(
                         ui,
                         SshMonitorIcon::System,
                         strings.ssh_monitor_system,
                         None,
+                        SSH_CARD_SYSTEM,
+                        st,
                         pal,
                     );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(strings.ssh_monitor_waiting)
-                            .small()
-                            .color(pal.fg_dim),
-                    );
-                    ui.add_space(8.0);
+                    if !collapsed {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(strings.ssh_monitor_waiting)
+                                .small()
+                                .color(pal.fg_dim),
+                        );
+                        ui.add_space(8.0);
+                    }
                 });
                 if let Some(error) = &view.metrics_error {
                     ui.add_space(6.0);
@@ -3721,15 +3751,15 @@ fn ssh_monitor_ui(
                 return;
             };
 
-            ssh_monitor_system_card(ui, view, monitor, pal);
+            ssh_monitor_system_card(ui, view, monitor, st, pal);
             ui.add_space(7.0);
-            ssh_monitor_cpu_card(ui, monitor, pal);
+            ssh_monitor_cpu_card(ui, monitor, st, pal);
             ui.add_space(7.0);
-            ssh_monitor_memory_card(ui, monitor, pal);
+            ssh_monitor_memory_card(ui, monitor, st, pal);
             ui.add_space(7.0);
-            ssh_monitor_network_card(ui, monitor, pal);
+            ssh_monitor_network_card(ui, monitor, st, pal);
             ui.add_space(7.0);
-            ssh_monitor_disk_card(ui, monitor, pal);
+            ssh_monitor_disk_card(ui, monitor, st, pal);
             ui.add_space(7.0);
             ssh_monitor_process_card(ui, view, monitor, st, pal, out);
 
@@ -3801,19 +3831,45 @@ fn ssh_monitor_card<R>(
         .inner
 }
 
+const SSH_CARD_SYSTEM: &str = ssh_ui::SSH_CARD_SYSTEM;
+const SSH_CARD_CPU: &str = ssh_ui::SSH_CARD_CPU;
+const SSH_CARD_MEMORY: &str = ssh_ui::SSH_CARD_MEMORY;
+const SSH_CARD_NETWORK: &str = ssh_ui::SSH_CARD_NETWORK;
+const SSH_CARD_DISK: &str = ssh_ui::SSH_CARD_DISK;
+const SSH_CARD_PROCESSES: &str = ssh_ui::SSH_CARD_PROCESSES;
+
+/// 卡片标题行：图标 + 标题 + 右侧 value 徽标 + 折叠 chevron（折叠 ▶ /
+/// 展开 ▼，点击切换）。返回当前折叠态，调用方据它决定是否绘制卡片内容。
 fn ssh_monitor_card_header(
     ui: &mut egui::Ui,
     icon: SshMonitorIcon,
     title: &str,
     value: Option<String>,
+    card_id: &'static str,
+    st: &mut ShellState,
     pal: &theme::Palette,
-) {
+) -> bool {
+    let collapsed = st.ssh_ui.monitor_card_collapsed(card_id);
     ui.horizontal(|ui| {
         let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
         paint_ssh_monitor_icon(ui.painter(), icon_rect, icon, pal.info);
         ui.label(egui::RichText::new(title).strong().size(13.0).color(pal.fg));
-        if let Some(value) = value {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (chev_rect, chev_resp) =
+                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            if chev_resp.hovered() {
+                ui.painter().rect_filled(chev_rect, 3.0, pal.bg_highlight);
+            }
+            let color = if chev_resp.hovered() { pal.fg } else { pal.fg_dim };
+            if collapsed {
+                paint_ssh_monitor_chevron(ui.painter(), chev_rect.shrink(3.0), false, color);
+            } else {
+                paint_ssh_monitor_chevron_down(ui.painter(), chev_rect.shrink(3.0), color);
+            }
+            if chev_resp.clicked() {
+                st.ssh_ui.toggle_monitor_card(card_id);
+            }
+            if let Some(value) = value {
                 egui::Frame::new()
                     .fill(pal.btn_bg)
                     .corner_radius(3)
@@ -3821,12 +3877,37 @@ fn ssh_monitor_card_header(
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new(value).monospace().small().color(pal.fg));
                     });
-            });
-        }
+            }
+        });
     });
-    ui.add_space(5.0);
-    ui.separator();
-    ui.add_space(5.0);
+    if !collapsed {
+        ui.add_space(5.0);
+        ui.separator();
+        ui.add_space(5.0);
+    }
+    collapsed
+}
+
+/// 画一个 ▼ 形 chevron（监控卡片展开态）。
+fn paint_ssh_monitor_chevron_down(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let center = rect.center();
+    let half_w = rect.width() * 0.42;
+    let half_h = rect.height() * 0.28;
+    let stroke = egui::Stroke::new(1.4_f32, color);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - half_w, center.y - half_h),
+            egui::pos2(center.x, center.y + half_h),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y + half_h),
+            egui::pos2(center.x + half_w, center.y - half_h),
+        ],
+        stroke,
+    );
 }
 
 fn paint_ssh_monitor_icon(
@@ -3936,17 +4017,23 @@ fn ssh_monitor_system_card(
     ui: &mut egui::Ui,
     view: &crate::ssh_runtime::RuntimeView,
     monitor: &crate::ssh_runtime::MonitorView,
+    st: &mut ShellState,
     pal: &theme::Palette,
 ) {
     let strings = crate::i18n::strings();
     ssh_monitor_card(ui, pal, |ui| {
-        ssh_monitor_card_header(
+        let collapsed = ssh_monitor_card_header(
             ui,
             SshMonitorIcon::System,
             strings.ssh_monitor_system,
             Some(view.endpoint.clone()),
+            SSH_CARD_SYSTEM,
+            st,
             pal,
         );
+        if collapsed {
+            return;
+        }
         if let Some(details) = &monitor.metrics.details {
             ui.add(
                 egui::Label::new(
@@ -4022,18 +4109,24 @@ fn ssh_monitor_system_card(
 fn ssh_monitor_cpu_card(
     ui: &mut egui::Ui,
     monitor: &crate::ssh_runtime::MonitorView,
+    st: &mut ShellState,
     pal: &theme::Palette,
 ) {
     let strings = crate::i18n::strings();
     let usage = monitor.metrics.cpu_usage_percent.unwrap_or(0.0);
     ssh_monitor_card(ui, pal, |ui| {
-        ssh_monitor_card_header(
+        let collapsed = ssh_monitor_card_header(
             ui,
             SshMonitorIcon::Cpu,
             strings.ssh_monitor_cpu,
             Some(format!("{usage:.1}%")),
+            SSH_CARD_CPU,
+            st,
             pal,
         );
+        if collapsed {
+            return;
+        }
         ssh_monitor_chart(
             ui,
             &[(&monitor.cpu_history, pal.info)],
@@ -4085,6 +4178,7 @@ fn ssh_monitor_cpu_card(
 fn ssh_monitor_memory_card(
     ui: &mut egui::Ui,
     monitor: &crate::ssh_runtime::MonitorView,
+    st: &mut ShellState,
     pal: &theme::Palette,
 ) {
     let strings = crate::i18n::strings();
@@ -4096,7 +4190,7 @@ fn ssh_monitor_memory_card(
         .as_ref()
         .map_or(0, |details| details.memory_cached_bytes);
     ssh_monitor_card(ui, pal, |ui| {
-        ssh_monitor_card_header(
+        let collapsed = ssh_monitor_card_header(
             ui,
             SshMonitorIcon::Memory,
             strings.ssh_monitor_memory,
@@ -4105,8 +4199,13 @@ fn ssh_monitor_memory_card(
                 strings.ssh_monitor_total,
                 monitor_format_bytes(memory.total_bytes)
             )),
+            SSH_CARD_MEMORY,
+            st,
             pal,
         );
+        if collapsed {
+            return;
+        }
         ui.horizontal(|ui| {
             ssh_monitor_donut(ui, ratio, pal);
             ui.add_space(4.0);
@@ -4134,6 +4233,7 @@ fn ssh_monitor_memory_card(
 fn ssh_monitor_network_card(
     ui: &mut egui::Ui,
     monitor: &crate::ssh_runtime::MonitorView,
+    st: &mut ShellState,
     pal: &theme::Palette,
 ) {
     let strings = crate::i18n::strings();
@@ -4148,13 +4248,18 @@ fn ssh_monitor_network_card(
         .map(|value| monitor_f64_to_f32(*value))
         .collect::<Vec<_>>();
     ssh_monitor_card(ui, pal, |ui| {
-        ssh_monitor_card_header(
+        let collapsed = ssh_monitor_card_header(
             ui,
             SshMonitorIcon::Network,
             strings.ssh_monitor_network,
             None,
+            SSH_CARD_NETWORK,
+            st,
             pal,
         );
+        if collapsed {
+            return;
+        }
         ssh_monitor_chart(
             ui,
             &[(&receive, pal.success), (&transmit, pal.info)],
@@ -4223,6 +4328,7 @@ fn ssh_monitor_network_card(
 fn ssh_monitor_disk_card(
     ui: &mut egui::Ui,
     monitor: &crate::ssh_runtime::MonitorView,
+    st: &mut ShellState,
     pal: &theme::Palette,
 ) {
     let strings = crate::i18n::strings();
@@ -4236,7 +4342,7 @@ fn ssh_monitor_disk_card(
     let read_rate = monitor_format_rate(disk_io.and_then(|io| io.read_bytes_per_second));
     let write_rate = monitor_format_rate(disk_io.and_then(|io| io.write_bytes_per_second));
     ssh_monitor_card(ui, pal, |ui| {
-        ssh_monitor_card_header(
+        let collapsed = ssh_monitor_card_header(
             ui,
             SshMonitorIcon::Disk,
             strings.ssh_monitor_disk,
@@ -4245,8 +4351,13 @@ fn ssh_monitor_disk_card(
                 monitor_format_bytes(disk.used_bytes),
                 monitor_format_bytes(disk.total_bytes)
             )),
+            SSH_CARD_DISK,
+            st,
             pal,
         );
+        if collapsed {
+            return;
+        }
         ui.add(
             egui::ProgressBar::new(ratio)
                 .desired_width(ui.available_width())
@@ -4326,64 +4437,54 @@ fn ssh_monitor_process_card(
     let strings = crate::i18n::strings();
     let session_id = view.session_id;
     ssh_monitor_card(ui, pal, |ui| {
-        ssh_monitor_card_header(
+        let collapsed = ssh_monitor_card_header(
             ui,
             SshMonitorIcon::Processes,
             strings.ssh_monitor_processes,
             None,
+            SSH_CARD_PROCESSES,
+            st,
             pal,
         );
+        if collapsed {
+            return;
+        }
 
         // ── 终止结果反馈条（有则显示，可关闭）──────────────────────
-        if let Some(feedback) = &view.kill_feedback {
-            use crate::ssh_runtime::SshKillStatus;
-            let (text, color) = match feedback.status {
-                SshKillStatus::Signalled => (
-                    format!("{} {}", strings.ssh_monitor_kill_sent, feedback.pid),
-                    pal.success,
-                ),
-                SshKillStatus::PermissionDenied => (
-                    format!("{} {}", strings.ssh_monitor_kill_denied, feedback.pid),
-                    pal.warn,
-                ),
-                SshKillStatus::NoSuchProcess => (
-                    format!("{} {}", strings.ssh_monitor_kill_missing, feedback.pid),
-                    pal.fg_dim,
-                ),
-                SshKillStatus::Failed => (
-                    format!("{} {}", strings.ssh_monitor_kill_failed, feedback.pid),
-                    pal.error,
-                ),
-            };
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(text).small().color(color));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new("×").small()).frame(false))
-                        .clicked()
-                    {
-                        out.ssh_runtime_action =
-                            Some(SshRuntimeAction::DismissKillFeedback { session_id });
-                    }
-                });
-            });
-            ui.add_space(4.0);
-        }
+        ssh_kill_feedback_bar(ui, view, pal, out);
 
-        // ── 名称搜索（远端一次性 exec，回车提交）──────────────────
-        let search_response = ui.add(
-            egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
-                .hint_text(strings.ssh_monitor_search_hint)
-                .font(egui::FontId::monospace(11.0))
-                .desired_width(f32::INFINITY),
-        );
-        if search_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            let query = st.ssh_ui.process_query().trim().to_owned();
-            if !query.is_empty() {
-                out.ssh_runtime_action =
-                    Some(SshRuntimeAction::SearchProcesses { session_id, query });
+        // ── 名称搜索（远端一次性 exec，回车提交）＋ 详情弹窗入口 ──────
+        ui.horizontal(|ui| {
+            let search_response = ui.add(
+                egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
+                    .hint_text(strings.ssh_monitor_search_hint)
+                    .font(egui::FontId::monospace(12.0))
+                    .desired_width(ui.available_width() - 46.0),
+            );
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new(strings.ssh_monitor_detail).small(),
+                ))
+                .clicked()
+            {
+                // 详情弹窗：以当前搜索词打开（空 = 全量进程列表）。
+                let query = st.ssh_ui.process_query().trim().to_owned();
+                st.ssh_ui.set_process_window_open(true);
+                out.ssh_runtime_action = Some(SshRuntimeAction::SearchProcesses {
+                    session_id,
+                    query,
+                });
             }
-        }
+            if search_response.lost_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                let query = st.ssh_ui.process_query().trim().to_owned();
+                if !query.is_empty() {
+                    out.ssh_runtime_action =
+                        Some(SshRuntimeAction::SearchProcesses { session_id, query });
+                }
+            }
+        });
         ui.add_space(4.0);
 
         // ── 端口查询（回车或按钮提交）────────────────────────────
@@ -4391,7 +4492,7 @@ fn ssh_monitor_process_card(
             let port_response = ui.add(
                 egui::TextEdit::singleline(st.ssh_ui.port_query_mut())
                     .hint_text(strings.ssh_monitor_port_hint)
-                    .font(egui::FontId::monospace(11.0))
+                    .font(egui::FontId::monospace(12.0))
                     .desired_width(72.0),
             );
             let submitted = ui
@@ -4413,55 +4514,7 @@ fn ssh_monitor_process_card(
         ui.add_space(5.0);
 
         // ── 终止确认条（点击行内 × 后出现，固定在结果区上方）───────
-        if let Some(pid) = st.ssh_ui.kill_confirm() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} PID {}?",
-                        strings.ssh_monitor_kill_confirm, pid
-                    ))
-                    .small()
-                    .color(pal.warn),
-                );
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new(strings.ssh_monitor_kill).small(),
-                    ))
-                    .clicked()
-                {
-                    out.ssh_runtime_action = Some(SshRuntimeAction::KillProcess {
-                        session_id,
-                        pid,
-                        force: false,
-                    });
-                    st.ssh_ui.set_kill_confirm(None);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new(strings.ssh_monitor_kill_force)
-                            .small()
-                            .color(pal.error),
-                    ))
-                    .clicked()
-                {
-                    out.ssh_runtime_action = Some(SshRuntimeAction::KillProcess {
-                        session_id,
-                        pid,
-                        force: true,
-                    });
-                    st.ssh_ui.set_kill_confirm(None);
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new(strings.ssh_monitor_kill_cancel).small(),
-                    ))
-                    .clicked()
-                {
-                    st.ssh_ui.set_kill_confirm(None);
-                }
-            });
-            ui.add_space(5.0);
-        }
+        ssh_kill_confirm_bar(ui, st, pal, out, session_id);
 
         // ── 结果区：名称搜索结果 > 端口查询结果 > 资源占用 Top ─────
         if let Some(search) = &view.process_search {
@@ -4657,7 +4710,7 @@ fn ssh_monitor_process_row(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let kill = ui
                 .add(
-                    egui::Button::new(egui::RichText::new("×").small().color(pal.fg_dim))
+                    egui::Button::new(egui::RichText::new("×").size(14.0).color(pal.fg_dim))
                         .frame(false),
                 )
                 .on_hover_text(crate::i18n::strings().ssh_monitor_kill);
@@ -4688,7 +4741,7 @@ fn ssh_monitor_port_row(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let kill = ui
                     .add(
-                        egui::Button::new(egui::RichText::new("×").small().color(pal.fg_dim))
+                        egui::Button::new(egui::RichText::new("×").size(14.0).color(pal.fg_dim))
                             .frame(false),
                     )
                     .on_hover_text(strings.ssh_monitor_kill);
@@ -4709,6 +4762,277 @@ fn ssh_monitor_port_row(
             .color(pal.fg_dim),
     );
     ui.add_space(2.0);
+}
+
+/// 终止结果反馈条（进程卡与详情弹窗共用）：有反馈则显示，可 × 关闭。
+fn ssh_kill_feedback_bar(
+    ui: &mut egui::Ui,
+    view: &crate::ssh_runtime::RuntimeView,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+) {
+    use crate::ssh_runtime::SshKillStatus;
+    let strings = crate::i18n::strings();
+    let Some(feedback) = &view.kill_feedback else {
+        return;
+    };
+    let (text, color) = match feedback.status {
+        SshKillStatus::Signalled => (
+            format!("{} {}", strings.ssh_monitor_kill_sent, feedback.pid),
+            pal.success,
+        ),
+        SshKillStatus::PermissionDenied => (
+            format!("{} {}", strings.ssh_monitor_kill_denied, feedback.pid),
+            pal.warn,
+        ),
+        SshKillStatus::NoSuchProcess => (
+            format!("{} {}", strings.ssh_monitor_kill_missing, feedback.pid),
+            pal.fg_dim,
+        ),
+        SshKillStatus::Failed => (
+            format!("{} {}", strings.ssh_monitor_kill_failed, feedback.pid),
+            pal.error,
+        ),
+    };
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(text).small().color(color));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("×").size(14.0)).frame(false))
+                .clicked()
+            {
+                out.ssh_runtime_action = Some(SshRuntimeAction::DismissKillFeedback {
+                    session_id: view.session_id,
+                });
+            }
+        });
+    });
+    ui.add_space(4.0);
+}
+
+/// 终止确认条（进程卡与详情弹窗共用）：确认 / 强杀 / 取消。
+fn ssh_kill_confirm_bar(
+    ui: &mut egui::Ui,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+    session_id: crate::ssh_runtime::SshSessionId,
+) {
+    let strings = crate::i18n::strings();
+    let Some(pid) = st.ssh_ui.kill_confirm() else {
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} PID {}?",
+                strings.ssh_monitor_kill_confirm, pid
+            ))
+            .small()
+            .color(pal.warn),
+        );
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new(strings.ssh_monitor_kill).small(),
+            ))
+            .clicked()
+        {
+            out.ssh_runtime_action = Some(SshRuntimeAction::KillProcess {
+                session_id,
+                pid,
+                force: false,
+            });
+            st.ssh_ui.set_kill_confirm(None);
+        }
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new(strings.ssh_monitor_kill_force)
+                    .small()
+                    .color(pal.error),
+            ))
+            .clicked()
+        {
+            out.ssh_runtime_action = Some(SshRuntimeAction::KillProcess {
+                session_id,
+                pid,
+                force: true,
+            });
+            st.ssh_ui.set_kill_confirm(None);
+        }
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new(strings.ssh_monitor_kill_cancel).small(),
+            ))
+            .clicked()
+        {
+            st.ssh_ui.set_kill_confirm(None);
+        }
+    });
+    ui.add_space(5.0);
+}
+
+/// 进程详情弹窗：全量/搜索进程列表 + 终止操作。数据源与监控面板进程卡
+/// 共用 `view.process_search`（空搜索词 = 全量列表，CPU 降序上限 200）。
+fn ssh_process_window(
+    ctx: &egui::Context,
+    view: &crate::ssh_runtime::RuntimeView,
+    st: &mut ShellState,
+    pal: &theme::Palette,
+    out: &mut ShellOutput,
+) {
+    let strings = crate::i18n::strings();
+    let session_id = view.session_id;
+    let mut open = true;
+    egui::Window::new(format!(
+        "{} — {}",
+        strings.ssh_process_window_title, view.profile_name
+    ))
+    .id(egui::Id::new(("ssh_process_window", session_id)))
+    .default_size([640.0, 440.0])
+    .resizable(true)
+    .collapsible(false)
+    .open(&mut open)
+    .show(ctx, |ui| {
+        // 与监控面板同款字号放大（Small 10pt → 12pt）。
+        let small_family = ui.style().text_styles[&egui::TextStyle::Small]
+            .family
+            .clone();
+        ui.style_mut()
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::new(12.0, small_family));
+
+        // ── 操作行：搜索框 + 搜索 + 刷新（空词 = 全量）─────────────
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(st.ssh_ui.process_query_mut())
+                    .hint_text(strings.ssh_monitor_search_hint)
+                    .font(egui::FontId::monospace(12.0))
+                    .desired_width(260.0),
+            );
+            let submit = ui
+                .add(egui::Button::new(
+                    egui::RichText::new(strings.ssh_process_search_btn).small(),
+                ))
+                .clicked()
+                || ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(strings.ssh_process_refresh).small(),
+                    ))
+                    .clicked()
+                || (response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            if submit {
+                let query = st.ssh_ui.process_query().trim().to_owned();
+                out.ssh_runtime_action =
+                    Some(SshRuntimeAction::SearchProcesses { session_id, query });
+            }
+        });
+        ui.add_space(6.0);
+
+        ssh_kill_feedback_bar(ui, view, pal, out);
+        ssh_kill_confirm_bar(ui, st, pal, out, session_id);
+
+        // ── 进程表格 ────────────────────────────────────────────
+        let Some(search) = &view.process_search else {
+            ui.label(
+                egui::RichText::new(strings.ssh_process_empty_hint)
+                    .small()
+                    .color(pal.fg_dim),
+            );
+            return;
+        };
+        if search.loading {
+            ui.label(
+                egui::RichText::new(strings.ssh_monitor_searching)
+                    .small()
+                    .color(pal.fg_dim),
+            );
+            return;
+        }
+        if search.error {
+            ui.label(
+                egui::RichText::new(strings.ssh_monitor_search_failed)
+                    .small()
+                    .color(pal.error),
+            );
+            return;
+        }
+        ui.label(
+            egui::RichText::new(crate::i18n::fmt1(
+                strings.ssh_process_count_fmt,
+                search.results.len()
+            ))
+            .small()
+            .color(pal.fg_dim),
+        );
+        ui.add_space(3.0);
+        egui::ScrollArea::vertical()
+            .id_salt(("ssh_process_window_scroll", session_id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new(("ssh_process_window_grid", session_id))
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing(egui::vec2(12.0, 4.0))
+                    .show(ui, |ui| {
+                        for text in ["PID", "CPU", "MEM", strings.ssh_monitor_command, ""] {
+                            ui.label(
+                                egui::RichText::new(text)
+                                    .monospace()
+                                    .small()
+                                    .color(pal.fg_dim),
+                            );
+                        }
+                        ui.end_row();
+                        for entry in &search.results {
+                            ui.label(
+                                egui::RichText::new(entry.pid.to_string())
+                                    .monospace()
+                                    .small()
+                                    .color(pal.fg),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{:.1}", entry.cpu_percent))
+                                    .monospace()
+                                    .small()
+                                    .color(pal.fg),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{:.1}", entry.memory_percent))
+                                    .monospace()
+                                    .small()
+                                    .color(pal.fg),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&entry.command)
+                                        .monospace()
+                                        .small()
+                                        .color(pal.fg),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&entry.command);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×").size(14.0).color(pal.fg_dim),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(strings.ssh_monitor_kill)
+                                .clicked()
+                            {
+                                st.ssh_ui.set_kill_confirm(Some(entry.pid));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    });
+    if !open {
+        st.ssh_ui.set_process_window_open(false);
+    }
 }
 
 fn ssh_monitor_value_tile(

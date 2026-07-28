@@ -220,6 +220,15 @@ pub struct LayoutSettings {
     /// 旧版布尔值 `false/true` 由 [`ViewMode`] 兼容迁移为本地/远程。
     #[serde(default)]
     pub view_mode: ViewMode,
+    /// SSH 监控面板是否收起（右侧只留展开手柄）：true = 收起。
+    /// 工具栏开关、SSH 状态栏按钮、面板手柄三入口共享 `SshUiState` 状态源，
+    /// 切换时写盘，重启恢复。`#[serde(default)]` 旧文件缺字段补 false（默认展开）。
+    #[serde(default)]
+    pub ssh_monitor_collapsed: bool,
+    /// SSH 监控面板各卡片的折叠状态（卡片稳定 id 列表）。
+    /// 卡片标题行 chevron 切换时写盘，重启恢复。`#[serde(default)]` 旧文件缺字段补空。
+    #[serde(default)]
+    pub ssh_monitor_cards_collapsed: Vec<String>,
 }
 
 /// sidebar_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
@@ -252,6 +261,8 @@ impl Default for LayoutSettings {
             ssh_server_list_visible: true,
             filetree_visible: true,
             view_mode: ViewMode::Local,
+            ssh_monitor_collapsed: false,
+            ssh_monitor_cards_collapsed: Vec::new(),
         }
     }
 }
@@ -553,6 +564,22 @@ impl Settings {
                     d.view_mode,
                     path,
                 );
+                // ssh_monitor_collapsed / ssh_monitor_cards_collapsed：旧文件缺字段
+                // 静默补默认（展开 / 无折叠卡片）。
+                s.layout.ssh_monitor_collapsed = lenient_field(
+                    ly,
+                    "ssh_monitor_collapsed",
+                    "layout.ssh_monitor_collapsed",
+                    d.ssh_monitor_collapsed,
+                    path,
+                );
+                s.layout.ssh_monitor_cards_collapsed = lenient_field(
+                    ly,
+                    "ssh_monitor_cards_collapsed",
+                    "layout.ssh_monitor_cards_collapsed",
+                    d.ssh_monitor_cards_collapsed.clone(),
+                    path,
+                );
             } else {
                 log::warn!("设置节 layout 不是对象，整节降级默认值: {}", path.display());
             }
@@ -832,6 +859,8 @@ mod tests {
                 ssh_server_list_visible: false,
                 filetree_visible: false,
                 view_mode: ViewMode::Ssh,
+                ssh_monitor_collapsed: false,
+                ssh_monitor_cards_collapsed: Vec::new(),
             },
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,
@@ -1431,6 +1460,62 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert!(loaded.layout.ssh_server_list_visible);
         assert_eq!(loaded.layout.view_mode, ViewMode::Ssh);
+    }
+
+    // ── SSH 监控面板/卡片显隐持久化测试 ────────────────────────────────────
+
+    #[test]
+    fn ssh监控显隐_默认值与旧文件兼容() {
+        assert!(!Settings::default().layout.ssh_monitor_collapsed);
+        assert!(Settings::default()
+            .layout
+            .ssh_monitor_cards_collapsed
+            .is_empty());
+
+        let p = temp_path("ssh_monitor_compat_old");
+        std::fs::write(&p, r#"{ "layout": { "view_mode": "ssh" } }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            !loaded.layout.ssh_monitor_collapsed,
+            "旧文件缺 ssh_monitor_collapsed 字段时应补 false（默认展开）"
+        );
+        assert!(loaded.layout.ssh_monitor_cards_collapsed.is_empty());
+    }
+
+    #[test]
+    fn ssh监控显隐_序列化往返() {
+        let p = temp_path("ssh_monitor_roundtrip");
+        let s = Settings {
+            layout: LayoutSettings {
+                ssh_monitor_collapsed: true,
+                ssh_monitor_cards_collapsed: vec!["cpu".to_owned(), "processes".to_owned()],
+                ..LayoutSettings::default()
+            },
+            ..Settings::default()
+        };
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(loaded.layout.ssh_monitor_collapsed);
+        assert_eq!(
+            loaded.layout.ssh_monitor_cards_collapsed,
+            vec!["cpu".to_owned(), "processes".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ssh监控显隐_字段类型非法降级默认() {
+        let p = temp_path("ssh_monitor_lenient");
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "ssh_monitor_collapsed": "yes", "ssh_monitor_cards_collapsed": 3 } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(!loaded.layout.ssh_monitor_collapsed);
+        assert!(loaded.layout.ssh_monitor_cards_collapsed.is_empty());
     }
 
     #[test]

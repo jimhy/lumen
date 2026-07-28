@@ -1,7 +1,10 @@
 //! SSH 密码与私钥口令的本机凭据存储。
 //!
-//! 本模块只处理 Windows Credential Manager；target 可写入 `SshLocalBinding`，但
-//! credential blob、target 和错误正文都不得进入 SSH 云同步 DTO 或日志。
+//! Windows 走 Credential Manager（Win32 CredWrite/CredRead）；Linux/macOS
+//! 走 AES-256-GCM 加密文件（`platform_file` 模块：数据目录 `ssh-secrets/`、
+//! 0600 权限、密钥由 machine-id 经 Argon2id 派生不落盘）。target 可写入
+//! `SshLocalBinding`，但 credential blob、target 和错误正文都不得进入 SSH
+//! 云同步 DTO 或日志。
 
 use std::fmt;
 use std::str::FromStr;
@@ -199,13 +202,13 @@ impl fmt::Display for CredentialError {
                 formatter.write_str("SSH credential storage is unsupported on this platform")
             }
             Self::WriteFailed(code) => {
-                write!(formatter, "SSH credential write failed (Win32={code})")
+                write!(formatter, "SSH credential write failed (OS error {code})")
             }
             Self::ReadFailed(code) => {
-                write!(formatter, "SSH credential read failed (Win32={code})")
+                write!(formatter, "SSH credential read failed (OS error {code})")
             }
             Self::DeleteFailed(code) => {
-                write!(formatter, "SSH credential delete failed (Win32={code})")
+                write!(formatter, "SSH credential delete failed (OS error {code})")
             }
         }
     }
@@ -410,7 +413,300 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod platform {
+    //! unix 凭据后端：AES-256-GCM 加密文件（2026-07-28，海风哥拍板「统一
+    //! 加密文件」方案——此前非 Windows 一律 Unsupported，Linux/macOS 密码
+    //! 与私钥口令保存不了、正式登录死循环重弹凭据框）。
+    //!
+    //! - 每条凭据一个文件：`<数据目录>/ssh-secrets/<sha256(target)[..32]>.lsec`，
+    //!   内容 = magic(8) + nonce(12) + AES-256-GCM(secret, aad=target)。
+    //! - 加密密钥由 machine-id（Linux /etc/machine-id；macOS kern.hostuuid）
+    //!   经 Argon2id 派生，进程内缓存、**永不落盘**——文件离开本机无法解密，
+    //!   明文也绝不出现在磁盘。安全级别：防明文落盘/同步泄露/随手翻看；
+    //!   同机同用户进程可派生同一密钥解密（与同类终端工具一致，海风哥已知悉）。
+    //! - 文件损坏/magic 不符/解密失败（换机、machine-id 变更）→ 删文件按
+    //!   「无凭据」处理，用户重输即可，不让坏文件把登录卡死。
+
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use argon2::{Algorithm, Argon2, Version};
+    use rand_core::{OsRng, RngCore};
+    use sha2::{Digest, Sha256};
+    use zeroize::Zeroizing;
+
+    use super::{
+        validate_secret_size, CredentialError, CredentialReference, SecretString, MAX_SECRET_BYTES,
+    };
+
+    const MAGIC: &[u8; 8] = b"LSSEC01\0";
+    const NONCE_LEN: usize = 12;
+    const KEY_LEN: usize = 32;
+    /// Argon2id 固定应用盐（非秘密——唯一性由 machine-id 提供）。
+    const KDF_SALT: &[u8; 16] = b"lumen-ssh-sec-v1";
+    const SECRETS_DIR_NAME: &str = "ssh-secrets";
+    const FILE_SUFFIX: &str = ".lsec";
+
+    pub(super) fn write_secret(
+        reference: &CredentialReference,
+        secret: &str,
+    ) -> Result<(), CredentialError> {
+        validate_secret_size(secret)?;
+        let dir = secrets_dir()?;
+        write_secret_in(&dir, reference, secret)
+    }
+
+    pub(super) fn read_secret(
+        reference: &CredentialReference,
+    ) -> Result<Option<SecretString>, CredentialError> {
+        let dir = secrets_dir()?;
+        read_secret_in(&dir, reference)
+    }
+
+    pub(super) fn delete_secret(reference: &CredentialReference) -> Result<bool, CredentialError> {
+        let dir = secrets_dir()?;
+        delete_secret_in(&dir, reference)
+    }
+
+    fn secrets_dir() -> Result<PathBuf, CredentialError> {
+        crate::paths::data_dir()
+            .map(|dir| dir.join(SECRETS_DIR_NAME))
+            .ok_or(CredentialError::Unsupported)
+    }
+
+    /// 凭据文件路径：文件名只含 target 哈希，不泄露 profile 结构、天然免路径注入。
+    fn secret_path(dir: &Path, reference: &CredentialReference) -> PathBuf {
+        let digest = Sha256::digest(reference.target().as_bytes());
+        let mut name = String::with_capacity(32 + FILE_SUFFIX.len());
+        for byte in &digest[..16] {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        name.push_str(FILE_SUFFIX);
+        dir.join(name)
+    }
+
+    /// 机器绑定派生材料：优先稳定 machine-id；读不到退化为
+    /// 用户名+主机名+家目录（同机同用户仍确定，绑定强度降为「本机本用户」）。
+    fn machine_material() -> Vec<u8> {
+        #[cfg(target_os = "linux")]
+        {
+            for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+                if let Ok(id) = std::fs::read_to_string(path) {
+                    let id = id.trim();
+                    if !id.is_empty() {
+                        return id.as_bytes().to_vec();
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(uuid) = macos_host_uuid() {
+                return uuid.into_bytes();
+            }
+        }
+        let mut fallback = std::env::var("USER").unwrap_or_default();
+        fallback.push('\0');
+        fallback.push_str(&hostname());
+        fallback.push('\0');
+        fallback.push_str(&std::env::var("HOME").unwrap_or_default());
+        fallback.into_bytes()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_host_uuid() -> Option<String> {
+        // sysctlbyname("kern.hostuuid")：libSystem 直链，无需 IOKit 依赖。
+        extern "C" {
+            fn sysctlbyname(
+                name: *const core::ffi::c_char,
+                oldp: *mut core::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *const core::ffi::c_void,
+                newlen: usize,
+            ) -> core::ffi::c_int;
+        }
+        let mut buf = [0u8; 64];
+        let mut len = buf.len();
+        // SAFETY: buf 可写 len 字节；成功时 oldlenp 写入含 NUL 的实际长度。
+        let rc = unsafe {
+            sysctlbyname(
+                c"kern.hostuuid".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if rc != 0 || len < 2 {
+            return None;
+        }
+        let end = buf[..len].iter().position(|&b| b == 0).unwrap_or(len);
+        String::from_utf8(buf[..end].to_vec()).ok()
+    }
+
+    fn hostname() -> String {
+        extern "C" {
+            fn gethostname(name: *mut core::ffi::c_char, len: usize) -> core::ffi::c_int;
+        }
+        let mut buf = [0u8; 256];
+        // SAFETY: buf 可写；gethostname 成功返回 0 并 NUL 结尾。
+        let rc = unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc != 0 {
+            return String::new();
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    }
+
+    /// Argon2id(machine_material) → 32B AES key。进程内只算一次（~50ms），
+    /// 材料与盐固定 → 同机同用户每次派生同一密钥。
+    fn master_key() -> Result<Zeroizing<[u8; KEY_LEN]>, CredentialError> {
+        static KEY: OnceLock<Result<Zeroizing<[u8; KEY_LEN]>, CredentialError>> = OnceLock::new();
+        KEY.get_or_init(|| {
+            let material = Zeroizing::new(machine_material());
+            if material.is_empty() {
+                return Err(CredentialError::Unsupported);
+            }
+            let params = argon2::Params::default();
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let mut key = Zeroizing::new([0u8; KEY_LEN]);
+            argon2
+                .hash_password_into(material.as_slice(), KDF_SALT, &mut key[..])
+                .map_err(|_| CredentialError::Unsupported)?;
+            Ok(key)
+        })
+        .clone()
+    }
+
+    fn cipher() -> Result<Aes256Gcm, CredentialError> {
+        let key = master_key()?;
+        Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice())))
+    }
+
+    fn io_code(error: &std::io::Error) -> u32 {
+        error.raw_os_error().unwrap_or(-1).unsigned_abs()
+    }
+
+    fn write_secret_in(
+        dir: &Path,
+        reference: &CredentialReference,
+        secret: &str,
+    ) -> Result<(), CredentialError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let cipher = cipher()?;
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: secret.as_bytes(),
+                    aad: reference.target().as_bytes(),
+                },
+            )
+            .map_err(|_| CredentialError::WriteFailed(0))?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder
+            .create(dir)
+            .map_err(|e| CredentialError::WriteFailed(io_code(&e)))?;
+
+        let path = secret_path(dir, reference);
+        let tmp = path.with_extension("lsec.tmp");
+        let write_tmp = || -> Result<(), std::io::Error> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(MAGIC)?;
+            file.write_all(&nonce)?;
+            file.write_all(&ciphertext)?;
+            file.sync_all()
+        };
+        let result = write_tmp()
+            .map_err(|e| CredentialError::WriteFailed(io_code(&e)))
+            .and_then(|()| {
+                std::fs::rename(&tmp, &path).map_err(|e| CredentialError::WriteFailed(io_code(&e)))
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    fn read_secret_in(
+        dir: &Path,
+        reference: &CredentialReference,
+    ) -> Result<Option<SecretString>, CredentialError> {
+        let path = secret_path(dir, reference);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(CredentialError::ReadFailed(io_code(&e))),
+        };
+        let parsed = parse_secret_file(&bytes, reference);
+        match parsed {
+            Ok(secret) => Ok(Some(secret)),
+            Err(()) => {
+                // 损坏/换机/被调换的文件：删除自愈，按「无凭据」处理（见模块注释）。
+                let _ = std::fs::remove_file(&path);
+                Ok(None)
+            }
+        }
+    }
+
+    fn parse_secret_file(
+        bytes: &[u8],
+        reference: &CredentialReference,
+    ) -> Result<SecretString, ()> {
+        if bytes.len() < MAGIC.len() + NONCE_LEN + 16 || bytes.len() > MAGIC.len() + NONCE_LEN + MAX_SECRET_BYTES + 16 {
+            return Err(());
+        }
+        if &bytes[..MAGIC.len()] != MAGIC {
+            return Err(());
+        }
+        let cipher = cipher().map_err(|_| ())?;
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&bytes[MAGIC.len()..MAGIC.len() + NONCE_LEN]),
+                Payload {
+                    msg: &bytes[MAGIC.len() + NONCE_LEN..],
+                    aad: reference.target().as_bytes(),
+                },
+            )
+            .map_err(|_| ())?;
+        let text = String::from_utf8(plaintext).map_err(|_| ())?;
+        Ok(SecretString::new(text))
+    }
+
+    fn delete_secret_in(dir: &Path, reference: &CredentialReference) -> Result<bool, CredentialError> {
+        let path = secret_path(dir, reference);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(CredentialError::DeleteFailed(io_code(&e))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) mod test_support {
+        //! 测试后门：带目录参数的后端入口与路径计算，避免污染真实数据目录。
+        pub(super) use super::{delete_secret_in, read_secret_in, secret_path, write_secret_in};
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::{CredentialError, CredentialReference, SecretString};
 
@@ -580,5 +876,79 @@ mod tests {
             Ok(()) => panic!("failing binding commit unexpectedly succeeded"),
         }
         assert!(read_secret(&reference).unwrap().is_none());
+    }
+
+    // ── unix（Linux/macOS）AES-GCM 加密文件后端 ────────────────────────────
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unix_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("lumen-cred-{tag}-{}-{nonce}", std::process::id()))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix加密文件_往返且删除幂等() {
+        use super::platform::test_support::*;
+        let dir = unix_temp_dir("roundtrip");
+        let reference = CredentialReference::password(PROFILE_ID).unwrap();
+
+        write_secret_in(&dir, &reference, "s3cr3t-密码").unwrap();
+        let loaded = read_secret_in(&dir, &reference)
+            .unwrap()
+            .expect("写入后应能读回");
+        assert!(!loaded.is_empty());
+        // 文件权限必须是 0600（仅属主可读写）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = std::fs::metadata(secret_path(&dir, &reference))
+                .unwrap()
+                .permissions();
+            assert_eq!(permissions.mode() & 0o777, 0o600);
+        }
+        assert!(delete_secret_in(&dir, &reference).unwrap());
+        assert!(read_secret_in(&dir, &reference).unwrap().is_none());
+        assert!(!delete_secret_in(&dir, &reference).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix加密文件_损坏文件自愈删除() {
+        use super::platform::test_support::*;
+        let dir = unix_temp_dir("corrupt");
+        let reference = CredentialReference::password(PROFILE_ID).unwrap();
+        let path = secret_path(&dir, &reference);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"garbage-not-our-format").unwrap();
+
+        // 损坏文件按「无凭据」处理并删除，不让登录卡死。
+        assert!(read_secret_in(&dir, &reference).unwrap().is_none());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix加密文件_调换防护() {
+        use super::platform::test_support::*;
+        let dir = unix_temp_dir("swap");
+        let ref_a = CredentialReference::password(PROFILE_ID).unwrap();
+        let other_id = "ssh_abcdef0123456789abcdef0123456789";
+        let ref_b = CredentialReference::password(other_id).unwrap();
+
+        write_secret_in(&dir, &ref_a, "secret-a").unwrap();
+        write_secret_in(&dir, &ref_b, "secret-b").unwrap();
+        // 攻击/事故：把 A 的密文覆盖到 B 的文件上——AAD 含 target，解密必失败。
+        std::fs::copy(secret_path(&dir, &ref_a), secret_path(&dir, &ref_b)).unwrap();
+        assert!(read_secret_in(&dir, &ref_b).unwrap().is_none());
+        // A 自己仍完好可读。
+        assert!(read_secret_in(&dir, &ref_a).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

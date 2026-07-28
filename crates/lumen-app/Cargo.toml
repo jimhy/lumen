@@ -53,6 +53,8 @@ sha2.workspace = true
 url.workspace = true
 # P0 应用锁：Argon2id 密码校验；随机盐与明文临时缓冲清零。
 argon2 = { version = "0.5", features = ["std"] }
+# SSH 凭据 unix 后端：AES-256-GCM 加密文件（纯 Rust，Linux/macOS 交叉构建无 C 依赖）。
+aes-gcm = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
 base64.workspace = true

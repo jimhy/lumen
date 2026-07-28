@@ -56,6 +56,8 @@ pub struct ToolbarOutput {
     pub toggle_sidebar: Option<bool>,
     /// 切换文件树显示/隐藏（点击②按钮，与 Ctrl+B 同状态源）。None = 未点击，Some(v) = 新可见值。
     pub toggle_filetree: Option<bool>,
+    /// 切换 SSH 监控面板显示/隐藏。None = 未点击，Some(v) = 新可见值。
+    pub toggle_ssh_monitor: Option<bool>,
     /// 点击了③还原窗格大小按钮（当前 tab 全部窗格比例恢复均分）。
     pub reset_layout: bool,
     /// 点击了④「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
@@ -82,6 +84,8 @@ pub struct ViewState {
     pub sidebar_visible: bool,
     /// 文件树（②）当前是否可见（与 Ctrl+B 同状态源）。
     pub filetree_visible: bool,
+    /// SSH 监控面板当前是否可见（仅 SSH 视图渲染该开关）。
+    pub ssh_monitor_visible: bool,
 }
 
 /// 绘制应用工具栏（全宽横条；须在 topbar 之后、侧栏之前加入面板
@@ -240,6 +244,23 @@ pub fn show(
                             out.toggle_filetree = Some(!view.filetree_visible);
                         }
                     }
+
+                    // ③ SSH 视图专属：显示/隐藏服务器监控面板。位于面板开关组
+                    // 末尾（同栏最右，海风哥指定位置）。
+                    if view.ssh_view {
+                        ui.add_space(BTN_GAP);
+                        let (mon_rect, mon_resp) =
+                            ui.allocate_exact_size(egui::vec2(BTN_W, BTN_H), egui::Sense::click());
+                        draw_icon_monitor(ui, mon_rect, view.ssh_monitor_visible, pal);
+                        let tip = if view.ssh_monitor_visible {
+                            s.toolbar_ssh_monitor_hide_tip
+                        } else {
+                            s.toolbar_ssh_monitor_show_tip
+                        };
+                        if mon_resp.on_hover_text(tip).clicked() {
+                            out.toggle_ssh_monitor = Some(!view.ssh_monitor_visible);
+                        }
+                    }
                 });
             });
         });
@@ -249,6 +270,36 @@ pub fn show(
 // ── 图标绘制子函数（自 topbar 迁入；R8.2 精绘规格原样保留）────────────────
 // 视觉盒 ~18×14 逻辑 px 居中于 28×26 热区；线宽 1.2；
 // 颜色常态 fg_dim，hover fg；hover 圆角底 bg_highlight（圆角 4）。
+
+/// SSH 监控面板图标：三根递增柱状条 + 基线，表达「服务器监控」。
+/// 可见态用 fg，隐藏态用 fg_dim（与相邻面板开关同一语言）。
+fn draw_icon_monitor(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palette) {
+    let painter = ui.painter();
+    if ui.rect_contains_pointer(rect) {
+        painter.rect_filled(rect, 4.0, pal.bg_highlight);
+    }
+    let fg = if visible { pal.fg } else { pal.fg_dim };
+    let stroke = egui::Stroke::new(1.2_f32, fg);
+    let c = rect.center();
+    let base_y = c.y + 6.0;
+    // 基线。
+    painter.line_segment(
+        [egui::pos2(c.x - 8.0, base_y), egui::pos2(c.x + 8.0, base_y)],
+        stroke,
+    );
+    // 三根递增柱状条（宽 3、间距 2，高 5/8/11）。
+    for (i, height) in [5.0_f32, 8.0, 11.0].into_iter().enumerate() {
+        let x = c.x - 6.0 + i as f32 * 5.0;
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(x, base_y - 1.0 - height),
+                egui::vec2(3.0, height),
+            ),
+            0.5,
+            fg,
+        );
+    }
+}
 
 /// 暂时隐藏的文本编辑器：纸张轮廓 + 三行正文。
 fn draw_icon_editor(ui: &egui::Ui, rect: egui::Rect, pal: &Palette) {
@@ -513,6 +564,7 @@ mod toolbar_layout_tests {
                     ssh_server_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: true,
+                    ssh_monitor_visible: true,
                 },
             );
             let rest = ui.available_rect_before_wrap();
@@ -547,6 +599,7 @@ mod toolbar_layout_tests {
                     ssh_server_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: false,
+                    ssh_monitor_visible: true,
                 },
             );
         });
@@ -601,6 +654,7 @@ mod toolbar_layout_tests {
                     ssh_server_list_visible: true,
                     sidebar_visible: false,
                     filetree_visible: true,
+                    ssh_monitor_visible: true,
                 },
             );
             got_default = !out.new_pane
@@ -634,6 +688,7 @@ mod toolbar_layout_tests {
                         ssh_server_list_visible: true,
                         sidebar_visible: true,
                         filetree_visible: true,
+                        ssh_monitor_visible: true,
                     },
                 );
             });
@@ -655,9 +710,13 @@ mod toolbar_layout_tests {
             remote >= local + 2,
             "远程视图应比本地视图多绘制设备栏图标：local={local}, remote={remote}"
         );
+        // SSH 视图在面板开关组末尾多一个监控面板开关（柱状图标：1 条基线
+        // 计入线段数，3 根柱子是 rect_filled 不计）——契约更新于监控开关
+        // 加入后（此前断言 ssh == remote 的完全同布局）。
         assert_eq!(
-            ssh, remote,
-            "SSH 服务器栏按钮应与远程设备栏按钮占用完全一致的布局：ssh={ssh}, remote={remote}"
+            ssh,
+            remote + 1,
+            "SSH 视图应比远程视图多监控开关的 1 条基线：ssh={ssh}, remote={remote}"
         );
     }
 
@@ -685,6 +744,7 @@ mod toolbar_layout_tests {
                         ssh_server_list_visible: true,
                         sidebar_visible: true,
                         filetree_visible: true,
+                        ssh_monitor_visible: true,
                     },
                 );
             });
@@ -735,6 +795,7 @@ mod toolbar_layout_tests {
                     ssh_server_list_visible: true,
                     sidebar_visible: true,
                     filetree_visible: true,
+                    ssh_monitor_visible: true,
                 },
             );
         });
@@ -784,6 +845,7 @@ mod toolbar_layout_tests {
                         ssh_server_list_visible: true,
                         sidebar_visible: true,
                         filetree_visible: true,
+                        ssh_monitor_visible: true,
                     },
                 );
             });

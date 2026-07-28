@@ -3601,13 +3601,13 @@ impl AppState {
         &mut self,
         profile: &ssh::SshProfile,
         mut submission: shell::SshCredentialSubmission,
-    ) -> Result<lumen_ssh::Credential, ()> {
+    ) -> Result<lumen_ssh::Credential, String> {
         let expected_kind = match profile.auth_method {
             ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
             ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
             ssh::AuthMethod::Agent => {
                 log::warn!("拒绝为 SSH agent 认证保存交互式凭据");
-                return Err(());
+                return Err(i18n::strings().ssh_cred_toast_stale.to_owned());
             }
         };
         if !submission.matches_target(
@@ -3618,7 +3618,7 @@ impl AppState {
             expected_kind,
         ) {
             log::warn!("拒绝已过期或认证方式不匹配的 SSH 凭据提交");
-            return Err(());
+            return Err(i18n::strings().ssh_cred_toast_stale.to_owned());
         }
 
         let previous = self
@@ -3636,12 +3636,12 @@ impl AppState {
         let credential = match submission.kind() {
             shell::SshCredentialKind::Password => {
                 if submission.password().is_empty() {
-                    return Err(());
+                    return Err(i18n::strings().ssh_cred_toast_empty_password.to_owned());
                 }
-                let reference =
-                    ssh::CredentialReference::password(&profile.id).map_err(|error| {
-                        log::warn!("创建 SSH 密码凭据引用失败: {error}");
-                    })?;
+                let reference = ssh::CredentialReference::password(&profile.id).map_err(|error| {
+                    log::warn!("创建 SSH 密码凭据引用失败: {error}");
+                    i18n::strings().ssh_cred_toast_invalid_id.to_owned()
+                })?;
                 binding.private_key_path = None;
                 binding.password_credential_ref = Some(reference.target());
                 binding.key_passphrase_credential_ref = None;
@@ -3656,9 +3656,10 @@ impl AppState {
                     },
                 );
                 if let Err(error) = transaction {
-                    match error {
+                    return Err(match error {
                         ssh::CredentialTransactionError::Write(error) => {
                             log::warn!("写入 SSH 本机密码凭据失败: {error}");
+                            i18n::fmt1(i18n::strings().ssh_cred_toast_write_failed_fmt, error)
                         }
                         ssh::CredentialTransactionError::Commit {
                             rollback_error, ..
@@ -3667,18 +3668,18 @@ impl AppState {
                             if let Some(error) = rollback_error {
                                 log::warn!("回滚新 SSH 本机密码凭据失败: {error}");
                             }
+                            i18n::strings().ssh_cred_toast_commit_failed.to_owned()
                         }
-                    }
-                    return Err(());
+                    });
                 }
                 lumen_ssh::Credential::password(submission.take_password())
             }
             shell::SshCredentialKind::PrivateKey => {
                 let Some(path) = submission.private_key_path() else {
-                    return Err(());
+                    return Err(i18n::strings().ssh_cred_toast_stale.to_owned());
                 };
                 if !path.is_absolute() || !path.is_file() {
-                    return Err(());
+                    return Err(i18n::strings().ssh_cred_toast_stale.to_owned());
                 }
                 let new_reference = if submission.key_passphrase().is_empty() {
                     None
@@ -3686,6 +3687,7 @@ impl AppState {
                     let reference = ssh::CredentialReference::key_passphrase(&profile.id)
                         .map_err(|error| {
                             log::warn!("创建 SSH 私钥口令引用失败: {error}");
+                            i18n::strings().ssh_cred_toast_invalid_id.to_owned()
                         })?;
                     Some(reference)
                 };
@@ -3734,7 +3736,15 @@ impl AppState {
                             }
                         }
                     }
-                    return Err(());
+                    return Err(match error {
+                        ssh::CredentialTransactionError::Write(error) => {
+                            log::warn!("写入 SSH 本机私钥口令失败: {error}");
+                            i18n::fmt1(i18n::strings().ssh_cred_toast_write_failed_fmt, error)
+                        }
+                        ssh::CredentialTransactionError::Commit { .. } => {
+                            i18n::strings().ssh_cred_toast_commit_failed.to_owned()
+                        }
+                    });
                 }
                 let path = submission
                     .take_private_key_path()
@@ -3794,24 +3804,26 @@ impl AppState {
                     );
                     return;
                 }
-                if let Ok(credential) =
-                    self.save_ssh_credential_submission(&profile, submission)
-                {
-                    self.start_ssh_connection(session_id, &profile, credential);
-                } else {
-                    self.shell_state.toast.push(
-                        shell::toast::ToastKind::Error,
-                        "无法安全保存 SSH 本机凭据，请重新选择或输入",
-                    );
-                    let kind = match profile.auth_method {
-                        ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
-                        ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
-                        ssh::AuthMethod::Agent => {
-                            self.ssh_runtime.close_session(session_id);
-                            return;
-                        }
-                    };
-                    self.open_ssh_credential_dialog(session_id, &profile, kind);
+                match self.save_ssh_credential_submission(&profile, submission) {
+                    Ok(credential) => {
+                        self.start_ssh_connection(session_id, &profile, credential);
+                    }
+                    Err(reason) => {
+                        // 失败原因直接上 toast（写入凭据管理器/配置变更/ID 不合法
+                        // 等），不再用一句笼统文案让用户无从判断（海风哥反馈）。
+                        self.shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Error, reason);
+                        let kind = match profile.auth_method {
+                            ssh::AuthMethod::Password => shell::SshCredentialKind::Password,
+                            ssh::AuthMethod::PrivateKey => shell::SshCredentialKind::PrivateKey,
+                            ssh::AuthMethod::Agent => {
+                                self.ssh_runtime.close_session(session_id);
+                                return;
+                            }
+                        };
+                        self.open_ssh_credential_dialog(session_id, &profile, kind);
+                    }
                 }
             }
             SshRuntimeAction::ActivateSession { session_id } => {
@@ -9098,6 +9110,12 @@ impl App {
         // 必须在此显式从 settings 读出。两入口（顶栏②按钮 + Ctrl+B）切换时均同步
         // 写盘（见 shell_out 处理段与 ToggleFiletree 分支），重启即可还原。
         state.shell_state.filetree.visible = state.settings.layout.filetree_visible;
+        // SSH 监控面板/卡片折叠状态：从持久化设置恢复（四入口切换时经
+        // shell_out.ssh_monitor_prefs_changed 写盘，见下方处理段）。
+        state.shell_state.ssh_ui.load_monitor_prefs(
+            state.settings.layout.ssh_monitor_collapsed,
+            &state.settings.layout.ssh_monitor_cards_collapsed,
+        );
         if let Some(error) = ssh_store_load_error {
             state
                 .shell_state
@@ -13771,6 +13789,17 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
+                // SSH 监控面板/卡片显隐：shell 层四入口已更新 SshUiState，
+                // 此处把当前状态写进 settings 并触发存盘（重启恢复）。
+                let ssh_monitor_prefs_changed = if shell_out.ssh_monitor_prefs_changed {
+                    state.settings.layout.ssh_monitor_collapsed =
+                        state.shell_state.ssh_ui.monitor_collapsed();
+                    state.settings.layout.ssh_monitor_cards_collapsed =
+                        state.shell_state.ssh_ui.collapsed_monitor_cards_vec();
+                    true
+                } else {
+                    false
+                };
                 // 三种工作模式切换 → 写 settings 并触发存盘。
                 let view_mode_changed = if let Some(v) = shell_out.toggle_view_mode {
                     state.switch_view_mode(v)
@@ -13789,6 +13818,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || remote_list_changed
                     || ssh_server_list_changed
                     || filetree_changed
+                    || ssh_monitor_prefs_changed
                     || view_mode_changed;
                 // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。
                 if shell_out.settings_update_changed {
