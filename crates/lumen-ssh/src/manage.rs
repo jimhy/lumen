@@ -21,12 +21,11 @@ use super::StrictHostKeyHandler;
 
 pub const MAX_CONCURRENT_REQUESTS: usize = 4;
 pub const MAX_QUERY_CHARS: usize = 64;
-/// 名称搜索的结果上限（弹窗全量列表放宽到 [`MAX_ALL_PROCESSES`]）。
-const MAX_SEARCH_RESULTS: usize = 40;
 /// 详情弹窗全量进程列表的条目上限（CPU/MEM top 并集各取此数）。
 const MAX_ALL_PROCESSES: usize = 200;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+/// 600 行进程（含长命令行）+ 300 行监听 socket 的预算，留一倍余量。
+const MAX_OUTPUT_BYTES: usize = 192 * 1024;
 const MAX_RESULTS: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,13 +155,15 @@ printf 'LUMEN_END\\n'";
 /// processes, whose command lines literally contain the word "grep".
 /// 进程字段含 ppid（任务管理器式父子分组）；`===LUMEN_SS===` 段附全量
 /// 监听 socket（详情弹窗「端口号」列的数据源，无 ss 的系统该段为空）。
+/// 两段各自独立限行——此前整段统一 head，进程行一多 ss 段就被挤出配额
+/// 之外，端口列大面积显示「-」（海风哥 docker 服务器实测复现）。
 const PROCESS_SCRIPT: &str = "q=$(printf '%bX' \"$1\"); q=${q%X}; \
 echo '===LUMEN_PS==='; \
 if [ -n \"$q\" ]; then \
-ps -eo pid=,ppid=,pcpu=,pmem=,args= 2>/dev/null | grep -i -F -- \"$q\" | grep -v grep; \
-else ps -eo pid=,ppid=,pcpu=,pmem=,args= 2>/dev/null; fi; \
+ps -eo pid=,ppid=,pcpu=,pmem=,args= 2>/dev/null | grep -i -F -- \"$q\" | grep -v grep | head -n 40; \
+else ps -eo pid=,ppid=,pcpu=,pmem=,args= 2>/dev/null | head -n 600; fi; \
 echo '===LUMEN_SS==='; \
-ss -lntup 2>/dev/null";
+ss -lntup 2>/dev/null | head -n 300";
 
 pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageError> {
     validate(request)?;
@@ -182,16 +183,9 @@ pub(super) fn build_command(request: &ManageRequest) -> Result<String, ManageErr
         }
         ManageAction::QueryProcess { query } => {
             let encoded = encode_octal(query.as_bytes());
-            // 全量列表预取给 CPU/MEM 双维度并集截断留余量；ss 段（监听
-            // socket，「端口号」列数据源）另留 200 行（最长命令行的极端
-            // 环境由输出字节上限兜底截断，parse 逐行容错）。
-            let head = if query.is_empty() {
-                MAX_ALL_PROCESSES * 3 + 200
-            } else {
-                MAX_SEARCH_RESULTS
-            };
+            // 行数配额已移入脚本（ps/ss 两段各自限行，见 PROCESS_SCRIPT 注释）。
             format!(
-                "LC_ALL=C /bin/sh -c {} lumen-manage '{encoded}' | head -n {head}",
+                "LC_ALL=C /bin/sh -c {} lumen-manage '{encoded}'",
                 shell_quote(PROCESS_SCRIPT)
             )
         }
@@ -303,7 +297,9 @@ async fn collect_output(mut channel: russh::Channel<client::Msg>) -> Result<Stri
     if exit_status.is_some_and(|status| status != 0) {
         return Err(ManageError::CommandFailed);
     }
-    String::from_utf8(output).map_err(|_| ManageError::CommandFailed)
+    // 输出在字节上限处可能正好切断多字节 UTF-8 序列（长命令行环境），
+    // 容错解码替换半个字符，绝不让一行坏数据灭掉整批结果。
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 pub fn parse_outcome(action: &ManageAction, output: &str) -> Result<ManageOutcome, ManageError> {
@@ -427,7 +423,7 @@ fn parse_process_entries(output: &str) -> Vec<ProcessEntry> {
     let ss_body = output.split("===LUMEN_SS===").nth(1).unwrap_or("");
 
     let mut listening: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
-    for line in ss_body.lines() {
+    for line in ss_body.lines().take(300) {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 5 {
             continue;
