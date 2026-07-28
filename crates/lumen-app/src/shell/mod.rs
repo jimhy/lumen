@@ -4573,10 +4573,7 @@ fn ssh_monitor_process_card(
             );
             return;
         }
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            ssh_process_sort_header(ui, st, pal);
-        });
+        ssh_process_sort_header(ui, st, pal);
         let sort_memory = st.ssh_ui.process_sort_memory();
         let mut processes: Vec<&lumen_ssh::ProcessMetrics> = processes.iter().collect();
         processes.sort_by(|left, right| {
@@ -4606,36 +4603,54 @@ fn ssh_monitor_process_card(
 }
 
 /// 进程列表排序表头（进程卡两处列表共用）：CPU/MEM 点击切换排序维度，
-/// 当前维度 ▼ 高亮。
+/// 当前维度 ▼ 高亮。列几何与 [`ssh_monitor_process_row`] 严格一致（同宽
+/// 同间距），否则表头与数据行错位（海风哥截图反馈）。
 fn ssh_process_sort_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme::Palette) {
     let strings = crate::i18n::strings();
     let sort_memory = st.ssh_ui.process_sort_memory();
-    for (text, active, memory) in [("CPU", !sort_memory, false), ("MEM", sort_memory, true)] {
-        let label = if active {
-            format!("{text} ▼")
-        } else {
-            text.to_owned()
-        };
-        let color = if active { pal.info } else { pal.fg_dim };
-        if ui
-            .add(
-                egui::Button::new(egui::RichText::new(label).monospace().small().color(color))
-                    .frame(false),
-            )
-            .on_hover_text(strings.ssh_process_sort_tip)
-            .clicked()
-        {
-            st.ssh_ui.set_process_sort_memory(memory);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (text, active, memory) in [("CPU", !sort_memory, false), ("MEM", sort_memory, true)] {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, 16.0), egui::Sense::click());
+            if response.hovered() {
+                ui.painter().rect_filled(rect, 3.0, pal.bg_highlight);
+            }
+            let label = if active {
+                format!("{text}▼")
+            } else {
+                text.to_owned()
+            };
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::monospace(12.0),
+                if active { pal.info } else { pal.fg_dim },
+            );
+            if response
+                .on_hover_text(strings.ssh_process_sort_tip)
+                .clicked()
+            {
+                st.ssh_ui.set_process_sort_memory(memory);
+            }
         }
-    }
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(strings.ssh_monitor_command)
-            .monospace()
-            .small()
-            .color(pal.fg_dim),
-    );
+        let (cmd_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), egui::Sense::hover());
+        ui.painter().text(
+            cmd_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            strings.ssh_monitor_command,
+            egui::FontId::monospace(12.0),
+            pal.fg_dim,
+        );
+    });
 }
+
+/// 进程行数字列宽（表头与数据行共用）。
+const SSH_PROC_NUM_W: f32 = 36.0;
+/// 进程行 × 按钮列宽。
+const SSH_PROC_KILL_W: f32 = 20.0;
 
 /// 结果区标题行：左标签 + 右侧「清除」按钮。
 fn ssh_monitor_result_header(
@@ -4665,7 +4680,8 @@ fn ssh_monitor_result_header(
     ui.add_space(2.0);
 }
 
-/// 一行进程：CPU / MEM / 命令（截断 + hover 全文 + PID 副行）/ 终止按钮。
+/// 一行进程：CPU / MEM（固定宽）/ 命令+PID（吃满剩余宽，hover 全文）/ ×。
+/// 命令列不再写死宽度——面板有多宽就填多宽（海风哥截图反馈右侧大片空白）。
 fn ssh_monitor_process_row(
     ui: &mut egui::Ui,
     pid: u32,
@@ -4675,50 +4691,63 @@ fn ssh_monitor_process_row(
     st: &mut ShellState,
     pal: &theme::Palette,
 ) {
+    const ROW_H: f32 = 28.0;
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!("{cpu_percent:>4.1}"))
-                .monospace()
-                .small()
-                .color(pal.fg),
-        );
-        ui.label(
-            egui::RichText::new(format!("{memory_percent:>4.1}"))
-                .monospace()
-                .small()
-                .color(pal.fg),
-        );
-        ui.vertical(|ui| {
-            ui.set_max_width(108.0);
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(command)
-                        .monospace()
-                        .small()
-                        .color(pal.fg),
-                )
-                .truncate(),
-            )
-            .on_hover_text(command);
-            ui.label(
-                egui::RichText::new(format!("PID {pid}"))
-                    .monospace()
-                    .small()
-                    .color(pal.fg_dim),
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for value in [cpu_percent, memory_percent] {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, ROW_H), egui::Sense::hover());
+            ui.painter().text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                format!("{value:.1}"),
+                egui::FontId::monospace(12.0),
+                pal.fg,
             );
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let kill = ui
-                .add(
-                    egui::Button::new(egui::RichText::new("×").size(14.0).color(pal.fg_dim))
-                        .frame(false),
-                )
-                .on_hover_text(crate::i18n::strings().ssh_monitor_kill);
-            if kill.clicked() {
-                st.ssh_ui.set_kill_confirm(Some(pid));
-            }
-        });
+        }
+        let cmd_w = (ui.available_width() - SSH_PROC_KILL_W).max(30.0);
+        let (cmd_rect, cmd_response) =
+            ui.allocate_exact_size(egui::vec2(cmd_w, ROW_H), egui::Sense::hover());
+        let painter = ui.painter_at(cmd_rect);
+        painter.text(
+            egui::pos2(cmd_rect.min.x, cmd_rect.min.y + 1.0),
+            egui::Align2::LEFT_TOP,
+            command,
+            egui::FontId::monospace(12.0),
+            pal.fg,
+        );
+        painter.text(
+            egui::pos2(cmd_rect.min.x, cmd_rect.min.y + 15.0),
+            egui::Align2::LEFT_TOP,
+            format!("PID {pid}"),
+            egui::FontId::monospace(11.0),
+            pal.fg_dim,
+        );
+        if cmd_response.hovered() {
+            cmd_response.on_hover_text(command);
+        }
+        let (kill_rect, kill_response) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_KILL_W, ROW_H), egui::Sense::click());
+        if kill_response.hovered() {
+            ui.painter().rect_filled(kill_rect, 3.0, pal.bg_highlight);
+        }
+        ui.painter().text(
+            kill_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(13.0),
+            if kill_response.hovered() {
+                pal.error
+            } else {
+                pal.fg_dim
+            },
+        );
+        if kill_response
+            .on_hover_text(crate::i18n::strings().ssh_monitor_kill)
+            .clicked()
+        {
+            st.ssh_ui.set_kill_confirm(Some(pid));
+        }
     });
     ui.add_space(2.0);
 }
