@@ -362,10 +362,25 @@ pub fn installer_dest(tag: &str) -> PathBuf {
 
 /// 拉起安装器（不等待）。调用方随后须走优雅退出流程让安装器替换 exe。
 ///
-/// 安装包为 Inno Setup 产物，自带 UI + 关闭运行进程 + 重启；这里只负责
-/// 启动它。返回是否成功 spawn。
+/// Windows 必须经当前桌面的 Explorer 转交启动，不能直接把安装器建成 Lumen
+/// 的子进程：一旦 Lumen 进程树带有 RedirectionGuard，安装器及安装后的首个
+/// PowerShell 会继承该策略，Scoop 的 `current` junction 将无法访问。
 pub fn launch_installer(path: &Path) -> Result<(), String> {
-    std::process::Command::new(path)
+    #[cfg(windows)]
+    let mut command = {
+        let explorer = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("explorer.exe");
+        let mut command = std::process::Command::new(explorer);
+        command.arg(path);
+        command
+    };
+
+    #[cfg(not(windows))]
+    let mut command = std::process::Command::new(path);
+
+    command
         .spawn()
         .map(|_child| ())
         .map_err(|e| format!("启动安装器失败 {}: {e}", path.display()))

@@ -39,9 +39,11 @@ DisableProgramGroupPage=yes
 ; 64 位专用（与 wgpu/ConPTY 一致）。
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; 覆盖安装时关闭正在运行的 Lumen，安装完按需重启（热更核心）。
+; 覆盖安装时关闭正在运行的 Lumen。禁止 Restart Manager 直接重启：
+; 若安装器由启用了 RedirectionGuard 的旧版 Lumen 拉起，直接重启会把该策略
+; 继续传给新进程。安装完成后的可选启动统一由 [Run] 经 Explorer 转交。
 CloseApplications=yes
-RestartApplications=yes
+RestartApplications=no
 ; 输出。
 OutputDir=..\dist
 OutputBaseFilename=Lumen-Setup-{#MyAppVersion}
@@ -50,11 +52,9 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; Inno Setup 6.7 起默认开启 RedirectionGuard。安装完成后由 [Run] 拉起的
-; 首个 Lumen 进程在真机上会继承该策略，连带其 PowerShell 子进程拒绝穿过
-; Scoop 为 apps\<包>\current 创建的普通用户 junction，导致 zoxide 等 shim
-; 启动失败；用户随后从 Explorer 重开则正常。Lumen 安装器不依赖遍历公共
-; 可写目录，故显式关闭安装器级策略，避免污染安装后首个终端进程树。
+; Inno Setup 6.7 起默认开启 RedirectionGuard。这里的 no 只能阻止安装器主动
+; 开启策略，不能清除从父进程继承且已生效的策略。因此还必须由更新器及下方
+; [Run] 通过既有 Explorer 进程启动，切断受污染的进程树。
 RedirectionGuard=no
 
 [Languages]
@@ -88,5 +88,8 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; 安装完成后按需启动（热更场景：覆盖安装后重启 Lumen）。
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+; 安装完成后按需启动。不要从 Setup 直接 CreateProcess：若 Setup 是由受影响
+; 的旧版 Lumen 拉起，新 Lumen 会继承 RedirectionGuard，并继续阻止 Scoop
+; current junction。explorer.exe 会把请求转交给当前桌面的既有 Explorer
+; 进程，由它建立干净的 Lumen/PowerShell 进程树。
+Filename: "{sys}\explorer.exe"; Parameters: """{app}\{#MyAppExeName}"""; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
