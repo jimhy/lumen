@@ -50,6 +50,12 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; Inno Setup 6.7 起默认开启 RedirectionGuard。安装完成后由 [Run] 拉起的
+; 首个 Lumen 进程在真机上会继承该策略，连带其 PowerShell 子进程拒绝穿过
+; Scoop 为 apps\<包>\current 创建的普通用户 junction，导致 zoxide 等 shim
+; 启动失败；用户随后从 Explorer 重开则正常。Lumen 安装器不依赖遍历公共
+; 可写目录，故显式关闭安装器级策略，避免污染安装后首个终端进程树。
+RedirectionGuard=no
 
 [Languages]
 ; 中英双语。简体中文用 vendor 进仓库的官方 ChineseSimplified.isl（installer/
