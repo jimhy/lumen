@@ -44,6 +44,10 @@ mod os_cwd;
 mod p2p;
 /// 应用数据目录解析（单一真源）：按构建类型隔离 debug/release 的持久化数据。
 mod paths;
+/// 安装完成后的首启门闩：等安装器完全退出后再恢复终端，避免安装事务
+/// 尚未收尾时并发启动 PowerShell/Scoop shim。
+#[cfg(windows)]
+mod post_install;
 /// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
 mod proc_icon;
 mod profile;
@@ -342,6 +346,9 @@ fn load_icon(bytes: &[u8]) -> Option<Icon> {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    post_install::wait_for_installer_if_requested();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
     // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；

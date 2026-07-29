@@ -39,9 +39,9 @@ DisableProgramGroupPage=yes
 ; 64 位专用（与 wgpu/ConPTY 一致）。
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-; 覆盖安装时关闭正在运行的 Lumen。禁止 Restart Manager 直接重启：
-; 若安装器由启用了 RedirectionGuard 的旧版 Lumen 拉起，直接重启会把该策略
-; 继续传给新进程。安装完成后的可选启动统一由 [Run] 经 Explorer 转交。
+; 覆盖安装时关闭正在运行的 Lumen。禁止 Restart Manager 自行重启：
+; 安装完成后的可选启动统一走 [Run]，并把 Setup PID 交给 Lumen；Lumen
+; 会等安装器完全退出后才创建窗口和恢复 PowerShell。
 CloseApplications=yes
 RestartApplications=no
 ; 输出。
@@ -52,10 +52,10 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; Inno Setup 6.7 起默认开启 RedirectionGuard。这里的 no 只能阻止安装器主动
-; 开启策略，不能清除从父进程继承且已生效的策略。因此还必须由更新器及下方
-; [Run] 通过既有 Explorer 进程启动，切断受污染的进程树。
-RedirectionGuard=no
+; RedirectionGuard 只影响 Setup/Uninstall 自身，官方明确说明不会传给安装
+; 后启动的子进程。保留安全默认值，保护安装器访问路径时不被非可信 junction
+; 重定向。
+RedirectionGuard=yes
 
 [Languages]
 ; 中英双语。简体中文用 vendor 进仓库的官方 ChineseSimplified.isl（installer/
@@ -88,8 +88,15 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; 安装完成后按需启动。不要从 Setup 直接 CreateProcess：若 Setup 是由受影响
-; 的旧版 Lumen 拉起，新 Lumen 会继承 RedirectionGuard，并继续阻止 Scoop
-; current junction。explorer.exe 会把请求转交给当前桌面的既有 Explorer
-; 进程，由它建立干净的 Lumen/PowerShell 进程树。
-Filename: "{sys}\explorer.exe"; Parameters: """{app}\{#MyAppExeName}"""; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; [Run] 发生时 Setup 还没完全退出。新 Lumen 先等待这里传入的 Setup PID
+; 结束，再额外留出短暂收尾时间，然后才恢复 PowerShell/Scoop shim。
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--wait-for-installer={code:GetSetupProcessId}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[Code]
+function GetCurrentProcessId: DWORD;
+  external 'GetCurrentProcessId@kernel32.dll stdcall';
+
+function GetSetupProcessId(Param: String): String;
+begin
+  Result := IntToStr(GetCurrentProcessId);
+end;
