@@ -10653,10 +10653,11 @@ impl ApplicationHandler<PtyWake> for App {
                         state.last_key_at = Some(Instant::now());
                     }
 
-                    Some(keymap::LookupResult::LlmClipboardPaste) => {
-                        // Codex / legacy kimi-cli 的 Ctrl+V 图片粘贴由 CLI 自己读取
-                        // 系统剪贴板；Lumen 若先走 get_text 会把图片静默吃掉。仅当
-                        // 当前确有图片时放行原始按键，纯文本仍沿用 bracketed paste。
+                    Some(keymap::LookupResult::ImageAwarePaste) => {
+                        // Codex / legacy kimi-cli 等交互程序的 Ctrl+V 图片粘贴由
+                        // 程序自己读取系统剪贴板；Lumen 若先走 get_text 会把图片
+                        // 静默吃掉。仅当确有图片时放行原始按键，纯文本仍沿用
+                        // bracketed paste。
                         let clipboard_has_image = state
                             .clipboard
                             .as_mut()

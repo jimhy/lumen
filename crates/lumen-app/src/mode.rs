@@ -54,25 +54,26 @@ pub enum InputMode {
 /// **禁止在任何地方缓存此函数的返回值到字段**。
 ///
 /// # 推导规则
-/// 1. `blocks` 为空 → [`InputMode::Fallback`]（从未见 OSC 133 标记，降级直通）
-/// 2. 当前未闭合命令是受支持的大模型 CLI → [`InputMode::LlmCli`]
-/// 3. `is_alt_screen()` → [`InputMode::AltScreen`]（全屏 TUI 让位）
+/// 1. 当前未闭合命令是受支持的大模型 CLI → [`InputMode::LlmCli`]
+/// 2. `is_alt_screen()` → [`InputMode::AltScreen`]（全屏 TUI 让位）
+/// 3. `blocks` 为空 → [`InputMode::Fallback`]（从未见 OSC 133 标记，降级直通）
 /// 4. 最后一块 `cmd_line.is_some()` && `output_line.is_none()` → [`InputMode::Compose`]
 ///    （133;B 到、133;C 未到 = PSReadLine 正在等输入）
 /// 5. 其余 → [`InputMode::Running`]（命令执行中 / REPL / 密码输入等）
 pub fn input_mode(term: &Terminal) -> InputMode {
-    // 规则 1：从未见 133 标记 → 降级直通
-    if term.blocks().is_empty() {
-        return InputMode::Fallback;
-    }
-    // 规则 2：受支持的 LLM CLI。必须在 AltScreen 之前判断，否则进入备用屏
+    // 规则 1：受支持的 LLM CLI。必须在 AltScreen 之前判断，否则进入备用屏
     // 后只能得到泛化的 AltScreen，图片剪贴板粘贴键无法走专用放行路径。
     if active_llm_cli(term) {
         return InputMode::LlmCli;
     }
-    // 规则 3：备用屏幕（vim / htop 等）
+    // 规则 2：备用屏幕（vim / htop 等）。先于 blocks 为空判断，使尚无
+    // shell integration 的 Linux/macOS 会话也能把全屏 TUI 键盘完整让位。
     if term.is_alt_screen() {
         return InputMode::AltScreen;
+    }
+    // 规则 3：从未见 133 标记 → 降级直通
+    if term.blocks().is_empty() {
+        return InputMode::Fallback;
     }
     // 规则 4：133;B 到、133;C 未到 = 等待输入
     match term.blocks().last() {
@@ -278,6 +279,17 @@ mod tests {
             input_mode(&term),
             InputMode::AltScreen,
             "进入备用屏后应为 AltScreen"
+        );
+    }
+
+    #[test]
+    fn alt_screen_precedes_fallback_without_shell_integration() {
+        let mut term = make_term(24, 80);
+        feed(&mut term, b"\x1b[?1049h");
+        assert_eq!(
+            input_mode(&term),
+            InputMode::AltScreen,
+            "无 OSC blocks 的跨平台 TUI 仍应完整让位"
         );
     }
 
