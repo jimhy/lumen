@@ -1529,7 +1529,9 @@ fn shortcuts(
                 ui.end_row();
             }
 
-            ui.add_space(4.0);
+            // Grid 布局不支持 `Ui::add_space`（egui Debug 构建会直接
+            // debug_assert panic）。用一个空行分隔应用快捷键与应用锁
+            // 快捷键，既保留视觉间距，也保持合法的 Grid 布局。
             ui.end_row();
             ui.label(egui::RichText::new(s.security_shortcut).color(pal.fg_dim));
             ui.label(
@@ -1632,6 +1634,7 @@ fn network(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::theme::DARK;
 
     #[test]
     fn 密码操作在校验中或退避期内均被阻止() {
@@ -1696,5 +1699,25 @@ mod tests {
             Some(SecurityFeedback::CurrentPasswordWrong)
         );
         assert_eq!(st.security_form, Some(SecurityForm::ChangePassword));
+    }
+
+    #[test]
+    fn 快捷键页面可在debug模式正常渲染() {
+        let ctx = egui::Context::default();
+        let mut st = SettingsUiState::default();
+        let mut settings = Settings::default();
+        let lock = AppLockFile::default();
+        let mut out = SettingsOutput::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        };
+
+        let _ = ctx.run_ui(raw, |ui| {
+            shortcuts(ui, &mut st, &mut settings, &DARK, &lock, &mut out);
+        });
     }
 }
