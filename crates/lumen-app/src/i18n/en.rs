@@ -297,6 +297,7 @@ pub static STRINGS: Strings = Strings {
     // M4.1 batch E: bottom status bar
     statusbar_mode_compose: "✏ Compose",
     statusbar_mode_running: "⇣ Passthrough",
+    statusbar_mode_llm_cli: "✦ LLM passthrough",
     statusbar_mode_altscreen: "⛶ Full-screen app",
     statusbar_mode_fallback: "⌨ Classic mode",
     statusbar_classic_off: "Classic: off",

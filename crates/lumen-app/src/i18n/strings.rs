@@ -852,6 +852,9 @@ pub struct Strings {
     /// 状态栏：Running 态模式指示文字
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub statusbar_mode_running: &'static str,
+    /// 状态栏：已识别 LLM CLI 的自动直通态
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_mode_llm_cli: &'static str,
     /// 状态栏：AltScreen 态模式指示文字
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub statusbar_mode_altscreen: &'static str,

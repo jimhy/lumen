@@ -285,8 +285,10 @@ pub fn lookup_input_with_shortcuts(
     }
 
     // ── 层 3：外壳级 Ctrl+* ────────────────────────────────────────────
-    // 守卫：非 alt screen 时生效（或 overlay 已打开，见 main.rs 注释）
-    if (guard.overlay_open || !guard.is_alt_screen)
+    // 守卫：非 alt screen / LLM CLI 时生效（或 overlay 已打开，见 main.rs
+    // 注释）。LLM 自己使用 Ctrl+T、Ctrl+R 等交互键，自动直通态必须让位。
+    let interactive_app_owns_keys = guard.is_alt_screen || mode == InputMode::LlmCli;
+    if (guard.overlay_open || !interactive_app_owns_keys)
         && !guard.renaming
         && !guard.filetree_dialog_open
         && !guard.shortcut_capture
@@ -342,7 +344,7 @@ pub fn lookup_input_with_shortcuts(
             // 中断仍随时可达：复制是一次性动作，CopySelection/CopyBlock 复制后
             // 立即清选区（见 main.rs），故再按一次 Ctrl+C 即落到 Interrupt——想杀
             // 跑飞进程 / 给 TUI 发 SIGINT，清掉选区（或本就无选区）再按即可。
-            InputMode::Running | InputMode::AltScreen | InputMode::Fallback => {
+            InputMode::Running | InputMode::LlmCli | InputMode::AltScreen | InputMode::Fallback => {
                 if guard.has_selection {
                     return Some(LookupResult::TerminalAction(Action::Term(
                         TermAction::CopySelection,
@@ -383,12 +385,12 @@ pub fn lookup_input_with_shortcuts(
     }
 
     // ── 层 7：Ctrl+↑/↓ 块跳转（非 alt screen）──────────────────────────
-    if !guard.is_alt_screen && shortcut(ShortcutAction::PreviousBlock) {
+    if !interactive_app_owns_keys && shortcut(ShortcutAction::PreviousBlock) {
         return Some(LookupResult::TerminalAction(Action::Term(
             TermAction::JumpBlock(-1),
         )));
     }
-    if !guard.is_alt_screen && shortcut(ShortcutAction::NextBlock) {
+    if !interactive_app_owns_keys && shortcut(ShortcutAction::NextBlock) {
         return Some(LookupResult::TerminalAction(Action::Term(
             TermAction::JumpBlock(1),
         )));
@@ -674,6 +676,13 @@ pub fn lookup_input_with_shortcuts(
 
     // ── 层 11：Ctrl+V 粘贴（非 Compose 态）────────────────────────────
     if shortcut(ShortcutAction::Paste) {
+        // Codex 与旧版 kimi-cli 通过收到 Ctrl+V 后自行读取系统图片剪贴板。
+        // 此处不能直接用 Lumen 的文本粘贴，否则图片会被静默丢掉。主循环收到
+        // 专用结果后先探测图片：有图片则把原始键事件写 PTY，无图片仍走普通
+        // 文本粘贴，兼顾两种剪贴板。
+        if mode == InputMode::LlmCli {
+            return Some(LookupResult::LlmClipboardPaste);
+        }
         return Some(LookupResult::TerminalAction(Action::Term(
             TermAction::PasteClipboard,
         )));
@@ -701,6 +710,8 @@ pub enum LookupResult {
     Consumed,
     /// 兜底直通：调用方用 encode_key / encode_key_win32 编码后写 PTY。
     PassThrough,
+    /// LLM CLI 粘贴键：图片剪贴板把原始键直通，纯文本走 Lumen 正常粘贴。
+    LlmClipboardPaste,
     /// Compose 态 Tab 键（M3.4 补全占位）——main.rs 显示状态条提示。
     ComposeTab,
     /// Compose 态 Ctrl+R（D2 历史搜索占位）——main.rs 显示状态条提示。
@@ -1270,6 +1281,36 @@ mod tests {
             ),
             "Ctrl+V → 粘贴"
         );
+    }
+
+    #[test]
+    fn llm_cli_ctrl_v_先探测图片剪贴板() {
+        let result = lookup_char(
+            "v",
+            ModifiersState::CONTROL,
+            InputMode::LlmCli,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::LlmClipboardPaste)),
+            "LLM CLI 的 Ctrl+V 应交由主循环区分图片和文本"
+        );
+    }
+
+    #[test]
+    fn llm_cli_slash_与交互快捷键直通() {
+        for (key, modifiers) in [
+            ("/", ModifiersState::empty()),
+            ("r", ModifiersState::CONTROL),
+            ("t", ModifiersState::CONTROL),
+        ] {
+            let result = lookup_char(key, modifiers, InputMode::LlmCli, true, &default_guard());
+            assert!(
+                matches!(result, Some(LookupResult::PassThrough)),
+                "LLM CLI 应独占交互键：{modifiers:?}+{key}"
+            );
+        }
     }
 
     // ── 外壳快捷键 ───────────────────────────────────────────────────────

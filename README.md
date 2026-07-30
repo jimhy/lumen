@@ -128,6 +128,7 @@ Useful shortcuts:
 | Editor-style input | A dedicated multi-line command area with selection, cut/copy/paste, Unicode grapheme-aware cursor movement, undo/redo, draft recovery, and smart submit behavior. |
 | PowerShell intelligence | Syntax highlighting, quote/pipe continuation detection, command and path completion, history navigation, ghost text, and `Ctrl+R` fuzzy search. |
 | Command blocks | OSC 133/633-aware command boundaries, success/failure state, elapsed time, block selection, block output copy, and keyboard navigation. |
+| LLM CLI passthrough | Automatically yields input to supported Claude Code, Codex, and Kimi CLIs, preserving their `/` command menus and native clipboard-image paste shortcuts. |
 | Classic compatibility | One shortcut switches back to byte-for-byte passthrough for shells, REPLs, TUIs, or workflows that want traditional terminal behavior. |
 | Terminal core | ANSI/VT, true color, alternate-screen apps such as Vim and `less`, bracketed paste, synchronized updates, mouse protocols, 10k-line scrollback, draggable scrollbar, and clickable URLs/file paths. |
 | International input | CJK IME pre-edit, emoji/grapheme-aware editing, cross-platform font fallback, and English/Simplified Chinese/Traditional Chinese UI. |

@@ -288,6 +288,7 @@ pub static STRINGS: Strings = Strings {
     // M4.1 批E：底部状态栏
     statusbar_mode_compose: "✏ 编辑模式",
     statusbar_mode_running: "⇣ 直通中",
+    statusbar_mode_llm_cli: "✦ LLM 直通",
     statusbar_mode_altscreen: "⛶ 全屏程序",
     statusbar_mode_fallback: "⌨ 经典直通",
     statusbar_classic_off: "经典模式：关",

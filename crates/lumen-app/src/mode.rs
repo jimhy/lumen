@@ -1,4 +1,4 @@
-//! 四态输入模式机（M4.1 批B）——设计稿 §2。
+//! 输入模式机（M4.1 批B）——设计稿 §2。
 //!
 //! # 核心纪律（铁律）
 //! **禁止任何地方缓存模式副本。** 模式是推导值，由 [`input_mode`] 从终端
@@ -15,11 +15,11 @@
 //! ```
 //!
 //! # 设计稿对应章节
-//! 设计稿 §2「输入模式机（四态，纯推导）」。
+//! 设计稿 §2「输入模式机（纯推导）」。
 
 use lumen_term::Terminal;
 
-/// 四态输入模式。
+/// 输入模式。
 ///
 /// 模式是**推导值**，由 [`input_mode`] 从终端状态单点求值。
 /// **禁止在任何结构体字段里缓存此枚举副本**（设计稿 §2 铁律）。
@@ -34,6 +34,11 @@ pub enum InputMode {
     ///
     /// 按键路由：逐键直通 PTY，不做本地缓冲。
     Running,
+    /// 已识别的大模型 CLI（Claude Code / Codex / Kimi）正在运行。
+    ///
+    /// 与 Running 一样逐键直通，但单独成态让 keymap 能把图片剪贴板粘贴键
+    /// 交还 CLI 自己读取，同时让状态栏明确显示「LLM 直通」。
+    LlmCli,
     /// 备用屏幕（vim / htop / codex TUI；`is_alt_screen()` == true）。
     ///
     /// 按键路由：完全直通（含 IME、Ctrl+C/V）。
@@ -50,31 +55,171 @@ pub enum InputMode {
 ///
 /// # 推导规则
 /// 1. `blocks` 为空 → [`InputMode::Fallback`]（从未见 OSC 133 标记，降级直通）
-/// 2. `is_alt_screen()` → [`InputMode::AltScreen`]（全屏 TUI 让位）
-/// 3. 最后一块 `cmd_line.is_some()` && `output_line.is_none()` → [`InputMode::Compose`]
+/// 2. 当前未闭合命令是受支持的大模型 CLI → [`InputMode::LlmCli`]
+/// 3. `is_alt_screen()` → [`InputMode::AltScreen`]（全屏 TUI 让位）
+/// 4. 最后一块 `cmd_line.is_some()` && `output_line.is_none()` → [`InputMode::Compose`]
 ///    （133;B 到、133;C 未到 = PSReadLine 正在等输入）
-/// 4. 其余 → [`InputMode::Running`]（命令执行中 / REPL / 密码输入等）
+/// 5. 其余 → [`InputMode::Running`]（命令执行中 / REPL / 密码输入等）
 pub fn input_mode(term: &Terminal) -> InputMode {
     // 规则 1：从未见 133 标记 → 降级直通
     if term.blocks().is_empty() {
         return InputMode::Fallback;
     }
-    // 规则 2：备用屏幕（vim / htop / codex）
+    // 规则 2：受支持的 LLM CLI。必须在 AltScreen 之前判断，否则进入备用屏
+    // 后只能得到泛化的 AltScreen，图片剪贴板粘贴键无法走专用放行路径。
+    if active_llm_cli(term) {
+        return InputMode::LlmCli;
+    }
+    // 规则 3：备用屏幕（vim / htop 等）
     if term.is_alt_screen() {
         return InputMode::AltScreen;
     }
-    // 规则 3：133;B 到、133;C 未到 = 等待输入
+    // 规则 4：133;B 到、133;C 未到 = 等待输入
     match term.blocks().last() {
         Some(b) if b.cmd_line.is_some() && b.output_line.is_none() => InputMode::Compose,
-        // 规则 4：其余均为运行中（含命令已发、退出码未到、REPL 等）
+        // 规则 5：其余均为运行中（含命令已发、退出码未到、REPL 等）
         _ => InputMode::Running,
     }
 }
 
+/// 当前未闭合命令是否为已验证具备「图片粘贴 + `/` 命令补全」的 LLM CLI。
+///
+/// `cmd_text` 来自 shell integration 在 OSC 133;C 中上报的权威命令文本，
+/// 因而不会依赖进程树形态（npm/PowerShell 包装器经常把真正程序藏在
+/// `node.exe` 或更深的子进程后面）。
+pub fn active_llm_cli(term: &Terminal) -> bool {
+    term.blocks().last().is_some_and(|block| {
+        block.output_line.is_some()
+            && !block.is_closed()
+            && block
+                .cmd_text
+                .as_deref()
+                .is_some_and(is_supported_llm_command)
+    })
+}
+
+/// 识别已调研并验证过交互能力的 CLI 启动命令。
+///
+/// 只识别命令位置，不扫描普通参数，避免 `echo codex` 一类误判。除直接命令
+/// 外兼容 PowerShell 调用运算符与常见的一次性包执行器。
+fn is_supported_llm_command(command: &str) -> bool {
+    let tokens = command_tokens(command);
+    let mut index = 0;
+
+    while tokens.get(index).is_some_and(|token| token == "&") {
+        index += 1;
+    }
+
+    let Some(program) = tokens.get(index).map(|token| executable_name(token)) else {
+        return false;
+    };
+    if is_llm_program(&program) {
+        return true;
+    }
+
+    match program.as_str() {
+        "npx" | "bunx" | "pnpx" | "uvx" => tokens
+            .iter()
+            .skip(index + 1)
+            .find(|token| !token.starts_with('-'))
+            .is_some_and(|token| is_llm_package(token)),
+        "npm"
+            if tokens
+                .get(index + 1)
+                .is_some_and(|token| token.eq_ignore_ascii_case("exec")) =>
+        {
+            tokens
+                .iter()
+                .skip(index + 2)
+                .find(|token| token.as_str() != "--" && !token.starts_with('-'))
+                .is_some_and(|token| is_llm_package(token))
+        }
+        "pnpm" | "yarn"
+            if tokens
+                .get(index + 1)
+                .is_some_and(|token| token.eq_ignore_ascii_case("dlx")) =>
+        {
+            tokens
+                .iter()
+                .skip(index + 2)
+                .find(|token| !token.starts_with('-'))
+                .is_some_and(|token| is_llm_package(token))
+        }
+        "python" | "python3" | "py"
+            if tokens
+                .get(index + 1)
+                .is_some_and(|token| token.eq_ignore_ascii_case("-m")) =>
+        {
+            tokens
+                .get(index + 2)
+                .is_some_and(|token| is_llm_package(token))
+        }
+        _ => false,
+    }
+}
+
+fn is_llm_program(program: &str) -> bool {
+    matches!(
+        program,
+        "claude" | "codex" | "kimi" | "kimi-cli" | "kimi-code"
+    )
+}
+
+fn is_llm_package(package: &str) -> bool {
+    let normalized = package.trim_matches(['\'', '"']).to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "@anthropic-ai/claude-code"
+            | "@openai/codex"
+            | "@moonshot-ai/kimi-code"
+            | "kimi-cli"
+            | "kimi_cli"
+            | "kimi-code"
+    )
+}
+
+fn executable_name(token: &str) -> String {
+    let token = token.trim_matches(['\'', '"']);
+    let file = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    let normalized = file.to_ascii_lowercase();
+    [".exe", ".cmd", ".bat", ".ps1"]
+        .iter()
+        .find_map(|suffix| normalized.strip_suffix(suffix))
+        .unwrap_or(&normalized)
+        .to_owned()
+}
+
+/// 足够解析 CLI 启动命令的轻量 tokenizer：空白分词、保留引号内空格，
+/// 并把 PowerShell 的独立 `&` 调用运算符作为普通 token。
+fn command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+
+    for ch in command.chars() {
+        match quote {
+            Some(end) if ch == end => quote = None,
+            Some(_) => current.push(ch),
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// 有效输入模式（含 `force_fallback` 手动逃生舱覆盖层）。
 ///
-/// `Ctrl+Shift+E` 置位 `force_fallback` 后，无论底层 [`input_mode`] 推导
-/// 结果如何，均强制返回 [`InputMode::Fallback`]。
+/// `Ctrl+Shift+E` 置位 `force_fallback` 后，通常强制返回
+/// [`InputMode::Fallback`]；活动 LLM CLI 保留 [`InputMode::LlmCli`]，以便
+/// 图片剪贴板仍能走 CLI 原生粘贴路径。CLI 退出后立即恢复 Fallback。
 ///
 /// **模式机纯函数 [`input_mode`] 本身不变；此函数是唯一的「逃生舱包装层」。**
 ///
@@ -82,6 +227,11 @@ pub fn input_mode(term: &Terminal) -> InputMode {
 /// * `term` - 终端状态机引用（按需求值，不缓存）。
 /// * `force_fallback` - `AppState::force_fallback` 字段（Ctrl+Shift+E 开关）。
 pub fn effective_mode(term: &Terminal, force_fallback: bool) -> InputMode {
+    // 手动经典模式与 LLM 自动态本质上都直通；优先保留 LLM 专用态，才能
+    // 继续区分图片剪贴板粘贴。CLI 退出后 classic_mode 仍会正常接管。
+    if active_llm_cli(term) {
+        return InputMode::LlmCli;
+    }
     if force_fallback {
         return InputMode::Fallback;
     }
@@ -163,6 +313,65 @@ mod tests {
         );
     }
 
+    // ── 规则 2：受支持的 LLM CLI → LlmCli ──────────────────────────────
+
+    #[test]
+    fn llm_cli_when_supported_command_is_running() {
+        let mut term = make_term(24, 80);
+        // base64("codex") = Y29kZXg=
+        feed(
+            &mut term,
+            b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;Y29kZXg=\x07",
+        );
+        assert_eq!(input_mode(&term), InputMode::LlmCli);
+
+        // LLM TUI 进入备用屏后仍保留专用模式，确保图片粘贴放行。
+        feed(&mut term, b"\x1b[?1049h");
+        assert_eq!(input_mode(&term), InputMode::LlmCli);
+
+        // 命令闭合后不再误判为活动 LLM。
+        feed(&mut term, b"\x1b]133;D;0\x07");
+        assert_eq!(input_mode(&term), InputMode::AltScreen);
+    }
+
+    #[test]
+    fn supported_llm_command_detector_accepts_verified_entry_points() {
+        for command in [
+            "claude",
+            "Codex.EXE --resume",
+            "kimi --continue",
+            "kimi-cli",
+            "& 'C:\\Program Files\\Claude\\claude.exe' --resume",
+            "npx @openai/codex",
+            "bunx @anthropic-ai/claude-code",
+            "pnpm dlx @moonshot-ai/kimi-code",
+            "npm exec -- @openai/codex",
+            "python -m kimi_cli",
+        ] {
+            assert!(
+                is_supported_llm_command(command),
+                "应识别受支持的 LLM CLI：{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_llm_command_detector_rejects_mentions_and_unknown_tools() {
+        for command in [
+            "",
+            "echo codex",
+            "rg claude",
+            "python script.py kimi",
+            "gemini",
+            "opencode",
+        ] {
+            assert!(
+                !is_supported_llm_command(command),
+                "不应把未验证或普通参数误判为 LLM CLI：{command}"
+            );
+        }
+    }
+
     // ── clear 后回到 Fallback 检验 ───────────────────────────────────────
 
     #[test]
@@ -233,6 +442,20 @@ mod tests {
             effective_mode(&term, true),
             InputMode::Fallback,
             "force_fallback=true 应覆盖 Running 为 Fallback"
+        );
+    }
+
+    #[test]
+    fn effective_mode_llm_cli_keeps_image_paste_routing_in_classic_mode() {
+        let mut term = make_term(24, 80);
+        feed(
+            &mut term,
+            b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;Y2xhdWRl\x07",
+        );
+        assert_eq!(
+            effective_mode(&term, true),
+            InputMode::LlmCli,
+            "经典模式下仍需保留 LLM 图片粘贴专用路由"
         );
     }
 
