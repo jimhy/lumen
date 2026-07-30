@@ -1284,8 +1284,8 @@ struct AppState {
     bg_texture: Option<background::BgTexture>,
     /// 经典直通模式开关（M4.1 批B，Ctrl+Shift+E 切换）。
     ///
-    /// 置位后 [`mode::effective_mode`] 通常返回 [`mode::InputMode::Fallback`]；
-    /// 活动 LLM CLI 保留专用直通态以支持图片粘贴。设计稿 §2「手动逃生」。
+    /// 置位后 [`mode::effective_mode`] 强制返回 [`mode::InputMode::Fallback`]，
+    /// 所有按键直通 PTY（= M2 现状）。设计稿 §2「手动逃生」。
     /// **禁止在此字段之外的地方保存输入模式副本**（设计稿铁律）。
     force_fallback: bool,
     /// 命令历史库（M4.1 批D2）：启动时加载，提交时追加写，退出时原子重写。
@@ -10651,41 +10651,6 @@ impl ApplicationHandler<PtyWake> for App {
                         state.dispatch(action, ti, pi);
                         // 按键记录（端到端延迟埋点）。
                         state.last_key_at = Some(Instant::now());
-                    }
-
-                    Some(keymap::LookupResult::LlmClipboardPaste) => {
-                        // Codex / legacy kimi-cli 的 Ctrl+V 图片粘贴由 CLI 自己读取
-                        // 系统剪贴板；Lumen 若先走 get_text 会把图片静默吃掉。仅当
-                        // 当前确有图片时放行原始按键，纯文本仍沿用 bracketed paste。
-                        let clipboard_has_image = state
-                            .clipboard
-                            .as_mut()
-                            .is_some_and(|clipboard| clipboard.get_image().is_ok());
-                        if clipboard_has_image {
-                            let use_win32 = state.tabs[ti].panes[pi].term.win32_input()
-                                && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
-                            let bytes = if use_win32 {
-                                input::encode_key_win32(&event, state.modifiers, true)
-                            } else {
-                                input::encode_key(&event, state.modifiers)
-                            };
-                            if let Some(bytes) = bytes {
-                                let write_t0 = Instant::now();
-                                let pane = &mut state.tabs[ti].panes[pi];
-                                pane.term.grid_mut().scroll_to_bottom();
-                                if let Err(e) = pane.write_user_input(&bytes) {
-                                    error!("LLM 图片粘贴键写入 PTY 失败: {e:#}");
-                                }
-                                state.last_key_at = Some(write_t0);
-                            }
-                        } else {
-                            state.dispatch(
-                                action::Action::Term(action::TermAction::PasteClipboard),
-                                ti,
-                                pi,
-                            );
-                            state.last_key_at = Some(Instant::now());
-                        }
                     }
 
                     Some(keymap::LookupResult::PassThrough) => {

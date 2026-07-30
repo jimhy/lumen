@@ -334,8 +334,7 @@ pub struct Settings {
     /// 经典直通模式开关（第十八轮持久化）：对应运行时 `AppState::force_fallback`。
     ///
     /// `true` 时启动即进入经典直通态（`force_fallback = true`），
-    /// 所有按键直通 PTY，不走 Compose 态编辑器；活动 LLM CLI 仍保留
-    /// 专用直通标识，用于原生图片粘贴。
+    /// 所有按键直通 PTY，不走 shell integration / Compose 态编辑器。
     /// 默认 `false`（正常 AI-native 模式）。
     ///
     /// 变更来源：`TermAction::ToggleFallback`（Ctrl+Shift+E 快捷键

@@ -54,7 +54,6 @@ fn token_to_footer_span(t: &lumen_editor::Token) -> FooterSpan {
 ///
 /// - [`InputMode::Compose`] → 完整编辑卡片，内容来自 `editor_view`（真实 EditorView 内容）
 /// - [`InputMode::Running`] → 等高状态条（文案 i18n）
-/// - [`InputMode::LlmCli`] → 隐藏（LLM CLI 自动直通）
 /// - [`InputMode::AltScreen`] → 隐藏（grid 收回全高）
 /// - [`InputMode::Fallback`] → 隐藏（与 AltScreen 同路径；底部状态栏已有"经典直通"模式指示）
 ///
@@ -136,8 +135,6 @@ pub fn compose_view_for_mode(
         // 高度在「1 行 ↔ 0」间变化，底部约 1 行高度轻微抖动并触发一次 resize——
         // 这是有意接受的权衡（用户要彻底隐藏 > 避免抖动）。
         InputMode::Running => ComposerView::hidden(),
-        // LLM CLI：输入与提示菜单由程序自己的 composer 完整接管。
-        InputMode::LlmCli => ComposerView::hidden(),
         // AltScreen：全屏 TUI 让位，footer 隐藏，grid 收回全高。
         InputMode::AltScreen => ComposerView::hidden(),
         // Fallback：shell integration 未生效，footer 隐藏（与 AltScreen 同路径，
@@ -153,7 +150,7 @@ pub fn compose_view_for_mode(mode: InputMode) -> ComposerView {
         InputMode::Compose => ComposerView::compose_empty(),
         // Running 也隐藏（海风哥反馈，取舍详见 feature 版注释）——与
         // AltScreen/Fallback 同路径，footer_px=0、grid 收回全高。
-        InputMode::Running | InputMode::LlmCli | InputMode::AltScreen | InputMode::Fallback => {
+        InputMode::Running | InputMode::AltScreen | InputMode::Fallback => {
             ComposerView::hidden()
         }
     }
@@ -164,7 +161,7 @@ mod tests {
     use super::*;
     use lumen_renderer::composer_view::FooterKind;
 
-    // ── 输入模式 → 形态映射（input-editor feature）──────────────────────
+    // ── 四模式 → 形态映射（input-editor feature）────────────────────────
 
     #[cfg(feature = "input-editor")]
     mod with_editor {
@@ -248,14 +245,6 @@ mod tests {
                 "Running 模式应产出 Hidden 形态（footer 隐藏）"
             );
             assert!(!v.is_visible(), "Running 形态应隐藏");
-        }
-
-        #[test]
-        fn llm_cli_模式_产出_hidden_形态() {
-            let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::LlmCli, editor.view(), None, None, None);
-            assert_eq!(v.kind, FooterKind::Hidden);
-            assert!(!v.is_visible(), "LLM CLI 应接管完整输入区域");
         }
 
         #[test]

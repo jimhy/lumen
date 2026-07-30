@@ -295,7 +295,6 @@ pub static STRINGS: Strings = Strings {
     // M4.1 批E：底部狀態列
     statusbar_mode_compose: "✏ 編輯模式",
     statusbar_mode_running: "⇣ 直通中",
-    statusbar_mode_llm_cli: "✦ LLM 直通",
     statusbar_mode_altscreen: "⛶ 全螢幕程式",
     statusbar_mode_fallback: "⌨ 傳統直通",
     statusbar_classic_off: "傳統模式：關",
