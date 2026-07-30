@@ -148,22 +148,6 @@ pub(crate) fn encode_plain_end(win32_input: bool) -> Vec<u8> {
     bytes
 }
 
-/// 本地智能输入框向交互程序提交时所需的无修饰 Enter。
-///
-/// 普通 VT 为 `CR`；DEC 9001 win32-input-mode 必须成对发送 VK_RETURN
-/// 按下与抬起，否则 Claude 等程序可能忽略裸 `CR` 或留下按键状态。
-pub(crate) fn encode_plain_enter(win32_input: bool) -> Vec<u8> {
-    let mods = ModifiersState::default();
-    if !win32_input {
-        return encode_named(NamedKey::Enter, mods).expect("Enter 必须有 VT 编码");
-    }
-
-    let (vk, uc) = win32_named_key(NamedKey::Enter).expect("Enter 必须有 win32 编码");
-    let mut bytes = encode_win32_key(vk, uc, mods, true);
-    bytes.extend_from_slice(&encode_win32_key(vk, uc, mods, false));
-    bytes
-}
-
 fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
     let seq: &[u8] = match key {
         NamedKey::Enter => b"\r",
@@ -206,7 +190,7 @@ fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_alternate_scroll, encode_plain_end, encode_plain_enter};
+    use super::{encode_alternate_scroll, encode_plain_end};
 
     #[test]
     fn alternate_scroll_编码上下方向与档数() {
@@ -225,15 +209,6 @@ mod tests {
         assert_eq!(
             encode_plain_end(true),
             b"\x1b[35;0;0;1;0;1_\x1b[35;0;0;0;0;1_"
-        );
-    }
-
-    #[test]
-    fn 智能输入提交_普通vt与win32均发送enter() {
-        assert_eq!(encode_plain_enter(false), b"\r");
-        assert_eq!(
-            encode_plain_enter(true),
-            b"\x1b[13;0;13;1;0;1_\x1b[13;0;13;0;0;1_"
         );
     }
 }

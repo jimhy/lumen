@@ -297,7 +297,6 @@ pub static STRINGS: Strings = Strings {
     // M4.1 batch E: bottom status bar
     statusbar_mode_compose: "✏ Compose",
     statusbar_mode_running: "⇣ Passthrough",
-    statusbar_mode_llm_compose: "✦ LLM smart input",
     statusbar_mode_llm_cli: "✦ LLM passthrough",
     statusbar_mode_altscreen: "⛶ Full-screen app",
     statusbar_mode_fallback: "⌨ Classic mode",
@@ -305,8 +304,6 @@ pub static STRINGS: Strings = Strings {
     statusbar_classic_on: "Classic: on",
     statusbar_classic_tip: "Toggle classic passthrough (Ctrl+Shift+E)",
     composer_placeholder: "Type a command, Enter to run  (Ctrl+Shift+E for classic mode)",
-    composer_llm_placeholder:
-        "Type a prompt, Enter to send (Ctrl+Shift+E enables native / menus and image paste)",
     // Login validation
     login_err_invalid_email: "Invalid email (expected format: name@example.com)",
     login_err_empty_password: "Please enter a password",

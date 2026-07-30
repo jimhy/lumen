@@ -295,7 +295,6 @@ pub static STRINGS: Strings = Strings {
     // M4.1 批E：底部狀態列
     statusbar_mode_compose: "✏ 編輯模式",
     statusbar_mode_running: "⇣ 直通中",
-    statusbar_mode_llm_compose: "✦ LLM 智慧輸入",
     statusbar_mode_llm_cli: "✦ LLM 直通",
     statusbar_mode_altscreen: "⛶ 全螢幕程式",
     statusbar_mode_fallback: "⌨ 傳統直通",
@@ -303,7 +302,6 @@ pub static STRINGS: Strings = Strings {
     statusbar_classic_on: "傳統模式：開",
     statusbar_classic_tip: "切換傳統直通模式 (Ctrl+Shift+E)",
     composer_placeholder: "輸入指令，Enter 送出（Ctrl+Shift+E 切換傳統模式）",
-    composer_llm_placeholder: "輸入提示詞，Enter 送出（Ctrl+Shift+E 使用原生 / 選單與圖片貼上）",
     // 登入校驗
     login_err_invalid_email: "電子郵件格式不正確（需形如 name@example.com）",
     login_err_empty_password: "請輸入密碼",

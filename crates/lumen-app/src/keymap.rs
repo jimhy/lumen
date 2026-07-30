@@ -246,14 +246,11 @@ pub fn lookup_input_with_shortcuts(
     let shift = mods.shift_key();
     let alt = mods.alt_key();
     let shortcut = |action| shortcuts.matches(action, &input.logical_key, mods);
-    let composer_owns_input = matches!(mode, InputMode::Compose | InputMode::LlmCompose);
 
     // ── 层 1：抬起事件（win32-input-mode）──────────────────────────────
-    // 抬起事件（pressed=false）仅在 win32-input-mode 的直通态投递。
-    // LLM 智能输入态虽然底层 CLI 已开启 DEC 9001，但按键由本地 composer
-    // 消费；若仍下发 key-up，会让 Claude 收到没有 key-down 的幽灵事件。
+    // 抬起事件（pressed=false）仅在 win32-input-mode 下投递。
     if !pressed {
-        if guard.win32_input && !composer_owns_input {
+        if guard.win32_input {
             return Some(LookupResult::Win32KeyUp);
         }
         return None;
@@ -362,7 +359,7 @@ pub fn lookup_input_with_shortcuts(
                     TermAction::Interrupt,
                 )));
             }
-            InputMode::Compose | InputMode::LlmCompose => {
+            InputMode::Compose => {
                 // Compose 态走三级优先级逻辑（见层 9）
             }
         }
@@ -406,7 +403,7 @@ pub fn lookup_input_with_shortcuts(
     // 搜索）要独占键盘，被面板抢就坏了（设计稿 §4：这两态 Ctrl+R 本就直通）。
     // 位于聚焦闸（层 4）之后保证终端聚焦；位于 Compose 开闸（层 9）之前。
     if shortcut(ShortcutAction::SearchHistory)
-        && (composer_owns_input || mode == InputMode::Fallback)
+        && matches!(mode, InputMode::Compose | InputMode::Fallback)
     {
         return Some(LookupResult::ComposeHistorySearch);
     }
@@ -415,7 +412,7 @@ pub fn lookup_input_with_shortcuts(
     // Running/AltScreen/Fallback 态跳过此层，走后续兜底直通。
     // E9 铁律：Running/AltScreen/Fallback 的 Ctrl+C 已在层 5 处理并返回，
     // 此层逻辑对非 Compose 态完全不可达（模式检查保证）。
-    if composer_owns_input {
+    if mode == InputMode::Compose {
         // 9-a: Enter → Composer(Submit)
         if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Enter) {
             return Some(LookupResult::TerminalAction(Action::Composer(
@@ -551,11 +548,7 @@ pub fn lookup_input_with_shortcuts(
 
         // 9-l: Ctrl+L → 直通（清屏是 shell 行为）
         if ctrl && !shift && is_char(input, 'l') {
-            return Some(if mode == InputMode::Compose {
-                LookupResult::PassThrough
-            } else {
-                LookupResult::Consumed
-            });
+            return Some(LookupResult::PassThrough);
         }
 
         // 9-m: Ctrl+C（Compose 态四级逻辑）——设计稿 §4 + 第十一轮
@@ -611,11 +604,7 @@ pub fn lookup_input_with_shortcuts(
                 )));
             }
             // 无选区：直通 PTY
-            return Some(if mode == InputMode::Compose {
-                LookupResult::PassThrough
-            } else {
-                LookupResult::Consumed
-            });
+            return Some(LookupResult::PassThrough);
         }
 
         // 9-n: Ctrl+D
@@ -623,11 +612,7 @@ pub fn lookup_input_with_shortcuts(
         //   缓冲非空 → DeleteForward
         if ctrl && !shift && is_char(input, 'd') {
             if guard.compose_buf_empty {
-                return Some(if mode == InputMode::Compose {
-                    LookupResult::PassThrough
-                } else {
-                    LookupResult::Consumed
-                });
+                return Some(LookupResult::PassThrough);
             } else {
                 return Some(LookupResult::TerminalAction(Action::Edit(
                     EditAction::DeleteForward,
@@ -1314,43 +1299,6 @@ mod tests {
     }
 
     #[test]
-    fn llm_compose_普通输入进入智能输入框() {
-        let result = lookup_char(
-            "/",
-            ModifiersState::empty(),
-            InputMode::LlmCompose,
-            true,
-            &default_guard(),
-        );
-        assert!(
-            matches!(
-                result,
-                Some(LookupResult::TerminalAction(Action::Edit(
-                    EditAction::InsertText(ref text)
-                ))) if text == "/"
-            ),
-            "LLM 默认态的文本应进入 Lumen 智能输入框"
-        );
-    }
-
-    #[test]
-    fn llm_compose_不向_win32_cli_发送幽灵_key_up() {
-        let guard = GuardState {
-            terminal_focused: true,
-            win32_input: true,
-            ..Default::default()
-        };
-        let result = lookup_char(
-            "a",
-            ModifiersState::empty(),
-            InputMode::LlmCompose,
-            false,
-            &guard,
-        );
-        assert!(result.is_none(), "智能输入态不得只向 CLI 发送 key-up");
-    }
-
-    #[test]
     fn altscreen_ctrl_v_也先探测图片剪贴板() {
         let guard = GuardState {
             terminal_focused: true,
@@ -1989,26 +1937,6 @@ mod tests {
         assert!(
             matches!(result, Some(LookupResult::ComposeHistorySearch)),
             "Compose 态 Ctrl+R → ComposeHistorySearch"
-        );
-    }
-
-    #[test]
-    fn ctrl_shift_e_works_in_llm_compose_mode() {
-        let result = lookup_char(
-            "e",
-            ModifiersState::CONTROL | ModifiersState::SHIFT,
-            InputMode::LlmCompose,
-            true,
-            &default_guard(),
-        );
-        assert!(
-            matches!(
-                result,
-                Some(LookupResult::TerminalAction(Action::Term(
-                    TermAction::ToggleFallback
-                )))
-            ),
-            "LLM 智能输入态必须能切到原生直通"
         );
     }
 

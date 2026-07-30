@@ -1285,8 +1285,7 @@ struct AppState {
     /// 经典直通模式开关（M4.1 批B，Ctrl+Shift+E 切换）。
     ///
     /// 置位后 [`mode::effective_mode`] 通常返回 [`mode::InputMode::Fallback`]；
-    /// 活动 LLM CLI 切到专用直通态以支持 `/` 菜单和图片粘贴。未置位时
-    /// LLM 默认保留智能输入框。设计稿 §2「手动逃生」。
+    /// 活动 LLM CLI 保留专用直通态以支持图片粘贴。设计稿 §2「手动逃生」。
     /// **禁止在此字段之外的地方保存输入模式副本**（设计稿铁律）。
     force_fallback: bool,
     /// 命令历史库（M4.1 批D2）：启动时加载，提交时追加写，退出时原子重写。
@@ -1357,26 +1356,6 @@ fn encode_submit(text: &str) -> Vec<u8> {
         buf.push(b'\r');
         buf
     }
-}
-
-/// 把 Lumen 智能输入框中的提示词提交给已运行的 LLM CLI。
-///
-/// 文本仍按终端粘贴语义写入；Enter 则按 CLI 当前键盘协议编码。Claude
-/// 在 Windows 上会开启 DEC 9001，此时裸 `CR` 不等价于完整的
-/// VK_RETURN 按下/抬起，必须用 win32-input-mode 序列提交。
-#[cfg(feature = "input-editor")]
-fn encode_llm_submit(text: &str, win32_input: bool) -> Vec<u8> {
-    let mut buf = if text.lines().count() > 1 {
-        let mut pasted = Vec::with_capacity(text.len() + 12);
-        pasted.extend_from_slice(b"\x1b[200~");
-        pasted.extend_from_slice(text.as_bytes());
-        pasted.extend_from_slice(b"\x1b[201~");
-        pasted
-    } else {
-        text.as_bytes().to_vec()
-    };
-    buf.extend_from_slice(&input::encode_plain_enter(win32_input));
-    buf
 }
 
 /// 将 app 层 [`action::EditAction`] 转换为 `lumen_editor::EditAction`（M4.1 批D1）。
@@ -4548,10 +4527,10 @@ impl AppState {
             // ── Edit：M4.1 批D1 —— 发给编辑器状态机 ──────────────────
             #[cfg(feature = "input-editor")]
             Action::Edit(ref ea) => {
-                // 双重门控：必须是 shell / LLM 智能输入态才走编辑器路径。
+                // 双重门控：必须在 Compose 态才走编辑器路径
                 let current_mode =
                     mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
-                if current_mode.uses_composer() {
+                if current_mode == mode::InputMode::Compose {
                     // 任意编辑动作 → 退出历史导航态（设计稿 §8：编辑即回到当前）。
                     // 仅在正在导航时才重置（is_navigating 纯判断，无副作用）。
                     if self.history.is_navigating() {
@@ -4582,14 +4561,11 @@ impl AppState {
                 let current_mode =
                     mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
                 match ca {
-                    ComposerAction::Submit if current_mode.uses_composer() => {
+                    ComposerAction::Submit if current_mode == mode::InputMode::Compose => {
                         // M4.2 批2：续行检测——文档末尾未闭合（引号/括号/here-string/
                         // 块注释、行尾管道 `|` 或续行反引号）时，Enter 自动换行而非提交
-                        // （设计稿 §4），复用 lumen-editor tokenizer 判定。LLM 提示词
-                        // 不按 PowerShell 语法猜续行；多行由 Shift+Enter 显式输入。
-                        if current_mode == mode::InputMode::Compose
-                            && self.tabs[ti].panes[pi].editor.needs_continuation()
-                        {
+                        // （设计稿 §4），复用 lumen-editor tokenizer 判定。
+                        if self.tabs[ti].panes[pi].editor.needs_continuation() {
                             self.tabs[ti].panes[pi]
                                 .editor
                                 .apply(&lumen_editor::EditAction::InsertNewline);
@@ -4599,48 +4575,31 @@ impl AppState {
                             self.window.request_redraw();
                         } else {
                             // 步骤 1：门控（双重检查，keymap 已检查过一次）
-                            // 步骤 2：编码。Shell 沿用 CR 提交；LLM 在 Windows
-                            // DEC 9001 下用成对的 VK_RETURN 提交。
+                            // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴无条件包裹）
                             let raw_text = self.tabs[ti].panes[pi].editor.view().text();
-                            let payload = if current_mode == mode::InputMode::LlmCompose {
-                                let win32_input = self.tabs[ti].panes[pi].term.win32_input()
-                                    && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
-                                encode_llm_submit(&raw_text, win32_input)
-                            } else {
-                                encode_submit(&raw_text)
-                            };
+                            let payload = encode_submit(&raw_text);
                             // 步骤 3：滚动到底 + 写 PTY
                             self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
                             if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
                                 log::error!("提交写 PTY 失败: {e:#}");
                             }
-                            // 步骤 4：清空编辑器。只有 shell 命令提交才创建
-                            // pending_submit / 命令历史；LLM 提示处在启动命令的
-                            // 同一 OSC 133 块内，覆盖 pending 会导致 `claude`
-                            // 退出时把整块错误回填成最后一条提示词。
-                            if current_mode == mode::InputMode::Compose {
-                                let submitted_at = std::time::Instant::now();
-                                let cwd = self.tabs[ti].panes[pi]
-                                    .term
-                                    .cwd()
-                                    .map(|p| p.display().to_string());
-                                let history_idx =
-                                    self.history.append_submitted(raw_text.clone(), cwd);
-                                let abandoned = self.tabs[ti].panes[pi]
-                                    .editor
-                                    .abandoned()
-                                    .map(|s| s.to_owned());
-                                self.history.set_abandoned(abandoned);
-                                self.tabs[ti].panes[pi].pending_submit =
-                                    Some((raw_text.clone(), submitted_at, history_idx));
-                                events.push(StateEvent::SubmittedText {
-                                    text: raw_text.clone(),
-                                    submitted_at,
-                                    history_idx,
-                                });
-                            }
-                            // 提交 = 新输入基线。
+                            // 步骤 4：清空编辑器缓冲 + 记录 pending_submit + 写历史库
+                            let submitted_at = std::time::Instant::now();
+                            // 取当前 cwd（OSC 9;9 上报值）
+                            let cwd = self.tabs[ti].panes[pi]
+                                .term
+                                .cwd()
+                                .map(|p| p.display().to_string());
+                            // 写历史库并取条目下标（用于块闭合时回填）
+                            let history_idx = self.history.append_submitted(raw_text.clone(), cwd);
+                            // 退出历史导航态（提交 = 新命令基线）
                             self.history.exit_navigation();
+                            // 同步 abandoned 到历史库
+                            let abandoned = self.tabs[ti].panes[pi]
+                                .editor
+                                .abandoned()
+                                .map(|s| s.to_owned());
+                            self.history.set_abandoned(abandoned);
                             self.tabs[ti].panes[pi]
                                 .editor
                                 .apply(&lumen_editor::EditAction::Clear);
@@ -4648,10 +4607,17 @@ impl AppState {
                             self.tabs[ti].panes[pi].preedit = None;
                             // 清退出码角标（提交新命令时角标已无意义）
                             self.tabs[ti].panes[pi].exit_badge = None;
+                            self.tabs[ti].panes[pi].pending_submit =
+                                Some((raw_text.clone(), submitted_at, history_idx));
+                            events.push(StateEvent::SubmittedText {
+                                text: raw_text,
+                                submitted_at,
+                                history_idx,
+                            });
                             self.window.request_redraw();
                         }
                     }
-                    ComposerAction::CancelLine if current_mode.uses_composer() => {
+                    ComposerAction::CancelLine if current_mode == mode::InputMode::Compose => {
                         // Ctrl+C 缓冲非空：清空并存放弃稿
                         let text = self.tabs[ti].panes[pi].editor.view().text();
                         self.tabs[ti].panes[pi].editor.stash_abandoned(text.clone());
@@ -4665,7 +4631,7 @@ impl AppState {
                             self.tabs[ti].panes[pi].editor.revision(),
                         ));
                     }
-                    ComposerAction::HistoryPrev if current_mode.uses_composer() => {
+                    ComposerAction::HistoryPrev if current_mode == mode::InputMode::Compose => {
                         // ↑ 历史向上导航（M4.1 批D2）
                         // 同步 abandoned 到历史库（每次进入导航前刷新）
                         let abandoned = self.tabs[ti].panes[pi]
@@ -4691,7 +4657,7 @@ impl AppState {
                             ));
                         }
                     }
-                    ComposerAction::HistoryNext if current_mode.uses_composer() => {
+                    ComposerAction::HistoryNext if current_mode == mode::InputMode::Compose => {
                         // ↓ 历史向下导航（M4.1 批D2）
                         if let Some(text) = self.history.navigate_down() {
                             self.tabs[ti].panes[pi]
@@ -4785,7 +4751,7 @@ impl AppState {
                             &self.tabs[ti].panes[pi].term,
                             self.force_fallback,
                         );
-                        if mode.uses_composer() {
+                        if mode == mode::InputMode::Compose {
                             let text = self
                                 .clipboard
                                 .as_mut()
@@ -5338,7 +5304,7 @@ impl AppState {
         #[cfg(feature = "input-editor")]
         let (ime_x, ime_y) = {
             let mode = mode::effective_mode(&s.term, self.force_fallback);
-            if mode.uses_composer() {
+            if mode == crate::mode::InputMode::Compose {
                 let cv_cursor = s.editor.view().cursor();
                 let footer_top_y = py + ph
                     - ch * (s.editor.view().line_count().max(1) as f32)
@@ -6760,8 +6726,8 @@ impl AppState {
     /// 中文首字 bug 的激进修复，H1）。
     ///
     /// 条件：**无任何 egui 覆盖层/模态打开**（否则 IME 应归 egui 输入框，
-    /// 放行会双投/劫持）+ 焦点窗格处于 shell / LLM 智能输入态（composer
-    /// 可用）。满足时，焦点翻转窗口期到达的首个
+    /// 放行会双投/劫持）+ 焦点窗格处于 [`mode::InputMode::Compose`]（提示符
+    /// 等待输入，composer 可用）。满足时，焦点翻转窗口期到达的首个
     /// `Ime::Preedit` 不再漏给 egui（画在默认控件位 ≈ 最左）、也不再被
     /// Lumen 的 `!terminal_focused` 闸丢弃，而是直达 composer。
     ///
@@ -6792,7 +6758,7 @@ impl AppState {
             }
             let (ti, pi) = (self.active_tab, self.tabs[self.active_tab].focused);
             mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback)
-                .uses_composer()
+                == mode::InputMode::Compose
         }
         #[cfg(not(feature = "input-editor"))]
         {
@@ -6930,7 +6896,7 @@ impl AppState {
         {
             let mode =
                 mode::effective_mode(&self.tabs[ti].panes[pi_focused].term, self.force_fallback);
-            if mode.uses_composer() {
+            if mode == mode::InputMode::Compose {
                 // path_insert_text_str 与 path_insert_text 同一引号规则；
                 // 控制字符路径返回 None，静默跳过（纵深防御）。
                 if let Some(text) = shell::filetree::path_insert_text_str(path) {
@@ -10413,25 +10379,17 @@ impl ApplicationHandler<PtyWake> for App {
                     // M4.1 批3：ghost 是否非空（缓存命中时复用，否则重算）
                     #[cfg(feature = "input-editor")]
                     ghost_exists: {
-                        let current_mode = mode::effective_mode(
-                            &state.tabs[ti].panes[pi].term,
-                            state.force_fallback,
-                        );
-                        if current_mode == mode::InputMode::Compose {
-                            let rev = state.tabs[ti].panes[pi].editor.revision();
-                            if state.ghost_cache.0 != rev {
-                                let text = state.tabs[ti].panes[pi].editor.view().text();
-                                let ghost = if text.contains('\n') || text.is_empty() {
-                                    None
-                                } else {
-                                    state.history.find_ghost_prefix(&text)
-                                };
-                                state.ghost_cache = (rev, ghost);
-                            }
-                            state.ghost_cache.1.is_some()
-                        } else {
-                            false
+                        let rev = state.tabs[ti].panes[pi].editor.revision();
+                        if state.ghost_cache.0 != rev {
+                            let text = state.tabs[ti].panes[pi].editor.view().text();
+                            let ghost = if text.contains('\n') || text.is_empty() {
+                                None
+                            } else {
+                                state.history.find_ghost_prefix(&text)
+                            };
+                            state.ghost_cache = (rev, ghost);
                         }
+                        state.ghost_cache.1.is_some()
                     },
                     // 第十一轮：编辑器选区非空（Ctrl+C 第一级 / Ctrl+X 判断）。
                     // 镜像态置空：不让本地编辑器残留选区把镜像 Ctrl+C 改道成复制本地文本。
@@ -11469,7 +11427,7 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     let mode =
                         mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
-                    if mode.uses_composer() {
+                    if mode == mode::InputMode::Compose {
                         if text.is_empty() {
                             // 空串 = 预编辑结束/取消
                             state.tabs[ti].panes[pi].preedit = None;
@@ -11527,7 +11485,7 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     let mode =
                         mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
-                    if mode.uses_composer() {
+                    if mode == mode::InputMode::Compose {
                         // 提交时清空 preedit（M4.1 批D2）
                         state.tabs[ti].panes[pi].preedit = None;
                         // IME 提交进编辑器（走 dispatch 确保门控逻辑一致）
@@ -13616,7 +13574,7 @@ impl ApplicationHandler<PtyWake> for App {
                     let cur_mode =
                         mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
                     #[cfg(feature = "input-editor")]
-                    if cur_mode.uses_composer() {
+                    if cur_mode == mode::InputMode::Compose {
                         state.tabs[ti].panes[pi]
                             .editor
                             .apply(&lumen_editor::EditAction::SetText(text));
@@ -14740,13 +14698,9 @@ impl ApplicationHandler<PtyWake> for App {
                                 state.ghost_cache = (rev, ghost);
                             }
                         }
+                        let ghost = state.ghost_cache.1.clone();
                         let focused = state.focused_pane();
                         let mode = mode::effective_mode(&focused.term, state.force_fallback);
-                        let ghost = if mode == mode::InputMode::Compose {
-                            state.ghost_cache.1.clone()
-                        } else {
-                            None
-                        };
                         composer::compose_view_for_mode(
                             mode,
                             focused.editor.view(),
@@ -15804,7 +15758,7 @@ mod tests {
 
     #[cfg(feature = "input-editor")]
     mod submit_encoding {
-        use super::super::{encode_llm_submit, encode_submit};
+        use super::super::encode_submit;
 
         #[test]
         fn 单行文本_末尾加_cr() {
@@ -15841,23 +15795,6 @@ mod tests {
             assert!(
                 payload.starts_with(b"\x1b[200~"),
                 "两行文本应走括号粘贴协议"
-            );
-        }
-
-        #[test]
-        fn llm提交_win32使用成对_vk_return() {
-            let payload = encode_llm_submit("hello", true);
-            assert_eq!(
-                payload,
-                b"hello\x1b[13;0;13;1;0;1_\x1b[13;0;13;0;0;1_"
-            );
-        }
-
-        #[test]
-        fn llm提交_多行保留括号粘贴并按协议发送_enter() {
-            assert_eq!(
-                encode_llm_submit("a\nb", false),
-                b"\x1b[200~a\nb\x1b[201~\r"
             );
         }
     }

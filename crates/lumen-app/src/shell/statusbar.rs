@@ -501,7 +501,6 @@ fn mode_label<'s>(
     match mode {
         InputMode::Compose => (s.statusbar_mode_compose, pal.fg_dim),
         InputMode::Running => (s.statusbar_mode_running, pal.fg_dim),
-        InputMode::LlmCompose => (s.statusbar_mode_llm_compose, pal.accent),
         InputMode::LlmCli => (s.statusbar_mode_llm_cli, pal.accent),
         InputMode::AltScreen => (s.statusbar_mode_altscreen, pal.fg_dim),
         // Fallback（含 force_fallback 覆盖）：警示微黄
@@ -551,15 +550,6 @@ mod tests {
         let pal = dummy_pal();
         let (text, _) = mode_label(InputMode::LlmCli, false, s, &pal);
         assert!(!text.is_empty(), "LLM CLI 模式文字不应为空");
-    }
-
-    #[test]
-    fn 状态栏模式文字_llm_compose_非空() {
-        use crate::i18n;
-        let s = i18n::strings();
-        let pal = dummy_pal();
-        let (text, _) = mode_label(InputMode::LlmCompose, false, s, &pal);
-        assert!(!text.is_empty(), "LLM 智能输入模式文字不应为空");
     }
 
     #[test]
