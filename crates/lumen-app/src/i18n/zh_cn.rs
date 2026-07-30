@@ -288,6 +288,7 @@ pub static STRINGS: Strings = Strings {
     // M4.1 批E：底部状态栏
     statusbar_mode_compose: "✏ 编辑模式",
     statusbar_mode_running: "⇣ 直通中",
+    statusbar_mode_llm_compose: "✦ LLM 智能输入",
     statusbar_mode_llm_cli: "✦ LLM 直通",
     statusbar_mode_altscreen: "⛶ 全屏程序",
     statusbar_mode_fallback: "⌨ 经典直通",
@@ -295,6 +296,7 @@ pub static STRINGS: Strings = Strings {
     statusbar_classic_on: "经典模式：开",
     statusbar_classic_tip: "切换经典直通模式 (Ctrl+Shift+E)",
     composer_placeholder: "输入命令，Enter 发送（Ctrl+Shift+E 切换经典模式）",
+    composer_llm_placeholder: "输入提示词，Enter 发送（Ctrl+Shift+E 使用原生 / 菜单与图片粘贴）",
     // 登录校验
     login_err_invalid_email: "邮箱格式不正确（需形如 name@example.com）",
     login_err_empty_password: "请输入密码",

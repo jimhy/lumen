@@ -34,10 +34,15 @@ pub enum InputMode {
     ///
     /// 按键路由：逐键直通 PTY，不做本地缓冲。
     Running,
+    /// 已识别的大模型 CLI 正在运行，且保留 Lumen 智能输入框。
+    ///
+    /// 默认在本地 composer 编辑，Enter 后把整段提示发送给 CLI；用户切换
+    /// 经典直通模式后才进入 [`InputMode::LlmCli`]，以使用 CLI 原生的逐键交互。
+    LlmCompose,
     /// 已识别的大模型 CLI（Claude Code / Codex / Kimi）正在运行。
     ///
-    /// 与 Running 一样逐键直通，但单独成态让 keymap 能把图片剪贴板粘贴键
-    /// 交还 CLI 自己读取，同时让状态栏明确显示「LLM 直通」。
+    /// 用户已开启经典直通：逐键交给 CLI，让 `/` 命令菜单和原生图片粘贴
+    /// 正常工作；单独成态让 keymap 能对图片剪贴板做专用放行。
     LlmCli,
     /// 备用屏幕（vim / htop / codex TUI；`is_alt_screen()` == true）。
     ///
@@ -49,22 +54,29 @@ pub enum InputMode {
     Fallback,
 }
 
+impl InputMode {
+    /// 此模式是否由 Lumen 本地智能输入框接管编辑。
+    pub const fn uses_composer(self) -> bool {
+        matches!(self, Self::Compose | Self::LlmCompose)
+    }
+}
+
 /// 从终端状态纯函数推导输入模式（设计稿 §2 原文实现）。
 ///
 /// **禁止在任何地方缓存此函数的返回值到字段**。
 ///
 /// # 推导规则
-/// 1. 当前未闭合命令是受支持的大模型 CLI → [`InputMode::LlmCli`]
+/// 1. 当前未闭合命令是受支持的大模型 CLI → [`InputMode::LlmCompose`]
 /// 2. `is_alt_screen()` → [`InputMode::AltScreen`]（全屏 TUI 让位）
 /// 3. `blocks` 为空 → [`InputMode::Fallback`]（从未见 OSC 133 标记，降级直通）
 /// 4. 最后一块 `cmd_line.is_some()` && `output_line.is_none()` → [`InputMode::Compose`]
 ///    （133;B 到、133;C 未到 = PSReadLine 正在等输入）
 /// 5. 其余 → [`InputMode::Running`]（命令执行中 / REPL / 密码输入等）
 pub fn input_mode(term: &Terminal) -> InputMode {
-    // 规则 1：受支持的 LLM CLI。必须在 AltScreen 之前判断，否则进入备用屏
-    // 后只能得到泛化的 AltScreen，图片剪贴板粘贴键无法走专用放行路径。
+    // 规则 1：受支持的 LLM CLI。默认保留 Lumen 智能输入框；用户显式切换
+    // 经典模式后由 effective_mode 改为 LlmCli 原生直通。
     if active_llm_cli(term) {
-        return InputMode::LlmCli;
+        return InputMode::LlmCompose;
     }
     // 规则 2：备用屏幕（vim / htop 等）。先于 blocks 为空判断，使尚无
     // shell integration 的 Linux/macOS 会话也能把全屏 TUI 键盘完整让位。
@@ -218,9 +230,9 @@ fn command_tokens(command: &str) -> Vec<String> {
 
 /// 有效输入模式（含 `force_fallback` 手动逃生舱覆盖层）。
 ///
-/// `Ctrl+Shift+E` 置位 `force_fallback` 后，通常强制返回
-/// [`InputMode::Fallback`]；活动 LLM CLI 保留 [`InputMode::LlmCli`]，以便
-/// 图片剪贴板仍能走 CLI 原生粘贴路径。CLI 退出后立即恢复 Fallback。
+/// `Ctrl+Shift+E` 置位 `force_fallback` 后，普通程序返回
+/// [`InputMode::Fallback`]；活动 LLM CLI 返回 [`InputMode::LlmCli`]，
+/// 进入支持 `/` 提示与图片粘贴的原生直通。CLI 退出后仍保持经典模式。
 ///
 /// **模式机纯函数 [`input_mode`] 本身不变；此函数是唯一的「逃生舱包装层」。**
 ///
@@ -228,9 +240,9 @@ fn command_tokens(command: &str) -> Vec<String> {
 /// * `term` - 终端状态机引用（按需求值，不缓存）。
 /// * `force_fallback` - `AppState::force_fallback` 字段（Ctrl+Shift+E 开关）。
 pub fn effective_mode(term: &Terminal, force_fallback: bool) -> InputMode {
-    // 手动经典模式与 LLM 自动态本质上都直通；优先保留 LLM 专用态，才能
-    // 继续区分图片剪贴板粘贴。CLI 退出后 classic_mode 仍会正常接管。
-    if active_llm_cli(term) {
+    // 活动 LLM 仅在用户显式开启经典模式后进入专用直通态；默认由
+    // input_mode 返回 LlmCompose，保留智能输入框。
+    if force_fallback && active_llm_cli(term) {
         return InputMode::LlmCli;
     }
     if force_fallback {
@@ -325,21 +337,23 @@ mod tests {
         );
     }
 
-    // ── 规则 2：受支持的 LLM CLI → LlmCli ──────────────────────────────
+    // ── 规则 2：受支持的 LLM CLI → LlmCompose ──────────────────────────
 
     #[test]
-    fn llm_cli_when_supported_command_is_running() {
+    fn llm_compose_when_supported_command_is_running() {
         let mut term = make_term(24, 80);
         // base64("codex") = Y29kZXg=
         feed(
             &mut term,
             b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;Y29kZXg=\x07",
         );
-        assert_eq!(input_mode(&term), InputMode::LlmCli);
+        assert_eq!(input_mode(&term), InputMode::LlmCompose);
+        assert_eq!(effective_mode(&term, false), InputMode::LlmCompose);
 
-        // LLM TUI 进入备用屏后仍保留专用模式，确保图片粘贴放行。
+        // 默认智能输入优先于备用屏；显式经典模式才会切到原生直通。
         feed(&mut term, b"\x1b[?1049h");
-        assert_eq!(input_mode(&term), InputMode::LlmCli);
+        assert_eq!(input_mode(&term), InputMode::LlmCompose);
+        assert_eq!(effective_mode(&term, true), InputMode::LlmCli);
 
         // 命令闭合后不再误判为活动 LLM。
         feed(&mut term, b"\x1b]133;D;0\x07");

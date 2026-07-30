@@ -53,8 +53,9 @@ fn token_to_footer_span(t: &lumen_editor::Token) -> FooterSpan {
 /// 按当前有效输入模式组装 [`ComposerView`]。
 ///
 /// - [`InputMode::Compose`] → 完整编辑卡片，内容来自 `editor_view`（真实 EditorView 内容）
+/// - [`InputMode::LlmCompose`] → 完整编辑卡片，内容来自 `editor_view`
 /// - [`InputMode::Running`] → 等高状态条（文案 i18n）
-/// - [`InputMode::LlmCli`] → 隐藏（LLM CLI 自动直通）
+/// - [`InputMode::LlmCli`] → 隐藏（用户开启 LLM 原生直通）
 /// - [`InputMode::AltScreen`] → 隐藏（grid 收回全高）
 /// - [`InputMode::Fallback`] → 隐藏（与 AltScreen 同路径；底部状态栏已有"经典直通"模式指示）
 ///
@@ -80,7 +81,7 @@ pub fn compose_view_for_mode(
 ) -> ComposerView {
     let s = i18n::strings();
     match mode {
-        InputMode::Compose => {
+        InputMode::Compose | InputMode::LlmCompose => {
             // 批D1：从真实 EditorView 读取内容，填充 lines 和 cursor。
             let lines: Vec<String> = editor_view
                 .lines()
@@ -96,7 +97,13 @@ pub fn compose_view_for_mode(
             let cur = editor_view.cursor();
             // 占位提示（M4.1 批E）：lines 全空时显示 composer_placeholder。
             let all_empty = lines.iter().all(|l| l.is_empty());
-            let placeholder = all_empty.then(|| s.composer_placeholder.to_owned());
+            let placeholder = all_empty.then(|| {
+                if mode == InputMode::LlmCompose {
+                    s.composer_llm_placeholder.to_owned()
+                } else {
+                    s.composer_placeholder.to_owned()
+                }
+            });
             // M4.1 批F：从 EditorView 取选区，规范化后填入 ComposerView。
             // anchor ≠ cursor 时为非空选区；normalize_selection 返回 Some(FooterSelection)。
             // 有选区时 ghost text 不显示（视觉冲突，系统惯例选区时无 inline 补全）。
@@ -136,7 +143,7 @@ pub fn compose_view_for_mode(
         // 高度在「1 行 ↔ 0」间变化，底部约 1 行高度轻微抖动并触发一次 resize——
         // 这是有意接受的权衡（用户要彻底隐藏 > 避免抖动）。
         InputMode::Running => ComposerView::hidden(),
-        // LLM CLI：输入与提示菜单由程序自己的 composer 完整接管。
+        // LLM 原生直通：输入与提示菜单由程序自己的 composer 完整接管。
         InputMode::LlmCli => ComposerView::hidden(),
         // AltScreen：全屏 TUI 让位，footer 隐藏，grid 收回全高。
         InputMode::AltScreen => ComposerView::hidden(),
@@ -150,7 +157,7 @@ pub fn compose_view_for_mode(
 #[cfg(not(feature = "input-editor"))]
 pub fn compose_view_for_mode(mode: InputMode) -> ComposerView {
     match mode {
-        InputMode::Compose => ComposerView::compose_empty(),
+        InputMode::Compose | InputMode::LlmCompose => ComposerView::compose_empty(),
         // Running 也隐藏（海风哥反馈，取舍详见 feature 版注释）——与
         // AltScreen/Fallback 同路径，footer_px=0、grid 收回全高。
         InputMode::Running | InputMode::LlmCli | InputMode::AltScreen | InputMode::Fallback => {
@@ -185,6 +192,19 @@ mod tests {
                 "Compose 模式应产出 Composer 形态"
             );
             assert!(v.is_visible(), "Compose 形态应可见");
+        }
+
+        #[test]
+        fn llm_compose_模式_保留智能输入框() {
+            let editor = empty_view();
+            let v =
+                compose_view_for_mode(InputMode::LlmCompose, editor.view(), None, None, None);
+            assert_eq!(v.kind, FooterKind::Composer);
+            assert!(v.is_visible(), "LLM 默认态应保留智能输入框");
+            assert_eq!(
+                v.placeholder.as_deref(),
+                Some(i18n::strings().composer_llm_placeholder)
+            );
         }
 
         #[test]
@@ -567,6 +587,13 @@ mod tests {
         #[test]
         fn compose_模式_产出_composer_形态() {
             let v = compose_view_for_mode(InputMode::Compose);
+            assert_eq!(v.kind, FooterKind::Composer);
+            assert!(v.is_visible());
+        }
+
+        #[test]
+        fn llm_compose_模式_产出_composer_形态() {
+            let v = compose_view_for_mode(InputMode::LlmCompose);
             assert_eq!(v.kind, FooterKind::Composer);
             assert!(v.is_visible());
         }

@@ -852,7 +852,10 @@ pub struct Strings {
     /// 状态栏：Running 态模式指示文字
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub statusbar_mode_running: &'static str,
-    /// 状态栏：已识别 LLM CLI 的自动直通态
+    /// 状态栏：已识别 LLM CLI 的智能输入态
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_mode_llm_compose: &'static str,
+    /// 状态栏：已识别 LLM CLI 的原生直通态
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub statusbar_mode_llm_cli: &'static str,
     /// 状态栏：AltScreen 态模式指示文字
@@ -873,6 +876,9 @@ pub struct Strings {
     /// Compose 态输入框占位提示文字（缓冲为空时 footer 显示）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub composer_placeholder: &'static str,
+    /// LLM 智能输入态占位提示；说明如何切到原生直通。
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub composer_llm_placeholder: &'static str,
 
     // ── 输入框右键菜单（第十一轮）────────────────────────────────────
     /// 右键菜单：复制
