@@ -23,6 +23,9 @@ use lumen_pty::{PtyEvent, PtySession};
 use lumen_term::{Selection, Terminal};
 use winit::event_loop::EventLoopProxy;
 
+#[cfg(feature = "input-editor")]
+use crate::llm_attachments::AttachmentDraft;
+use crate::llm_cli::{LlmCliKind, SlashProbeState};
 use crate::shell::layout::PaneLayout;
 use crate::PtyWake;
 
@@ -377,6 +380,10 @@ pub struct Session {
     frame_activity: FrameActivity,
     /// DECSET 1007 滚轮已让应用内部视口离开底部的距离估算。
     alternate_scroll_tracker: AlternateScrollTracker,
+    /// 当前前台 LLM CLI。仅表示程序类型，不表示忙闲状态。
+    pub llm_cli: Option<LlmCliKind>,
+    /// `/prefix` 临时镜像到原生 CLI 后，从终端菜单提取到的候选。
+    pub slash_probe: SlashProbeState,
     /// M4.1 批D1：焦点窗格的输入编辑器（`input-editor` feature 门控）。
     /// 挂在窗格生命周期内，模式切换不清缓冲（草稿保全）。
     #[cfg(feature = "input-editor")]
@@ -404,6 +411,9 @@ pub struct Session {
     /// M4.1 批D2：当前已提交给 renderer 的 footer 高度（防抖实际生效值）。
     #[cfg(feature = "input-editor")]
     pub footer_committed_h: f32,
+    /// 当前草稿的图片附件。缩略图与正文 `[#N]` 引用同源。
+    #[cfg(feature = "input-editor")]
+    pub attachments: AttachmentDraft,
 }
 
 impl Session {
@@ -481,6 +491,8 @@ impl Session {
             title_activity,
             frame_activity,
             alternate_scroll_tracker: AlternateScrollTracker::default(),
+            llm_cli: None,
+            slash_probe: SlashProbeState::default(),
             #[cfg(feature = "input-editor")]
             editor: Editor::default(),
             #[cfg(feature = "input-editor")]
@@ -497,6 +509,8 @@ impl Session {
             footer_h_changed_at: std::time::Instant::now(),
             #[cfg(feature = "input-editor")]
             footer_committed_h: 0.0,
+            #[cfg(feature = "input-editor")]
+            attachments: AttachmentDraft::default(),
         })
     }
 

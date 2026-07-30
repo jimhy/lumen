@@ -123,6 +123,7 @@ pub fn compose_view_for_mode(
                 placeholder, // M4.1 批E：占位提示（仅空编辑器显示）
                 ghost,       // M4.1 批3：历史联想后缀（有选区时为 None）
                 highlight,   // M4.2 批2：语法高亮 spans（逐行）
+                attachment_count: 0,
             }
         }
         // Running（命令运行中）：footer 隐藏（海风哥反馈——命令运行时不要那条

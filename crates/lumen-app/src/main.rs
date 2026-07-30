@@ -35,6 +35,9 @@ mod history;
 mod i18n;
 mod input;
 mod keymap;
+#[cfg(feature = "input-editor")]
+mod llm_attachments;
+mod llm_cli;
 /// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
 mod links;
 mod mode;
@@ -901,6 +904,23 @@ struct ScrollToBottomTarget {
     action: ScrollToBottomAction,
 }
 
+#[cfg(feature = "input-editor")]
+struct AttachmentOverlayItem {
+    id: u64,
+    label: String,
+    texture: egui::TextureId,
+    size: egui::Vec2,
+    original_size: (u32, u32),
+}
+
+#[cfg(feature = "input-editor")]
+struct AttachmentOverlay {
+    session_id: SessionId,
+    cli_name: &'static str,
+    rect: egui::Rect,
+    items: Vec<AttachmentOverlayItem>,
+}
+
 fn scroll_to_bottom_action(
     display_offset: usize,
     rows: usize,
@@ -1236,8 +1256,13 @@ struct AppState {
     /// F7②-remote 控制端远程图标纹理缓存（键 = 图标位图内容 hash，同图标多 tab
     /// 共享一张纹理）：把被控端传来的 RGBA 贴成本地 egui 纹理。
     remote_icon_tex: HashMap<u64, egui::TextureHandle>,
+    /// LLM 草稿图片缩略图纹理，键为（会话 id，附件内部 id）。
+    #[cfg(feature = "input-editor")]
+    attachment_textures: HashMap<(SessionId, u64), egui::TextureHandle>,
     /// F7② 前台进程轮询的上次时刻（节流；进程快照较重，不必每帧查）。
     last_icon_probe: Option<Instant>,
+    /// LLM CLI 识别轮询时刻。与侧栏图标解耦，侧栏隐藏时输入适配仍生效。
+    last_llm_cli_probe: Option<Instant>,
     /// 激活 tab 各窗格的矩形（会话 id, 物理像素 x/y/w/h），来自最近
     /// 一帧 egui 布局（鼠标命中/IME 候选框定位用）。tab 结构变更后
     /// 的陈旧条目按 id 解析不到窗格、自然失效。
@@ -1356,6 +1381,73 @@ fn encode_submit(text: &str) -> Vec<u8> {
         buf.push(b'\r');
         buf
     }
+}
+
+fn effective_session_mode(pane: &Session, force_fallback: bool) -> mode::InputMode {
+    let llm_active = pane
+        .llm_cli
+        .or_else(|| llm_cli::detect(None, &pane.term))
+        .is_some_and(|kind| llm_cli::composer_ready(&pane.term, kind));
+    if llm_active {
+        mode::effective_mode_for_cli(&pane.term, force_fallback, true)
+    } else {
+        mode::effective_mode(&pane.term, force_fallback)
+    }
+}
+
+/// Kimi 的原生编辑器会在逐字收到 `/yolo` 时再次打开自己的斜杠补全；
+/// 紧随其后的 Enter 会再次接受当前候选，形成 `/yoyolo`。括号粘贴走
+/// Kimi 编辑器的原子 paste 路径，不触发补全，然后末尾 CR 只负责提交。
+#[cfg(feature = "input-editor")]
+fn encode_llm_submit(text: &str, kind: Option<llm_cli::LlmCliKind>) -> Vec<u8> {
+    if kind == Some(llm_cli::LlmCliKind::Kimi) && text.lines().count() <= 1 {
+        let mut buf = Vec::with_capacity(text.len() + 14);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~\r");
+        buf
+    } else {
+        encode_submit(text)
+    }
+}
+
+/// LLM CLI 的本地编辑器为空时，方向键/Esc 应留给 CLI 自己的交互
+/// 选择器（如 Claude `/resume`），但 Lumen 补全弹层打开时仍由弹层接管。
+#[cfg(feature = "input-editor")]
+fn llm_cli_native_navigation_passthrough(
+    llm_active: bool,
+    editor_empty: bool,
+    completion_open: bool,
+    modifiers: ModifiersState,
+    key: PhysicalKey,
+) -> bool {
+    llm_active
+        && editor_empty
+        && !completion_open
+        && modifiers.is_empty()
+        && matches!(
+            key,
+            PhysicalKey::Code(
+                KeyCode::ArrowUp
+                    | KeyCode::ArrowDown
+                    | KeyCode::ArrowLeft
+                    | KeyCode::ArrowRight
+                    | KeyCode::Escape
+            )
+        )
+}
+
+/// 普通 Shell 可根据语法自动续行；LLM CLI 的 Enter 始终提交。
+///
+/// 附件草稿也视为 LLM 输入，避免 `[#1]` 中的 `#` 被 PowerShell 分词器当作
+/// 注释，继而把 `[` 误判为未闭合表达式。
+#[cfg(feature = "input-editor")]
+fn composer_should_insert_newline(
+    llm_active: bool,
+    has_attachments: bool,
+    parser_needs_continuation: bool,
+) -> bool {
+    !llm_active && !has_attachments && parser_needs_continuation
 }
 
 /// 将 app 层 [`action::EditAction`] 转换为 `lumen_editor::EditAction`（M4.1 批D1）。
@@ -1579,6 +1671,7 @@ impl AppState {
         self.shell_state.history_search.open = false;
         self.shell_state.history_search.query.clear();
         self.shell_state.completion.open = false;
+        self.shell_state.completion.passive = false;
         self.shell_state.login.close_for_app_lock();
         self.shell_state.settings.clear_sensitive_for_app_lock();
         self.shell_state.remote_ui.reset();
@@ -2491,7 +2584,7 @@ impl AppState {
         let overlay = self.shell_state.settings.open
             || self.shell_state.login.open
             || self.shell_state.history_search.open
-            || self.shell_state.completion.open
+            || (self.shell_state.completion.open && !self.shell_state.completion.passive)
             || self.shell_state.renaming.is_some()
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.ssh_session_renaming.is_some()
@@ -4513,6 +4606,298 @@ impl AppState {
         self.window.request_redraw();
     }
 
+    #[cfg(feature = "input-editor")]
+    fn close_passive_completion(&mut self) {
+        if self.shell_state.completion.passive {
+            self.shell_state.completion.open = false;
+            self.shell_state.completion.passive = false;
+            self.shell_state.completion.selected = 0;
+            self.shell_state.completion.popup_rect = None;
+            self.shell_state.completion.last_scrolled_selected = None;
+            self.completion_candidates.clear();
+        }
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn show_cached_llm_slash_candidates(
+        &mut self,
+        ti: usize,
+        pi: usize,
+        prefix: &str,
+    ) -> bool {
+        let commands: Vec<llm_cli::SlashCommand> = self.tabs[ti].panes[pi]
+            .slash_probe
+            .commands
+            .iter()
+            .filter(|item| item.command.starts_with(prefix))
+            .cloned()
+            .collect();
+        if commands.is_empty() {
+            return false;
+        }
+        if ti != self.active_tab || pi != self.tabs[ti].focused {
+            return true;
+        }
+        self.completion_candidates = commands
+            .into_iter()
+            .map(|item| completion::Completion {
+                display: if item.description.is_empty() {
+                    item.command.clone()
+                } else {
+                    format!("{}  {}", item.command, item.description)
+                },
+                replacement: item.command,
+                is_dir: false,
+                replace_range: Some((0, prefix.len())),
+            })
+            .collect();
+        self.shell_state.completion.open = true;
+        self.shell_state.completion.passive = true;
+        self.shell_state.completion.selected = self
+            .shell_state
+            .completion
+            .selected
+            .min(self.completion_candidates.len().saturating_sub(1));
+        self.terminal_focused = true;
+        self.window.request_redraw();
+        true
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn write_llm_slash_probe_clear(&mut self, ti: usize, pi: usize, context: &str) -> bool {
+        if let Err(error) = self.tabs[ti].panes[pi].write_user_input(b"\x15") {
+            log::error!("{context}: {error:#}");
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn write_llm_slash_probe_escape(&mut self, ti: usize, pi: usize, context: &str) -> bool {
+        if let Err(error) = self.tabs[ti].panes[pi].write_user_input(b"\x1b") {
+            log::error!("{context}: {error:#}");
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn begin_llm_slash_probe_clear(
+        &mut self,
+        ti: usize,
+        pi: usize,
+        resume_after_clear: bool,
+        context: &str,
+    ) -> bool {
+        if !self.write_llm_slash_probe_clear(ti, pi, context) {
+            return false;
+        }
+        let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+        probe.clearing = true;
+        probe.escape_sent = false;
+        probe.clear_at = Some(Instant::now() + LLM_SLASH_CLEAR_STAGE_DELAY);
+        probe.resume_after_clear = resume_after_clear;
+        probe.probe_deadline = None;
+        self.close_passive_completion();
+        true
+    }
+
+    /// 把本地编辑器中的 `/prefix` 临时镜像给 CLI，从 CLI 自己的菜单
+    /// 采集命令。采集完成立即 Ctrl+U 清掉影子输入；后续前缀优先筛选
+    /// 会话缓存，不让 CLI 原生菜单与 Lumen 弹层长期重叠。
+    #[cfg(feature = "input-editor")]
+    fn sync_llm_slash_probe(&mut self, ti: usize, pi: usize) {
+        if ti >= self.tabs.len() || pi >= self.tabs[ti].panes.len() {
+            return;
+        }
+        let is_llm = {
+            let pane = &self.tabs[ti].panes[pi];
+            pane.llm_cli
+                .or_else(|| llm_cli::detect(None, &pane.term))
+                .is_some_and(|kind| llm_cli::composer_ready(&pane.term, kind))
+        };
+        let next = if is_llm {
+            let text = self.tabs[ti].panes[pi].editor.view().text();
+            llm_cli::slash_prefix(&text).map(str::to_owned)
+        } else {
+            None
+        };
+        let current = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
+        if next.as_deref() == (!current.is_empty()).then_some(current.as_str()) {
+            return;
+        }
+
+        if !current.is_empty() {
+            if self.begin_llm_slash_probe_clear(
+                ti,
+                pi,
+                true,
+                "清理 LLM CLI 斜杠探测输入失败",
+            ) {
+                return;
+            }
+            self.tabs[ti].panes[pi].slash_probe.clear_active();
+        }
+        self.close_passive_completion();
+
+        if let Some(prefix) = next {
+            self.completion_req_id = 0;
+            self.completion_candidates.clear();
+            self.shell_state.completion.open = false;
+            self.shell_state.completion.passive = false;
+            if self.show_cached_llm_slash_candidates(ti, pi, &prefix) {
+                return;
+            }
+            if let Err(error) =
+                self.tabs[ti].panes[pi].write_user_input(prefix.as_bytes())
+            {
+                log::error!("写入 LLM CLI 斜杠探测前缀失败: {error:#}");
+                return;
+            }
+            self.tabs[ti].panes[pi].slash_probe.begin_probe(
+                prefix,
+                Instant::now() + LLM_SLASH_PROBE_TIMEOUT,
+            );
+        }
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn clear_llm_slash_shadow(&mut self, ti: usize, pi: usize) {
+        if !self.tabs[ti].panes[pi].slash_probe.shadow.is_empty() {
+            self.write_llm_slash_probe_clear(ti, pi, "提交前清理 LLM CLI 斜杠探测输入失败");
+        }
+        self.tabs[ti].panes[pi].slash_probe.clear();
+        self.close_passive_completion();
+    }
+
+    /// PTY 输出更新后从 CLI 当前可视菜单刷新被动斜杠候选。
+    #[cfg(feature = "input-editor")]
+    fn refresh_llm_slash_candidates(&mut self, ti: usize, pi: usize) {
+        let prefix = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
+        if prefix.is_empty() {
+            return;
+        }
+        let kind = {
+            let pane = &self.tabs[ti].panes[pi];
+            pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term))
+        };
+        let commands = kind.map_or_else(Vec::new, |kind| {
+            llm_cli::slash_commands(&self.tabs[ti].panes[pi].term, &prefix, kind)
+        });
+        if self.tabs[ti].panes[pi].slash_probe.clearing {
+            return;
+        }
+        if commands.is_empty() {
+            return;
+        }
+        self.tabs[ti].panes[pi]
+            .slash_probe
+            .merge_commands(commands);
+        if !self.begin_llm_slash_probe_clear(
+            ti,
+            pi,
+            true,
+            "清理已采集的 LLM CLI 斜杠菜单失败",
+        ) {
+            self.tabs[ti].panes[pi].slash_probe.clear_active();
+            self.window.request_redraw();
+        }
+    }
+
+    /// 定时推进斜杠探测清理。不能依赖 PTY 再产出一帧：Kimi 处理
+    /// Ctrl+U/Esc 后可能没有任何输出，纯输出驱动会永久保留 shadow，
+    /// 让终端纹理看起来卡死。
+    #[cfg(feature = "input-editor")]
+    fn poll_llm_slash_probe_clear(&mut self, now: Instant) -> Option<Instant> {
+        let timed_out = self
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, tab)| {
+                tab.panes
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(pi, pane)| {
+                        pane.slash_probe.probe_timed_out(now).then_some((ti, pi))
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (ti, pi) in timed_out {
+            if !self.begin_llm_slash_probe_clear(
+                ti,
+                pi,
+                false,
+                "取消超时的 LLM CLI 斜杠探测失败",
+            ) {
+                self.tabs[ti].panes[pi].slash_probe.clear_active();
+                self.close_passive_completion();
+            }
+        }
+
+        let mut due = Vec::new();
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                let probe = &pane.slash_probe;
+                if !probe.clearing {
+                    continue;
+                }
+                let Some(at) = probe.clear_at else {
+                    due.push((ti, pi, false));
+                    continue;
+                };
+                if now < at {
+                    continue;
+                }
+                let kind = pane
+                    .llm_cli
+                    .or_else(|| llm_cli::detect(None, &pane.term));
+                let send_escape = llm_cli::slash_clear_stage(kind, probe.escape_sent)
+                    == llm_cli::SlashClearStage::SendEscape;
+                due.push((ti, pi, send_escape));
+            }
+        }
+
+        for (ti, pi, send_escape) in due {
+            if send_escape {
+                if self.write_llm_slash_probe_escape(
+                    ti,
+                    pi,
+                    "关闭 Kimi 原生斜杠菜单失败",
+                ) {
+                    let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+                    probe.escape_sent = true;
+                    probe.clear_at = Some(now + LLM_SLASH_CLEAR_STAGE_DELAY);
+                } else {
+                    self.tabs[ti].panes[pi].slash_probe.clear_active();
+                    self.close_passive_completion();
+                }
+                continue;
+            }
+
+            let resume = self.tabs[ti].panes[pi]
+                .slash_probe
+                .resume_after_clear;
+            self.tabs[ti].panes[pi].slash_probe.clear_active();
+            if resume {
+                self.sync_llm_slash_probe(ti, pi);
+            }
+            self.window.request_redraw();
+        }
+
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .flat_map(|pane| {
+                [
+                    pane.slash_probe.clear_at,
+                    pane.slash_probe.probe_deadline,
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .min()
+    }
+
     fn dispatch(
         &mut self,
         action: action::Action,
@@ -4529,7 +4914,7 @@ impl AppState {
             Action::Edit(ref ea) => {
                 // 双重门控：必须在 Compose 态才走编辑器路径
                 let current_mode =
-                    mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
+                    effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback);
                 if current_mode == mode::InputMode::Compose {
                     // 任意编辑动作 → 退出历史导航态（设计稿 §8：编辑即回到当前）。
                     // 仅在正在导航时才重置（is_navigating 纯判断，无副作用）。
@@ -4559,13 +4944,24 @@ impl AppState {
             Action::Composer(ref ca) => {
                 use action::ComposerAction;
                 let current_mode =
-                    mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
+                    effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback);
                 match ca {
                     ComposerAction::Submit if current_mode == mode::InputMode::Compose => {
                         // M4.2 批2：续行检测——文档末尾未闭合（引号/括号/here-string/
                         // 块注释、行尾管道 `|` 或续行反引号）时，Enter 自动换行而非提交
-                        // （设计稿 §4），复用 lumen-editor tokenizer 判定。
-                        if self.tabs[ti].panes[pi].editor.needs_continuation() {
+                        // （设计稿 §4），复用 lumen-editor tokenizer 判定。LLM CLI 不套用
+                        // Shell 语法续行：Enter 始终提交，Shift+Enter 负责手动换行。
+                        let should_insert_newline = {
+                            let pane = &self.tabs[ti].panes[pi];
+                            let llm_active =
+                                pane.llm_cli.is_some() || llm_cli::detect(None, &pane.term).is_some();
+                            composer_should_insert_newline(
+                                llm_active,
+                                !pane.attachments.is_empty(),
+                                pane.editor.needs_continuation(),
+                            )
+                        };
+                        if should_insert_newline {
                             self.tabs[ti].panes[pi]
                                 .editor
                                 .apply(&lumen_editor::EditAction::InsertNewline);
@@ -4574,10 +4970,35 @@ impl AppState {
                             ));
                             self.window.request_redraw();
                         } else {
+                            // 探测前缀仍在 CLI 原生编辑器里时不能紧跟着提交：
+                            // Kimi 会把 `Ctrl+U` 与命令文本并发处理，形成
+                            // `/y` + `/yolo` 之类的重复。先完成定时清理，
+                            // 保留本地草稿，用户下一次 Enter 再提交。
+                            if !self.tabs[ti].panes[pi].slash_probe.shadow.is_empty() {
+                                if !self.begin_llm_slash_probe_clear(
+                                    ti,
+                                    pi,
+                                    false,
+                                    "提交前清理 LLM CLI 斜杠探测输入失败",
+                                ) {
+                                    self.tabs[ti].panes[pi].slash_probe.clear_active();
+                                }
+                                self.window.request_redraw();
+                                return events;
+                            }
                             // 步骤 1：门控（双重检查，keymap 已检查过一次）
-                            // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴无条件包裹）
+                            // 步骤 2：编码。Kimi 的单行也必须走括号粘贴，
+                            // 防止最终命令重新触发其原生斜杠补全。
                             let raw_text = self.tabs[ti].panes[pi].editor.view().text();
-                            let payload = encode_submit(&raw_text);
+                            let compiled_text =
+                                self.tabs[ti].panes[pi].attachments.compile_prompt(&raw_text);
+                            let llm_kind = {
+                                let pane = &self.tabs[ti].panes[pi];
+                                pane.llm_cli
+                                    .or_else(|| llm_cli::detect(None, &pane.term))
+                            };
+                            self.clear_llm_slash_shadow(ti, pi);
+                            let payload = encode_llm_submit(&compiled_text, llm_kind);
                             // 步骤 3：滚动到底 + 写 PTY
                             self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
                             if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
@@ -4609,6 +5030,7 @@ impl AppState {
                             self.tabs[ti].panes[pi].exit_badge = None;
                             self.tabs[ti].panes[pi].pending_submit =
                                 Some((raw_text.clone(), submitted_at, history_idx));
+                            self.tabs[ti].panes[pi].attachments.advance_draft();
                             events.push(StateEvent::SubmittedText {
                                 text: raw_text,
                                 submitted_at,
@@ -4626,6 +5048,20 @@ impl AppState {
                         self.tabs[ti].panes[pi]
                             .editor
                             .apply(&lumen_editor::EditAction::Clear);
+                        let session_id = self.tabs[ti].panes[pi].id;
+                        let discarded = self.tabs[ti].panes[pi].attachments.discard_draft();
+                        self.attachment_textures
+                            .retain(|(sid, _), _| *sid != session_id);
+                        for path in discarded {
+                            if let Err(error) = std::fs::remove_file(&path) {
+                                if error.kind() != std::io::ErrorKind::NotFound {
+                                    log::warn!(
+                                        "清理已取消的图片附件失败 {}: {error}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
                         self.window.request_redraw();
                         events.push(StateEvent::EditorRevision(
                             self.tabs[ti].panes[pi].editor.revision(),
@@ -4747,11 +5183,56 @@ impl AppState {
                     // 全部继承，多行文本直接落多行编辑（设计稿 §4 Ctrl+V 行）。
                     #[cfg(feature = "input-editor")]
                     {
-                        let mode = mode::effective_mode(
-                            &self.tabs[ti].panes[pi].term,
-                            self.force_fallback,
-                        );
+                        let mode =
+                            effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback);
                         if mode == mode::InputMode::Compose {
+                            let is_llm = self.tabs[ti].panes[pi].llm_cli.is_some()
+                                || llm_cli::detect(None, &self.tabs[ti].panes[pi].term).is_some();
+                            if is_llm {
+                                let clipboard_image =
+                                    llm_attachments::read_clipboard_image(&mut self.clipboard);
+                                if let Ok(Some(image)) = clipboard_image {
+                                    let workspace = self.tabs[ti].panes[pi]
+                                        .term
+                                        .cwd()
+                                        .map(std::path::Path::to_path_buf)
+                                        .or_else(|| std::env::current_dir().ok())
+                                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                                    let session_id = self.tabs[ti].panes[pi].id;
+                                    match self.tabs[ti].panes[pi].attachments.add_rgba(
+                                        &workspace,
+                                        session_id,
+                                        image.width,
+                                        image.height,
+                                        &image.rgba,
+                                    ) {
+                                        Ok(label) => {
+                                            return self.dispatch(
+                                                action::Action::Edit(
+                                                    action::EditAction::InsertText(label),
+                                                ),
+                                                ti,
+                                                pi,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            log::error!("保存 LLM CLI 图片附件失败: {error:#}");
+                                            self.shell_state.toast.push(
+                                                shell::toast::ToastKind::Error,
+                                                format!("粘贴图片失败：{error:#}"),
+                                            );
+                                            return Vec::new();
+                                        }
+                                    }
+                                } else if let Err(error) = clipboard_image {
+                                    log::error!("读取 LLM CLI 剪贴板图片失败: {error:#}");
+                                    self.shell_state.toast.push(
+                                        shell::toast::ToastKind::Error,
+                                        format!("读取剪贴板图片失败：{error:#}"),
+                                    );
+                                    return Vec::new();
+                                }
+                            }
                             let text = self
                                 .clipboard
                                 .as_mut()
@@ -4763,6 +5244,13 @@ impl AppState {
                                     ti,
                                     pi,
                                 );
+                            }
+                            if is_llm {
+                                self.shell_state.toast.push(
+                                    shell::toast::ToastKind::Warn,
+                                    "剪贴板中没有可读取的图片或文本",
+                                );
+                                self.window.request_redraw();
                             }
                             return Vec::new();
                         }
@@ -4945,9 +5433,11 @@ impl AppState {
         }
 
         // 每次 dispatch 后推导当前模式，若变化则发 ModeChanged 事件。
+        #[cfg(feature = "input-editor")]
+        self.sync_llm_slash_probe(ti, pi);
         // 此推导调用符合设计稿「按键处理后实时计算」的纪律，不缓存。
         let _current_mode =
-            mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
+            effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback);
         // 批B：ModeChanged 事件待消费方（状态条）就绪后填充。
         // events.push(StateEvent::ModeChanged(current_mode));
 
@@ -5087,14 +5577,15 @@ impl AppState {
     fn focused_footer_rect_px(&self) -> Option<(f32, f32, f32, f32)> {
         let (x, y, w, h) = self.focused_pane_rect_px()?;
         let pane = self.focused_pane();
-        let mode = mode::effective_mode(&pane.term, self.force_fallback);
-        let cv = composer::compose_view_for_mode(
+        let mode = effective_session_mode(pane, self.force_fallback);
+        let mut cv = composer::compose_view_for_mode(
             mode,
             pane.editor.view(),
             pane.preedit.clone(),
             pane.exit_badge.clone(),
             None,
         );
+        cv.attachment_count = pane.attachments.len();
         if !cv.is_visible() {
             return None;
         }
@@ -5108,6 +5599,141 @@ impl AppState {
         }
         // footer 区域 = 窗格底部 footer_h 像素带
         Some((x, y + h - footer_h, w, footer_h))
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn attachment_overlay(&mut self) -> Option<AttachmentOverlay> {
+        let (fx, fy, fw, footer_h) = self.focused_footer_rect_px()?;
+        let session_id = self.focused_pane().id;
+        let cli_name = self
+            .focused_pane()
+            .llm_cli
+            .or_else(|| llm_cli::detect(None, &self.focused_pane().term))
+            .map(llm_cli::LlmCliKind::display_name)
+            .unwrap_or("LLM CLI");
+
+        let live: HashSet<(SessionId, u64)> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| {
+                tab.panes.iter().flat_map(|pane| {
+                    pane.attachments
+                        .images()
+                        .iter()
+                        .map(move |image| (pane.id, image.id))
+                })
+            })
+            .collect();
+        self.attachment_textures
+            .retain(|key, _| live.contains(key));
+        if self.focused_pane().attachments.is_empty() {
+            return None;
+        }
+
+        let source: Vec<(u64, String, u32, u32, Vec<u8>)> = self
+            .focused_pane()
+            .attachments
+            .images()
+            .iter()
+            .map(|image| {
+                (
+                    image.id,
+                    image.label.clone(),
+                    image.thumbnail_width,
+                    image.thumbnail_height,
+                    image.thumbnail_rgba.clone(),
+                )
+            })
+            .collect();
+        for (id, label, width, height, rgba) in source {
+            self.attachment_textures
+                .entry((session_id, id))
+                .or_insert_with(|| {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [width as usize, height as usize],
+                        &rgba,
+                    );
+                    self.egui_ctx.load_texture(
+                        format!("llm-attachment-{session_id}-{id}-{label}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
+        }
+
+        let ppp = self.egui_ctx.pixels_per_point();
+        let (_, cell_h) = self.renderer.cell_size();
+        let fp = self.renderer.padding() * 0.4;
+        let strip_h_px = (cell_h
+            * lumen_renderer::composer_view::ATTACHMENT_STRIP_ROWS)
+            .min((footer_h - cell_h - fp * 2.0).max(0.0));
+        if strip_h_px <= 0.0 {
+            return None;
+        }
+        let strip_h = strip_h_px / ppp;
+        let items = self
+            .focused_pane()
+            .attachments
+            .images()
+            .iter()
+            .filter_map(|image| {
+                let texture = self
+                    .attachment_textures
+                    .get(&(session_id, image.id))?
+                    .id();
+                // 明确保留底部的编号/删除按钮行及 item spacing，不能
+                // 让图片吃满附件栏后把标签裁掉。
+                let max_h = (strip_h - 34.0).max(1.0);
+                let scale = (max_h / image.thumbnail_height.max(1) as f32).min(1.0);
+                Some(AttachmentOverlayItem {
+                    id: image.id,
+                    label: image.label.clone(),
+                    texture,
+                    size: egui::vec2(
+                        image.thumbnail_width as f32 * scale,
+                        image.thumbnail_height as f32 * scale,
+                    ),
+                    original_size: (image.width, image.height),
+                })
+            })
+            .collect();
+        Some(AttachmentOverlay {
+            session_id,
+            cli_name,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(fx / ppp, fy / ppp),
+                egui::vec2(fw / ppp, strip_h),
+            ),
+            items,
+        })
+    }
+
+    #[cfg(feature = "input-editor")]
+    fn remove_llm_attachment(&mut self, session_id: SessionId, attachment_id: u64) {
+        let Some((ti, pi)) = self.find_pane(session_id) else {
+            return;
+        };
+        let Some(attachment) = self.tabs[ti].panes[pi].attachments.remove(attachment_id) else {
+            return;
+        };
+        let text = self.tabs[ti].panes[pi]
+            .editor
+            .view()
+            .text()
+            .replace(&attachment.label, "");
+        self.tabs[ti].panes[pi]
+            .editor
+            .apply(&lumen_editor::EditAction::SetText(text));
+        self.attachment_textures
+            .remove(&(session_id, attachment_id));
+        if let Err(error) = std::fs::remove_file(&attachment.path) {
+            log::warn!(
+                "删除图片附件失败（文件可能已被外部移走）{}: {error}",
+                attachment.path.display()
+            );
+        }
+        self.sync_llm_slash_probe(ti, pi);
+        self.window.request_redraw();
     }
 
     /// 当前鼠标位置是否落在焦点窗格的 footer 区域内（Compose/可见态）。
@@ -5125,13 +5751,23 @@ impl AppState {
     /// 便于调用 `footer_mouse::pixel_to_position`。
     #[cfg(feature = "input-editor")]
     fn mouse_footer_relative(&self) -> Option<(f32, f32, f32, f32, f32, Vec<String>)> {
-        let (fx, fy, _fw, _fh) = self.focused_footer_rect_px()?;
+        let (fx, fy, _fw, footer_h) = self.focused_footer_rect_px()?;
         let (mx, my) = self.mouse_pos;
         let rel_x = mx as f32 - fx;
-        let rel_y = my as f32 - fy;
+        let mut rel_y = my as f32 - fy;
         let (cell_w, cell_h) = self.renderer.cell_size();
         let fp = self.renderer.padding() * 0.4;
         let pane = self.focused_pane();
+        let attachment_h = if pane.attachments.is_empty() {
+            0.0
+        } else {
+            (cell_h * lumen_renderer::composer_view::ATTACHMENT_STRIP_ROWS)
+                .min((footer_h - cell_h - fp * 2.0).max(0.0))
+        };
+        if rel_y < attachment_h {
+            return None;
+        }
+        rel_y -= attachment_h;
         let lines: Vec<String> = pane.editor.view().lines().map(|l| l.to_owned()).collect();
         Some((rel_x, rel_y, cell_w, cell_h, fp, lines))
     }
@@ -5303,12 +5939,22 @@ impl AppState {
         let (cw, ch) = self.renderer.cell_size();
         #[cfg(feature = "input-editor")]
         let (ime_x, ime_y) = {
-            let mode = mode::effective_mode(&s.term, self.force_fallback);
+            let mode = effective_session_mode(s, self.force_fallback);
             if mode == crate::mode::InputMode::Compose {
                 let cv_cursor = s.editor.view().cursor();
-                let footer_top_y = py + ph
-                    - ch * (s.editor.view().line_count().max(1) as f32)
-                    - self.renderer.padding() * 0.8;
+                let raw_attachment_h = if s.attachments.is_empty() {
+                    0.0
+                } else {
+                    ch * lumen_renderer::composer_view::ATTACHMENT_STRIP_ROWS
+                };
+                let footer_h = (ch * s.editor.view().line_count().max(1) as f32
+                    + self.renderer.padding() * 0.8
+                    + raw_attachment_h)
+                    .min(ph / 3.0);
+                let fp = self.renderer.padding() * 0.4;
+                let attachment_h =
+                    raw_attachment_h.min((footer_h - ch - fp * 2.0).max(0.0));
+                let footer_top_y = py + ph - footer_h + attachment_h;
                 let col_approx = cv_cursor.byte.min(200) as f32;
                 let footer_x = px + col_approx * cw;
                 let footer_y = footer_top_y + cv_cursor.line as f32 * ch;
@@ -5495,14 +6141,15 @@ impl AppState {
         #[cfg(feature = "input-editor")]
         let footer_px = {
             let pane = self.focused_pane();
-            let mode = mode::effective_mode(&pane.term, self.force_fallback);
-            let cv = composer::compose_view_for_mode(
+            let mode = effective_session_mode(pane, self.force_fallback);
+            let mut cv = composer::compose_view_for_mode(
                 mode,
                 pane.editor.view(),
                 pane.preedit.clone(),
                 pane.exit_badge.clone(),
                 None, // ghost 仅用于渲染，高度计算不需要
             );
+            cv.attachment_count = pane.attachments.len();
             let (_, cell_h) = self.renderer.cell_size();
             let fp = self.renderer.padding() * 0.4;
             let max_h = h / 3.0;
@@ -5625,14 +6272,15 @@ impl AppState {
             return 0.0;
         }
         let pane = &self.tabs[self.active_tab].panes[pane_idx];
-        let mode = mode::effective_mode(&pane.term, self.force_fallback);
-        let cv = composer::compose_view_for_mode(
+        let mode = effective_session_mode(pane, self.force_fallback);
+        let mut cv = composer::compose_view_for_mode(
             mode,
             pane.editor.view(),
             pane.preedit.clone(),
             pane.exit_badge.clone(),
             None,
         );
+        cv.attachment_count = pane.attachments.len();
         let (_, cell_h) = self.renderer.cell_size();
         let fp = self.renderer.padding() * 0.4;
         let max_h = pane_h / 3.0;
@@ -6743,7 +7391,7 @@ impl AppState {
             let overlay = self.shell_state.settings.open
                 || self.shell_state.login.open
                 || self.shell_state.history_search.open
-                || self.shell_state.completion.open
+                || (self.shell_state.completion.open && !self.shell_state.completion.passive)
                 || self.shell_state.renaming.is_some()
                 || self.shell_state.pane_renaming.is_some()
                 || self.shell_state.ssh_session_renaming.is_some()
@@ -6757,7 +7405,7 @@ impl AppState {
                 return false;
             }
             let (ti, pi) = (self.active_tab, self.tabs[self.active_tab].focused);
-            mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback)
+            effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback)
                 == mode::InputMode::Compose
         }
         #[cfg(not(feature = "input-editor"))]
@@ -6873,7 +7521,7 @@ impl AppState {
         if self.shell_state.settings.open
             || self.shell_state.login.open
             || self.shell_state.history_search.open
-            || self.shell_state.completion.open
+            || (self.shell_state.completion.open && !self.shell_state.completion.passive)
             || self.shell_state.renaming.is_some()
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.ssh_session_renaming.is_some()
@@ -6895,7 +7543,7 @@ impl AppState {
         #[cfg(feature = "input-editor")]
         {
             let mode =
-                mode::effective_mode(&self.tabs[ti].panes[pi_focused].term, self.force_fallback);
+                effective_session_mode(&self.tabs[ti].panes[pi_focused], self.force_fallback);
             if mode == mode::InputMode::Compose {
                 // path_insert_text_str 与 path_insert_text 同一引号规则；
                 // 控制字符路径返回 None，静默跳过（纵深防御）。
@@ -7454,6 +8102,37 @@ impl AppState {
         // [BUILD-MARKER r4]（composer-IME 取证临时）：标题栏带版本标记，海风哥
         // 一眼确认跑的是不是带修复的新版，不用翻日志。坐实后连同诊断一并移除。
         self.window.set_title(&format!("Lumen [ime-r4] — {title}"));
+    }
+
+    /// 识别每个窗格的前台 LLM CLI。只识别程序类型，不判断回答/空闲状态。
+    fn probe_llm_clis(&mut self, now: Instant) {
+        if self
+            .last_llm_cli_probe
+            .is_some_and(|last| now.duration_since(last) < LLM_CLI_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.last_llm_cli_probe = Some(now);
+        let mut cleared_slash_probe = false;
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                let exe = pane
+                    .pty
+                    .shell_pid()
+                    .and_then(proc_icon::foreground_exe);
+                pane.llm_cli = llm_cli::detect(exe.as_deref(), &pane.term);
+                if pane.llm_cli.is_none() && !pane.slash_probe.shadow.is_empty() {
+                    // CLI 已退出时清掉尚未提交的探测输入，避免候选串到 shell。
+                    let _ = pane.write_user_input(b"\x15");
+                    pane.slash_probe.clear();
+                    cleared_slash_probe = true;
+                }
+            }
+        }
+        #[cfg(feature = "input-editor")]
+        if cleared_slash_probe {
+            self.close_passive_completion();
+        }
     }
 
     /// F7② 节流轮询各 tab 焦点窗格的前台运行程序 exe（进程快照较重，
@@ -9097,7 +9776,10 @@ impl App {
             session_icon_tex: HashMap::new(),
             session_icon_rgba: HashMap::new(),
             remote_icon_tex: HashMap::new(),
+            #[cfg(feature = "input-editor")]
+            attachment_textures: HashMap::new(),
             last_icon_probe: None,
+            last_llm_cli_probe: None,
             pane_rects_px: Vec::new(),
             pending_resize_dir: None,
             pane_close_rects_px: Vec::new(),
@@ -9273,6 +9955,14 @@ const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// F7② 会话前台进程轮询间隔：进程快照较重，限频到 ~0.8s（命令起止的
 /// 图标切换感知足够灵敏，开销可忽略）。
 const ICON_PROBE_INTERVAL: Duration = Duration::from_millis(800);
+/// LLM CLI 识别需独立于侧栏图标工作；同样节流进程快照查询。
+const LLM_CLI_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// LLM CLI 的原生候选可能异步生成；在截止时间内允许任意数量的局部
+/// PTY 重绘，不能用“无结果帧数”提前判定失败。
+const LLM_SLASH_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+/// Ctrl+U 与 Kimi 的 Esc 必须分成两个 ConPTY 写入；每阶段留出一个
+/// 很短的处理窗口，同时由 about_to_wait 定时唤醒，绝不等待 CLI 回显。
+const LLM_SLASH_CLEAR_STAGE_DELAY: Duration = Duration::from_millis(60);
 
 /// F7② 会话图标首抽后延迟重抽一次的间隔：首抽可能撞上前台进程刚 spawn、系统
 /// 图标未就绪而抽到通用占位图标；隔此时间进程已稳定，重抽覆盖（> [`ICON_PROBE_INTERVAL`]，
@@ -9451,6 +10141,8 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                         }
                         state.tabs[ti].panes[pi].advance_terminal(&bytes);
+                        #[cfg(feature = "input-editor")]
+                        state.refresh_llm_slash_candidates(ti, pi);
                         // M5.3 part3d 被控端：被控期间转发**控制端订阅会话**的焦点窗格 PTY
                         // 输出给控制端（带双 id；与被控端自身焦点解耦——需求 c/e）。整屏初始
                         // 快照由 pump_remote 的 mirror_src 变化触发 SubscriptionStarted，先于
@@ -9814,6 +10506,7 @@ impl ApplicationHandler<PtyWake> for App {
                 if !state.shell_state.completion.open {
                     state.shell_state.completion.open = true;
                     state.shell_state.completion.selected = 0;
+                    state.shell_state.completion.passive = false;
                     state.terminal_focused = false;
                 }
                 state.window.request_redraw();
@@ -9851,6 +10544,8 @@ impl ApplicationHandler<PtyWake> for App {
             .ssh_runtime
             .has_live_connections()
             .then(|| now + Duration::from_millis(33));
+        #[cfg(feature = "input-editor")]
+        let slash_cleanup_at = state.poll_llm_slash_probe_clear(now);
 
         // 应用锁退避与自动入口。软件锁默认关闭；所有入口都先经过
         // is_enabled 门控，因此缺少 app_lock.json 的旧用户零行为变化。
@@ -9907,6 +10602,10 @@ impl ApplicationHandler<PtyWake> for App {
         }
         // 未到点计划中的最早时刻（含 egui 计划）。
         let mut wake: Option<Instant> = ssh_poll_at;
+        #[cfg(feature = "input-editor")]
+        if let Some(at) = slash_cleanup_at {
+            wake = Some(wake.map_or(at, |current| current.min(at)));
+        }
         if state.app_lock.is_enabled()
             && !state.app_lock.is_locked()
             && state.app_lock.config().idle_timeout_minutes() > 0
@@ -10037,7 +10736,7 @@ impl ApplicationHandler<PtyWake> for App {
             && !state.shell_state.settings.open
             && !state.shell_state.login.open
             && !state.shell_state.history_search.open
-            && !state.shell_state.completion.open
+            && (!state.shell_state.completion.open || state.shell_state.completion.passive)
             && state.shell_state.renaming.is_none()
             && state.shell_state.pane_renaming.is_none()
             && state.shell_state.ssh_session_renaming.is_none()
@@ -10230,7 +10929,8 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
-                    && !state.shell_state.completion.open
+                    && (!state.shell_state.completion.open
+                        || state.shell_state.completion.passive)
                     && state.shell_state.renaming.is_none()
                     && state.shell_state.pane_renaming.is_none()
                     && state.shell_state.ssh_session_renaming.is_none()
@@ -10312,7 +11012,8 @@ impl ApplicationHandler<PtyWake> for App {
                     overlay_open: state.shell_state.settings.open
                         || state.shell_state.login.open
                         || state.shell_state.history_search.open
-                        || state.shell_state.completion.open
+                        || (state.shell_state.completion.open
+                            && !state.shell_state.completion.passive)
                         || state.shell_state.text_editor.is_visible(),
                     renaming: state.shell_state.renaming.is_some()
                         || state.shell_state.pane_renaming.is_some()
@@ -10400,7 +11101,7 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // 求值当前有效输入模式（纯推导，不缓存）。
                 let mode =
-                    mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                    effective_session_mode(&state.tabs[ti].panes[pi], state.force_fallback);
 
                 // 查表。M5.3 part4c：镜像态强制按非 Compose（Running）路由——否则控制端
                 // 本地窗格停在自己提示符（Compose 态）时，普通字符/按键会被 keymap 第 9 层
@@ -10412,7 +11113,7 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     mode
                 };
-                let result = keymap::lookup_with_shortcuts(
+                let mut result = keymap::lookup_with_shortcuts(
                     &event,
                     state.modifiers,
                     lookup_mode,
@@ -10420,6 +11121,88 @@ impl ApplicationHandler<PtyWake> for App {
                     &guard,
                     &state.settings.keyboard,
                 );
+                #[cfg(feature = "input-editor")]
+                if !mirror_active {
+                    let pane = &state.tabs[ti].panes[pi];
+                    let llm_active =
+                        pane.llm_cli.is_some() || llm_cli::detect(None, &pane.term).is_some();
+                    if pressed
+                        && llm_cli_native_navigation_passthrough(
+                            llm_active,
+                            pane.editor.view().text().is_empty(),
+                            state.shell_state.completion.open,
+                            state.modifiers,
+                            event.physical_key,
+                        )
+                    {
+                        result = Some(keymap::LookupResult::PassThrough);
+                    }
+                }
+                #[cfg(feature = "input-editor")]
+                if pressed
+                    && state.modifiers.is_empty()
+                    && state.shell_state.completion.open
+                    && state.shell_state.completion.passive
+                    && !state.completion_candidates.is_empty()
+                {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowUp) => {
+                            let count = state.completion_candidates.len();
+                            let selected = &mut state.shell_state.completion.selected;
+                            *selected = if *selected == 0 {
+                                count - 1
+                            } else {
+                                *selected - 1
+                            };
+                            result = Some(keymap::LookupResult::Consumed);
+                            state.window.request_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => {
+                            let count = state.completion_candidates.len();
+                            state.shell_state.completion.selected =
+                                (state.shell_state.completion.selected + 1) % count;
+                            result = Some(keymap::LookupResult::Consumed);
+                            state.window.request_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            state.clear_llm_slash_shadow(ti, pi);
+                            result = Some(keymap::LookupResult::Consumed);
+                            state.window.request_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Enter)
+                        | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                            let idx = state
+                                .shell_state
+                                .completion
+                                .selected
+                                .min(state.completion_candidates.len() - 1);
+                            let candidate = &state.completion_candidates[idx];
+                            let replacement = candidate.replacement.clone();
+                            let (start, end) = candidate.replace_range.unwrap_or((0, 0));
+                            state.tabs[ti].panes[pi].editor.apply(
+                                &lumen_editor::EditAction::SetSelection(
+                                    lumen_editor::Selection {
+                                        anchor: lumen_editor::Position {
+                                            line: 0,
+                                            byte: start,
+                                        },
+                                        cursor: lumen_editor::Position {
+                                            line: 0,
+                                            byte: end,
+                                        },
+                                    },
+                                ),
+                            );
+                            state.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::InsertText(replacement));
+                            state.close_passive_completion();
+                            // `result` 保持 Enter 对应的 Submit；dispatch 会先清
+                            // shadow，再提交刚接受的完整命令。
+                        }
+                        _ => {}
+                    }
+                }
 
                 // 任意按键命中 → 清退出码角标（设计稿 §3.2 第⑥步，M4.1 批D2）。
                 // 仅 Compose 态有 exit_badge；result=None（keymap 拦截）时也清，
@@ -10558,6 +11341,40 @@ impl ApplicationHandler<PtyWake> for App {
                         {
                             let ti = state.active_tab;
                             let pi = state.tabs[ti].focused;
+                            if state.shell_state.completion.open
+                                && state.shell_state.completion.passive
+                                && !state.completion_candidates.is_empty()
+                            {
+                                let idx = state
+                                    .shell_state
+                                    .completion
+                                    .selected
+                                    .min(state.completion_candidates.len() - 1);
+                                let candidate = &state.completion_candidates[idx];
+                                let replacement = candidate.replacement.clone();
+                                let (start, end) =
+                                    candidate.replace_range.unwrap_or((0, 0));
+                                state.tabs[ti].panes[pi].editor.apply(
+                                    &lumen_editor::EditAction::SetSelection(
+                                        lumen_editor::Selection {
+                                            anchor: lumen_editor::Position {
+                                                line: 0,
+                                                byte: start,
+                                            },
+                                            cursor: lumen_editor::Position {
+                                                line: 0,
+                                                byte: end,
+                                            },
+                                        },
+                                    ),
+                                );
+                                state.tabs[ti].panes[pi]
+                                    .editor
+                                    .apply(&lumen_editor::EditAction::InsertText(replacement));
+                                state.close_passive_completion();
+                                state.sync_llm_slash_probe(ti, pi);
+                                state.window.request_redraw();
+                            } else {
                             // 取当前行文本与光标字节偏移。
                             let (line_text, cursor_byte) = {
                                 let view = state.tabs[ti].panes[pi].editor.view();
@@ -10597,8 +11414,10 @@ impl ApplicationHandler<PtyWake> for App {
                                 let comp = &mut state.shell_state.completion;
                                 comp.open = true;
                                 comp.selected = 0;
+                                comp.passive = false;
                                 state.terminal_focused = false;
                                 state.window.request_redraw();
+                            }
                             }
                         }
                         // 无 input-editor feature 时沿用占位提示。
@@ -11390,7 +12209,7 @@ impl ApplicationHandler<PtyWake> for App {
                 #[cfg(feature = "input-editor")]
                 {
                     let mode =
-                        mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                        effective_session_mode(&state.tabs[ti].panes[pi], state.force_fallback);
                     if mode == mode::InputMode::Compose {
                         if text.is_empty() {
                             // 空串 = 预编辑结束/取消
@@ -11448,7 +12267,7 @@ impl ApplicationHandler<PtyWake> for App {
                 #[cfg(feature = "input-editor")]
                 {
                     let mode =
-                        mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                        effective_session_mode(&state.tabs[ti].panes[pi], state.force_fallback);
                     if mode == mode::InputMode::Compose {
                         // 提交时清空 preedit（M4.1 批D2）
                         state.tabs[ti].panes[pi].preedit = None;
@@ -11472,6 +12291,20 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                #[cfg(feature = "input-editor")]
+                if state.shell_state.completion.open
+                    && state
+                        .shell_state
+                        .completion
+                        .popup_rect
+                        .zip(state.egui_ctx.pointer_latest_pos())
+                        .is_some_and(|(rect, pointer)| rect.contains(pointer))
+                {
+                    // egui_state 已在上方收到本次滚轮；命中补全弹层时到此
+                    // 截断，避免同一事件继续滚动底下的终端。
+                    state.window.request_redraw();
+                    return;
+                }
                 if state.settings.layout.view_mode.is_ssh() {
                     if !state.mouse_in_ssh_terminal() {
                         return;
@@ -11668,6 +12501,7 @@ impl ApplicationHandler<PtyWake> for App {
                     return;
                 };
                 let render_t0 = Instant::now();
+                state.probe_llm_clis(render_t0);
 
                 // —— DEC 2026 同步区间门控（事件驱动重绘的保护层，F5
                 // 起**逐窗格**判定）——
@@ -11817,6 +12651,10 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.is_mirror_active() {
                     state.ensure_remote_icon_textures();
                 }
+                #[cfg(feature = "input-editor")]
+                let attachment_overlay = state.attachment_overlay();
+                #[cfg(feature = "input-editor")]
+                let mut remove_attachment_req: Option<(SessionId, u64)> = None;
                 // part3d（K3）：远程视图 + 控制中 → 会话栏整组替换为被控端的远程会话列表
                 // （active = 当前订阅会话；点击切换 = 订阅，由下方 activate 分流）。否则画本地
                 // tab 列表（原 F7② 两行条目：名称行 + 路径行 + 前台程序 exe 图标）。
@@ -12254,8 +13092,8 @@ impl ApplicationHandler<PtyWake> for App {
                     bg_image,
                     // 底部状态栏所需：当前有效输入模式 + 经典直通开关（M4.1 批E）
                     #[cfg(feature = "input-editor")]
-                    input_mode: mode::effective_mode(
-                        &tab.focused_pane().term,
+                    input_mode: effective_session_mode(
+                        tab.focused_pane(),
                         state.force_fallback,
                     ),
                     #[cfg(feature = "input-editor")]
@@ -12419,6 +13257,98 @@ impl ApplicationHandler<PtyWake> for App {
                         app_lock_input,
                         is_maximized,
                     ));
+                    #[cfg(feature = "input-editor")]
+                    if let Some(overlay) = &attachment_overlay {
+                        egui::Area::new(egui::Id::new((
+                            "lumen_llm_attachment_strip",
+                            overlay.session_id,
+                        )))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(overlay.rect.min)
+                        .show(ui.ctx(), |ui| {
+                            // Area 的默认可用高度会延伸到窗口底部；这里只设
+                            // set_min_size 会令横向 ScrollArea 把整块高度占满，
+                            // 从而遮住文字输入区。先精确分配附件栏矩形，再把
+                            // 背景、子 UI 和 clip 全部锁在该矩形内。
+                            let (strip_rect, _) = ui.allocate_exact_size(
+                                overlay.rect.size(),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter().with_clip_rect(strip_rect);
+                            painter.rect_filled(strip_rect, 0.0, modal_pal.bg_dark);
+                            painter.rect_stroke(
+                                strip_rect,
+                                0.0,
+                                egui::Stroke::new(1.0, modal_pal.panel_outline),
+                                egui::StrokeKind::Inside,
+                            );
+
+                            let content_rect =
+                                strip_rect.shrink2(egui::vec2(6.0, 4.0));
+                            let mut content_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(content_rect)
+                                    .layout(egui::Layout::left_to_right(
+                                        egui::Align::Min,
+                                    )),
+                            );
+                            content_ui.set_clip_rect(content_rect);
+                            egui::ScrollArea::horizontal()
+                                .id_salt(("llm_attachment_scroll", overlay.session_id))
+                                .max_height(content_rect.height())
+                                .auto_shrink([false, false])
+                                .show(&mut content_ui, |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} 图片",
+                                                overlay.cli_name
+                                            ))
+                                            .small()
+                                            .color(modal_pal.fg_dim),
+                                        );
+                                        ui.separator();
+                                        for item in &overlay.items {
+                                            ui.vertical(|ui| {
+                                                ui.add(
+                                                    egui::Image::new(
+                                                        egui::load::SizedTexture::new(
+                                                            item.texture,
+                                                            item.size,
+                                                        ),
+                                                    )
+                                                    .corner_radius(4.0),
+                                                )
+                                                .on_hover_text(format!(
+                                                    "{} · {}×{}",
+                                                    item.label,
+                                                    item.original_size.0,
+                                                    item.original_size.1
+                                                ));
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&item.label)
+                                                            .monospace()
+                                                            .color(modal_pal.fg),
+                                                    );
+                                                    if ui
+                                                        .small_button("×")
+                                                        .on_hover_text("移除图片")
+                                                        .clicked()
+                                                    {
+                                                        remove_attachment_req = Some((
+                                                            overlay.session_id,
+                                                            item.id,
+                                                        ));
+                                                    }
+                                                });
+                                            });
+                                            ui.add_space(8.0);
+                                        }
+                                    });
+                                });
+                        });
+                    }
                     // 边缘 resize 光标：放在 shell::show 之后设，覆盖边缘处控件的
                     // 默认光标（egui 末次 set_cursor_icon 生效）。
                     if let Some(c) = resize_cursor {
@@ -12858,6 +13788,10 @@ impl ApplicationHandler<PtyWake> for App {
                 let Some(mut shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
                 };
+                #[cfg(feature = "input-editor")]
+                if let Some((session_id, attachment_id)) = remove_attachment_req {
+                    state.remove_llm_attachment(session_id, attachment_id);
+                }
                 let ssh_actions = std::mem::take(&mut shell_out.ssh_actions);
                 state.apply_ssh_ui_actions(ssh_actions);
                 if let Some(action) = shell_out.ssh_runtime_action.take() {
@@ -13016,7 +13950,8 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
-                    && !state.shell_state.completion.open
+                    && (!state.shell_state.completion.open
+                        || state.shell_state.completion.passive)
                     && !state.shell_state.text_editor.is_visible()
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
@@ -13536,7 +14471,7 @@ impl ApplicationHandler<PtyWake> for App {
                     let ti = state.active_tab;
                     let pi = state.tabs[ti].focused;
                     let cur_mode =
-                        mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                        effective_session_mode(&state.tabs[ti].panes[pi], state.force_fallback);
                     #[cfg(feature = "input-editor")]
                     if cur_mode == mode::InputMode::Compose {
                         state.tabs[ti].panes[pi]
@@ -13626,15 +14561,18 @@ impl ApplicationHandler<PtyWake> for App {
                             .editor
                             .apply(&lumen_editor::EditAction::InsertText(replacement));
                         state.shell_state.completion.open = false;
+                        state.shell_state.completion.passive = false;
                         state.completion_candidates.clear();
                         state.completion_req_id = 0; // 取消 sidecar 在途请求（若还有）。
                         state.terminal_focused = true;
+                        state.sync_llm_slash_probe(ti, pi);
                         state.window.request_redraw();
                     }
                 }
                 // completion_closed：关闭弹窗，焦点还给终端。
                 if shell_out.completion_closed {
                     state.shell_state.completion.open = false;
+                    state.shell_state.completion.passive = false;
                     state.completion_candidates.clear();
                     #[cfg(feature = "input-editor")]
                     {
@@ -13645,7 +14583,9 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // 弹窗打开期间键盘归 egui（终端不收键盘）。
                 #[cfg(feature = "input-editor")]
-                if state.shell_state.completion.open {
+                if state.shell_state.completion.open
+                    && !state.shell_state.completion.passive
+                {
                     state.terminal_focused = false;
                 }
 
@@ -14504,14 +15444,15 @@ impl ApplicationHandler<PtyWake> for App {
                             let is_focused = state.tabs[state.active_tab].focused == pane_idx;
                             if is_focused {
                                 let pane = &state.tabs[state.active_tab].panes[i];
-                                let mode = mode::effective_mode(&pane.term, state.force_fallback);
-                                let cv = composer::compose_view_for_mode(
+                                let mode = effective_session_mode(pane, state.force_fallback);
+                                let mut cv = composer::compose_view_for_mode(
                                     mode,
                                     pane.editor.view(),
                                     pane.preedit.clone(),
                                     pane.exit_badge.clone(),
                                     None, // ghost 仅用于渲染，resize 高度计算不需要
                                 );
+                                cv.attachment_count = pane.attachments.len();
                                 let (_, cell_h) = state.renderer.cell_size();
                                 let fp = state.renderer.padding() * 0.4;
                                 let max_h = th as f32 / 3.0;
@@ -14623,6 +15564,16 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.request_redraw();
                 }
 
+                #[cfg(feature = "input-editor")]
+                for (i, pane) in state.tabs[state.active_tab].panes.iter().enumerate() {
+                    if !pane.slash_probe.shadow.is_empty() {
+                        // 原生 CLI 菜单仅作为命令数据源：探测前缀写入到
+                        // Ctrl+U 擦除完成之间保留上一张稳定终端纹理，避免
+                        // 原生菜单和 Lumen 弹层同时出现在屏幕上。
+                        skip_pane[i] = true;
+                    }
+                }
+
                 // —— 终端管线渲染到各窗格离屏纹理（damage/行缓存机制
                 // 原样，行缓存按会话 id 隔离）——同步区间门控跳过的窗
                 // 格不渲染：其纹理保留上一完整帧，egui pass 照常采样
@@ -14664,14 +15615,16 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                         let ghost = state.ghost_cache.1.clone();
                         let focused = state.focused_pane();
-                        let mode = mode::effective_mode(&focused.term, state.force_fallback);
-                        composer::compose_view_for_mode(
+                        let mode = effective_session_mode(focused, state.force_fallback);
+                        let mut view = composer::compose_view_for_mode(
                             mode,
                             focused.editor.view(),
                             focused.preedit.clone(),
                             focused.exit_badge.clone(),
                             ghost,
-                        )
+                        );
+                        view.attachment_count = focused.attachments.len();
+                        view
                     };
 
                     for (i, skip) in skip_pane.iter().enumerate() {
@@ -15047,6 +16000,9 @@ mod tests {
     use winit::event::ElementState;
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
+    #[cfg(feature = "input-editor")]
+    use super::{composer_should_insert_newline, llm_cli_native_navigation_passthrough};
+
     // ── 本机复制粘贴（local→local，海风哥本轮新增）单测 ───────────────────
     use super::{local_copy_item, unique_copy_name, CopyStats};
 
@@ -15099,6 +16055,62 @@ mod tests {
             view_mode_shortcut(modifiers, PhysicalKey::Code(KeyCode::KeyS)),
             None
         );
+    }
+
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn llm空编辑器方向键与esc直通原生选择器() {
+        for key in [
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowRight,
+            KeyCode::Escape,
+        ] {
+            assert!(llm_cli_native_navigation_passthrough(
+                true,
+                true,
+                false,
+                ModifiersState::default(),
+                PhysicalKey::Code(key),
+            ));
+        }
+    }
+
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn llm导航直通不抢本地文本或lumen补全() {
+        let up = PhysicalKey::Code(KeyCode::ArrowUp);
+        assert!(!llm_cli_native_navigation_passthrough(
+            true,
+            false,
+            false,
+            ModifiersState::default(),
+            up,
+        ));
+        assert!(!llm_cli_native_navigation_passthrough(
+            true,
+            true,
+            true,
+            ModifiersState::default(),
+            up,
+        ));
+        assert!(!llm_cli_native_navigation_passthrough(
+            false,
+            true,
+            false,
+            ModifiersState::default(),
+            up,
+        ));
+    }
+
+    #[cfg(feature = "input-editor")]
+    #[test]
+    fn llm与图片草稿的enter不触发shell自动续行() {
+        assert!(!composer_should_insert_newline(true, false, true));
+        assert!(!composer_should_insert_newline(false, true, true));
+        assert!(composer_should_insert_newline(false, false, true));
+        assert!(!composer_should_insert_newline(false, false, false));
     }
 
     #[test]
@@ -15722,7 +16734,8 @@ mod tests {
 
     #[cfg(feature = "input-editor")]
     mod submit_encoding {
-        use super::super::encode_submit;
+        use super::super::{encode_llm_submit, encode_submit};
+        use crate::llm_cli::LlmCliKind;
 
         #[test]
         fn 单行文本_末尾加_cr() {
@@ -15760,6 +16773,28 @@ mod tests {
                 payload.starts_with(b"\x1b[200~"),
                 "两行文本应走括号粘贴协议"
             );
+        }
+
+        #[test]
+        fn kimi_单行斜杠命令使用括号粘贴避免二次补全() {
+            let payload = encode_llm_submit("/yolo", Some(LlmCliKind::Kimi));
+            assert_eq!(
+                payload,
+                b"\x1b[200~/yolo\x1b[201~\r",
+                "Kimi 单行命令必须原子粘贴后再提交"
+            );
+        }
+
+        #[test]
+        fn 其他_cli_单行仍按普通输入提交() {
+            for kind in [
+                None,
+                Some(LlmCliKind::Claude),
+                Some(LlmCliKind::Codex),
+                Some(LlmCliKind::Gemini),
+            ] {
+                assert_eq!(encode_llm_submit("/help", kind), b"/help\r");
+            }
         }
     }
 }

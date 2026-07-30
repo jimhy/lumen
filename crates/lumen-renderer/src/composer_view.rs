@@ -176,6 +176,9 @@ pub struct ComposerView {
     /// 有 IME preedit 的行由 renderer 降级为单色（preedit 内嵌致字节偏移错位，
     /// 组字过程短暂，可接受）。
     pub highlight: Vec<Vec<FooterSpan>>,
+    /// 独立缩略图栏中的附件数量；renderer 仅据此预留高度，图片由 app
+    /// 的 egui 层绘制。
+    pub attachment_count: usize,
 }
 
 /// IME 预编辑状态（M4.1 批D2，设计稿 §7.3）。
@@ -213,6 +216,7 @@ impl ComposerView {
             placeholder: None,
             ghost: None,
             highlight: Vec::new(),
+            attachment_count: 0,
         }
     }
 
@@ -231,6 +235,7 @@ impl ComposerView {
             placeholder: None,
             ghost: None,
             highlight: Vec::new(),
+            attachment_count: 0,
         }
     }
 
@@ -246,6 +251,7 @@ impl ComposerView {
             placeholder: None,
             ghost: None,
             highlight: Vec::new(),
+            attachment_count: 0,
         }
     }
 
@@ -295,8 +301,31 @@ pub fn footer_height_px(
         return 0.0;
     }
     let line_count = v.line_count().max(1) as f32;
-    let raw = line_count * cell_h + footer_padding * 2.0;
+    let raw = line_count * cell_h + footer_padding * 2.0 + attachment_strip_height_px(v, cell_h);
     raw.min(max_height_px)
+}
+
+/// 图片缩略图栏占用的物理像素高度。该栏位于 footer 文本上方。
+pub const ATTACHMENT_STRIP_ROWS: f32 = 5.5;
+
+pub fn attachment_strip_height_px(view: &ComposerView, cell_h: f32) -> f32 {
+    if view.kind == FooterKind::Composer && view.attachment_count > 0 {
+        cell_h * ATTACHMENT_STRIP_ROWS
+    } else {
+        0.0
+    }
+}
+
+/// 在 footer 总高度受窗格 1/3 上限钳制时，为正文至少保留一行及上下
+/// padding，附件栏只能使用剩余高度。
+pub fn fitted_attachment_strip_height_px(
+    view: &ComposerView,
+    cell_h: f32,
+    footer_padding: f32,
+    footer_height_px: f32,
+) -> f32 {
+    let available = (footer_height_px - cell_h - footer_padding * 2.0).max(0.0);
+    attachment_strip_height_px(view, cell_h).min(available)
 }
 
 /// 将行内字节偏移转换为显示列数（宽字符 CJK/emoji 占 2 列）。
@@ -497,6 +526,28 @@ mod tests {
         v.lines = vec!["line1".to_owned(), "line2".to_owned(), "line3".to_owned()];
         let h = footer_height_px(Some(&v), 20.0, 6.0, 1000.0);
         assert_eq!(h, 3.0 * 20.0 + 12.0, "3 行：3*cell_h + padding*2");
+    }
+
+    #[test]
+    fn 图片附件为缩略图和下方标签保留独立栏() {
+        let mut v = ComposerView::compose_empty();
+        v.attachment_count = 2;
+        let h = footer_height_px(Some(&v), 20.0, 6.0, 1000.0);
+        assert_eq!(h, 20.0 + 12.0 + ATTACHMENT_STRIP_ROWS * 20.0);
+        assert_eq!(
+            attachment_strip_height_px(&v, 20.0),
+            ATTACHMENT_STRIP_ROWS * 20.0
+        );
+    }
+
+    #[test]
+    fn 图片栏受限时仍给正文保留一行和padding() {
+        let mut v = ComposerView::compose_empty();
+        v.attachment_count = 1;
+        assert_eq!(
+            fitted_attachment_strip_height_px(&v, 20.0, 6.0, 90.0),
+            58.0
+        );
     }
 
     /// 1/3 窗高上限钳制。
