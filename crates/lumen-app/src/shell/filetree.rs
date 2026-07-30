@@ -7,7 +7,8 @@
 //! - 树根 = 激活会话上报的 cwd（OSC 9;9）；未上报时显示等待占位；
 //!   切 tab / cd 后树根跟随，根变化时重置展开状态。
 //! - 懒加载：目录首次展开才读子项；目录在前文件在后、各按名排序；
-//!   隐藏项（Windows Hidden 属性或点开头）默认不显示。
+//!   隐藏项（Windows Hidden 属性或点开头）默认不显示，可通过工具条
+//!   「显示隐藏项」开关切换；目录树和递归搜索共用该开关。
 //! - 读盘在后台线程进行（M3 审查项：UI 线程同步 read_dir 会被慢速
 //!   网络盘/超大目录冻结整个应用）：首次展开先画「加载中…」占位并
 //!   派发后台读取，回包经 mpsc 通道送回 UI 线程替换占位；换根/刷新
@@ -238,6 +239,8 @@ enum MenuAction {
 pub struct FileTreeState {
     /// 栏是否展开（工具条按钮 / Ctrl+B 切换）。
     pub visible: bool,
+    /// 本地「显示隐藏项」开关（默认关闭；目录懒加载与递归搜索共用）。
+    show_hidden: bool,
     /// 当前树根（= 激活会话 cwd）。None 显示等待占位。
     root: Option<PathBuf>,
     /// ltreeview 的展开/选中状态。自持有而非存 egui memory：根变化时
@@ -299,6 +302,7 @@ impl Default for FileTreeState {
         let (search_tx, search_rx) = mpsc::channel();
         Self {
             visible: true,
+            show_hidden: false,
             root: None,
             tree: TreeViewState::default(),
             nodes: Vec::new(),
@@ -482,6 +486,27 @@ impl FileTreeState {
         self.root = cwd.map(Path::to_path_buf);
         self.reset_nodes();
         self.close_search();
+    }
+
+    /// 切换本地「显示隐藏项」。行为与远程树一致：仅在值变化时重列，
+    /// 清空旧目录缓存/在途回包并折叠回根；搜索已生效时也立即按新条件
+    /// 重新扫描，保证树视图与搜索结果口径一致。
+    fn set_show_hidden(&mut self, show: bool) {
+        if self.show_hidden == show {
+            return;
+        }
+        self.show_hidden = show;
+        self.reset_nodes();
+
+        // 先作废旧搜索 worker；若搜索条件已生效，立即按新开关重跑。
+        self.search_epoch.fetch_add(1, Ordering::Relaxed);
+        self.search_dispatch_at = None;
+        self.search_results = None;
+        self.search_pending = false;
+        self.search_selected = None;
+        if self.search_open && self.search_query.trim().chars().count() >= SEARCH_MIN_CHARS {
+            self.dispatch_search();
+        }
     }
 
     /// 重建节点表（仅换根走这里；P15 起工具条全局刷新按钮已移除，
@@ -706,8 +731,9 @@ impl FileTreeState {
         self.search_results = None;
         let tx = self.search_tx.clone();
         let current = self.search_epoch.clone();
+        let show_hidden = self.show_hidden;
         std::thread::spawn(move || {
-            let (items, truncated) = search_worker(&root, &query, epoch, &current);
+            let (items, truncated) = search_worker(&root, &query, show_hidden, epoch, &current);
             let _ = tx.send(SearchReply {
                 epoch,
                 items,
@@ -1194,6 +1220,18 @@ fn panel_ui(
             shared_filetree_root_label(ui, &title, full_path.as_deref(), pal);
         });
     });
+    // 与远程树同款「显示隐藏项」开关；变化后本地状态直接重列，无需
+    // 像远程树那样经 ShellOutput 跨借用回传 main。
+    let mut show_hidden = st.show_hidden;
+    if ui
+        .checkbox(
+            &mut show_hidden,
+            egui::RichText::new(s.remote_show_hidden).size(11.0),
+        )
+        .changed()
+    {
+        st.set_show_hidden(show_hidden);
+    }
 
     // —— 搜索输入行（🔍 展开时显示）——
     if st.search_open {
@@ -1275,6 +1313,7 @@ fn tree_ui(
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let show_hidden = st.show_hidden;
             let FileTreeState {
                 tree,
                 nodes,
@@ -1294,6 +1333,7 @@ fn tree_ui(
                 epoch: *epoch,
                 tx: reply_tx,
                 can_paste,
+                show_hidden,
             };
             let (resp, actions) = TreeView::new(ui.make_persistent_id("lumen_file_tree"))
                 .allow_multi_selection(false)
@@ -1717,6 +1757,8 @@ struct LoadCtx<'a> {
     tx: &'a mpsc::Sender<LoadReply>,
     /// part3c-2 #7：是否在目录右键菜单显示「粘贴到此目录」（有远程剪贴板时）。
     can_paste: bool,
+    /// 是否包含 Windows Hidden 属性项和点前缀项。
+    show_hidden: bool,
 }
 
 /// 递归添加一个节点（目录展开时先懒加载子项再下钻）。
@@ -1965,12 +2007,13 @@ fn ensure_listing(load: &mut LoadCtx<'_>, id: usize) {
     load.pending.insert(id, seq);
     let tx = load.tx.clone();
     let epoch = load.epoch;
+    let show_hidden = load.show_hidden;
     // 后台线程读盘（M3 审查项：UI 线程同步 read_dir 会被慢速网络盘
     // 冻结整个应用）。线程按请求派发、用后即弃：请求频率受「目录
     // 首次展开」天然限速；卡死在断连网络盘上的线程随超时自行了结，
     // 其回包按代次丢弃即可。
     std::thread::spawn(move || {
-        let result = read_dir_worker(&dir);
+        let result = read_dir_worker(&dir, show_hidden);
         // UI 先退出时通道已关：发送失败静默忽略。
         let _ = tx.send(LoadReply {
             epoch,
@@ -1984,10 +2027,9 @@ fn ensure_listing(load: &mut LoadCtx<'_>, id: usize) {
 /// [`read_dir_worker_ex`] 产物：(子项 `[(路径, 是否目录, 字节数)]`, 单层溢出计数)。
 type ReadDirResult = (Vec<(PathBuf, bool, u64)>, usize);
 
-/// 本地文件树用：读目录并过滤隐藏项（[`read_dir_worker_ex`] 的 `show_hidden=false` 包装）。
-/// 本地树不需要文件大小，丢弃 size。
-fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
-    let (entries, overflow) = read_dir_worker_ex(dir, false)?;
+/// 本地文件树用：按 `show_hidden` 读目录。本地树不需要文件大小，丢弃 size。
+fn read_dir_worker(dir: &Path, show_hidden: bool) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
+    let (entries, overflow) = read_dir_worker_ex(dir, show_hidden)?;
     Ok((
         entries.into_iter().map(|(p, d, _)| (p, d)).collect(),
         overflow,
@@ -1999,8 +2041,8 @@ fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
 /// 单层上限。枚举本身受 [`ENUM_HARD_CAP`] 封顶，超出时溢出计数是下界。读失败（权限/
 /// 网络盘断连）返回 `Err`，由 UI 侧画「无法读取」占位，不 panic。
 ///
-/// `show_hidden`：part3c-2 远程「文件管理」语义下控制端可选显示 `.env`/`.gitignore` 等
-/// （本地树恒传 `false` 维持现状）。
+/// `show_hidden`：本地/远程文件树共用的隐藏项口径，可选显示 `.env`/`.gitignore`
+/// 或带 Windows Hidden 属性的项目。
 pub(crate) fn read_dir_worker_ex(dir: &Path, show_hidden: bool) -> Result<ReadDirResult, ()> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -2069,6 +2111,7 @@ pub(crate) fn list_dir_entries(
 fn search_worker(
     root: &Path,
     query_lower: &str,
+    show_hidden: bool,
     epoch: u64,
     current: &AtomicU64,
 ) -> (Vec<(PathBuf, bool)>, bool) {
@@ -2094,7 +2137,7 @@ fn search_worker(
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            if is_hidden(&name, &meta) {
+            if !show_hidden && is_hidden(&name, &meta) {
                 continue;
             }
             let dir_flag = is_dir(&meta);
@@ -4046,43 +4089,62 @@ mod tests {
     }
 
     #[test]
-    fn 后台读目录_排序与隐藏过滤() {
+    fn 后台读目录_排序与隐藏开关() {
         let base = std::env::temp_dir().join(format!("lumen_ft_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("zdir")).expect("建测试目录失败");
         std::fs::write(base.join("Afile.txt"), b"x").expect("写测试文件失败");
         std::fs::write(base.join(".hidden"), b"x").expect("写测试文件失败");
-        let (entries, overflow) = read_dir_worker(&base).expect("读目录应成功");
+        let (entries, overflow) = read_dir_worker(&base, false).expect("读目录应成功");
+        let (with_hidden, hidden_overflow) =
+            read_dir_worker(&base, true).expect("显示隐藏项时读目录应成功");
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(overflow, 0);
+        assert_eq!(hidden_overflow, 0);
         // 隐藏项被过滤；目录排在文件前。
         let names: Vec<String> = entries.iter().map(|(p, _)| display_name(p)).collect();
         assert_eq!(names, vec!["zdir".to_owned(), "Afile.txt".to_owned()]);
         assert!(entries[0].1, "目录应标记为 is_dir");
         assert!(!entries[1].1, "文件不应标记为 is_dir");
+        let with_hidden_names: Vec<String> =
+            with_hidden.iter().map(|(p, _)| display_name(p)).collect();
+        assert_eq!(
+            with_hidden_names,
+            vec![
+                "zdir".to_owned(),
+                ".hidden".to_owned(),
+                "Afile.txt".to_owned()
+            ],
+            "show_hidden=true 应列出点前缀隐藏项并保持原排序"
+        );
     }
 
     #[test]
     fn 后台读目录_不存在目录返回err() {
-        assert!(read_dir_worker(Path::new(r"C:\lumen_不存在的目录_单测专用")).is_err());
+        assert!(read_dir_worker(Path::new(r"C:\lumen_不存在的目录_单测专用"), false).is_err());
     }
 
     #[test]
-    fn 搜索_递归匹配与隐藏过滤() {
+    fn 搜索_递归匹配与隐藏开关() {
         let base = std::env::temp_dir().join(format!("lumen_search_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("sub").join("deep")).expect("建测试目录失败");
+        std::fs::create_dir_all(base.join(".hidden_dir")).expect("建隐藏测试目录失败");
         std::fs::write(base.join("Report.md"), b"x").expect("写测试文件失败");
         std::fs::write(base.join("sub").join("report_v2.md"), b"x").expect("写测试文件失败");
         std::fs::write(base.join("sub").join("deep").join("REPORTS.txt"), b"x")
             .expect("写测试文件失败");
         std::fs::write(base.join(".report_hidden"), b"x").expect("写测试文件失败");
+        std::fs::write(base.join(".hidden_dir").join("report_nested.md"), b"x")
+            .expect("写隐藏目录测试文件失败");
         std::fs::write(base.join("other.txt"), b"x").expect("写测试文件失败");
         let epoch = AtomicU64::new(7);
         // 不分大小写包含匹配；隐藏项与不匹配项被过滤。
-        let (items, truncated) = search_worker(&base, "report", 7, &epoch);
+        let (items, truncated) = search_worker(&base, "report", false, 7, &epoch);
+        let (with_hidden, hidden_truncated) = search_worker(&base, "report", true, 7, &epoch);
         let _ = std::fs::remove_dir_all(&base);
         assert!(!truncated);
+        assert!(!hidden_truncated);
         let mut names: Vec<String> = items.iter().map(|(p, _)| display_name(p)).collect();
         names.sort();
         assert_eq!(
@@ -4093,6 +4155,49 @@ mod tests {
                 "report_v2.md".to_owned()
             ]
         );
+        let mut with_hidden_names: Vec<String> =
+            with_hidden.iter().map(|(p, _)| display_name(p)).collect();
+        with_hidden_names.sort();
+        assert_eq!(
+            with_hidden_names,
+            vec![
+                ".report_hidden".to_owned(),
+                "REPORTS.txt".to_owned(),
+                "Report.md".to_owned(),
+                "report_nested.md".to_owned(),
+                "report_v2.md".to_owned(),
+            ],
+            "show_hidden=true 应匹配隐藏项并下钻隐藏目录"
+        );
+    }
+
+    #[test]
+    fn 本地隐藏开关_默认关闭且变化时重列() {
+        let mut st = FileTreeState::default();
+        st.sync_root(Some(Path::new(r"C:\workspace")));
+        st.listings.insert(
+            0,
+            DirListing {
+                children: Vec::new(),
+            },
+        );
+        st.pending.insert(0, 42);
+        let epoch = st.epoch;
+
+        assert!(!st.show_hidden);
+        st.set_show_hidden(false);
+        assert_eq!(st.epoch, epoch, "同值不应重列");
+
+        st.set_show_hidden(true);
+        assert!(st.show_hidden);
+        assert_eq!(st.epoch, epoch.wrapping_add(1));
+        assert_eq!(st.nodes.len(), 1, "重列后只保留根节点");
+        assert!(st.listings.is_empty());
+        assert!(st.pending.is_empty());
+
+        let changed_epoch = st.epoch;
+        st.set_show_hidden(true);
+        assert_eq!(st.epoch, changed_epoch, "重复设置同值不应再次重列");
     }
 
     #[test]
@@ -4286,7 +4391,7 @@ mod tests {
         std::fs::write(base.join("match.txt"), b"x").expect("写测试文件失败");
         // 当前代次已前进（模拟用户改了输入）：扫描应立即截断退出。
         let epoch = AtomicU64::new(8);
-        let (items, truncated) = search_worker(&base, "match", 7, &epoch);
+        let (items, truncated) = search_worker(&base, "match", false, 7, &epoch);
         let _ = std::fs::remove_dir_all(&base);
         assert!(truncated);
         assert!(items.is_empty());

@@ -310,7 +310,7 @@ pub struct Strings {
     pub filetree_unreadable: &'static str,
     /// "加载中…" 占位
     pub filetree_loading: &'static str,
-    /// part3c-2 远程树工具条「显示隐藏项」勾选框
+    /// 本地与远程树工具条共用的「显示隐藏项」勾选框
     pub remote_show_hidden: &'static str,
     /// part3c-2 远程树目录行悬停刷新图标 tooltip（P15 起本地树行内刷新同款复用）
     pub remote_refresh_dir_tip: &'static str,
