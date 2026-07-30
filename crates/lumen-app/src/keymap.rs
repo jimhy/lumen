@@ -248,9 +248,11 @@ pub fn lookup_input_with_shortcuts(
     let shortcut = |action| shortcuts.matches(action, &input.logical_key, mods);
 
     // ── 层 1：抬起事件（win32-input-mode）──────────────────────────────
-    // 抬起事件（pressed=false）仅在 win32-input-mode 下投递。
+    // 抬起事件（pressed=false）仅在 win32-input-mode 的直通模式下投递。
+    // Compose 由 Lumen 本地编辑器持有按键，若仍把 key-up 发给 CLI，
+    // Kimi（启动即开 DEC 9001）会收到没有对应 key-down 的幽灵事件。
     if !pressed {
-        if guard.win32_input {
+        if guard.win32_input && mode != InputMode::Compose {
             return Some(LookupResult::Win32KeyUp);
         }
         return None;
@@ -1581,6 +1583,26 @@ mod tests {
         assert!(
             matches!(result, Some(LookupResult::Win32KeyUp)),
             "win32-input 模式下抬起事件应返回 Win32KeyUp"
+        );
+    }
+
+    #[test]
+    fn compose_owns_win32_key_up_instead_of_leaking_it_to_cli() {
+        let guard = GuardState {
+            terminal_focused: true,
+            win32_input: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "a",
+            ModifiersState::empty(),
+            InputMode::Compose,
+            false,
+            &guard,
+        );
+        assert!(
+            result.is_none(),
+            "本地 Compose 编辑期间不能向 CLI 发送无配对的 Win32 key-up"
         );
     }
 

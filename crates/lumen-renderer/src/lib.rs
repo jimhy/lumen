@@ -762,6 +762,13 @@ impl Renderer {
                     let footer_top = target_h as f32 - footer_px;
                     let footer_w = target_w as f32;
                     let fp = self.padding * 0.4; // footer 内边距（与 footer_px 计算一致）
+                    let attachment_h = composer_view::fitted_attachment_strip_height_px(
+                        cv,
+                        self.cell_h,
+                        fp,
+                        footer_px,
+                    );
+                    let text_top = footer_top + attachment_h;
 
                     // 卡片背景：主题背景色略深（alpha 混合到离屏纹理上）。
                     // 取主题背景 RGB，提高亮度或改变色调。
@@ -786,7 +793,7 @@ impl Renderer {
                         // M4.1 批F：选区高亮矩形（先于光标入队，z 序在文字底下，与终端选区同惯例）。
                         if let Some(sel) = &cv.selection {
                             let sel_rects = composer_view::selection_rects(
-                                sel, &cv.lines, footer_top, fp, footer_w, cw, ch,
+                                sel, &cv.lines, text_top, fp, footer_w, cw, ch,
                             );
                             for (sx, sy, sw, sh) in sel_rects {
                                 instances.push(rect::RectInstance {
@@ -806,7 +813,7 @@ impl Renderer {
                         // 取代原 chars().count()——后者对 CJK 每字符计 1 列而非 2 列，会低估列数。
                         let col = composer_view::footer_byte_to_col(line_text, cur_byte) as f32;
                         let cursor_x = fp + col * cw;
-                        let cursor_y = footer_top + fp + cur_line as f32 * ch;
+                        let cursor_y = text_top + fp + cur_line as f32 * ch;
                         if cursor_x < footer_w && cursor_y + ch <= target_h as f32 {
                             instances.push(rect::RectInstance {
                                 pos: [cursor_x, cursor_y],
@@ -853,8 +860,8 @@ impl Renderer {
                             let badge_w = cw * 6.0_f32.min(footer_w / 4.0);
                             let badge_h = ch * 0.8;
                             let badge_x = (footer_w - badge_w - fp).max(fp);
-                            let badge_y = footer_top + (footer_px - badge_h) / 2.0;
-                            if badge_x > fp && badge_y > footer_top {
+                            let badge_y = text_top + ((footer_px - attachment_h) - badge_h) / 2.0;
+                            if badge_x > fp && badge_y > text_top {
                                 instances.push(rect::RectInstance {
                                     pos: [badge_x, badge_y],
                                     size: [badge_w, badge_h],
@@ -1031,6 +1038,13 @@ impl Renderer {
                     if cv.is_visible() {
                         let footer_top = target_h as f32 - footer_px;
                         let fp = self.padding * 0.4;
+                        let attachment_h = composer_view::fitted_attachment_strip_height_px(
+                            cv,
+                            self.cell_h,
+                            fp,
+                            footer_px,
+                        );
+                        let text_top = footer_top + attachment_h;
 
                         // 编辑器正文行（Compose 态/Running 态文案）。
                         for (li, line_text) in cv.lines.iter().enumerate() {
@@ -1129,7 +1143,7 @@ impl Renderer {
                                     None,
                                 );
                             }
-                            let text_y = footer_top + fp + li as f32 * ch;
+                            let text_y = text_top + fp + li as f32 * ch;
                             let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
                             bufs.push((li, buf, text_y, bottom_clamp, fp));
                         }
@@ -1166,7 +1180,7 @@ impl Renderer {
                                             None,
                                         );
                                         // 占位文字与光标同行（行 0，光标在行首）
-                                        let text_y = footer_top + fp;
+                                        let text_y = text_top + fp;
                                         let bottom_clamp =
                                             ((text_y + ch) as i32).min(target_h as i32);
                                         // line_idx = usize::MAX - 1 区分 placeholder 行
@@ -1198,7 +1212,7 @@ impl Renderer {
                                             line_text.len(),
                                         ) as f32;
                                         let ghost_x = fp + col * cw;
-                                        let ghost_y = footer_top + fp + cur_line as f32 * ch;
+                                        let ghost_y = text_top + fp + cur_line as f32 * ch;
                                         log::debug!(
                                             "[ghost] 绘制 ghost={:?} ghost_x={ghost_x:.1} ghost_y={ghost_y:.1} col={col} cw={cw} fp={fp}",
                                             ghost
@@ -1258,7 +1272,7 @@ impl Renderer {
                                 // 角标文字靠右对齐：近似用 badge_w 对齐
                                 let badge_w = cw * 6.0_f32.min(target_w as f32 / 4.0);
                                 let badge_x = (target_w as f32 - badge_w - fp - fp).max(fp + fp);
-                                let text_y = footer_top + (footer_px - ch) / 2.0;
+                                let text_y = text_top + ((footer_px - attachment_h) - ch) / 2.0;
                                 let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
                                 // 用一个特殊 line_idx=usize::MAX 区分角标行
                                 bufs.push((usize::MAX, buf, text_y, bottom_clamp, badge_x));

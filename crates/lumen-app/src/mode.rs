@@ -88,6 +88,25 @@ pub fn effective_mode(term: &Terminal, force_fallback: bool) -> InputMode {
     input_mode(term)
 }
 
+/// LLM CLI 感知的有效输入模式。
+///
+/// LLM CLI 支持在回答期间继续输入，因此只要检测到受支持 CLI，输入框就
+/// 保持 Compose；不读取进度、动画或 alt-screen 来判断“是否空闲”。
+/// 手动逃生舱仍拥有最高优先级。
+pub fn effective_mode_for_cli(
+    term: &Terminal,
+    force_fallback: bool,
+    llm_cli_active: bool,
+) -> InputMode {
+    if force_fallback {
+        InputMode::Fallback
+    } else if llm_cli_active {
+        InputMode::Compose
+    } else {
+        input_mode(term)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +263,26 @@ mod tests {
             effective_mode(&term, true),
             InputMode::Fallback,
             "force_fallback=true 应覆盖 AltScreen 为 Fallback"
+        );
+    }
+
+    #[test]
+    fn llm_cli_stays_compose_while_terminal_reports_running() {
+        let mut term = make_term(24, 80);
+        feed(&mut term, b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert_eq!(
+            effective_mode_for_cli(&term, false, true),
+            InputMode::Compose
+        );
+    }
+
+    #[test]
+    fn llm_cli_stays_compose_in_alt_screen() {
+        let mut term = make_term(24, 80);
+        feed(&mut term, b"\x1b]133;A\x07\x1b]133;B\x07\x1b[?1049h");
+        assert_eq!(
+            effective_mode_for_cli(&term, false, true),
+            InputMode::Compose
         );
     }
 }

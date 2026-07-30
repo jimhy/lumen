@@ -30,6 +30,14 @@ pub struct CompletionUiState {
     pub open: bool,
     /// 当前高亮行下标（0 = 第一行）。
     pub selected: usize,
+    /// 被动候选不抢终端键盘焦点；用于展示从 LLM CLI 原生菜单读取的命令。
+    pub passive: bool,
+    /// 上一帧弹层矩形。winit 的滚轮分流据此把弹层滚动留给 egui，
+    /// 避免同一个滚轮事件继续穿透到底下的终端。
+    pub popup_rect: Option<egui::Rect>,
+    /// 上次已自动滚动到可见范围的选中项。仅选中项变化时跟随，
+    /// 不能每帧强制回滚，否则用户鼠标滚轮永远离不开当前项。
+    pub last_scrolled_selected: Option<usize>,
 }
 
 /// 一帧补全弹窗 UI 的产出。
@@ -51,8 +59,17 @@ const HPAD: f32 = 10.0;
 const VPAD: f32 = 4.0;
 /// 弹窗圆角半径。
 const RADIUS: f32 = 6.0;
-/// 弹窗固定宽度（逻辑像素）。
-const POPUP_WIDTH: f32 = 320.0;
+/// 弹窗宽度上下限（逻辑像素）。长说明优先扩宽，仍超出时严格裁剪。
+const POPUP_MIN_WIDTH: f32 = 320.0;
+const POPUP_MAX_WIDTH: f32 = 720.0;
+/// 弹层与窗口边缘的最小间距。
+const SCREEN_MARGIN: f32 = 8.0;
+
+fn estimated_text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 7.8 } else { 13.0 })
+        .sum()
+}
 
 /// 绘制文件路径补全弹窗。调用方保证 `state.open == true` 时才调用。
 ///
@@ -84,6 +101,9 @@ pub fn show(
     // 返回本帧 selected 是否由键盘移动（驱动 scroll_to_rect，使到底部的
     // 选中项跟随滚动可见——海风哥反馈：到底部内容看不见）。
     let kbd_moved = ctx.input(|i| {
+        if state.passive {
+            return false;
+        }
         let n = candidates.len();
         if n == 0 {
             return false;
@@ -122,35 +142,61 @@ pub fn show(
 
     // 已决定关闭则提前返回（不画弹窗）。
     if out.closed {
+        state.popup_rect = None;
+        state.last_scrolled_selected = None;
         return out;
     }
+    let selection_changed = state.last_scrolled_selected != Some(state.selected);
 
     // ── 计算弹窗尺寸 ──────────────────────────────────────────────────
     let visible_rows = candidates.len().min(MAX_VISIBLE_ROWS);
     let list_h = visible_rows as f32 * ROW_HEIGHT;
     let popup_h = list_h + VPAD * 2.0;
+    let screen_rect = ctx.content_rect();
+    let desired_width = candidates
+        .iter()
+        .map(|row| estimated_text_width(&row.display))
+        .fold(POPUP_MIN_WIDTH, f32::max)
+        + HPAD * 2.0;
+    let screen_width = (screen_rect.width() - SCREEN_MARGIN * 2.0).max(1.0);
+    let popup_width = desired_width
+        .clamp(POPUP_MIN_WIDTH, POPUP_MAX_WIDTH)
+        .min(screen_width);
 
     // 弹窗**向上**展开：anchor 是 footer 上方位置，弹窗顶部 = anchor.y - popup_h。
-    let popup_min = egui::pos2(view.anchor.x, view.anchor.y - popup_h);
-    let popup_rect = egui::Rect::from_min_size(popup_min, egui::vec2(POPUP_WIDTH, popup_h));
+    // 靠近右边缘时整体左移，确保背景和内容都留在窗口内。
+    let popup_x = view
+        .anchor
+        .x
+        .min(screen_rect.right() - SCREEN_MARGIN - popup_width)
+        .max(screen_rect.left() + SCREEN_MARGIN);
+    let popup_y = (view.anchor.y - popup_h).max(screen_rect.top() + SCREEN_MARGIN);
+    let popup_min = egui::pos2(popup_x, popup_y);
+    let popup_rect =
+        egui::Rect::from_min_size(popup_min, egui::vec2(popup_width, popup_h));
 
     // ── Area 浮层（Foreground 层，盖在终端纹理之上）──────────────────
-    egui::Area::new(egui::Id::new("lumen_completion_popup"))
+    let area = egui::Area::new(egui::Id::new("lumen_completion_popup"))
         .fixed_pos(popup_rect.min)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
+            // Area 默认按内容收缩。显式登记完整尺寸后，背景、鼠标命中和
+            // ScrollArea 的滚轮区域才会覆盖整个弹层。
+            ui.set_min_size(popup_rect.size());
+
             // 背景底色 + 描边 + 圆角。
-            let painter = ui.painter();
-            painter.rect_filled(popup_rect, RADIUS, pal.bg_dark);
+            let local_rect = egui::Rect::from_min_size(ui.min_rect().min, popup_rect.size());
+            let painter = ui.painter().with_clip_rect(local_rect);
+            painter.rect_filled(local_rect, RADIUS, pal.bg_dark);
             painter.rect_stroke(
-                popup_rect,
+                local_rect,
                 RADIUS,
                 egui::Stroke::new(1.0_f32, pal.panel_outline),
                 egui::StrokeKind::Inside,
             );
 
             // 内容区。
-            let inner = popup_rect.shrink2(egui::vec2(HPAD, VPAD));
+            let inner = local_rect.shrink2(egui::vec2(HPAD, VPAD));
             let list_rect = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), list_h));
 
             if candidates.is_empty() {
@@ -178,7 +224,7 @@ pub fn show(
                         let is_hovered = resp.hovered();
 
                         // 键盘移动选中项时滚动使其可见（含到底部时跟随滚动）。
-                        if is_selected && kbd_moved {
+                        if is_selected && (kbd_moved || selection_changed) {
                             ui.scroll_to_rect(row_rect, None);
                         }
 
@@ -199,7 +245,8 @@ pub fn show(
 
                         // 文本绘制：目录用 accent 色、文件用 fg。
                         let text_color = if row.is_dir { pal.accent } else { pal.fg };
-                        let p = ui.painter();
+                        // 描述过长时只能在本行/弹层内显示，绝不能穿出背景。
+                        let p = ui.painter().with_clip_rect(row_rect);
                         let galley = p.layout_no_wrap(
                             row.display.clone(),
                             egui::FontId::monospace(13.0),
@@ -215,6 +262,8 @@ pub fn show(
                     }
                 });
         });
+    state.popup_rect = Some(area.response.rect);
+    state.last_scrolled_selected = Some(state.selected);
 
     out
 }
