@@ -677,11 +677,11 @@ pub fn lookup_input_with_shortcuts(
     // ── 层 11：Ctrl+V 粘贴（非 Compose 态）────────────────────────────
     if shortcut(ShortcutAction::Paste) {
         // Codex 与旧版 kimi-cli 通过收到 Ctrl+V 后自行读取系统图片剪贴板。
-        // 此处不能直接用 Lumen 的文本粘贴，否则图片会被静默丢掉。已识别的
-        // LLM CLI 与跨平台 AltScreen TUI 都先探测图片：有图片则把原始键事件
-        // 写 PTY，无图片仍走普通文本粘贴，兼顾两种剪贴板。
-        if matches!(mode, InputMode::LlmCli | InputMode::AltScreen) {
-            return Some(LookupResult::ImageAwarePaste);
+        // 此处不能直接用 Lumen 的文本粘贴，否则图片会被静默丢掉。主循环收到
+        // 专用结果后先探测图片：有图片则把原始键事件写 PTY，无图片仍走普通
+        // 文本粘贴，兼顾两种剪贴板。
+        if mode == InputMode::LlmCli {
+            return Some(LookupResult::LlmClipboardPaste);
         }
         return Some(LookupResult::TerminalAction(Action::Term(
             TermAction::PasteClipboard,
@@ -710,8 +710,8 @@ pub enum LookupResult {
     Consumed,
     /// 兜底直通：调用方用 encode_key / encode_key_win32 编码后写 PTY。
     PassThrough,
-    /// 交互程序粘贴键：图片剪贴板把原始键直通，纯文本走 Lumen 正常粘贴。
-    ImageAwarePaste,
+    /// LLM CLI 粘贴键：图片剪贴板把原始键直通，纯文本走 Lumen 正常粘贴。
+    LlmClipboardPaste,
     /// Compose 态 Tab 键（M3.4 补全占位）——main.rs 显示状态条提示。
     ComposeTab,
     /// Compose 态 Ctrl+R（D2 历史搜索占位）——main.rs 显示状态条提示。
@@ -1293,28 +1293,8 @@ mod tests {
             &default_guard(),
         );
         assert!(
-            matches!(result, Some(LookupResult::ImageAwarePaste)),
+            matches!(result, Some(LookupResult::LlmClipboardPaste)),
             "LLM CLI 的 Ctrl+V 应交由主循环区分图片和文本"
-        );
-    }
-
-    #[test]
-    fn altscreen_ctrl_v_也先探测图片剪贴板() {
-        let guard = GuardState {
-            terminal_focused: true,
-            is_alt_screen: true,
-            ..Default::default()
-        };
-        let result = lookup_char(
-            "v",
-            ModifiersState::CONTROL,
-            InputMode::AltScreen,
-            true,
-            &guard,
-        );
-        assert!(
-            matches!(result, Some(LookupResult::ImageAwarePaste)),
-            "无 shell integration 的全屏 LLM TUI 也应支持原生图片粘贴"
         );
     }
 
