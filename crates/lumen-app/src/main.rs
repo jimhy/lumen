@@ -54,6 +54,7 @@ mod profile;
 mod session;
 mod sessions_store;
 mod settings;
+mod shortcuts;
 // P1 SSH：领域库存先独立落地，UI/连接/同步分批接线。
 #[allow(dead_code)]
 mod ssh;
@@ -10317,6 +10318,10 @@ impl ApplicationHandler<PtyWake> for App {
                         || state.shell_state.pane_renaming.is_some()
                         || state.shell_state.ssh_session_renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
+                    shortcut_capture: state
+                        .shell_state
+                        .settings
+                        .is_capturing_shortcut(),
                     terminal_focused: state.terminal_focused,
                     // part4c：镜像态按**被控端**焦点窗格 win32 模式裁决（控制端转发
                     // win32 编码 + key-up）；本地态按本地窗格 + env 门控。
@@ -10407,7 +10412,14 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     mode
                 };
-                let result = keymap::lookup(&event, state.modifiers, lookup_mode, pressed, &guard);
+                let result = keymap::lookup_with_shortcuts(
+                    &event,
+                    state.modifiers,
+                    lookup_mode,
+                    pressed,
+                    &guard,
+                    &state.settings.keyboard,
+                );
 
                 // 任意按键命中 → 清退出码角标（设计稿 §3.2 第⑥步，M4.1 批D2）。
                 // 仅 Compose 态有 exit_badge；result=None（keymap 拦截）时也清，
@@ -13841,6 +13853,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_update_changed
                     || shell_out.settings_proxy_changed
                     || shell_out.settings_server_url_changed
+                    || shell_out.settings_shortcuts_changed
                     || sidebar_changed
                     || remote_list_changed
                     || ssh_server_list_changed

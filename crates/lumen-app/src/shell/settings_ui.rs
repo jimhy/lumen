@@ -12,6 +12,7 @@ use crate::app_lock::{self, AppLockFile, LockShortcut, PasswordPolicyError, Pref
 use crate::i18n::{self, Language};
 use crate::profile::Profile;
 use crate::settings::{self, Settings};
+use crate::shortcuts::{ShortcutAction, ShortcutBinding};
 
 use super::theme::Palette;
 use std::time::Duration;
@@ -43,21 +44,6 @@ const FONT_PRESETS: &[&str] = &[
     "JetBrains Mono",
     "Fira Code",
     "Source Code Pro",
-];
-
-/// 快捷键表（键位列固定不翻；说明列通过 i18n 表取值）。
-/// 元组：(键位字符串, Strings 字段取值闭包)。
-const SHORTCUT_KEYS: &[&str] = &[
-    "Ctrl+T",
-    "Ctrl+W",
-    "Ctrl+Tab / Ctrl+Shift+Tab",
-    "Ctrl+B",
-    "Ctrl+,",
-    "Ctrl+↑ / Ctrl+↓",
-    "Ctrl+C",
-    "Ctrl+V / Shift+Insert",
-    "Shift+PgUp / PgDn",
-    "Esc",
 ];
 
 /// 设置页分类。
@@ -112,6 +98,12 @@ enum SecurityFeedback {
     OperationFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutFeedback {
+    Conflict(ShortcutAction),
+    Invalid,
+}
+
 /// 设置页的跨帧 UI 状态。
 #[derive(Default)]
 pub struct SettingsUiState {
@@ -134,6 +126,9 @@ pub struct SettingsUiState {
     bg_opacity_drag: Option<f32>,
     /// 背景图暗化滑块拖动中的预览值（松手才写盘）。
     bg_dim_drag: Option<f32>,
+    /// 正在等待用户按下新组合键的动作。
+    shortcut_capture: Option<ShortcutAction>,
+    shortcut_feedback: Option<ShortcutFeedback>,
     /// 应用锁设置表单。密码只存在于这些短生命周期缓冲中；切换分类、
     /// 取消、关闭设置页和销毁状态时都会主动清零。
     security_form: Option<SecurityForm>,
@@ -154,6 +149,8 @@ impl SettingsUiState {
         self.font_size_drag = None;
         self.bg_opacity_drag = None;
         self.bg_dim_drag = None;
+        self.shortcut_capture = None;
+        self.shortcut_feedback = None;
         self.clear_security_form();
     }
 
@@ -182,7 +179,14 @@ impl SettingsUiState {
 
     /// 进入本机锁屏前清除设置页中的全部应用锁密码缓冲。
     pub fn clear_sensitive_for_app_lock(&mut self) {
+        self.shortcut_capture = None;
+        self.shortcut_feedback = None;
         self.clear_security_form();
+    }
+
+    /// main 的键盘路由据此让外壳快捷键暂时让位给录入控件。
+    pub fn is_capturing_shortcut(&self) -> bool {
+        self.shortcut_capture.is_some()
     }
 
     fn open_security_form(&mut self, form: SecurityForm) {
@@ -256,6 +260,8 @@ pub struct SettingsOutput {
     pub proxy_changed: bool,
     /// Network 页改了服务端地址（M5.2）：main 落盘 + 应用到 cloud 全局。
     pub server_url_changed: bool,
+    /// Keyboard shortcuts 页修改或恢复了快捷键。
+    pub shortcuts_changed: bool,
     /// Security 页的一次性命令；每帧最多产生一个。
     pub security_action: Option<SecurityAction>,
 }
@@ -287,6 +293,30 @@ pub fn show(
     } = app_lock;
     let mut out = SettingsOutput::default();
     let screen = ctx.content_rect();
+    let capturing_shortcut = st.shortcut_capture.is_some();
+
+    // 录入态 Esc 只取消录入，不关闭设置页。非录入态则按用户配置的
+    // “关闭设置页”组合键关闭；若用户改掉了 Esc，先消费裸 Esc，避免
+    // egui::Modal 的内建关闭行为绕过自定义绑定。
+    if capturing_shortcut
+        && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        st.shortcut_capture = None;
+        st.shortcut_feedback = None;
+    }
+    let close_settings = !capturing_shortcut
+        && settings
+            .keyboard
+            .get(ShortcutAction::CloseSettings)
+            .to_egui()
+            .is_some_and(|shortcut| ctx.input_mut(|input| input.consume_shortcut(&shortcut)));
+    let default_escape = ShortcutAction::CloseSettings.default_binding();
+    if !capturing_shortcut && settings.keyboard.get(ShortcutAction::CloseSettings) != default_escape
+    {
+        ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        });
+    }
 
     let modal = egui::Modal::new(egui::Id::new("lumen_settings_modal"))
         // 内容铺满整窗，backdrop 不可见但仍负责阻断下层输入。
@@ -370,7 +400,7 @@ pub fn show(
                 .show(&mut content_ui, |ui| match st.category {
                     Category::Account => account(ui, profile, pal, &mut out),
                     Category::Appearance => appearance(ui, st, settings, pal, &mut out, os_dark),
-                    Category::Shortcuts => shortcuts(ui, pal, lock),
+                    Category::Shortcuts => shortcuts(ui, st, settings, pal, lock, &mut out),
                     Category::Security => {
                         security(ui, st, lock, lock_busy, lock_retry_remaining, pal, &mut out)
                     }
@@ -379,7 +409,7 @@ pub fn show(
                 });
         });
     // Esc（顶层 modal 且无弹层打开时）或 backdrop 点击 → 关闭。
-    if modal.should_close() {
+    if close_settings || (modal.should_close() && !capturing_shortcut) {
         out.closed = true;
     }
     if out.closed {
@@ -408,6 +438,10 @@ fn nav(ui: &mut egui::Ui, st: &mut SettingsUiState, pal: &Palette) {
         if ui.add(btn).clicked() {
             if st.category == Category::Security && cat != Category::Security {
                 st.clear_security_form();
+            }
+            if st.category == Category::Shortcuts && cat != Category::Shortcuts {
+                st.shortcut_capture = None;
+                st.shortcut_feedback = None;
             }
             st.category = cat;
         }
@@ -1357,38 +1391,157 @@ fn submit_security_form(st: &mut SettingsUiState, form: SecurityForm, out: &mut 
     }
 }
 
-/// Keyboard shortcuts：只读列表（表驱动；键位列固定，说明列走 i18n 表）。
-fn shortcuts(ui: &mut egui::Ui, pal: &Palette, lock: &AppLockFile) {
+fn shortcut_label(action: ShortcutAction) -> &'static str {
+    let s = i18n::strings();
+    match action {
+        ShortcutAction::NewTab => s.shortcut_new_session,
+        ShortcutAction::CloseTab => s.shortcut_close_session,
+        ShortcutAction::NextTab => s.shortcut_next_session,
+        ShortcutAction::PreviousTab => s.shortcut_previous_session,
+        ShortcutAction::NewPane => s.shortcut_new_pane,
+        ShortcutAction::ClosePane => s.shortcut_close_pane,
+        ShortcutAction::ToggleMaximizePane => s.shortcut_toggle_maximize_pane,
+        ShortcutAction::ToggleFiletree => s.shortcut_filetree_toggle,
+        ShortcutAction::ToggleSettings => s.shortcut_settings_toggle,
+        ShortcutAction::ToggleClassicMode => s.shortcut_toggle_classic_mode,
+        ShortcutAction::PreviousBlock => s.shortcut_previous_block,
+        ShortcutAction::NextBlock => s.shortcut_next_block,
+        ShortcutAction::SearchHistory => s.shortcut_history_search,
+        ShortcutAction::CopyOrInterrupt => s.shortcut_copy_or_interrupt,
+        ShortcutAction::Paste => s.shortcut_paste,
+        ShortcutAction::AlternatePaste => s.shortcut_alternate_paste,
+        ShortcutAction::ScrollUp => s.shortcut_scroll_up,
+        ShortcutAction::ScrollDown => s.shortcut_scroll_down,
+        ShortcutAction::CloseSettings => s.shortcut_close_settings,
+    }
+}
+
+/// Keyboard shortcuts：点击键位进入录入态，按键后即时校验、应用与持久化。
+fn shortcuts(
+    ui: &mut egui::Ui,
+    st: &mut SettingsUiState,
+    settings: &mut Settings,
+    pal: &Palette,
+    lock: &AppLockFile,
+    out: &mut SettingsOutput,
+) {
     let s = i18n::strings();
     heading(ui, pal, s.shortcuts_heading);
-    // 说明列与键位列保持同序（与 SHORTCUT_KEYS 同索引）。
-    let descs: [&str; 10] = [
-        s.shortcut_new_session,
-        s.shortcut_close_session,
-        s.shortcut_next_prev_session,
-        s.shortcut_filetree_toggle,
-        s.shortcut_settings_toggle,
-        s.shortcut_jump_block,
-        s.shortcut_copy_or_interrupt,
-        s.shortcut_paste,
-        s.shortcut_scroll,
-        s.shortcut_close_settings,
-    ];
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(s.shortcuts_hint)
+                .size(11.0)
+                .color(pal.fg_dim),
+        );
+        ui.add_space(12.0);
+        if ui.button(s.shortcuts_reset_all).clicked() {
+            settings.keyboard.reset_all();
+            st.shortcut_capture = None;
+            st.shortcut_feedback = None;
+            out.shortcuts_changed = true;
+        }
+    });
+    ui.add_space(12.0);
+
+    // 捕获本帧最新的非重复按键。裸可打印字符由 ShortcutBinding 拒绝，
+    // 避免把普通字母配置成全局快捷键后导致终端无法输入。
+    if let Some(action) = st.shortcut_capture {
+        let pressed = ui.ctx().input(|input| {
+            input.events.iter().rev().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
+                _ => None,
+            })
+        });
+        if let Some((key, modifiers)) = pressed {
+            match ShortcutBinding::from_egui(key, modifiers) {
+                Some(binding) => {
+                    if let Some(other) = settings.keyboard.conflict(action, binding) {
+                        st.shortcut_feedback = Some(ShortcutFeedback::Conflict(other));
+                    } else {
+                        settings.keyboard.set(action, binding);
+                        st.shortcut_capture = None;
+                        st.shortcut_feedback = None;
+                        out.shortcuts_changed = true;
+                    }
+                }
+                None => st.shortcut_feedback = Some(ShortcutFeedback::Invalid),
+            }
+        }
+    }
+
+    if let Some(feedback) = st.shortcut_feedback {
+        let message = match feedback {
+            ShortcutFeedback::Conflict(other) => {
+                i18n::fmt1(s.shortcuts_conflict_fmt, shortcut_label(other))
+            }
+            ShortcutFeedback::Invalid => s.shortcuts_invalid.to_owned(),
+        };
+        ui.label(egui::RichText::new(message).size(11.0).color(pal.error));
+        ui.add_space(8.0);
+    }
+
     egui::Grid::new("lumen_shortcut_grid")
-        .num_columns(2)
-        .spacing([32.0, 8.0])
+        .num_columns(3)
+        .spacing([24.0, 8.0])
+        .striped(true)
         .show(ui, |ui| {
-            for (keys, desc) in SHORTCUT_KEYS.iter().zip(descs.iter()) {
-                ui.label(egui::RichText::new(*keys).monospace().color(pal.fg));
-                ui.label(egui::RichText::new(*desc).color(pal.fg_dim));
+            for action in ShortcutAction::ALL {
+                ui.label(egui::RichText::new(shortcut_label(action)).color(pal.fg));
+
+                let capturing = st.shortcut_capture == Some(action);
+                let text = if capturing {
+                    s.shortcuts_capture.to_owned()
+                } else {
+                    settings.keyboard.get(action).to_string()
+                };
+                let binding_button =
+                    egui::Button::new(egui::RichText::new(text).monospace().color(if capturing {
+                        pal.accent_fg
+                    } else {
+                        pal.fg
+                    }))
+                    .fill(if capturing { pal.accent } else { pal.btn_bg })
+                    .min_size(egui::vec2(174.0, 28.0));
+                if ui.add(binding_button).clicked() {
+                    st.shortcut_capture = Some(action);
+                    st.shortcut_feedback = None;
+                }
+
+                let is_default = settings.keyboard.get(action) == action.default_binding();
+                if ui
+                    .add_enabled(!is_default, egui::Button::new(s.shortcuts_reset))
+                    .clicked()
+                {
+                    settings.keyboard.reset(action);
+                    if st.shortcut_capture == Some(action) {
+                        st.shortcut_capture = None;
+                    }
+                    st.shortcut_feedback = None;
+                    out.shortcuts_changed = true;
+                }
                 ui.end_row();
             }
+
+            ui.add_space(4.0);
+            ui.end_row();
+            ui.label(egui::RichText::new(s.security_shortcut).color(pal.fg_dim));
             ui.label(
                 egui::RichText::new(lock.shortcut().label())
                     .monospace()
                     .color(pal.fg),
             );
-            ui.label(egui::RichText::new(s.security_shortcut).color(pal.fg_dim));
+            ui.label(
+                egui::RichText::new(s.shortcuts_lock_managed)
+                    .size(10.0)
+                    .color(pal.fg_dim),
+            );
             ui.end_row();
         });
 }
