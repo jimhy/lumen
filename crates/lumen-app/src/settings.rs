@@ -324,6 +324,10 @@ pub struct Settings {
     pub version: u32,
     pub appearance: AppearanceSettings,
     pub layout: LayoutSettings,
+    /// 用户可配置的应用快捷键。旧文件缺少本节时补全默认绑定；后续
+    /// 新增动作也由 [`crate::shortcuts::KeyboardShortcuts`] 自动补齐。
+    #[serde(default)]
+    pub keyboard: crate::shortcuts::KeyboardShortcuts,
     /// 界面语言（F6）：`#[serde(default)]` 旧文件无此字段时补默认值
     /// [`crate::i18n::Language::ZhCn`]（简体中文）。
     pub language: crate::i18n::Language,
@@ -355,6 +359,7 @@ impl Default for Settings {
             version: SETTINGS_VERSION,
             appearance: AppearanceSettings::default(),
             layout: LayoutSettings::default(),
+            keyboard: crate::shortcuts::KeyboardShortcuts::default(),
             language: crate::i18n::Language::default(),
             classic_mode: false,
             server_url: String::new(),
@@ -584,6 +589,15 @@ impl Settings {
                 log::warn!("设置节 layout 不是对象，整节降级默认值: {}", path.display());
             }
         }
+        // keyboard：旧文件缺整节时补默认快捷键；合法 JSON 中某个绑定
+        // 无法解析时仅整节降级，不影响主题、布局等其他设置。
+        s.keyboard = lenient_field(
+            root,
+            "keyboard",
+            "keyboard",
+            crate::shortcuts::KeyboardShortcuts::default(),
+            path,
+        );
         // language：旧文件缺字段时静默补默认值（ZhCn）；值非法记 warn
         // 后降级——与其余字段同款字段级容错。
         s.language = lenient_field(
@@ -701,6 +715,11 @@ impl Settings {
                 log::warn!("设置字段 {field} 主题 id「{id}」未注册，降级「{fallback}」");
                 *id = fallback.to_owned();
             }
+        }
+        self.keyboard.fill_missing_defaults();
+        if self.keyboard.has_conflicts() {
+            log::warn!("keyboard 中存在重复快捷键，整节降级默认值");
+            self.keyboard.reset_all();
         }
         valid_theme_or(
             &mut self.appearance.theme,
@@ -862,6 +881,7 @@ mod tests {
                 ssh_monitor_collapsed: false,
                 ssh_monitor_cards_collapsed: Vec::new(),
             },
+            keyboard: crate::shortcuts::KeyboardShortcuts::default(),
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,
             server_url: String::new(),
@@ -957,6 +977,67 @@ mod tests {
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert!(loaded.classic_mode, "classic_mode=true 写盘后加载应为 true");
+    }
+
+    #[test]
+    fn keyboard_旧文件缺节补默认且包含历史搜索() {
+        let p = temp_path("keyboard_missing");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 16.0 } }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            loaded
+                .keyboard
+                .get(crate::shortcuts::ShortcutAction::SearchHistory)
+                .to_string(),
+            "Ctrl+R"
+        );
+    }
+
+    #[test]
+    fn keyboard_自定义绑定写盘往返() {
+        let p = temp_path("keyboard_roundtrip");
+        let mut s = Settings::default();
+        s.keyboard.set(
+            crate::shortcuts::ShortcutAction::SearchHistory,
+            "Ctrl+Shift+H".parse().unwrap(),
+        );
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            loaded
+                .keyboard
+                .get(crate::shortcuts::ShortcutAction::SearchHistory)
+                .to_string(),
+            "Ctrl+Shift+H"
+        );
+    }
+
+    #[test]
+    fn keyboard_部分配置为其余动作补默认值() {
+        let p = temp_path("keyboard_partial");
+        std::fs::write(
+            &p,
+            r#"{ "keyboard": { "search_history": "Ctrl+Shift+H" } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            loaded
+                .keyboard
+                .get(crate::shortcuts::ShortcutAction::SearchHistory)
+                .to_string(),
+            "Ctrl+Shift+H"
+        );
+        assert_eq!(
+            loaded
+                .keyboard
+                .get(crate::shortcuts::ShortcutAction::NewTab)
+                .to_string(),
+            "Ctrl+T"
+        );
     }
 
     #[test]

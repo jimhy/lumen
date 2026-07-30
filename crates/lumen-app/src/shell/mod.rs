@@ -794,6 +794,8 @@ pub struct ShellOutput {
     pub settings_proxy_changed: bool,
     /// 设置页 Network 改了服务端地址（M5.2）：main 落盘 + 应用 cloud 全局。
     pub settings_server_url_changed: bool,
+    /// 设置页修改或恢复了用户快捷键。
+    pub settings_shortcuts_changed: bool,
     /// 设置页 Security 的一次性应用锁命令；由 main 在帧后执行密码线程或写盘。
     pub settings_security_action: Option<settings_ui::SecurityAction>,
     /// 头像菜单「更新到 vX」：有就绪更新时显示更新弹窗（main 清 dismissed）。
@@ -937,6 +939,7 @@ pub fn show(
         settings_update_changed: false,
         settings_proxy_changed: false,
         settings_server_url_changed: false,
+        settings_shortcuts_changed: false,
         settings_security_action: None,
         open_update: false,
         open_whats_new: false,
@@ -2548,6 +2551,7 @@ pub fn show(
         out.settings_update_changed = s_out.update_changed;
         out.settings_proxy_changed = s_out.proxy_changed;
         out.settings_server_url_changed = s_out.server_url_changed;
+        out.settings_shortcuts_changed = s_out.shortcuts_changed;
         out.settings_security_action = s_out.security_action;
         if s_out.log_out {
             out.logged_out = true;

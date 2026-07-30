@@ -150,16 +150,32 @@ pub struct Strings {
     // Keyboard shortcuts 页
     /// Keyboard shortcuts heading
     pub shortcuts_heading: &'static str,
-    // 快捷键说明列（键位列不翻）
+    pub shortcuts_hint: &'static str,
+    pub shortcuts_capture: &'static str,
+    pub shortcuts_reset: &'static str,
+    pub shortcuts_reset_all: &'static str,
+    pub shortcuts_conflict_fmt: &'static str,
+    pub shortcuts_invalid: &'static str,
+    pub shortcuts_lock_managed: &'static str,
+    // 快捷键动作名称
     pub shortcut_new_session: &'static str,
     pub shortcut_close_session: &'static str,
-    pub shortcut_next_prev_session: &'static str,
+    pub shortcut_next_session: &'static str,
+    pub shortcut_previous_session: &'static str,
+    pub shortcut_new_pane: &'static str,
+    pub shortcut_close_pane: &'static str,
+    pub shortcut_toggle_maximize_pane: &'static str,
     pub shortcut_filetree_toggle: &'static str,
     pub shortcut_settings_toggle: &'static str,
-    pub shortcut_jump_block: &'static str,
+    pub shortcut_toggle_classic_mode: &'static str,
+    pub shortcut_previous_block: &'static str,
+    pub shortcut_next_block: &'static str,
+    pub shortcut_history_search: &'static str,
     pub shortcut_copy_or_interrupt: &'static str,
     pub shortcut_paste: &'static str,
-    pub shortcut_scroll: &'static str,
+    pub shortcut_alternate_paste: &'static str,
+    pub shortcut_scroll_up: &'static str,
+    pub shortcut_scroll_down: &'static str,
     pub shortcut_close_settings: &'static str,
     // Security 页
     /// Security heading

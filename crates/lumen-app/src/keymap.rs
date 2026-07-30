@@ -30,6 +30,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey as WinitNamedKey};
 
 use crate::action::{Action, ComposerAction, EditAction, Motion, ScrollDir, TermAction};
 use crate::mode::InputMode;
+use crate::shortcuts::{KeyboardShortcuts, ShortcutAction};
 
 // ─────────────────────────────────────────────────────────────────
 // 内部键匹配辅助类型（测试友好，不依赖 KeyEvent 结构体字段）
@@ -102,6 +103,8 @@ pub struct GuardState {
     pub renaming: bool,
     /// 文件树对话框打开（键盘归 egui）。
     pub filetree_dialog_open: bool,
+    /// 设置页正在录入新快捷键；此时外壳快捷键必须让位给录入控件。
+    pub shortcut_capture: bool,
     /// 终端是否持有键盘焦点（非聚焦时按键不写 PTY）。
     pub terminal_focused: bool,
     /// win32-input-mode 已开启（终端开了 DEC 9001 即自动启用；可经
@@ -158,6 +161,7 @@ fn is_named(input: &KeyInput, named: WinitNamedKey) -> bool {
 /// 查键表（便利包装，接受 winit `KeyEvent`）。
 ///
 /// 内部将 `event` 转换为 [`KeyInput`] 后调用 [`lookup_input`]。
+#[allow(dead_code)]
 pub fn lookup(
     event: &KeyEvent,
     mods: ModifiersState,
@@ -165,7 +169,33 @@ pub fn lookup(
     pressed: bool,
     guard: &GuardState,
 ) -> Option<LookupResult> {
-    lookup_input(&KeyInput::from_event(event), mods, mode, pressed, guard)
+    lookup_with_shortcuts(
+        event,
+        mods,
+        mode,
+        pressed,
+        guard,
+        &KeyboardShortcuts::default(),
+    )
+}
+
+/// 使用用户设置快捷键的生产入口。
+pub fn lookup_with_shortcuts(
+    event: &KeyEvent,
+    mods: ModifiersState,
+    mode: InputMode,
+    pressed: bool,
+    guard: &GuardState,
+    shortcuts: &KeyboardShortcuts,
+) -> Option<LookupResult> {
+    lookup_input_with_shortcuts(
+        &KeyInput::from_event(event),
+        mods,
+        mode,
+        pressed,
+        guard,
+        shortcuts,
+    )
 }
 
 /// 查键表核心逻辑（测试友好版，接受 [`KeyInput`] 而非 winit `KeyEvent`）。
@@ -185,6 +215,7 @@ pub fn lookup(
 /// 12. 兜底直通编码
 ///
 /// 返回 None 表示此键位无 keymap 命中（终端非聚焦等情况），调用方不写 PTY。
+#[allow(dead_code)]
 pub fn lookup_input(
     input: &KeyInput,
     mods: ModifiersState,
@@ -192,9 +223,29 @@ pub fn lookup_input(
     pressed: bool,
     guard: &GuardState,
 ) -> Option<LookupResult> {
+    lookup_input_with_shortcuts(
+        input,
+        mods,
+        mode,
+        pressed,
+        guard,
+        &KeyboardShortcuts::default(),
+    )
+}
+
+/// 使用用户设置快捷键的查表核心。
+pub fn lookup_input_with_shortcuts(
+    input: &KeyInput,
+    mods: ModifiersState,
+    mode: InputMode,
+    pressed: bool,
+    guard: &GuardState,
+    shortcuts: &KeyboardShortcuts,
+) -> Option<LookupResult> {
     let ctrl = mods.control_key();
     let shift = mods.shift_key();
     let alt = mods.alt_key();
+    let shortcut = |action| shortcuts.matches(action, &input.logical_key, mods);
 
     // ── 层 1：抬起事件（win32-input-mode）──────────────────────────────
     // 抬起事件（pressed=false）仅在 win32-input-mode 下投递。
@@ -208,58 +259,60 @@ pub fn lookup_input(
     // ── 层 2：外壳级 Ctrl+Shift+* ──────────────────────────────────────
     // 守卫：overlay / renaming / filetree_dialog 均不拦截
     // （全局拦截，alt screen 也生效，裁决见 main.rs 注释）
-    if ctrl && shift && !guard.overlay_open && !guard.renaming && !guard.filetree_dialog_open {
-        if is_char(input, 'd') {
+    if !guard.overlay_open
+        && !guard.renaming
+        && !guard.filetree_dialog_open
+        && !guard.shortcut_capture
+    {
+        if shortcut(ShortcutAction::NewPane) {
             return Some(LookupResult::ShellAction(ShellAction::NewPane));
         }
-        if is_char(input, 'w') {
+        if shortcut(ShortcutAction::ClosePane) {
             return Some(LookupResult::ShellAction(ShellAction::ClosePane));
         }
-        if is_named(input, WinitNamedKey::Enter) {
+        if shortcut(ShortcutAction::ToggleMaximizePane) {
             return Some(LookupResult::ShellAction(ShellAction::ToggleMaximizePane));
         }
-        // Ctrl+Shift+E：全模式可用的经典直通切换（在此层处理，守卫与 D/W 一致）
-        if is_char(input, 'e') {
+        // 经典直通切换：全模式可用（守卫与窗格操作一致）。
+        if shortcut(ShortcutAction::ToggleClassicMode) {
             return Some(LookupResult::TerminalAction(Action::Term(
                 TermAction::ToggleFallback,
             )));
         }
-        // Ctrl+Shift+Tab：切换到上一 tab（在 overlay/renaming 检查之后）
-        if is_named(input, WinitNamedKey::Tab) {
+        if shortcut(ShortcutAction::PreviousTab) {
             return Some(LookupResult::ShellAction(ShellAction::CycleTab(-1isize)));
         }
     }
 
     // ── 层 3：外壳级 Ctrl+* ────────────────────────────────────────────
     // 守卫：非 alt screen 时生效（或 overlay 已打开，见 main.rs 注释）
-    if ctrl
-        && (guard.overlay_open || !guard.is_alt_screen)
+    if (guard.overlay_open || !guard.is_alt_screen)
         && !guard.renaming
         && !guard.filetree_dialog_open
+        && !guard.shortcut_capture
     {
-        // overlay 已开时仅 Ctrl+, 可关闭设置页，其余不响应
+        // overlay 已开时仅设置开关可关闭设置页，其余不响应。
         if guard.overlay_open {
-            if !shift && is_char(input, ',') {
+            if shortcut(ShortcutAction::ToggleSettings) {
                 return Some(LookupResult::ShellAction(ShellAction::ToggleSettings));
             }
             // 其余外壳快捷键在 overlay 打开时静默（不写 PTY，不匹配）
             // 注意：这里不 return None，继续向后走（terminal_focused 闸会拦住）
         } else {
-            // overlay 未开时完整外壳快捷键
-            if !shift && is_char(input, ',') {
+            // overlay 未开时完整外壳快捷键。
+            if shortcut(ShortcutAction::ToggleSettings) {
                 return Some(LookupResult::ShellAction(ShellAction::ToggleSettings));
             }
-            if !shift && is_char(input, 't') {
+            if shortcut(ShortcutAction::NewTab) {
                 return Some(LookupResult::ShellAction(ShellAction::NewTab));
             }
-            if !shift && is_char(input, 'w') {
+            if shortcut(ShortcutAction::CloseTab) {
                 return Some(LookupResult::ShellAction(ShellAction::CloseTab));
             }
-            if !shift && is_char(input, 'b') {
+            if shortcut(ShortcutAction::ToggleFiletree) {
                 return Some(LookupResult::ShellAction(ShellAction::ToggleFiletree));
             }
-            // Ctrl+Tab：切换到下一 tab（不含 Shift 的路径）
-            if !shift && is_named(input, WinitNamedKey::Tab) {
+            if shortcut(ShortcutAction::NextTab) {
                 return Some(LookupResult::ShellAction(ShellAction::CycleTab(1isize)));
             }
         }
@@ -278,7 +331,7 @@ pub fn lookup_input(
     // 待命）走层 9：同样有选区复制。海风哥反馈：claude code 等全屏 TUI 选中文本
     // Ctrl+C 必须能复制（对标 PowerShell / Windows Terminal），不再「运行中无条件
     // 中断」——中断仍随时可达（复制是一次性让路，清选区/无选区再按即中断）。
-    if ctrl && is_char(input, 'c') && !shift {
+    if shortcut(ShortcutAction::CopyOrInterrupt) {
         match mode {
             // Running（命令运行中）/ AltScreen（全屏 TUI）/ Fallback（集成未生效）
             // 三态统一为标准终端惯例（对标 PowerShell / Windows Terminal，海风哥
@@ -312,38 +365,33 @@ pub fn lookup_input(
 
     // ── 层 6：Shift+PgUp / Shift+PgDn 翻屏，Shift+Insert 粘贴 ─────────
     // Compose 态 Shift+Insert → 进编辑器（PasteClipboard 走 dispatch）；其余态直通。
-    if shift && !ctrl {
-        if is_named(input, WinitNamedKey::PageUp) {
-            return Some(LookupResult::TerminalAction(Action::Term(
-                TermAction::Scroll(ScrollDir::Up),
-            )));
-        }
-        if is_named(input, WinitNamedKey::PageDown) {
-            return Some(LookupResult::TerminalAction(Action::Term(
-                TermAction::Scroll(ScrollDir::Down),
-            )));
-        }
-        if is_named(input, WinitNamedKey::Insert) {
-            // Compose 态：粘贴进编辑器（dispatch 内按 bracketed_paste 状态包装）
-            // Running/AltScreen/Fallback 态：与 Ctrl+V 同语义直通 PTY
-            return Some(LookupResult::TerminalAction(Action::Term(
-                TermAction::PasteClipboard,
-            )));
-        }
+    if shortcut(ShortcutAction::ScrollUp) {
+        return Some(LookupResult::TerminalAction(Action::Term(
+            TermAction::Scroll(ScrollDir::Up),
+        )));
+    }
+    if shortcut(ShortcutAction::ScrollDown) {
+        return Some(LookupResult::TerminalAction(Action::Term(
+            TermAction::Scroll(ScrollDir::Down),
+        )));
+    }
+    if shortcut(ShortcutAction::AlternatePaste) {
+        // Compose 态粘贴进编辑器；其余模式按终端粘贴处理。
+        return Some(LookupResult::TerminalAction(Action::Term(
+            TermAction::PasteClipboard,
+        )));
     }
 
     // ── 层 7：Ctrl+↑/↓ 块跳转（非 alt screen）──────────────────────────
-    if ctrl && !guard.is_alt_screen {
-        if is_named(input, WinitNamedKey::ArrowUp) {
-            return Some(LookupResult::TerminalAction(Action::Term(
-                TermAction::JumpBlock(-1),
-            )));
-        }
-        if is_named(input, WinitNamedKey::ArrowDown) {
-            return Some(LookupResult::TerminalAction(Action::Term(
-                TermAction::JumpBlock(1),
-            )));
-        }
+    if !guard.is_alt_screen && shortcut(ShortcutAction::PreviousBlock) {
+        return Some(LookupResult::TerminalAction(Action::Term(
+            TermAction::JumpBlock(-1),
+        )));
+    }
+    if !guard.is_alt_screen && shortcut(ShortcutAction::NextBlock) {
+        return Some(LookupResult::TerminalAction(Action::Term(
+            TermAction::JumpBlock(1),
+        )));
     }
 
     // ── 层 8：Ctrl+R 历史搜索（Compose + 经典直通 Fallback）─────────────
@@ -352,9 +400,7 @@ pub fn lookup_input(
     // 全屏程序（vim/codex 的 Ctrl+R redo）与运行中程序（python REPL 的反向
     // 搜索）要独占键盘，被面板抢就坏了（设计稿 §4：这两态 Ctrl+R 本就直通）。
     // 位于聚焦闸（层 4）之后保证终端聚焦；位于 Compose 开闸（层 9）之前。
-    if ctrl
-        && !shift
-        && is_char(input, 'r')
+    if shortcut(ShortcutAction::SearchHistory)
         && matches!(mode, InputMode::Compose | InputMode::Fallback)
     {
         return Some(LookupResult::ComposeHistorySearch);
@@ -512,7 +558,7 @@ pub fn lookup_input(
         //
         // E9 铁律：Running/AltScreen/Fallback 态的 Ctrl+C 已在层 5 处理并返回，
         // 此层仅在 Compose 态可达，安全规则不受影响。
-        if ctrl && !shift && is_char(input, 'c') {
+        if shortcut(ShortcutAction::CopyOrInterrupt) {
             // 第一级（新增）：编辑器选区非空 → 复制编辑器选区文本
             #[cfg(feature = "input-editor")]
             if guard.has_editor_selection {
@@ -573,7 +619,7 @@ pub fn lookup_input(
         }
 
         // 9-o: Ctrl+V → 粘贴进编辑器（走 dispatch 按 bracketed_paste 包装）
-        if ctrl && !shift && is_char(input, 'v') {
+        if shortcut(ShortcutAction::Paste) {
             return Some(LookupResult::TerminalAction(Action::Term(
                 TermAction::PasteClipboard,
             )));
@@ -627,7 +673,7 @@ pub fn lookup_input(
     }
 
     // ── 层 11：Ctrl+V 粘贴（非 Compose 态）────────────────────────────
-    if ctrl && is_char(input, 'v') {
+    if shortcut(ShortcutAction::Paste) {
         return Some(LookupResult::TerminalAction(Action::Term(
             TermAction::PasteClipboard,
         )));
@@ -1831,6 +1877,58 @@ mod tests {
             matches!(result, Some(LookupResult::ComposeHistorySearch)),
             "Compose 态 Ctrl+R → ComposeHistorySearch"
         );
+    }
+
+    #[test]
+    fn 历史搜索使用用户自定义快捷键() {
+        let mut shortcuts = KeyboardShortcuts::default();
+        shortcuts.set(
+            ShortcutAction::SearchHistory,
+            "Ctrl+Shift+H".parse().unwrap(),
+        );
+        let guard = default_guard();
+        let old = lookup_input_with_shortcuts(
+            &KeyInput::char("r"),
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+            &shortcuts,
+        );
+        let custom = lookup_input_with_shortcuts(
+            &KeyInput::char("h"),
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            InputMode::Compose,
+            true,
+            &guard,
+            &shortcuts,
+        );
+        assert!(
+            !matches!(old, Some(LookupResult::ComposeHistorySearch)),
+            "旧 Ctrl+R 不再打开面板"
+        );
+        assert!(
+            matches!(custom, Some(LookupResult::ComposeHistorySearch)),
+            "新绑定应立即驱动历史搜索"
+        );
+    }
+
+    #[test]
+    fn 录入快捷键时外壳动作让位() {
+        let guard = GuardState {
+            terminal_focused: false,
+            overlay_open: true,
+            shortcut_capture: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            ",",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(result.is_none(), "录入 Ctrl+, 时不应把设置页关闭");
     }
 
     #[test]
