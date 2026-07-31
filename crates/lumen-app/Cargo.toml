@@ -50,6 +50,8 @@ lumen-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+md5 = "0.8.1"
+chrono = "0.4"
 url.workspace = true
 # P0 应用锁：Argon2id 密码校验；随机盐与明文临时缓冲清零。
 argon2 = { version = "0.5", features = ["std"] }

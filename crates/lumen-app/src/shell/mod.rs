@@ -11,6 +11,7 @@
 pub mod completion_ui;
 pub mod filetree;
 pub mod history_search_ui;
+pub mod hud;
 pub mod layout;
 pub mod lock_ui;
 pub mod login_ui;
@@ -108,6 +109,8 @@ pub struct ShellState {
     pub completion: completion_ui::CompletionUiState,
     /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
     pub toast: toast::ToastState,
+    /// LLM CLI 右下角 HUD 的展开/关闭状态。
+    pub hud: hud::HudState,
     /// 进行中的远程设备重命名（M5.2）：(设备 id, 编辑中文本)。编辑期间键盘归 egui。
     pub renaming_device: Option<(String, String)>,
     /// 设备重命名刚开始，下一帧把焦点交给编辑框。
@@ -479,6 +482,8 @@ pub struct ShellInput<'a> {
     /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
     /// 候选列表由 main 在 render 前计算好。
     pub completion_view: Option<completion_ui::CompletionView<'a>>,
+    /// 焦点窗格运行受支持 LLM CLI 时的 HUD 数据。
+    pub llm_hud: Option<hud::HudView>,
     /// 远程设备列表（M5.2；仅远程 tab 渲染，服务端已按 last_seen 倒序）。
     pub remote_devices: &'a [lumen_protocol::DeviceRecord],
     /// 当前账号（或未登录作用域）的 SSH 服务器与分组库存。
@@ -2610,7 +2615,32 @@ pub fn show(
         }
     }
 
-    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录之上，toast 之下）——
+    // —— LLM CLI HUD（右下角；设置/登录等覆盖层打开时暂时隐藏）——
+    // HUD 先于补全弹层绘制：斜杠菜单与 HUD 可以同时存在，重叠时菜单
+    // 位于 HUD 上方，且菜单的鼠标/滚轮命中不会被 HUD 截获。
+    let hud_pane_rect = input
+        .panes
+        .iter()
+        .position(|pane| pane.focused)
+        .and_then(|index| out.pane_rects.get(index))
+        .copied()
+        .unwrap_or(egui::Rect::NOTHING);
+    let hud_blocked = st.settings.open
+        || st.login.open
+        || st.history_search.open
+        || st.text_editor.is_visible()
+        || is_remote_view
+        || is_ssh_view;
+    hud::show(
+        root.ctx(),
+        &mut st.hud,
+        input.llm_hud.as_ref(),
+        hud_pane_rect,
+        pal,
+        hud_blocked,
+    );
+
+    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录/HUD 之上，toast 之下）——
     // completion_view 由 main 每帧传入；Some = 显示弹窗，None = 不显示。
     if let Some(cv) = &input.completion_view {
         let c_out = completion_ui::show(root.ctx(), &mut st.completion, cv, pal);
@@ -3581,10 +3611,7 @@ fn ssh_workspace(
         // 长错误文本（如认证失败详情）截断保护：截断+hover 全文，防把
         // 右侧按钮挤出/压变形（header 固定 48px 高、宽度有限）。
         header_ui
-            .add(
-                egui::Label::new(egui::RichText::new(detail).small().color(pal.fg_dim))
-                    .truncate(),
-            )
+            .add(egui::Label::new(egui::RichText::new(detail).small().color(pal.fg_dim)).truncate())
             .on_hover_text(detail);
     }
     if matches!(
@@ -3602,7 +3629,10 @@ fn ssh_workspace(
                 out.ssh_runtime_action = Some(SshRuntimeAction::Disconnect);
             }
         });
-    } else if matches!(view.state, ConnectionState::Disconnected | ConnectionState::Error) {
+    } else if matches!(
+        view.state,
+        ConnectionState::Disconnected | ConnectionState::Error
+    ) {
         // 断开/失败后同一位置变为「连接」按钮（海风哥）：重新走凭据→连接链路。
         header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button(strings.ssh_connect).clicked() {
@@ -3707,9 +3737,10 @@ fn ssh_monitor_ui(
     let small_family = ui.style().text_styles[&egui::TextStyle::Small]
         .family
         .clone();
-    ui.style_mut()
-        .text_styles
-        .insert(egui::TextStyle::Small, egui::FontId::new(12.0, small_family));
+    ui.style_mut().text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::new(12.0, small_family),
+    );
     egui::ScrollArea::vertical()
         .id_salt(("ssh_monitor_scroll", view.session_id))
         .auto_shrink([false, false])
@@ -3860,7 +3891,11 @@ fn ssh_monitor_card_header(
             if chev_resp.hovered() {
                 ui.painter().rect_filled(chev_rect, 3.0, pal.bg_highlight);
             }
-            let color = if chev_resp.hovered() { pal.fg } else { pal.fg_dim };
+            let color = if chev_resp.hovered() {
+                pal.fg
+            } else {
+                pal.fg_dim
+            };
             if collapsed {
                 paint_ssh_monitor_chevron(ui.painter(), chev_rect.shrink(3.0), false, color);
             } else {
@@ -4156,14 +4191,17 @@ fn ssh_monitor_cpu_card(
                                     .desired_height(9.0)
                                     .fill(pal.info),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{value:.1}%"))
-                                        .monospace()
-                                        .small()
-                                        .color(pal.fg),
-                                );
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{value:.1}%"))
+                                            .monospace()
+                                            .small()
+                                            .color(pal.fg),
+                                    );
+                                },
+                            );
                         });
                     }
                 });
@@ -4476,8 +4514,7 @@ fn ssh_live_search_tick(
             out.ssh_runtime_action = Some(SshRuntimeAction::QueryPort { session_id, port });
         }
         Some(SshSearchTarget::Processes(query)) => {
-            out.ssh_runtime_action =
-                Some(SshRuntimeAction::SearchProcesses { session_id, query });
+            out.ssh_runtime_action = Some(SshRuntimeAction::SearchProcesses { session_id, query });
         }
         None => {
             // 非法端口（`:8` 输入途中或 `:abc`）：不发查询也不标记已提交，
@@ -4486,7 +4523,8 @@ fn ssh_live_search_tick(
         }
     }
     st.ssh_ui.mark_process_query_submitted(text);
-    st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+    st.ssh_ui
+        .set_process_query_last_at(std::time::Instant::now());
 }
 
 fn ssh_monitor_process_card(
@@ -4625,9 +4663,8 @@ fn ssh_monitor_process_card(
                         entry.pid.unwrap_or(0),
                         proc_entry.map(|process| process.cpu_percent),
                         proc_entry.map(|process| process.memory_percent),
-                        proc_entry.map_or(entry.command.as_str(), |process| {
-                            process.command.as_str()
-                        }),
+                        proc_entry
+                            .map_or(entry.command.as_str(), |process| process.command.as_str()),
                         st,
                         pal,
                     );
@@ -4738,7 +4775,8 @@ fn ssh_process_sort_header(
                 // 详情弹窗：以统一搜索框内容打开（空 = 全量进程列表，
                 // `:端口` = 端口占用结果）；同步已提交文本防防抖重复提交。
                 st.ssh_ui.set_process_window_open(true);
-                st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+                st.ssh_ui
+                    .set_process_query_last_at(std::time::Instant::now());
                 match ssh_search_target(st.ssh_ui.process_query()) {
                     Some(SshSearchTarget::Port(port)) => {
                         out.ssh_runtime_action =
@@ -4908,12 +4946,9 @@ fn ssh_kill_confirm_bar(
     };
     ui.horizontal_wrapped(|ui| {
         ui.label(
-            egui::RichText::new(format!(
-                "{} PID {}?",
-                strings.ssh_monitor_kill_confirm, pid
-            ))
-            .small()
-            .color(pal.warn),
+            egui::RichText::new(format!("{} PID {}?", strings.ssh_monitor_kill_confirm, pid))
+                .small()
+                .color(pal.warn),
         );
         if ui
             .add(egui::Button::new(
@@ -4989,10 +5024,7 @@ fn ssh_process_window_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme
             egui::FontId::monospace(13.0),
             pal.fg_dim,
         );
-        for (text, active, memory) in [
-            ("CPU", !sort_memory, false),
-            ("MEM", sort_memory, true),
-        ] {
+        for (text, active, memory) in [("CPU", !sort_memory, false), ("MEM", sort_memory, true)] {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(SSH_PROC_NUM_W, 18.0), egui::Sense::click());
             let label = if active {
@@ -5028,8 +5060,7 @@ fn ssh_process_window_header(ui: &mut egui::Ui, st: &mut ShellState, pal: &theme
         // 内容贴满会形成「窗口变大→内容更宽→窗口更大」正反馈（海风哥：
         // 弹窗一直往右扩、调不了）。内容适应容器，容器不迎合内容。
         let cmd_w = (ui.available_width() - SSH_PROC_KILL_W - 8.0).max(40.0);
-        let (cmd_rect, _) =
-            ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
+        let (cmd_rect, _) = ui.allocate_exact_size(egui::vec2(cmd_w, 18.0), egui::Sense::hover());
         ui.painter().text(
             cmd_rect.left_center(),
             egui::Align2::LEFT_CENTER,
@@ -5106,10 +5137,8 @@ fn ssh_process_grid_row(
                 pal.fg,
             );
         }
-        let (port_rect, port_response) = ui.allocate_exact_size(
-            egui::vec2(SSH_PROC_PORT_W, 20.0),
-            egui::Sense::hover(),
-        );
+        let (port_rect, port_response) =
+            ui.allocate_exact_size(egui::vec2(SSH_PROC_PORT_W, 20.0), egui::Sense::hover());
         ui.painter_at(port_rect).text(
             port_rect.left_center(),
             egui::Align2::LEFT_CENTER,
@@ -5277,9 +5306,10 @@ fn ssh_process_window(
         let small_family = ui.style().text_styles[&egui::TextStyle::Small]
             .family
             .clone();
-        ui.style_mut()
-            .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::new(13.0, small_family));
+        ui.style_mut().text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(13.0, small_family),
+        );
 
         // 打开期间每 3 秒自动重查：进程是活数据，一次性查询会让用户看到
         // 永远不变的列表（海风哥反馈）。loading 中不重发，返回即更新。
@@ -5292,7 +5322,10 @@ fn ssh_process_window(
             .process_search
             .as_ref()
             .is_some_and(|search| search.loading)
-            || view.port_lookup.as_ref().is_some_and(|lookup| lookup.loading);
+            || view
+                .port_lookup
+                .as_ref()
+                .is_some_and(|lookup| lookup.loading);
         if stale && !loading {
             match ssh_search_target(st.ssh_ui.process_query()) {
                 Some(SshSearchTarget::Port(port)) => {
@@ -5304,7 +5337,8 @@ fn ssh_process_window(
                 }
                 None => {}
             }
-            st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+            st.ssh_ui
+                .set_process_query_last_at(std::time::Instant::now());
         }
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
@@ -5341,7 +5375,8 @@ fn ssh_process_window(
                 }
                 st.ssh_ui
                     .mark_process_query_submitted(st.ssh_ui.process_query().trim().to_owned());
-                st.ssh_ui.set_process_query_last_at(std::time::Instant::now());
+                st.ssh_ui
+                    .set_process_query_last_at(std::time::Instant::now());
             }
         });
         ui.add_space(6.0);
@@ -5407,10 +5442,9 @@ fn ssh_process_window(
                                     mem: proc_entry.map(|process| process.memory_percent),
                                     ports_text,
                                     ports_hover,
-                                    command: proc_entry.map_or(
-                                        entry.command.as_str(),
-                                        |process| process.command.as_str(),
-                                    ),
+                                    command: proc_entry.map_or(entry.command.as_str(), |process| {
+                                        process.command.as_str()
+                                    }),
                                     has_children: false,
                                 },
                                 st,
@@ -5451,7 +5485,7 @@ fn ssh_process_window(
             ui.label(
                 egui::RichText::new(crate::i18n::fmt1(
                     strings.ssh_process_count_fmt,
-                    search.results.len()
+                    search.results.len(),
                 ))
                 .small()
                 .color(pal.fg_dim),
@@ -5783,11 +5817,7 @@ fn ssh_runtime_modals(
                 // 上一次失败原因（认证失败/连接失败）红字显示在对话框内——
                 // 用户重输时知道为什么（海风哥：密码错误文本位置不对）。
                 if let Some(error_text) = dialog.error_text() {
-                    ui.label(
-                        egui::RichText::new(error_text)
-                            .small()
-                            .color(pal.error),
-                    );
+                    ui.label(egui::RichText::new(error_text).small().color(pal.error));
                     ui.add_space(6.0);
                 }
                 ui.label(

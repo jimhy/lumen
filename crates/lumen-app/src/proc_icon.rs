@@ -31,6 +31,14 @@ pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
     imp::foreground_exe(shell_pid)
 }
 
+/// 会话前台运行程序 PID；无子进程时回落到 shell 自身 PID。
+///
+/// HUD 用它关联 Claude Code 的 `.claude/sessions/<pid>.json`，从而精确
+/// 找到当前窗格而不是“同目录最近一次”的 transcript。
+pub fn foreground_pid(shell_pid: u32) -> u32 {
+    imp::foreground_pid(shell_pid).unwrap_or(shell_pid)
+}
+
 /// 抽取 `exe` 关联图标为 RGBA8。失败返回 `None`（上层回退自绘字形）。
 pub fn load_icon_rgba(exe: &Path) -> Option<IconRgba> {
     imp::load_icon_rgba(exe)
@@ -54,9 +62,7 @@ mod imp {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows_sys::Win32::UI::Shell::{
-        SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-    };
+    use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
     use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
     pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
@@ -66,7 +72,7 @@ mod imp {
 
     /// 进程快照里找 `shell_pid` 的直接子进程（前台程序）。多个时取 PID
     /// 最大者（近似最近创建）。无子进程返回 `None`（停在提示符）。
-    fn foreground_pid(shell_pid: u32) -> Option<u32> {
+    pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
         // SAFETY: CreateToolhelp32Snapshot 返回有效句柄或 INVALID_HANDLE_VALUE，
         // 失败即不遍历。
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -103,8 +109,7 @@ mod imp {
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
         // SAFETY: handle 有效；buf/len 指向有效缓冲；成功时写入路径并回填长度。
-        let ok =
-            unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
         // SAFETY: handle 有效，关闭一次。
         unsafe { CloseHandle(handle) };
         if ok == 0 || len == 0 {
@@ -275,7 +280,7 @@ mod imp {
         bi.header.biPlanes = 1;
         bi.header.biBitCount = 1;
         bi.header.biCompression = 0; // BI_RGB
-        // SAFETY: CreateCompatibleDC(null)=内存 DC，失败返回 null。
+                                     // SAFETY: CreateCompatibleDC(null)=内存 DC，失败返回 null。
         let dc = unsafe { CreateCompatibleDC(ptr::null_mut()) };
         if dc.is_null() {
             return None;
@@ -338,10 +343,14 @@ mod imp {
 
     /// 扫 `/proc` 找 `shell_pid` 的直接子进程（前台程序）；多个取 PID 最大者（近似最近
     /// 创建）。无子进程返回 `None`（停在提示符 → 回落 shell 自身）。
-    fn foreground_pid(shell_pid: u32) -> Option<u32> {
+    pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
         let mut best: Option<u32> = None;
         for entry in fs::read_dir("/proc").ok()?.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
                 continue; // 非数字目录（/proc/self、/proc/cpuinfo 等）跳过
             };
             let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
@@ -406,7 +415,7 @@ mod imp {
     }
 
     /// shell 的直接子进程（前台程序），取 PID 最大者（近似最近创建）。无子进程返回 None。
-    fn foreground_pid(shell_pid: u32) -> Option<u32> {
+    pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
         let mut buf = vec![0i32; 256];
         // SAFETY: buf 可写、buffersize 与其字节容量一致。返回填入的字节数（proc_list* 家族
         // 约定），<=0 视为无子进程/失败。
@@ -498,7 +507,8 @@ mod imp {
                     }
                 };
                 let (r, g, b) = if premultiplied && a != 0 {
-                    let un = |c: u8| (((c as u32) * 255 + (a as u32) / 2) / a as u32).min(255) as u8;
+                    let un =
+                        |c: u8| (((c as u32) * 255 + (a as u32) / 2) / a as u32).min(255) as u8;
                     (un(r), un(g), un(b))
                 } else {
                     (r, g, b)
@@ -520,6 +530,10 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     pub fn foreground_exe(_shell_pid: u32) -> Option<PathBuf> {
+        None
+    }
+
+    pub fn foreground_pid(_shell_pid: u32) -> Option<u32> {
         None
     }
 
