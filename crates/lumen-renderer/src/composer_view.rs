@@ -11,6 +11,10 @@
 //! # 设计稿对应章节
 //! 设计稿 §2「输入模式机（四态）」、§7.1「footer 输入区（零新 GPU 管线）」。
 
+use std::ops::Range;
+
+use unicode_segmentation::UnicodeSegmentation;
+
 /// footer 编辑器的文本选区（规范化端点，start ≤ end）。
 ///
 /// 坐标单位与 [`ComposerView::cursor`] 相同：`(行索引, 行内字节偏移)`。
@@ -357,12 +361,41 @@ pub fn footer_byte_to_col(line: &str, byte: usize) -> usize {
     //
     // ALLOW: unicode_width 是 glyphon 传递依赖，已在 workspace Cargo.lock 中；
     // renderer Cargo.toml 显式声明以避免隐式传递依赖被静默升降版本。
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
     let byte = byte.min(line.len());
-    line[..byte]
-        .chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum()
+    UnicodeWidthStr::width(&line[..byte])
+}
+
+/// 将 footer 一行切成可独立锚定到终端网格的排版段。
+///
+/// ASCII 连续排版，保留等宽字体正常的字距；每个非 ASCII grapheme 独立成段，
+/// 段起点按 [`footer_byte_to_col`] 钉到网格列。这样 CJK/emoji 的回退字体
+/// advance 即使不等于 `cell_w × 显示列数`，误差也不会逐字累积到光标位置。
+pub(crate) fn footer_text_segments(line: &str) -> Vec<(Range<usize>, usize)> {
+    let mut segments = Vec::new();
+    let mut ascii_start = None;
+
+    for (start, grapheme) in line.grapheme_indices(true) {
+        let end = start + grapheme.len();
+        if grapheme.is_ascii() {
+            ascii_start.get_or_insert(start);
+            continue;
+        }
+
+        if let Some(run_start) = ascii_start.take() {
+            segments.push((run_start..start, footer_byte_to_col(line, run_start)));
+        }
+        segments.push((start..end, footer_byte_to_col(line, start)));
+    }
+
+    if let Some(run_start) = ascii_start {
+        segments.push((
+            run_start..line.len(),
+            footer_byte_to_col(line, run_start),
+        ));
+    }
+
+    segments
 }
 
 /// 选区高亮矩形（像素坐标），供 renderer 转为 `RectInstance`。
@@ -656,6 +689,41 @@ mod tests {
     #[test]
     fn 字节到列_超出行长夹紧() {
         assert_eq!(footer_byte_to_col("hi", 999), 2, "超出行长应夹紧到行尾");
+    }
+
+    #[test]
+    fn footer排版段_中文逐字锚定且英文保持连续() {
+        let line = "[#1]这是一张图?";
+        let segments = footer_text_segments(line);
+        let rendered: Vec<(&str, usize)> = segments
+            .iter()
+            .map(|(range, col)| (&line[range.clone()], *col))
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                ("[#1]", 0),
+                ("这", 4),
+                ("是", 6),
+                ("一", 8),
+                ("张", 10),
+                ("图", 12),
+                ("?", 14),
+            ]
+        );
+    }
+
+    #[test]
+    fn footer排版段_emoji字素簇不拆散() {
+        let line = "a👨‍👩‍👧‍👦b";
+        let segments = footer_text_segments(line);
+        let rendered: Vec<&str> = segments
+            .iter()
+            .map(|(range, _)| &line[range.clone()])
+            .collect();
+
+        assert_eq!(rendered, vec!["a", "👨‍👩‍👧‍👦", "b"]);
     }
 
     // ── selection_rects 选区几何纯函数 ────────────────────────────────

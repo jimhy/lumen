@@ -1070,9 +1070,6 @@ impl Renderer {
                                 line_text.clone()
                             };
 
-                            let mut buf = TextBuffer::new(&mut self.font_system, metrics);
-                            buf.set_size(&mut self.font_system, None, Some(ch));
-
                             // M4.2 批2：语法高亮。无 preedit 内嵌的 Compose 行按 token
                             // 着色（set_rich_text）；其余情形（preedit 行 / Running 文案 /
                             // 无 highlight 数据）保持前景单色（set_text），与改造前逐字节一致。
@@ -1083,7 +1080,7 @@ impl Renderer {
                             } else {
                                 None
                             };
-                            if let Some(spans) = line_spans {
+                            let styled_ranges = if let Some(spans) = line_spans {
                                 let base_color = self.theme.foreground.to_glyphon();
                                 let dlen = display_text.len();
                                 // 按 token 切成覆盖整行的连续段：span 区间用派生色，
@@ -1126,26 +1123,64 @@ impl Renderer {
                                 if pos < dlen {
                                     rich.push((pos, dlen, base_attrs.clone()));
                                 }
-                                buf.set_rich_text(
-                                    &mut self.font_system,
-                                    rich.iter()
-                                        .map(|(s, e, a)| (&display_text[*s..*e], a.clone())),
-                                    &base_attrs,
-                                    Shaping::Advanced,
-                                    None,
-                                );
+                                Some(rich)
                             } else {
-                                buf.set_text(
-                                    &mut self.font_system,
-                                    &display_text,
-                                    &base_attrs,
-                                    Shaping::Advanced,
-                                    None,
-                                );
-                            }
+                                None
+                            };
                             let text_y = text_top + fp + li as f32 * ch;
                             let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
-                            bufs.push((li, buf, text_y, bottom_clamp, fp));
+
+                            // 字体回退时 CJK/emoji 的自然 advance 不一定等于终端网格
+                            // 预留的显示列宽。若整行交给 glyphon 连续排版，正文与按网格
+                            // 算出的光标会逐字漂移。ASCII 保持连续排版，非 ASCII grapheme
+                            // 则逐个钉到其显示列起点，使误差不会跨字符累积。
+                            for (range, display_col) in
+                                composer_view::footer_text_segments(&display_text)
+                            {
+                                let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                                buf.set_size(&mut self.font_system, None, Some(ch));
+                                if let Some(styled) = &styled_ranges {
+                                    let segment_spans: Vec<(usize, usize, Attrs)> = styled
+                                        .iter()
+                                        .filter_map(|(start, end, attrs)| {
+                                            let start = (*start).max(range.start);
+                                            let end = (*end).min(range.end);
+                                            (start < end).then(|| {
+                                                (
+                                                    start - range.start,
+                                                    end - range.start,
+                                                    attrs.clone(),
+                                                )
+                                            })
+                                        })
+                                        .collect();
+                                    let segment_text = &display_text[range.clone()];
+                                    buf.set_rich_text(
+                                        &mut self.font_system,
+                                        segment_spans.iter().map(|(start, end, attrs)| {
+                                            (&segment_text[*start..*end], attrs.clone())
+                                        }),
+                                        &base_attrs,
+                                        Shaping::Advanced,
+                                        None,
+                                    );
+                                } else {
+                                    buf.set_text(
+                                        &mut self.font_system,
+                                        &display_text[range],
+                                        &base_attrs,
+                                        Shaping::Advanced,
+                                        None,
+                                    );
+                                }
+                                bufs.push((
+                                    li,
+                                    buf,
+                                    text_y,
+                                    bottom_clamp,
+                                    fp + display_col as f32 * cw,
+                                ));
+                            }
                         }
 
                         // M4.1 批E：placeholder（空缓冲占位提示）+ ghost text 绘制。

@@ -15624,6 +15624,16 @@ impl ApplicationHandler<PtyWake> for App {
                             ghost,
                         );
                         view.attachment_count = focused.attachments.len();
+                        // LLM CLI 的输入是自然语言/Markdown，不是 PowerShell。
+                        // 尤其图片标签 `[#1]` 会让 shell lexer 把 `#1]...`
+                        // 误判为注释并染成很暗的 ansi[8]，导致正文近乎不可读。
+                        if focused
+                            .llm_cli
+                            .or_else(|| llm_cli::detect(None, &focused.term))
+                            .is_some()
+                        {
+                            view.highlight.clear();
+                        }
                         view
                     };
 
