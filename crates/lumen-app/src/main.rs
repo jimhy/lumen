@@ -35,11 +35,12 @@ mod history;
 mod i18n;
 mod input;
 mod keymap;
+/// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
+mod links;
 #[cfg(feature = "input-editor")]
 mod llm_attachments;
 mod llm_cli;
-/// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
-mod links;
+mod llm_hud;
 mod mode;
 /// unix：从系统读 shell 进程实时 cwd（bash/zsh 无 OSC 9;9 cwd 上报时文件树的兜底）。
 #[cfg(unix)]
@@ -59,11 +60,11 @@ mod sessions_store;
 mod settings;
 mod shortcuts;
 // P1 SSH：领域库存先独立落地，UI/连接/同步分批接线。
+mod shell;
+mod single_instance;
 #[allow(dead_code)]
 mod ssh;
 mod ssh_runtime;
-mod shell;
-mod single_instance;
 // M3.8 批2 Snap Layouts 子类化（仅 Windows）。
 #[cfg(target_os = "windows")]
 mod snap_layouts;
@@ -154,10 +155,7 @@ fn profile_server_origin(
     (profile.auth_origin.as_deref() == Some(current.as_str())).then_some(current)
 }
 
-fn profile_origin_requires_reauth(
-    profile: &profile::Profile,
-    current_server_url: &str,
-) -> bool {
+fn profile_origin_requires_reauth(profile: &profile::Profile, current_server_url: &str) -> bool {
     if profile
         .token
         .as_deref()
@@ -829,9 +827,8 @@ fn ssh_host_key_confirmation_is_current(
     algorithm: &str,
     fingerprint: &str,
 ) -> bool {
-    current.is_none_or(|trusted| {
-        trusted.algorithm == algorithm && trusted.fingerprint == fingerprint
-    })
+    current
+        .is_none_or(|trusted| trusted.algorithm == algorithm && trusted.fingerprint == fingerprint)
 }
 
 fn ssh_test_profile(form_id: u64, draft: &ssh::NewSshProfile) -> ssh::SshProfile {
@@ -978,9 +975,7 @@ fn remote_edit_error_message(error: lumen_protocol::remote::EditFileError) -> St
         EditFileError::Symlink => "为安全起见，内置编辑器不直接编辑符号链接",
         EditFileError::Busy => "远程文件服务正忙，请稍后重试",
         EditFileError::ChangedDuringRead => "读取过程中远程文件发生了变化，请重试",
-        EditFileError::LengthMismatch | EditFileError::Integrity => {
-            "远程文件传输校验失败，请重试"
-        }
+        EditFileError::LengthMismatch | EditFileError::Integrity => "远程文件传输校验失败，请重试",
         EditFileError::Cancelled => "远程文件编辑操作已取消",
         EditFileError::StaleSession => "远程控制会话已变化，请重新打开文件",
         EditFileError::Io => "远程文件读写失败",
@@ -991,9 +986,7 @@ fn remote_edit_error_message(error: lumen_protocol::remote::EditFileError) -> St
 fn remote_parent_path(path: &str) -> Option<&str> {
     let trimmed = path.trim_end_matches(['/', '\\']);
     let separator = trimmed.rfind(['/', '\\'])?;
-    if separator == 0
-        || (separator == 2 && trimmed.as_bytes().get(1).copied() == Some(b':'))
-    {
+    if separator == 0 || (separator == 2 && trimmed.as_bytes().get(1).copied() == Some(b':')) {
         Some(&trimmed[..=separator])
     } else {
         Some(&trimmed[..separator])
@@ -1399,8 +1392,8 @@ fn effective_session_mode(pane: &Session, force_fallback: bool) -> mode::InputMo
 /// 紧随其后的 Enter 会再次接受当前候选，形成 `/yoyolo`。括号粘贴走
 /// Kimi 编辑器的原子 paste 路径，不触发补全，然后末尾 CR 只负责提交。
 #[cfg(feature = "input-editor")]
-fn encode_llm_submit(text: &str, kind: Option<llm_cli::LlmCliKind>) -> Vec<u8> {
-    if kind == Some(llm_cli::LlmCliKind::Kimi) && text.lines().count() <= 1 {
+fn encode_llm_submit(text: &str, kind: Option<llm_cli::LlmCliKind>, win32_input: bool) -> Vec<u8> {
+    let mut buf = if kind == Some(llm_cli::LlmCliKind::Kimi) && text.lines().count() <= 1 {
         let mut buf = Vec::with_capacity(text.len() + 14);
         buf.extend_from_slice(b"\x1b[200~");
         buf.extend_from_slice(text.as_bytes());
@@ -1408,7 +1401,13 @@ fn encode_llm_submit(text: &str, kind: Option<llm_cli::LlmCliKind>) -> Vec<u8> {
         buf
     } else {
         encode_submit(text)
+    };
+    if win32_input {
+        debug_assert_eq!(buf.last(), Some(&b'\r'));
+        buf.pop();
+        buf.extend_from_slice(&input::encode_plain_enter(true));
     }
+    buf
 }
 
 /// LLM CLI 的本地编辑器为空时，方向键/Esc 应留给 CLI 自己的交互
@@ -1562,9 +1561,7 @@ impl AppState {
                 self.app_lock.mark_storage_error();
                 self.prepare_locked_ui();
             } else {
-                self.shell_state
-                    .settings
-                    .security_operation_failed();
+                self.shell_state.settings.security_operation_failed();
             }
         }
         self.window.request_redraw();
@@ -1578,32 +1575,22 @@ impl AppState {
             match response {
                 app_lock::CryptoResponse::Enable(Ok(verifier)) => {
                     if self.app_lock.finish_enable(verifier).is_ok() {
-                        self.shell_state
-                            .settings
-                            .security_operation_succeeded();
+                        self.shell_state.settings.security_operation_succeeded();
                     } else {
-                        self.shell_state
-                            .settings
-                            .security_operation_failed();
+                        self.shell_state.settings.security_operation_failed();
                     }
                 }
                 app_lock::CryptoResponse::Disable(Ok(true)) => {
                     if self.app_lock.finish_disable().is_ok() {
-                        self.shell_state
-                            .settings
-                            .security_operation_succeeded();
+                        self.shell_state.settings.security_operation_succeeded();
                     } else {
-                        self.shell_state
-                            .settings
-                            .security_operation_failed();
+                        self.shell_state.settings.security_operation_failed();
                     }
                 }
                 app_lock::CryptoResponse::Disable(Ok(false))
                 | app_lock::CryptoResponse::ChangePassword(Ok(None)) => {
                     if self.app_lock.unlock_failure(Instant::now()).is_ok() {
-                        self.shell_state
-                            .settings
-                            .security_current_password_wrong();
+                        self.shell_state.settings.security_current_password_wrong();
                     } else {
                         self.app_lock.mark_storage_error();
                         self.prepare_locked_ui();
@@ -1611,13 +1598,9 @@ impl AppState {
                 }
                 app_lock::CryptoResponse::ChangePassword(Ok(Some(verifier))) => {
                     if self.app_lock.finish_change_password(verifier).is_ok() {
-                        self.shell_state
-                            .settings
-                            .security_operation_succeeded();
+                        self.shell_state.settings.security_operation_succeeded();
                     } else {
-                        self.shell_state
-                            .settings
-                            .security_operation_failed();
+                        self.shell_state.settings.security_operation_failed();
                     }
                 }
                 app_lock::CryptoResponse::Unlock(Ok(true)) => {
@@ -1640,9 +1623,7 @@ impl AppState {
                 app_lock::CryptoResponse::Enable(Err(_))
                 | app_lock::CryptoResponse::Disable(Err(_))
                 | app_lock::CryptoResponse::ChangePassword(Err(_)) => {
-                    self.shell_state
-                        .settings
-                        .security_operation_failed();
+                    self.shell_state.settings.security_operation_failed();
                 }
                 app_lock::CryptoResponse::Unlock(Err(_)) => {
                     self.app_lock.mark_storage_error();
@@ -1709,9 +1690,7 @@ impl AppState {
             Ok(false) => false,
             Err(e) => {
                 log::error!("应用锁状态写盘失败: {e}");
-                self.shell_state
-                    .settings
-                    .security_operation_failed();
+                self.shell_state.settings.security_operation_failed();
                 self.shell_state.toast.push(
                     shell::toast::ToastKind::Error,
                     i18n::strings().security_operation_failed,
@@ -1729,10 +1708,7 @@ impl AppState {
         let now = Instant::now();
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
-                pane.term_frame_due_since = Some(
-                    now.checked_sub(REDRAW_ABS_CAP)
-                        .unwrap_or(now),
-                );
+                pane.term_frame_due_since = Some(now.checked_sub(REDRAW_ABS_CAP).unwrap_or(now));
             }
         }
         self.last_local_input = now;
@@ -1778,19 +1754,14 @@ impl AppState {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         for (id, delta) in &full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(device, queue, *id, delta);
+            self.egui_renderer.update_texture(device, queue, *id, delta);
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("lumen app lock frame"),
         });
-        let user_cmds = self.egui_renderer.update_buffers(
-            device,
-            queue,
-            &mut encoder,
-            &clipped,
-            &screen,
-        );
+        let user_cmds =
+            self.egui_renderer
+                .update_buffers(device, queue, &mut encoder, &clipped, &screen);
         let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1801,9 +1772,7 @@ impl AppState {
                     view: &surface_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(
-                            self.renderer.theme().background.to_wgpu(),
-                        ),
+                        load: wgpu::LoadOp::Clear(self.renderer.theme().background.to_wgpu()),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -2366,15 +2335,11 @@ impl AppState {
         }
     }
 
-    fn text_editor_source_is_current(
-        &self,
-        source: &shell::text_editor::TextFileSource,
-    ) -> bool {
+    fn text_editor_source_is_current(&self, source: &shell::text_editor::TextFileSource) -> bool {
         use shell::text_editor::TextFileSource;
         match source {
             TextFileSource::Remote { generation, .. } => {
-                self.remote_ws.is_controlling()
-                    && *generation == self.remote_ws.edit_generation()
+                self.remote_ws.is_controlling() && *generation == self.remote_ws.edit_generation()
             }
             TextFileSource::Ssh {
                 runtime_id,
@@ -2396,10 +2361,9 @@ impl AppState {
             .cloned()
             .collect::<Vec<_>>();
         for source in stale_sources {
-            self.shell_state.text_editor.invalidate_source(
-                &source,
-                i18n::strings().text_editor_source_invalidated,
-            );
+            self.shell_state
+                .text_editor
+                .invalidate_source(&source, i18n::strings().text_editor_source_invalidated);
         }
     }
 
@@ -2427,11 +2391,7 @@ impl AppState {
                         _ => None,
                     };
                     if let Some(path) = path {
-                        if self
-                            .shell_state
-                            .text_editor
-                            .apply_saved(token, Ok(()))
-                        {
+                        if self.shell_state.text_editor.apply_saved(token, Ok(())) {
                             if let Some(parent) = remote_parent_path(&path) {
                                 self.remote_ws.refresh_remote_path(parent);
                             }
@@ -2455,10 +2415,11 @@ impl AppState {
                         self.shell_state.text_editor.source_for_token(token),
                         Some(TextFileSource::Remote { generation, .. })
                             if *generation == current_generation
-                    ) && !self.shell_state.text_editor.apply_saved(
-                        token,
-                        Err(SaveFailure::Message(message.clone())),
-                    ) {
+                    ) && !self
+                        .shell_state
+                        .text_editor
+                        .apply_saved(token, Err(SaveFailure::Message(message.clone())))
+                    {
                         self.shell_state
                             .text_editor
                             .apply_loaded(token, Err(message));
@@ -2502,14 +2463,10 @@ impl AppState {
             }
             shell::text_editor::TextFileSource::Ssh {
                 session_id, path, ..
-            } => {
-                self.ssh_runtime.read_text(session_id, token, path)
-            }
+            } => self.ssh_runtime.read_text(session_id, token, path),
         };
         if let Err(error) = result {
-            self.shell_state
-                .text_editor
-                .apply_loaded(token, Err(error));
+            self.shell_state.text_editor.apply_loaded(token, Err(error));
         }
     }
 
@@ -2651,8 +2608,7 @@ impl AppState {
 
     fn ensure_ssh_sync_worker(&mut self) {
         let server_url = cloud::server_url();
-        let Some((account_id, server_url)) =
-            ssh_sync_identity(self.profile.as_ref(), &server_url)
+        let Some((account_id, server_url)) = ssh_sync_identity(self.profile.as_ref(), &server_url)
         else {
             // 地址被清空时只停止同步，不抹掉仍供远程功能使用的当前账号 token。
             drop(self.ssh_sync.take());
@@ -2675,13 +2631,8 @@ impl AppState {
             drop(self.ssh_sync.take());
             return;
         };
-        if !should_trigger_ssh_sync_after_local_change(
-            Some(&account_id),
-            store.account_id(),
-        ) {
-            log::warn!(
-                "拒绝启动 SSH 同步：worker 账号与库存作用域不一致（worker={account_id}）"
-            );
+        if !should_trigger_ssh_sync_after_local_change(Some(&account_id), store.account_id()) {
+            log::warn!("拒绝启动 SSH 同步：worker 账号与库存作用域不一致（worker={account_id}）");
             drop(self.ssh_sync.take());
             return;
         }
@@ -2872,10 +2823,8 @@ impl AppState {
         let Some(store) = self.ssh_store.as_ref() else {
             return;
         };
-        if !should_trigger_ssh_sync_after_local_change(
-            Some(&active.account_id),
-            store.account_id(),
-        ) {
+        if !should_trigger_ssh_sync_after_local_change(Some(&active.account_id), store.account_id())
+        {
             return;
         }
         if let Some(snapshot) = store.sync_snapshot() {
@@ -2926,15 +2875,8 @@ impl AppState {
                 .ssh_sync
                 .as_ref()
                 .map(|active| active.account_id.as_str());
-            let store_account = self
-                .ssh_store
-                .as_ref()
-                .and_then(ssh::SshStore::account_id);
-            if !should_apply_ssh_sync_event(
-                worker_account,
-                store_account,
-                &event_account,
-            ) {
+            let store_account = self.ssh_store.as_ref().and_then(ssh::SshStore::account_id);
+            if !should_apply_ssh_sync_event(worker_account, store_account, &event_account) {
                 log::warn!(
                     "丢弃过期 SSH 同步事件：event_account={event_account}, worker_account={worker_account:?}, store_account={store_account:?}"
                 );
@@ -2959,10 +2901,7 @@ impl AppState {
                             .profiles()
                             .iter()
                             .map(|profile| {
-                                (
-                                    profile.id.clone(),
-                                    store.binding(&profile.id).cloned(),
-                                )
+                                (profile.id.clone(), store.binding(&profile.id).cloned())
                             })
                             .collect::<Vec<_>>();
                         match store.apply_sync_completed(completed) {
@@ -3161,8 +3100,7 @@ impl AppState {
         let draft = submission.take_draft();
         let mut password = zeroize::Zeroizing::new(submission.take_password());
         let private_key_path = submission.take_private_key_path();
-        let mut key_passphrase =
-            zeroize::Zeroizing::new(submission.take_key_passphrase());
+        let mut key_passphrase = zeroize::Zeroizing::new(submission.take_key_passphrase());
 
         // UI 会禁用无效提交，但主线程必须在任何 inventory mutation 前再次
         // 复核本机私钥。编辑且 endpoint/auth 均未变化时允许沿用现有绑定；
@@ -3261,15 +3199,14 @@ impl AppState {
             }
             ssh::AuthMethod::PrivateKey => {
                 if let Some(path) = private_key_path {
-                    let credential_submission =
-                        shell::SshCredentialSubmission::from_private_key(
-                            profile.id.clone(),
-                            profile.host.clone(),
-                            profile.port,
-                            profile.username.clone(),
-                            path,
-                            std::mem::take(&mut *key_passphrase),
-                        );
+                    let credential_submission = shell::SshCredentialSubmission::from_private_key(
+                        profile.id.clone(),
+                        profile.host.clone(),
+                        profile.port,
+                        profile.username.clone(),
+                        path,
+                        std::mem::take(&mut *key_passphrase),
+                    );
                     if self
                         .save_ssh_credential_submission(&profile, credential_submission)
                         .is_err()
@@ -3278,8 +3215,7 @@ impl AppState {
                     }
                 }
             }
-            ssh::AuthMethod::Password
-            | ssh::AuthMethod::Agent
+            ssh::AuthMethod::Password | ssh::AuthMethod::Agent
                 if !password.is_empty() || !key_passphrase.is_empty() =>
             {
                 log::warn!("忽略认证方式已变化的 SSH 表单凭据缓冲");
@@ -3303,10 +3239,9 @@ impl AppState {
             } else {
                 "SSH 服务器已保存，但密码无法安全写入本机凭据存储"
             };
-            self.shell_state.toast.push(
-                shell::toast::ToastKind::Error,
-                message,
-            );
+            self.shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, message);
         }
         self.window.request_redraw();
     }
@@ -3318,8 +3253,7 @@ impl AppState {
         let draft = submission.take_draft();
         let mut password = zeroize::Zeroizing::new(submission.take_password());
         let private_key_path = submission.take_private_key_path();
-        let mut key_passphrase =
-            zeroize::Zeroizing::new(submission.take_key_passphrase());
+        let mut key_passphrase = zeroize::Zeroizing::new(submission.take_key_passphrase());
         let profile = ssh_test_profile(form_id, &draft);
 
         let saved_credential = || -> Option<lumen_ssh::Credential> {
@@ -3394,7 +3328,11 @@ impl AppState {
         .into_iter()
         .flatten()
         {
-            if retained.into_iter().flatten().any(|value| value == raw_reference) {
+            if retained
+                .into_iter()
+                .flatten()
+                .any(|value| value == raw_reference)
+            {
                 continue;
             }
             let Ok(reference) = raw_reference.parse::<ssh::CredentialReference>() else {
@@ -3489,23 +3427,20 @@ impl AppState {
         else {
             return Ok(None);
         };
-        let read_bound_secret =
-            |raw: &str, expected_slot: ssh::CredentialSlot| -> Result<_, ()> {
-                let reference = raw.parse::<ssh::CredentialReference>().map_err(|_| ())?;
-                if reference.profile_id() != profile.id || reference.slot() != expected_slot {
-                    return Err(());
-                }
-                ssh::read_secret(&reference).map_err(|_| ())
-            };
+        let read_bound_secret = |raw: &str, expected_slot: ssh::CredentialSlot| -> Result<_, ()> {
+            let reference = raw.parse::<ssh::CredentialReference>().map_err(|_| ())?;
+            if reference.profile_id() != profile.id || reference.slot() != expected_slot {
+                return Err(());
+            }
+            ssh::read_secret(&reference).map_err(|_| ())
+        };
 
         match profile.auth_method {
             ssh::AuthMethod::Password => {
                 let Some(raw) = binding.password_credential_ref.as_deref() else {
                     return Ok(None);
                 };
-                let Some(secret) =
-                    read_bound_secret(raw, ssh::CredentialSlot::Password)?
-                else {
+                let Some(secret) = read_bound_secret(raw, ssh::CredentialSlot::Password)? else {
                     return Ok(None);
                 };
                 if secret.is_empty() {
@@ -3582,10 +3517,9 @@ impl AppState {
             return;
         };
         let Some(intent) = self.ssh_runtime.connect_intent(session_id, &profile) else {
-            self.shell_state.toast.push(
-                shell::toast::ToastKind::Error,
-                "SSH 会话已关闭，请重新连接",
-            );
+            self.shell_state
+                .toast
+                .push(shell::toast::ToastKind::Error, "SSH 会话已关闭，请重新连接");
             return;
         };
         self.apply_ssh_connect_intent(session_id, &profile, intent);
@@ -3745,32 +3679,28 @@ impl AppState {
                 if submission.password().is_empty() {
                     return Err(i18n::strings().ssh_cred_toast_empty_password.to_owned());
                 }
-                let reference = ssh::CredentialReference::password(&profile.id).map_err(|error| {
-                    log::warn!("创建 SSH 密码凭据引用失败: {error}");
-                    i18n::strings().ssh_cred_toast_invalid_id.to_owned()
-                })?;
+                let reference =
+                    ssh::CredentialReference::password(&profile.id).map_err(|error| {
+                        log::warn!("创建 SSH 密码凭据引用失败: {error}");
+                        i18n::strings().ssh_cred_toast_invalid_id.to_owned()
+                    })?;
                 binding.private_key_path = None;
                 binding.password_credential_ref = Some(reference.target());
                 binding.key_passphrase_credential_ref = None;
-                let transaction = ssh::write_secret_with_commit(
-                    &reference,
-                    submission.password(),
-                    || {
+                let transaction =
+                    ssh::write_secret_with_commit(&reference, submission.password(), || {
                         self.ssh_store
                             .as_mut()
                             .ok_or(())
                             .and_then(|store| store.upsert_binding(binding).map_err(|_| ()))
-                    },
-                );
+                    });
                 if let Err(error) = transaction {
                     return Err(match error {
                         ssh::CredentialTransactionError::Write(error) => {
                             log::warn!("写入 SSH 本机密码凭据失败: {error}");
                             i18n::fmt1(i18n::strings().ssh_cred_toast_write_failed_fmt, error)
                         }
-                        ssh::CredentialTransactionError::Commit {
-                            rollback_error, ..
-                        } => {
+                        ssh::CredentialTransactionError::Commit { rollback_error, .. } => {
                             log::warn!("提交 SSH 本机密码绑定失败");
                             if let Some(error) = rollback_error {
                                 log::warn!("回滚新 SSH 本机密码凭据失败: {error}");
@@ -3791,8 +3721,8 @@ impl AppState {
                 let new_reference = if submission.key_passphrase().is_empty() {
                     None
                 } else {
-                    let reference = ssh::CredentialReference::key_passphrase(&profile.id)
-                        .map_err(|error| {
+                    let reference =
+                        ssh::CredentialReference::key_passphrase(&profile.id).map_err(|error| {
                             log::warn!("创建 SSH 私钥口令引用失败: {error}");
                             i18n::strings().ssh_cred_toast_invalid_id.to_owned()
                         })?;
@@ -3834,9 +3764,7 @@ impl AppState {
                         ssh::CredentialTransactionError::Write(error) => {
                             log::warn!("写入 SSH 本机私钥口令失败: {error}");
                         }
-                        ssh::CredentialTransactionError::Commit {
-                            rollback_error, ..
-                        } => {
+                        ssh::CredentialTransactionError::Commit { rollback_error, .. } => {
                             log::warn!("提交 SSH 本机私钥绑定失败");
                             if let Some(error) = rollback_error {
                                 log::warn!("回滚新 SSH 本机私钥口令失败: {error}");
@@ -3856,9 +3784,8 @@ impl AppState {
                 let path = submission
                     .take_private_key_path()
                     .expect("私钥路径已在上方严格校验");
-                let passphrase = (!submission.key_passphrase().is_empty()).then(|| {
-                    lumen_ssh::SecretString::new(submission.take_key_passphrase())
-                });
+                let passphrase = (!submission.key_passphrase().is_empty())
+                    .then(|| lumen_ssh::SecretString::new(submission.take_key_passphrase()));
                 lumen_ssh::Credential::private_key(path, passphrase)
             }
         };
@@ -3894,10 +3821,9 @@ impl AppState {
                     .cloned();
                 let Some(profile) = profile else {
                     self.ssh_runtime.close_session(session_id);
-                    self.shell_state.toast.push(
-                        shell::toast::ToastKind::Error,
-                        "SSH 服务器配置已不存在",
-                    );
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Error, "SSH 服务器配置已不存在");
                     return;
                 };
                 if !self
@@ -3950,8 +3876,7 @@ impl AppState {
                 }
             }
             SshRuntimeAction::CloseSession { session_id } => {
-                let cleared_dialog =
-                    self.clear_ssh_credential_dialog_for_session(session_id);
+                let cleared_dialog = self.clear_ssh_credential_dialog_for_session(session_id);
                 if self.ssh_runtime.close_session(session_id) || cleared_dialog {
                     let active_profile_id = self
                         .ssh_runtime
@@ -4100,11 +4025,10 @@ impl AppState {
                     return;
                 }
                 self.notify_ssh_local_change();
-                if self.ssh_runtime.confirm_unknown_host_key(
-                    session_id,
-                    &algorithm,
-                    &fingerprint,
-                ) {
+                if self
+                    .ssh_runtime
+                    .confirm_unknown_host_key(session_id, &algorithm, &fingerprint)
+                {
                     // Never cache/reuse the credential that reached the first
                     // host-key probe. Password/private-key modes prompt again.
                     self.continue_ssh_profile_connect(session_id, &profile_id);
@@ -4166,10 +4090,9 @@ impl AppState {
                     .cloned()
                     .collect::<Vec<_>>();
                 for source in sources {
-                    self.shell_state.text_editor.invalidate_source(
-                        &source,
-                        i18n::strings().text_editor_source_invalidated,
-                    );
+                    self.shell_state
+                        .text_editor
+                        .invalidate_source(&source, i18n::strings().text_editor_source_invalidated);
                 }
             }
             self.window.request_redraw();
@@ -4188,8 +4111,7 @@ impl AppState {
         let mut clipboard_sequence = system_clipboard_sequence_number();
         if let Some(clipboard) = self.clipboard.as_mut() {
             if clipboard.clear().is_ok() {
-                clipboard_sequence =
-                    system_clipboard_sequence_number().or(clipboard_sequence);
+                clipboard_sequence = system_clipboard_sequence_number().or(clipboard_sequence);
             }
         }
 
@@ -4201,10 +4123,7 @@ impl AppState {
             Err(error) => {
                 self.shell_state.toast.push(
                     shell::toast::ToastKind::Error,
-                    i18n::fmt1(
-                        i18n::strings().ssh_clipboard_prepare_failed_fmt,
-                        error,
-                    ),
+                    i18n::fmt1(i18n::strings().ssh_clipboard_prepare_failed_fmt, error),
                 );
                 self.window.request_redraw();
                 return;
@@ -4218,20 +4137,15 @@ impl AppState {
                 clipboard_sequence,
             },
         );
-        if let Err(error) = self.ssh_runtime.download_file(
-            item.session_id,
-            item.path,
-            destination.clone(),
-            false,
-        ) {
+        if let Err(error) =
+            self.ssh_runtime
+                .download_file(item.session_id, item.path, destination.clone(), false)
+        {
             self.ssh_clipboard_exports.remove(&destination);
             remove_ssh_clipboard_staging_path(&destination);
             self.shell_state.toast.push(
                 shell::toast::ToastKind::Error,
-                i18n::fmt1(
-                    i18n::strings().ssh_clipboard_prepare_failed_fmt,
-                    error,
-                ),
+                i18n::fmt1(i18n::strings().ssh_clipboard_prepare_failed_fmt, error),
             );
             self.window.request_redraw();
             return;
@@ -4249,10 +4163,8 @@ impl AppState {
         let Some(export) = self.ssh_clipboard_exports.remove(&local_path) else {
             return false;
         };
-        if !ssh_clipboard_export_is_current(
-            export.generation,
-            self.ssh_clipboard_export_generation,
-        ) {
+        if !ssh_clipboard_export_is_current(export.generation, self.ssh_clipboard_export_generation)
+        {
             remove_ssh_clipboard_staging_path(&local_path);
             return true;
         }
@@ -4290,34 +4202,22 @@ impl AppState {
 
     /// 返回 `true` 表示该失败属于 SSH→系统剪贴板链路。旧代次静默清理；
     /// 只有当前复制显示错误，避免连续复制时旧任务失败干扰最新结果。
-    fn fail_ssh_clipboard_export(
-        &mut self,
-        local_path: &std::path::Path,
-        message: &str,
-    ) -> bool {
+    fn fail_ssh_clipboard_export(&mut self, local_path: &std::path::Path, message: &str) -> bool {
         let Some(export) = self.ssh_clipboard_exports.remove(local_path) else {
             return false;
         };
         remove_ssh_clipboard_staging_path(local_path);
-        if ssh_clipboard_export_is_current(
-            export.generation,
-            self.ssh_clipboard_export_generation,
-        ) {
+        if ssh_clipboard_export_is_current(export.generation, self.ssh_clipboard_export_generation)
+        {
             self.shell_state.toast.push(
                 shell::toast::ToastKind::Error,
-                i18n::fmt1(
-                    i18n::strings().ssh_clipboard_prepare_failed_fmt,
-                    message,
-                ),
+                i18n::fmt1(i18n::strings().ssh_clipboard_prepare_failed_fmt, message),
             );
         }
         true
     }
 
-    fn invalidate_ssh_clipboard_exports(
-        &mut self,
-        session_ids: &[ssh_runtime::SshSessionId],
-    ) {
+    fn invalidate_ssh_clipboard_exports(&mut self, session_ids: &[ssh_runtime::SshSessionId]) {
         let paths = self
             .ssh_clipboard_exports
             .iter()
@@ -4337,8 +4237,7 @@ impl AppState {
                 path,
                 is_directory,
             } => {
-                self.ssh_runtime
-                    .select_file(session_id, path, is_directory);
+                self.ssh_runtime.select_file(session_id, path, is_directory);
             }
             SshFileTreeIntent::ClearSelection { session_id } => {
                 self.ssh_runtime.clear_file_selection(session_id);
@@ -4441,10 +4340,7 @@ impl AppState {
         }
     }
 
-    fn apply_ssh_file_runtime_events(
-        &mut self,
-        events: Vec<ssh_runtime::SshFileRuntimeEvent>,
-    ) {
+    fn apply_ssh_file_runtime_events(&mut self, events: Vec<ssh_runtime::SshFileRuntimeEvent>) {
         use shell::text_editor::{SaveFailure, TextFileSource};
         let runtime_id = self.ssh_runtime.runtime_id();
         for event in events {
@@ -4538,10 +4434,9 @@ impl AppState {
                                     }
                                     Err(error) => {
                                         remove_staged_path(&local_path);
-                                        self.shell_state.toast.push(
-                                            shell::toast::ToastKind::Error,
-                                            error,
-                                        );
+                                        self.shell_state
+                                            .toast
+                                            .push(shell::toast::ToastKind::Error, error);
                                     }
                                 }
                             } else if let Some(parent) = local_path.parent() {
@@ -4588,12 +4483,14 @@ impl AppState {
                                 && *source_session == session_id
                         );
                         if source_matches
-                            && !self.shell_state.text_editor.apply_saved(
-                                token,
-                                Err(SaveFailure::Message(message.clone())),
-                            )
+                            && !self
+                                .shell_state
+                                .text_editor
+                                .apply_saved(token, Err(SaveFailure::Message(message.clone())))
                         {
-                            self.shell_state.text_editor.apply_loaded(token, Err(message));
+                            self.shell_state
+                                .text_editor
+                                .apply_loaded(token, Err(message));
                         }
                     } else {
                         self.shell_state
@@ -4619,12 +4516,7 @@ impl AppState {
     }
 
     #[cfg(feature = "input-editor")]
-    fn show_cached_llm_slash_candidates(
-        &mut self,
-        ti: usize,
-        pi: usize,
-        prefix: &str,
-    ) -> bool {
+    fn show_cached_llm_slash_candidates(&mut self, ti: usize, pi: usize, prefix: &str) -> bool {
         let commands: Vec<llm_cli::SlashCommand> = self.tabs[ti].panes[pi]
             .slash_probe
             .commands
@@ -4682,6 +4574,24 @@ impl AppState {
     }
 
     #[cfg(feature = "input-editor")]
+    fn write_llm_slash_probe_next(
+        &mut self,
+        ti: usize,
+        pi: usize,
+        steps: usize,
+        context: &str,
+    ) -> bool {
+        let win32_input = self.tabs[ti].panes[pi].term.win32_input()
+            && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
+        let bytes = input::encode_plain_arrow_down(win32_input).repeat(steps.max(1));
+        if let Err(error) = self.tabs[ti].panes[pi].write_user_input(&bytes) {
+            log::error!("{context}: {error:#}");
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "input-editor")]
     fn begin_llm_slash_probe_clear(
         &mut self,
         ti: usize,
@@ -4693,6 +4603,7 @@ impl AppState {
             return false;
         }
         let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+        probe.stop_scan();
         probe.clearing = true;
         probe.escape_sent = false;
         probe.clear_at = Some(Instant::now() + LLM_SLASH_CLEAR_STAGE_DELAY);
@@ -4703,8 +4614,9 @@ impl AppState {
     }
 
     /// 把本地编辑器中的 `/prefix` 临时镜像给 CLI，从 CLI 自己的菜单
-    /// 采集命令。采集完成立即 Ctrl+U 清掉影子输入；后续前缀优先筛选
-    /// 会话缓存，不让 CLI 原生菜单与 Lumen 弹层长期重叠。
+    /// 自动遍历原生菜单并累计全部命令。遍历完成立即 Ctrl+U 清掉影子
+    /// 输入；后续前缀优先筛选完整会话缓存，不让 CLI 原生菜单与 Lumen
+    /// 弹层长期重叠。
     #[cfg(feature = "input-editor")]
     fn sync_llm_slash_probe(&mut self, ti: usize, pi: usize) {
         if ti >= self.tabs.len() || pi >= self.tabs[ti].panes.len() {
@@ -4723,17 +4635,32 @@ impl AppState {
             None
         };
         let current = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
+        let probe_active = {
+            let probe = &self.tabs[ti].panes[pi].slash_probe;
+            probe.scanning() || probe.clearing
+        };
+        let can_filter_active_probe =
+            llm_cli::can_filter_active_probe(probe_active, &current, next.as_deref());
+        if can_filter_active_probe {
+            // 裸 `/` 的全量扫描尚未结束时，继续输入字符只改变 Lumen
+            // 本地筛选条件。不要中断扫描后对 Kimi 执行 Ctrl+U→Esc→
+            // 重新探测，否则每输入一个字符都会让编辑器短暂停住。
+            let prefix = next.as_deref().expect("活动扫描筛选必须有斜杠前缀");
+            self.completion_req_id = 0;
+            self.completion_candidates.clear();
+            self.shell_state.completion.open = false;
+            self.shell_state.completion.passive = false;
+            self.show_cached_llm_slash_candidates(ti, pi, prefix);
+            self.window.request_redraw();
+            return;
+        }
         if next.as_deref() == (!current.is_empty()).then_some(current.as_str()) {
             return;
         }
 
         if !current.is_empty() {
-            if self.begin_llm_slash_probe_clear(
-                ti,
-                pi,
-                true,
-                "清理 LLM CLI 斜杠探测输入失败",
-            ) {
+            if self.begin_llm_slash_probe_clear(ti, pi, true, "清理 LLM CLI 斜杠探测输入失败")
+            {
                 return;
             }
             self.tabs[ti].panes[pi].slash_probe.clear_active();
@@ -4745,19 +4672,18 @@ impl AppState {
             self.completion_candidates.clear();
             self.shell_state.completion.open = false;
             self.shell_state.completion.passive = false;
-            if self.show_cached_llm_slash_candidates(ti, pi, &prefix) {
+            let prefix_complete = self.tabs[ti].panes[pi].slash_probe.prefix_complete(&prefix);
+            if prefix_complete {
+                self.show_cached_llm_slash_candidates(ti, pi, &prefix);
                 return;
             }
-            if let Err(error) =
-                self.tabs[ti].panes[pi].write_user_input(prefix.as_bytes())
-            {
+            if let Err(error) = self.tabs[ti].panes[pi].write_user_input(prefix.as_bytes()) {
                 log::error!("写入 LLM CLI 斜杠探测前缀失败: {error:#}");
                 return;
             }
-            self.tabs[ti].panes[pi].slash_probe.begin_probe(
-                prefix,
-                Instant::now() + LLM_SLASH_PROBE_TIMEOUT,
-            );
+            self.tabs[ti].panes[pi]
+                .slash_probe
+                .begin_probe(prefix, Instant::now() + LLM_SLASH_PROBE_TIMEOUT);
         }
     }
 
@@ -4770,7 +4696,8 @@ impl AppState {
         self.close_passive_completion();
     }
 
-    /// PTY 输出更新后从 CLI 当前可视菜单刷新被动斜杠候选。
+    /// PTY 输出更新后累计 CLI 当前可视菜单；第一次拿到菜单时启动自动
+    /// 下移扫描，直到精确页码到尾、选中项回环或兜底停止条件触发。
     #[cfg(feature = "input-editor")]
     fn refresh_llm_slash_candidates(&mut self, ti: usize, pi: usize) {
         let prefix = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
@@ -4781,54 +4708,136 @@ impl AppState {
             let pane = &self.tabs[ti].panes[pi];
             pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term))
         };
-        let commands = kind.map_or_else(Vec::new, |kind| {
-            llm_cli::slash_commands(&self.tabs[ti].panes[pi].term, &prefix, kind)
-        });
+        let snapshot =
+            kind.map(|kind| llm_cli::slash_menu(&self.tabs[ti].panes[pi].term, &prefix, kind));
         if self.tabs[ti].panes[pi].slash_probe.clearing {
             return;
         }
-        if commands.is_empty() {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        if snapshot.commands.is_empty() {
             return;
         }
-        self.tabs[ti].panes[pi]
-            .slash_probe
-            .merge_commands(commands);
-        if !self.begin_llm_slash_probe_clear(
-            ti,
-            pi,
-            true,
-            "清理已采集的 LLM CLI 斜杠菜单失败",
-        ) {
-            self.tabs[ti].panes[pi].slash_probe.clear_active();
-            self.window.request_redraw();
+        let commands_changed = {
+            let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+            let commands_changed = probe.merge_commands(snapshot.commands.clone());
+            if !probe.scanning() {
+                let now = Instant::now();
+                let command_count = probe.commands.len();
+                probe.begin_scan(
+                    &snapshot,
+                    command_count,
+                    now + LLM_SLASH_SCAN_INTERVAL,
+                    now + LLM_SLASH_SCAN_TIMEOUT,
+                );
+            }
+            commands_changed
+        };
+        if commands_changed
+            || !self.shell_state.completion.open
+            || !self.shell_state.completion.passive
+        {
+            // 首屏拿到即展示，后台滚动只负责持续追加。扫描无论是否能识别
+            // 页码，都不能再阻塞菜单与本地编辑器。
+            let display_prefix = {
+                let text = self.tabs[ti].panes[pi].editor.view().text();
+                llm_cli::slash_prefix(&text)
+                    .map(str::to_owned)
+                    .unwrap_or(prefix)
+            };
+            self.show_cached_llm_slash_candidates(ti, pi, &display_prefix);
         }
     }
 
-    /// 定时推进斜杠探测清理。不能依赖 PTY 再产出一帧：Kimi 处理
-    /// Ctrl+U/Esc 后可能没有任何输出，纯输出驱动会永久保留 shadow，
-    /// 让终端纹理看起来卡死。
+    /// 定时推进斜杠菜单全量扫描与探测清理。扫描不能只依赖 PTY 输出：
+    /// 下一次方向键需要稳定节拍；Ctrl+U/Esc 后也可能没有任何回显，
+    /// 纯输出驱动会永久保留 shadow，让终端纹理看起来卡死。
     #[cfg(feature = "input-editor")]
     fn poll_llm_slash_probe_clear(&mut self, now: Instant) -> Option<Instant> {
+        let scan_due = self
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, tab)| {
+                tab.panes.iter().enumerate().filter_map(move |(pi, pane)| {
+                    (!pane.slash_probe.clearing
+                        && pane.slash_probe.scan_at.is_some_and(|at| now >= at))
+                    .then_some((ti, pi))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (ti, pi) in scan_due {
+            let prefix = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
+            let kind = {
+                let pane = &self.tabs[ti].panes[pi];
+                pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term))
+            };
+            let Some(kind) = kind else {
+                self.tabs[ti].panes[pi].slash_probe.stop_scan();
+                continue;
+            };
+            let snapshot = llm_cli::slash_menu(&self.tabs[ti].panes[pi].term, &prefix, kind);
+            let decision = {
+                let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+                probe.merge_commands(snapshot.commands.clone());
+                let command_count = probe.commands.len();
+                probe.observe_scan(
+                    &snapshot,
+                    command_count,
+                    now,
+                    LLM_SLASH_SCAN_MAX_STEPS,
+                    LLM_SLASH_SCAN_MAX_STAGNANT_STEPS,
+                )
+            };
+            match decision {
+                llm_cli::SlashScanDecision::Advance => {
+                    let steps = llm_cli::slash_scan_advance_steps(kind, &snapshot);
+                    if self.write_llm_slash_probe_next(ti, pi, steps, "遍历 LLM CLI 斜杠菜单失败")
+                    {
+                        self.tabs[ti].panes[pi]
+                            .slash_probe
+                            .schedule_scan(now + LLM_SLASH_SCAN_INTERVAL);
+                    } else if !self.begin_llm_slash_probe_clear(
+                        ti,
+                        pi,
+                        false,
+                        "取消未完成的 LLM CLI 斜杠菜单扫描失败",
+                    ) {
+                        self.tabs[ti].panes[pi].slash_probe.clear_active();
+                        self.close_passive_completion();
+                    }
+                }
+                llm_cli::SlashScanDecision::Finish => {
+                    self.tabs[ti].panes[pi]
+                        .slash_probe
+                        .mark_prefix_complete(prefix);
+                    if !self.begin_llm_slash_probe_clear(
+                        ti,
+                        pi,
+                        true,
+                        "清理已完整采集的 LLM CLI 斜杠菜单失败",
+                    ) {
+                        self.tabs[ti].panes[pi].slash_probe.clear_active();
+                        self.window.request_redraw();
+                    }
+                }
+            }
+        }
+
         let timed_out = self
             .tabs
             .iter()
             .enumerate()
             .flat_map(|(ti, tab)| {
-                tab.panes
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(pi, pane)| {
-                        pane.slash_probe.probe_timed_out(now).then_some((ti, pi))
-                    })
+                tab.panes.iter().enumerate().filter_map(move |(pi, pane)| {
+                    pane.slash_probe.probe_timed_out(now).then_some((ti, pi))
+                })
             })
             .collect::<Vec<_>>();
         for (ti, pi) in timed_out {
-            if !self.begin_llm_slash_probe_clear(
-                ti,
-                pi,
-                false,
-                "取消超时的 LLM CLI 斜杠探测失败",
-            ) {
+            if !self.begin_llm_slash_probe_clear(ti, pi, false, "取消超时的 LLM CLI 斜杠探测失败")
+            {
                 self.tabs[ti].panes[pi].slash_probe.clear_active();
                 self.close_passive_completion();
             }
@@ -4848,9 +4857,7 @@ impl AppState {
                 if now < at {
                     continue;
                 }
-                let kind = pane
-                    .llm_cli
-                    .or_else(|| llm_cli::detect(None, &pane.term));
+                let kind = pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term));
                 let send_escape = llm_cli::slash_clear_stage(kind, probe.escape_sent)
                     == llm_cli::SlashClearStage::SendEscape;
                 due.push((ti, pi, send_escape));
@@ -4859,11 +4866,8 @@ impl AppState {
 
         for (ti, pi, send_escape) in due {
             if send_escape {
-                if self.write_llm_slash_probe_escape(
-                    ti,
-                    pi,
-                    "关闭 Kimi 原生斜杠菜单失败",
-                ) {
+                if self.write_llm_slash_probe_escape(ti, pi, "关闭 Kimi 原生斜杠菜单失败")
+                {
                     let probe = &mut self.tabs[ti].panes[pi].slash_probe;
                     probe.escape_sent = true;
                     probe.clear_at = Some(now + LLM_SLASH_CLEAR_STAGE_DELAY);
@@ -4874,9 +4878,7 @@ impl AppState {
                 continue;
             }
 
-            let resume = self.tabs[ti].panes[pi]
-                .slash_probe
-                .resume_after_clear;
+            let resume = self.tabs[ti].panes[pi].slash_probe.resume_after_clear;
             self.tabs[ti].panes[pi].slash_probe.clear_active();
             if resume {
                 self.sync_llm_slash_probe(ti, pi);
@@ -4891,6 +4893,7 @@ impl AppState {
                 [
                     pane.slash_probe.clear_at,
                     pane.slash_probe.probe_deadline,
+                    pane.slash_probe.scan_at,
                 ]
                 .into_iter()
                 .flatten()
@@ -4953,8 +4956,8 @@ impl AppState {
                         // Shell 语法续行：Enter 始终提交，Shift+Enter 负责手动换行。
                         let should_insert_newline = {
                             let pane = &self.tabs[ti].panes[pi];
-                            let llm_active =
-                                pane.llm_cli.is_some() || llm_cli::detect(None, &pane.term).is_some();
+                            let llm_active = pane.llm_cli.is_some()
+                                || llm_cli::detect(None, &pane.term).is_some();
                             composer_should_insert_newline(
                                 llm_active,
                                 !pane.attachments.is_empty(),
@@ -4990,15 +4993,17 @@ impl AppState {
                             // 步骤 2：编码。Kimi 的单行也必须走括号粘贴，
                             // 防止最终命令重新触发其原生斜杠补全。
                             let raw_text = self.tabs[ti].panes[pi].editor.view().text();
-                            let compiled_text =
-                                self.tabs[ti].panes[pi].attachments.compile_prompt(&raw_text);
+                            let compiled_text = self.tabs[ti].panes[pi]
+                                .attachments
+                                .compile_prompt(&raw_text);
                             let llm_kind = {
                                 let pane = &self.tabs[ti].panes[pi];
-                                pane.llm_cli
-                                    .or_else(|| llm_cli::detect(None, &pane.term))
+                                pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term))
                             };
+                            let win32_input = self.tabs[ti].panes[pi].term.win32_input()
+                                && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
                             self.clear_llm_slash_shadow(ti, pi);
-                            let payload = encode_llm_submit(&compiled_text, llm_kind);
+                            let payload = encode_llm_submit(&compiled_text, llm_kind, win32_input);
                             // 步骤 3：滚动到底 + 写 PTY
                             self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
                             if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
@@ -5436,8 +5441,7 @@ impl AppState {
         #[cfg(feature = "input-editor")]
         self.sync_llm_slash_probe(ti, pi);
         // 此推导调用符合设计稿「按键处理后实时计算」的纪律，不缓存。
-        let _current_mode =
-            effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback);
+        let _current_mode = effective_session_mode(&self.tabs[ti].panes[pi], self.force_fallback);
         // 批B：ModeChanged 事件待消费方（状态条）就绪后填充。
         // events.push(StateEvent::ModeChanged(current_mode));
 
@@ -5536,8 +5540,7 @@ impl AppState {
             mouse_x as f32 / points_per_pixel,
             mouse_y as f32 / points_per_pixel,
         );
-        self
-            .egui_ctx
+        self.egui_ctx
             .layer_id_at(position)
             .is_none_or(|layer| layer.order == egui::Order::Background)
     }
@@ -5568,6 +5571,36 @@ impl AppState {
         })
     }
 
+    /// 鼠标是否命中焦点 LLM 会话的 HUD（展开卡片或收起按钮）。
+    ///
+    /// HUD 属于终端内工具：点击关闭/展开不应把键盘焦点交给 egui，
+    /// 否则后续普通字符落入无文本控件的 UI 层，Windows 会播放默认
+    /// 提示音。Area 的 LayerId 与创建时的 Id 同源，可精确区分 HUD
+    /// 和设置页、登录框等真正需要接管输入的前景层。
+    fn mouse_on_llm_hud(&self) -> bool {
+        if self.shell_state.hud.captures_pointer() {
+            return true;
+        }
+        if self.settings.layout.view_mode.is_remote() || self.settings.layout.view_mode.is_ssh() {
+            return false;
+        }
+        let session_id = self.focused_pane().id;
+        let ppp = self.egui_ctx.pixels_per_point();
+        let pos = egui::pos2(self.mouse_pos.0 as f32 / ppp, self.mouse_pos.1 as f32 / ppp);
+        self.egui_ctx.layer_id_at(pos).is_some_and(|layer| {
+            layer
+                == egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new(("lumen_llm_hud", session_id)),
+                )
+                || layer
+                    == egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new(("lumen_llm_hud_collapsed", session_id)),
+                    )
+        })
+    }
+
     /// 焦点窗格 footer 区域的物理像素矩形 (x, y, w, h)。
     ///
     /// 与 `sel_point_at_mouse` 使用相同几何源（同函数计算 footer_px），
@@ -5589,8 +5622,11 @@ impl AppState {
         if !cv.is_visible() {
             return None;
         }
-        let (_, cell_h) = self.renderer.cell_size();
+        let (cell_w, cell_h) = self.renderer.cell_size();
         let fp = self.renderer.padding() * 0.4;
+        cv.soft_wrap(lumen_renderer::composer_view::footer_wrap_columns(
+            w, cell_w, fp,
+        ));
         let max_h = h / 3.0;
         let footer_h =
             lumen_renderer::composer_view::footer_height_px(Some(&cv), cell_h, fp, max_h);
@@ -5624,8 +5660,7 @@ impl AppState {
                 })
             })
             .collect();
-        self.attachment_textures
-            .retain(|key, _| live.contains(key));
+        self.attachment_textures.retain(|key, _| live.contains(key));
         if self.focused_pane().attachments.is_empty() {
             return None;
         }
@@ -5664,8 +5699,7 @@ impl AppState {
         let ppp = self.egui_ctx.pixels_per_point();
         let (_, cell_h) = self.renderer.cell_size();
         let fp = self.renderer.padding() * 0.4;
-        let strip_h_px = (cell_h
-            * lumen_renderer::composer_view::ATTACHMENT_STRIP_ROWS)
+        let strip_h_px = (cell_h * lumen_renderer::composer_view::ATTACHMENT_STRIP_ROWS)
             .min((footer_h - cell_h - fp * 2.0).max(0.0));
         if strip_h_px <= 0.0 {
             return None;
@@ -5677,10 +5711,7 @@ impl AppState {
             .images()
             .iter()
             .filter_map(|image| {
-                let texture = self
-                    .attachment_textures
-                    .get(&(session_id, image.id))?
-                    .id();
+                let texture = self.attachment_textures.get(&(session_id, image.id))?.id();
                 // 明确保留底部的编号/删除按钮行及 item spacing，不能
                 // 让图片吃满附件栏后把标签裁掉。
                 let max_h = (strip_h - 34.0).max(1.0);
@@ -5747,11 +5778,20 @@ impl AppState {
     }
 
     /// 当前鼠标物理像素位置换算为 footer 内相对坐标（相对 footer 左上角）。
-    /// 返回 (rel_x, rel_y, cell_w, cell_h, footer_padding, lines)，
+    /// 返回 (rel_x, rel_y, cell_w, cell_h, footer_padding, visual_lines)，
     /// 便于调用 `footer_mouse::pixel_to_position`。
     #[cfg(feature = "input-editor")]
-    fn mouse_footer_relative(&self) -> Option<(f32, f32, f32, f32, f32, Vec<String>)> {
-        let (fx, fy, _fw, footer_h) = self.focused_footer_rect_px()?;
+    fn mouse_footer_relative(
+        &self,
+    ) -> Option<(
+        f32,
+        f32,
+        f32,
+        f32,
+        f32,
+        Vec<lumen_renderer::composer_view::WrappedFooterLine>,
+    )> {
+        let (fx, fy, fw, footer_h) = self.focused_footer_rect_px()?;
         let (mx, my) = self.mouse_pos;
         let rel_x = mx as f32 - fx;
         let mut rel_y = my as f32 - fy;
@@ -5769,7 +5809,9 @@ impl AppState {
         }
         rel_y -= attachment_h;
         let lines: Vec<String> = pane.editor.view().lines().map(|l| l.to_owned()).collect();
-        Some((rel_x, rel_y, cell_w, cell_h, fp, lines))
+        let wrap_cols = lumen_renderer::composer_view::footer_wrap_columns(fw, cell_w, fp);
+        let visual_lines = lumen_renderer::composer_view::soft_wrap_lines(&lines, wrap_cols);
+        Some((rel_x, rel_y, cell_w, cell_h, fp, visual_lines))
     }
 
     /// 焦点窗格的物理像素矩形 (x, y, w, h)。首帧布局前/结构刚变更
@@ -5787,10 +5829,10 @@ impl AppState {
     /// 区内返回 0。坐标几何与 `sel_point_at_mouse` 同源（`focused_pane_rect_px` +
     /// `pane_footer_px`，均物理像素）。
     fn autoscroll_dir_for_drag(&self) -> i8 {
-        let Some((_, y, _, h)) = self.focused_pane_rect_px() else {
+        let Some((_, y, w, h)) = self.focused_pane_rect_px() else {
             return 0;
         };
-        let footer = self.pane_footer_px(self.tabs[self.active_tab].focused, h);
+        let footer = self.pane_footer_px(self.tabs[self.active_tab].focused, w, h);
         let top = f64::from(y);
         let bottom = f64::from(y + h - footer);
         let my = self.mouse_pos.1;
@@ -5903,10 +5945,7 @@ impl AppState {
                     f64::from(px + cursor_x),
                     f64::from(py + cursor_y),
                 ),
-                winit::dpi::PhysicalSize::new(
-                    f64::from(cell_width),
-                    f64::from(cell_height),
-                ),
+                winit::dpi::PhysicalSize::new(f64::from(cell_width), f64::from(cell_height)),
             );
             return;
         }
@@ -5952,8 +5991,7 @@ impl AppState {
                     + raw_attachment_h)
                     .min(ph / 3.0);
                 let fp = self.renderer.padding() * 0.4;
-                let attachment_h =
-                    raw_attachment_h.min((footer_h - ch - fp * 2.0).max(0.0));
+                let attachment_h = raw_attachment_h.min((footer_h - ch - fp * 2.0).max(0.0));
                 let footer_top_y = py + ph - footer_h + attachment_h;
                 let col_approx = cv_cursor.byte.min(200) as f32;
                 let footer_x = px + col_approx * cw;
@@ -6036,10 +6074,7 @@ impl AppState {
             let center = egui::pos2(center_x, bottom - GAP - RADIUS);
             out.push(ScrollToBottomTarget {
                 sid: *sid,
-                rect: egui::Rect::from_center_size(
-                    center,
-                    egui::vec2(RADIUS * 2.0, RADIUS * 2.0),
-                ),
+                rect: egui::Rect::from_center_size(center, egui::vec2(RADIUS * 2.0, RADIUS * 2.0)),
                 action,
             });
         }
@@ -6150,8 +6185,11 @@ impl AppState {
                 None, // ghost 仅用于渲染，高度计算不需要
             );
             cv.attachment_count = pane.attachments.len();
-            let (_, cell_h) = self.renderer.cell_size();
+            let (cell_w, cell_h) = self.renderer.cell_size();
             let fp = self.renderer.padding() * 0.4;
+            cv.soft_wrap(lumen_renderer::composer_view::footer_wrap_columns(
+                w, cell_w, fp,
+            ));
             let max_h = h / 3.0;
             lumen_renderer::composer_view::footer_height_px(Some(&cv), cell_h, fp, max_h)
         };
@@ -6267,7 +6305,7 @@ impl AppState {
     /// 某窗格底部 footer 物理像素高度：仅聚焦窗格显示 footer，其余为 0。
     /// 与渲染/resize 用同一 `footer_height_px` 算法，保证命中坐标一致。
     #[cfg(feature = "input-editor")]
-    fn pane_footer_px(&self, pane_idx: usize, pane_h: f32) -> f32 {
+    fn pane_footer_px(&self, pane_idx: usize, pane_w: f32, pane_h: f32) -> f32 {
         if self.tabs[self.active_tab].focused != pane_idx {
             return 0.0;
         }
@@ -6281,13 +6319,16 @@ impl AppState {
             None,
         );
         cv.attachment_count = pane.attachments.len();
-        let (_, cell_h) = self.renderer.cell_size();
+        let (cell_w, cell_h) = self.renderer.cell_size();
         let fp = self.renderer.padding() * 0.4;
+        cv.soft_wrap(lumen_renderer::composer_view::footer_wrap_columns(
+            pane_w, cell_w, fp,
+        ));
         let max_h = pane_h / 3.0;
         lumen_renderer::composer_view::footer_height_px(Some(&cv), cell_h, fp, max_h)
     }
     #[cfg(not(feature = "input-editor"))]
-    fn pane_footer_px(&self, _pane_idx: usize, _pane_h: f32) -> f32 {
+    fn pane_footer_px(&self, _pane_idx: usize, _pane_w: f32, _pane_h: f32) -> f32 {
         0.0
     }
 
@@ -6303,7 +6344,7 @@ impl AppState {
             .iter()
             .find(|(id, _)| *id == pane_id)
             .map(|(_, r)| *r)?;
-        let footer_px = self.pane_footer_px(pane_idx, h);
+        let footer_px = self.pane_footer_px(pane_idx, w, h);
         let (row, col) = self.renderer.cell_at_with_footer(
             self.mouse_pos.0 - x as f64,
             self.mouse_pos.1 - y as f64,
@@ -6330,7 +6371,7 @@ impl AppState {
             .iter()
             .find(|(id, _)| *id == pane_id)
             .map(|(_, r)| *r)?;
-        let footer_px = self.pane_footer_px(pane_idx, h);
+        let footer_px = self.pane_footer_px(pane_idx, w, h);
         let (row, col) = self.renderer.cell_at_with_footer(
             self.mouse_pos.0 - x as f64,
             self.mouse_pos.1 - y as f64,
@@ -6508,7 +6549,7 @@ impl AppState {
             .iter()
             .find(|(id, _)| *id == pane_id)
             .map(|(_, r)| *r)?;
-        let footer_px = self.pane_footer_px(pane_idx, h);
+        let footer_px = self.pane_footer_px(pane_idx, w, h);
         let (row, col) = self.renderer.cell_at_with_footer(
             self.mouse_pos.0 - x as f64,
             self.mouse_pos.1 - y as f64,
@@ -8116,11 +8157,15 @@ impl AppState {
         let mut cleared_slash_probe = false;
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
-                let exe = pane
-                    .pty
-                    .shell_pid()
-                    .and_then(proc_icon::foreground_exe);
-                pane.llm_cli = llm_cli::detect(exe.as_deref(), &pane.term);
+                let shell_pid = pane.pty.shell_pid();
+                let foreground_pid = shell_pid.map(proc_icon::foreground_pid);
+                let exe = shell_pid.and_then(proc_icon::foreground_exe);
+                let detected = llm_cli::detect(exe.as_deref(), &pane.term);
+                if detected != pane.llm_cli {
+                    pane.llm_started_at = detected.map(|_| now);
+                }
+                pane.llm_cli = detected;
+                pane.llm_foreground_pid = detected.and(foreground_pid);
                 if pane.llm_cli.is_none() && !pane.slash_probe.shadow.is_empty() {
                     // CLI 已退出时清掉尚未提交的探测输入，避免候选串到 shell。
                     let _ = pane.write_user_input(b"\x15");
@@ -8423,10 +8468,7 @@ impl AppState {
                     let destination =
                         std::path::Path::new(&dir).join(safe_staging_file_name(&item.name));
                     if destination.exists() {
-                        self.pending_ssh_download = Some(PendingSshDownload {
-                            item,
-                            destination,
-                        });
+                        self.pending_ssh_download = Some(PendingSshDownload { item, destination });
                     } else {
                         self.start_ssh_download_to_local(item, destination, false);
                     }
@@ -8489,9 +8531,7 @@ impl AppState {
             && self
                 .ssh_clipboard_ready_path
                 .as_ref()
-                .is_some_and(|ready| {
-                    local_paths.len() == 1 && local_paths.first() == Some(ready)
-                });
+                .is_some_and(|ready| local_paths.len() == 1 && local_paths.first() == Some(ready));
         if !local_paths.is_empty() && !system_paths_are_current_ssh_export {
             self.ssh_file_clipboard = None;
             for path in local_paths {
@@ -8899,9 +8939,7 @@ fn clipboard_changed_since(started: Option<u32>, current: Option<u32>) -> bool {
 #[cfg(windows)]
 fn system_clipboard_sequence_number() -> Option<u32> {
     // SAFETY: 只读取系统维护的全局剪贴板序号，不持有句柄或指针。
-    Some(unsafe {
-        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
-    })
+    Some(unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() })
 }
 
 #[cfg(not(windows))]
@@ -8910,10 +8948,7 @@ fn system_clipboard_sequence_number() -> Option<u32> {
 }
 
 fn ssh_clipboard_staging_root() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "lumen_ssh_clipboard-{}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("lumen_ssh_clipboard-{}", std::process::id()))
 }
 
 fn ssh_clipboard_batch_directory(
@@ -8934,8 +8969,7 @@ fn create_ssh_clipboard_staging_path(
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    let batch =
-        ssh_clipboard_batch_directory(&root, generation, item.session_id, nonce);
+    let batch = ssh_clipboard_batch_directory(&root, generation, item.session_id, nonce);
     std::fs::create_dir(&batch)?;
     Ok(batch.join(safe_staging_file_name(&item.name)))
 }
@@ -9425,10 +9459,7 @@ impl App {
             user_profile.as_ref(),
         ) {
             if profile_origin_migrated {
-                cloud::claim_legacy_device_id_for_origin(
-                    &origin,
-                    profile.device_id.as_deref(),
-                );
+                cloud::claim_legacy_device_id_for_origin(&origin, profile.device_id.as_deref());
             }
             cloud::reconcile_device_id_for_origin(
                 &origin,
@@ -9467,8 +9498,7 @@ impl App {
                 Some("无法解析 Lumen 数据目录，SSH 配置本次不可写".to_owned()),
             ),
         };
-        let initial_auth_token =
-            profile_auth_token(user_profile.as_ref(), &current_server_url);
+        let initial_auth_token = profile_auth_token(user_profile.as_ref(), &current_server_url);
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
@@ -9960,6 +9990,12 @@ const LLM_CLI_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// LLM CLI 的原生候选可能异步生成；在截止时间内允许任意数量的局部
 /// PTY 重绘，不能用“无结果帧数”提前判定失败。
 const LLM_SLASH_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+/// 原生菜单每次移动一项。间隔需覆盖常见 TUI 的局部重绘；Kimi 有精确
+/// 总数，其他 CLI 在选中项回环或连续多次无新增时结束。
+const LLM_SLASH_SCAN_INTERVAL: Duration = Duration::from_millis(40);
+const LLM_SLASH_SCAN_TIMEOUT: Duration = Duration::from_secs(90);
+const LLM_SLASH_SCAN_MAX_STEPS: u16 = 2048;
+const LLM_SLASH_SCAN_MAX_STAGNANT_STEPS: u16 = 256;
 /// Ctrl+U 与 Kimi 的 Esc 必须分成两个 ConPTY 写入；每阶段留出一个
 /// 很短的处理窗口，同时由 about_to_wait 定时唤醒，绝不等待 CLI 回显。
 const LLM_SLASH_CLEAR_STAGE_DELAY: Duration = Duration::from_millis(60);
@@ -10570,9 +10606,8 @@ impl ApplicationHandler<PtyWake> for App {
             state.next_lock_poll = now + Duration::from_secs(1);
             let idle = app_lock::system_idle_duration()
                 .unwrap_or_else(|| now.saturating_duration_since(state.last_local_input));
-            let limit = Duration::from_secs(
-                u64::from(state.app_lock.config().idle_timeout_minutes()) * 60,
-            );
+            let limit =
+                Duration::from_secs(u64::from(state.app_lock.config().idle_timeout_minutes()) * 60);
             if idle >= limit {
                 state.lock_now();
             }
@@ -10929,8 +10964,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
-                    && (!state.shell_state.completion.open
-                        || state.shell_state.completion.passive)
+                    && (!state.shell_state.completion.open || state.shell_state.completion.passive)
                     && state.shell_state.renaming.is_none()
                     && state.shell_state.pane_renaming.is_none()
                     && state.shell_state.ssh_session_renaming.is_none()
@@ -11019,10 +11053,7 @@ impl ApplicationHandler<PtyWake> for App {
                         || state.shell_state.pane_renaming.is_some()
                         || state.shell_state.ssh_session_renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
-                    shortcut_capture: state
-                        .shell_state
-                        .settings
-                        .is_capturing_shortcut(),
+                    shortcut_capture: state.shell_state.settings.is_capturing_shortcut(),
                     terminal_focused: state.terminal_focused,
                     // part4c：镜像态按**被控端**焦点窗格 win32 模式裁决（控制端转发
                     // win32 编码 + key-up）；本地态按本地窗格 + env 门控。
@@ -11100,8 +11131,7 @@ impl ApplicationHandler<PtyWake> for App {
                 };
 
                 // 求值当前有效输入模式（纯推导，不缓存）。
-                let mode =
-                    effective_session_mode(&state.tabs[ti].panes[pi], state.force_fallback);
+                let mode = effective_session_mode(&state.tabs[ti].panes[pi], state.force_fallback);
 
                 // 查表。M5.3 part4c：镜像态强制按非 Compose（Running）路由——否则控制端
                 // 本地窗格停在自己提示符（Compose 态）时，普通字符/按键会被 keymap 第 9 层
@@ -11180,18 +11210,13 @@ impl ApplicationHandler<PtyWake> for App {
                             let replacement = candidate.replacement.clone();
                             let (start, end) = candidate.replace_range.unwrap_or((0, 0));
                             state.tabs[ti].panes[pi].editor.apply(
-                                &lumen_editor::EditAction::SetSelection(
-                                    lumen_editor::Selection {
-                                        anchor: lumen_editor::Position {
-                                            line: 0,
-                                            byte: start,
-                                        },
-                                        cursor: lumen_editor::Position {
-                                            line: 0,
-                                            byte: end,
-                                        },
+                                &lumen_editor::EditAction::SetSelection(lumen_editor::Selection {
+                                    anchor: lumen_editor::Position {
+                                        line: 0,
+                                        byte: start,
                                     },
-                                ),
+                                    cursor: lumen_editor::Position { line: 0, byte: end },
+                                }),
                             );
                             state.tabs[ti].panes[pi]
                                 .editor
@@ -11352,8 +11377,7 @@ impl ApplicationHandler<PtyWake> for App {
                                     .min(state.completion_candidates.len() - 1);
                                 let candidate = &state.completion_candidates[idx];
                                 let replacement = candidate.replacement.clone();
-                                let (start, end) =
-                                    candidate.replace_range.unwrap_or((0, 0));
+                                let (start, end) = candidate.replace_range.unwrap_or((0, 0));
                                 state.tabs[ti].panes[pi].editor.apply(
                                     &lumen_editor::EditAction::SetSelection(
                                         lumen_editor::Selection {
@@ -11361,10 +11385,7 @@ impl ApplicationHandler<PtyWake> for App {
                                                 line: 0,
                                                 byte: start,
                                             },
-                                            cursor: lumen_editor::Position {
-                                                line: 0,
-                                                byte: end,
-                                            },
+                                            cursor: lumen_editor::Position { line: 0, byte: end },
                                         },
                                     ),
                                 );
@@ -11375,49 +11396,50 @@ impl ApplicationHandler<PtyWake> for App {
                                 state.sync_llm_slash_probe(ti, pi);
                                 state.window.request_redraw();
                             } else {
-                            // 取当前行文本与光标字节偏移。
-                            let (line_text, cursor_byte) = {
-                                let view = state.tabs[ti].panes[pi].editor.view();
-                                let cur = view.cursor();
-                                let line = view.line(cur.line).to_owned();
-                                (line, cur.byte)
-                            };
-                            let cwd = state.tabs[ti].panes[pi]
-                                .term
-                                .cwd()
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_else(|| std::path::PathBuf::from("."));
-                            let (_, token) = completion::current_token(&line_text, cursor_byte);
-                            let candidates = completion::complete_path(token, &cwd);
+                                // 取当前行文本与光标字节偏移。
+                                let (line_text, cursor_byte) = {
+                                    let view = state.tabs[ti].panes[pi].editor.view();
+                                    let cur = view.cursor();
+                                    let line = view.line(cur.line).to_owned();
+                                    (line, cur.byte)
+                                };
+                                let cwd = state.tabs[ti].panes[pi]
+                                    .term
+                                    .cwd()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                                let (_, token) = completion::current_token(&line_text, cursor_byte);
+                                let candidates = completion::complete_path(token, &cwd);
 
-                            // 批2：计算光标的 char 偏移，发送 sidecar 命令补全请求。
-                            // char 偏移 = line_text[..cursor_byte] 的 Unicode char 数。
-                            let cursor_char = line_text[..cursor_byte.min(line_text.len())]
-                                .chars()
-                                .count();
-                            let cwd_str = cwd.to_string_lossy();
-                            let req_id =
-                                state
-                                    .completion_sidecar
-                                    .request(&line_text, cursor_char, &cwd_str);
-                            state.completion_req_id = req_id;
+                                // 批2：计算光标的 char 偏移，发送 sidecar 命令补全请求。
+                                // char 偏移 = line_text[..cursor_byte] 的 Unicode char 数。
+                                let cursor_char = line_text[..cursor_byte.min(line_text.len())]
+                                    .chars()
+                                    .count();
+                                let cwd_str = cwd.to_string_lossy();
+                                let req_id = state.completion_sidecar.request(
+                                    &line_text,
+                                    cursor_char,
+                                    &cwd_str,
+                                );
+                                state.completion_req_id = req_id;
 
-                            if candidates.is_empty() {
-                                // 无文件路径候选，但命令补全可能异步到达：
-                                // 先清候选列表、打开弹窗（空状态）等待 sidecar 响应；
-                                // 若 sidecar 也无候选才降级提示。
-                                // 此处先只清旧候选，弹窗在 sidecar 响应到达后开。
-                                state.completion_candidates.clear();
-                                // 无文件路径候选时先不开弹窗（等 sidecar），但不推 toast。
-                            } else {
-                                state.completion_candidates = candidates;
-                                let comp = &mut state.shell_state.completion;
-                                comp.open = true;
-                                comp.selected = 0;
-                                comp.passive = false;
-                                state.terminal_focused = false;
-                                state.window.request_redraw();
-                            }
+                                if candidates.is_empty() {
+                                    // 无文件路径候选，但命令补全可能异步到达：
+                                    // 先清候选列表、打开弹窗（空状态）等待 sidecar 响应；
+                                    // 若 sidecar 也无候选才降级提示。
+                                    // 此处先只清旧候选，弹窗在 sidecar 响应到达后开。
+                                    state.completion_candidates.clear();
+                                    // 无文件路径候选时先不开弹窗（等 sidecar），但不推 toast。
+                                } else {
+                                    state.completion_candidates = candidates;
+                                    let comp = &mut state.shell_state.completion;
+                                    comp.open = true;
+                                    comp.selected = 0;
+                                    comp.passive = false;
+                                    state.terminal_focused = false;
+                                    state.window.request_redraw();
+                                }
                             }
                         }
                         // 无 input-editor feature 时沿用占位提示。
@@ -11525,6 +11547,11 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.settings.layout.view_mode.is_ssh() {
                     return;
                 }
+                // HUD resize 必须独占整段拖动；否则 CursorMoved 会同时进入终端
+                // 鼠标上报或文本拖选，表现为尺寸跳动、CLI 被意外操作。
+                if state.mouse_on_llm_hud() {
+                    return;
+                }
 
                 // 镜像态（远程视图）：拖选进行中则更新选区终点并 return；其余
                 // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
@@ -11587,13 +11614,20 @@ impl ApplicationHandler<PtyWake> for App {
                 // ── footer 拖选跟踪（第十一轮，input-editor feature）────
                 #[cfg(feature = "input-editor")]
                 if state.footer_dragging {
-                    if let Some((rel_x, rel_y, cell_w, cell_h, fp, lines)) =
+                    if let Some((rel_x, rel_y, cell_w, cell_h, fp, visual_lines)) =
                         state.mouse_footer_relative()
                     {
-                        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-                        let cursor_pos = footer_mouse::clamped_position(
+                        let line_refs: Vec<&str> =
+                            visual_lines.iter().map(|row| row.text.as_str()).collect();
+                        let visual_pos = footer_mouse::clamped_position(
                             rel_x, rel_y, cell_w, cell_h, fp, &line_refs,
                         );
+                        let (line, byte) =
+                            lumen_renderer::composer_view::source_position_for_wrapped(
+                                &visual_lines,
+                                (visual_pos.line, visual_pos.byte),
+                            );
+                        let cursor_pos = lumen_editor::Position { line, byte };
                         let anchor = state.footer_drag_anchor;
                         let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
                         let old_sel = state.tabs[ti].panes[pi].editor.view().selection();
@@ -11727,8 +11761,7 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.settings.layout.view_mode.is_ssh() {
                     if button == MouseButton::Left && btn_state == ElementState::Pressed {
                         let in_terminal = state.mouse_in_ssh_terminal();
-                        state.terminal_focused =
-                            in_terminal && state.terminal_focus_allowed();
+                        state.terminal_focused = in_terminal && state.terminal_focus_allowed();
                         if in_terminal {
                             state.filetree_focused = false;
                             state.egui_ctx.memory_mut(|memory| {
@@ -11742,432 +11775,465 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     return;
                 }
+                // HUD 是终端内工具：所有鼠标键都由 egui Area 自己处理，
+                // 不穿透到终端选区/鼠标上报，也不夺走终端键盘焦点。
+                if state.mouse_on_llm_hud() {
+                    if button == MouseButton::Left && btn_state == ElementState::Pressed {
+                        state.terminal_focused = state.terminal_focus_allowed();
+                    }
+                    return;
+                }
                 match (button, btn_state) {
-                (MouseButton::Left, ElementState::Pressed) => {
-                    // 无边框窗口边缘拖动 resize（左/右/下及下方两角）：命中窗口
-                    // 外缘则记下方向、下一帧 RedrawRequested 内发起系统 resize 拖动
-                    // （窗口操作须在该处执行，见 drag_window 注释）；本次按下不
-                    // 聚焦/不建选区/不交出焦点。优先于其余命中判定（最外缘几像素）。
-                    if let Some(dir) = resize_edge_dir(
-                        &state.window,
-                        state.mouse_pos,
-                        state.egui_ctx.pixels_per_point(),
-                    ) {
-                        state.pending_resize_dir = Some(dir);
-                        state.window.request_redraw();
-                        return;
-                    }
-                    // M5.3 part4b：控制中+远程视图，点在镜像区内 → 起镜像拖选（作用于
-                    // 显示的镜像终端），不走本地窗格选区；保持终端焦点（键盘续转发）。
-                    // 但须让位本地布局的关闭✕/分隔条/侧栏拖宽手柄（它们的命中区可能落在
-                    // 终端区内或左缘几像素），否则控制中无法操作这些控件、反而误起拖选。
-                    if state.is_mirror_active()
-                        && !state.mouse_on_pane_close()
-                        && !state.mouse_on_pane_divider()
-                        && !state.mouse_on_panel_resize()
-                    {
-                        // 鼠标上报开（Claude/codex 全屏）→ 左键按下转发给被控端，不起
-                        // 本地镜像拖选（上报未开时返 false，落到下面镜像拖选）。
-                        if state.report_mirror_mouse_button(MouseButton::Left, true) {
-                            state.terminal_focused = true;
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        // 无边框窗口边缘拖动 resize（左/右/下及下方两角）：命中窗口
+                        // 外缘则记下方向、下一帧 RedrawRequested 内发起系统 resize 拖动
+                        // （窗口操作须在该处执行，见 drag_window 注释）；本次按下不
+                        // 聚焦/不建选区/不交出焦点。优先于其余命中判定（最外缘几像素）。
+                        if let Some(dir) = resize_edge_dir(
+                            &state.window,
+                            state.mouse_pos,
+                            state.egui_ctx.pixels_per_point(),
+                        ) {
+                            state.pending_resize_dir = Some(dir);
+                            state.window.request_redraw();
                             return;
                         }
-                        // Phase 4 多窗格：点哪个镜像窗格 → 选它做**焦点**（输入/回看/复制/IME 目标）+
-                        // 起该窗格 per-pane 拖选。单窗格镜像走既有 part4b 单选区。
-                        // Shift+左键 = 范围扩展：保留现有选区锚点、把 head 续到点击处（标准
-                        // 「先拖选一段、Shift+点别处扩展」语义）；无选区则等价新建。
-                        let shift = state.modifiers.shift_key();
-                        if !state.remote_ws.mirror_panes().is_empty() {
-                            if let Some((sid, row, col)) = state.mirror_pane_cell_at_mouse() {
+                        // M5.3 part4b：控制中+远程视图，点在镜像区内 → 起镜像拖选（作用于
+                        // 显示的镜像终端），不走本地窗格选区；保持终端焦点（键盘续转发）。
+                        // 但须让位本地布局的关闭✕/分隔条/侧栏拖宽手柄（它们的命中区可能落在
+                        // 终端区内或左缘几像素），否则控制中无法操作这些控件、反而误起拖选。
+                        if state.is_mirror_active()
+                            && !state.mouse_on_pane_close()
+                            && !state.mouse_on_pane_divider()
+                            && !state.mouse_on_panel_resize()
+                        {
+                            // 鼠标上报开（Claude/codex 全屏）→ 左键按下转发给被控端，不起
+                            // 本地镜像拖选（上报未开时返 false，落到下面镜像拖选）。
+                            if state.report_mirror_mouse_button(MouseButton::Left, true) {
                                 state.terminal_focused = true;
-                                state.remote_ws.set_mirror_active_pane(sid);
+                                return;
+                            }
+                            // Phase 4 多窗格：点哪个镜像窗格 → 选它做**焦点**（输入/回看/复制/IME 目标）+
+                            // 起该窗格 per-pane 拖选。单窗格镜像走既有 part4b 单选区。
+                            // Shift+左键 = 范围扩展：保留现有选区锚点、把 head 续到点击处（标准
+                            // 「先拖选一段、Shift+点别处扩展」语义）；无选区则等价新建。
+                            let shift = state.modifiers.shift_key();
+                            if !state.remote_ws.mirror_panes().is_empty() {
+                                if let Some((sid, row, col)) = state.mirror_pane_cell_at_mouse() {
+                                    state.terminal_focused = true;
+                                    state.remote_ws.set_mirror_active_pane(sid);
+                                    if shift {
+                                        state.remote_ws.mirror_pane_sel_extend(sid, row, col);
+                                    } else {
+                                        state.remote_ws.mirror_pane_sel_start(sid, row, col);
+                                    }
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                            } else if let Some((row, col)) = state.mirror_cell_at_mouse() {
+                                state.terminal_focused = true;
                                 if shift {
-                                    state.remote_ws.mirror_pane_sel_extend(sid, row, col);
+                                    state.remote_ws.mirror_sel_extend(row, col);
                                 } else {
-                                    state.remote_ws.mirror_pane_sel_start(sid, row, col);
+                                    state.remote_ws.mirror_sel_start(row, col);
                                 }
                                 state.window.request_redraw();
                                 return;
                             }
-                        } else if let Some((row, col)) = state.mirror_cell_at_mouse() {
-                            state.terminal_focused = true;
-                            if shift {
-                                state.remote_ws.mirror_sel_extend(row, col);
-                            } else {
-                                state.remote_ws.mirror_sel_start(row, col);
-                            }
-                            state.window.request_redraw();
+                        }
+                        // 点的是窗格关闭按钮：动作由 egui 侧处理（✕ →
+                        // pane_close），这里不聚焦不建选区，也不视作
+                        // 「点击面板交出焦点」——关完接着打字不该断流。
+                        if state.mouse_on_pane_close() {
                             return;
                         }
-                    }
-                    // 点的是窗格关闭按钮：动作由 egui 侧处理（✕ →
-                    // pane_close），这里不聚焦不建选区，也不视作
-                    // 「点击面板交出焦点」——关完接着打字不该断流。
-                    if state.mouse_on_pane_close() {
-                        return;
-                    }
-                    // 按在分隔条上：拖动调比例由 egui 侧处理（F7③，
-                    // divider_drag），这里不聚焦/不建选区，也不交出
-                    // 终端焦点——调完比例接着打字不该断流。
-                    if state.mouse_on_pane_divider() {
-                        return;
-                    }
-                    // 按在侧栏/文件树栏的拖宽手柄上（P10）：拖宽由
-                    // egui 面板处理，这里同样不聚焦/不建选区/不交出
-                    // 终端焦点——调完宽度接着打字不该断流。
-                    if state.mouse_on_panel_resize() {
-                        return;
-                    }
-                    // 焦点仲裁（F5）：点击窗格聚焦该窗格 + 终端拿键盘/
-                    // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
-                    let Some(pi) = state.pane_under_mouse() else {
-                        state.terminal_focused = false;
-                        if !state.filetree_hovered {
-                            state.filetree_focused = false;
+                        // 按在分隔条上：拖动调比例由 egui 侧处理（F7③，
+                        // divider_drag），这里不聚焦/不建选区，也不交出
+                        // 终端焦点——调完比例接着打字不该断流。
+                        if state.mouse_on_pane_divider() {
+                            return;
                         }
-                        return;
-                    };
-                    state.terminal_focused = true;
-                    state.filetree_focused = false;
-                    state.egui_ctx.memory_mut(|memory| {
-                        if let Some(focused) = memory.focused() {
-                            memory.surrender_focus(focused);
+                        // 按在侧栏/文件树栏的拖宽手柄上（P10）：拖宽由
+                        // egui 面板处理，这里同样不聚焦/不建选区/不交出
+                        // 终端焦点——调完宽度接着打字不该断流。
+                        if state.mouse_on_panel_resize() {
+                            return;
                         }
-                    });
-                    state.focus_pane(pi);
+                        // 焦点仲裁（F5）：点击窗格聚焦该窗格 + 终端拿键盘/
+                        // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
+                        let Some(pi) = state.pane_under_mouse() else {
+                            state.terminal_focused = false;
+                            if !state.filetree_hovered {
+                                state.filetree_focused = false;
+                            }
+                            return;
+                        };
+                        state.terminal_focused = true;
+                        state.filetree_focused = false;
+                        state.egui_ctx.memory_mut(|memory| {
+                            if let Some(focused) = memory.focused() {
+                                memory.surrender_focus(focused);
+                            }
+                        });
+                        state.focus_pane(pi);
 
-                    // ── footer 区域分流（第十一轮，input-editor feature）─
-                    // Compose/可见态下点击 footer 区域时，不建终端选区，
-                    // 转入编辑器鼠标处理路径。键盘续走编辑器（terminal_focused=true 保持）。
-                    #[cfg(feature = "input-editor")]
-                    if state.mouse_on_footer() {
-                        if let Some((rel_x, rel_y, cell_w, cell_h, fp, lines)) =
-                            state.mouse_footer_relative()
+                        // ── footer 区域分流（第十一轮，input-editor feature）─
+                        // Compose/可见态下点击 footer 区域时，不建终端选区，
+                        // 转入编辑器鼠标处理路径。键盘续走编辑器（terminal_focused=true 保持）。
+                        #[cfg(feature = "input-editor")]
+                        if state.mouse_on_footer() {
+                            if let Some((rel_x, rel_y, cell_w, cell_h, fp, visual_lines)) =
+                                state.mouse_footer_relative()
+                            {
+                                let line_refs: Vec<&str> = visual_lines
+                                    .iter()
+                                    .map(|row| row.text.as_str())
+                                    .collect();
+                                // 像素 → 编辑器位置
+                                let visual_pos = footer_mouse::pixel_to_position(
+                                    rel_x, rel_y, cell_w, cell_h, fp, &line_refs,
+                                );
+                                let (line, byte) =
+                                    lumen_renderer::composer_view::source_position_for_wrapped(
+                                        &visual_lines,
+                                        (visual_pos.line, visual_pos.byte),
+                                    );
+                                let pos = lumen_editor::Position { line, byte };
+                                // 显示列（用于 click-count 位移检测）
+                                let display_col = (rel_x / cell_w.max(1.0)).floor() as usize;
+                                let row = visual_pos.line;
+                                let kind = state.footer_click_state.record_click(
+                                    row,
+                                    display_col,
+                                    std::time::Instant::now(),
+                                );
+
+                                let (ti, pi) =
+                                    (state.active_tab, state.tabs[state.active_tab].focused);
+
+                                let action = match kind {
+                                    footer_mouse::ClickKind::Single => {
+                                        let shift = state.modifiers.shift_key();
+                                        let cur_anchor = state.tabs[ti].panes[pi]
+                                            .editor
+                                            .view()
+                                            .selection()
+                                            .anchor;
+                                        footer_mouse::single_click_action(pos, shift, cur_anchor)
+                                    }
+                                    footer_mouse::ClickKind::Double => {
+                                        let line_text = state.tabs[ti].panes[pi]
+                                            .editor
+                                            .view()
+                                            .lines()
+                                            .nth(pos.line)
+                                            .unwrap_or("")
+                                            .to_owned();
+                                        let sel = footer_mouse::word_selection(pos, &line_text);
+                                        lumen_editor::EditAction::SetSelection(sel)
+                                    }
+                                    footer_mouse::ClickKind::Triple => {
+                                        let line_text = state.tabs[ti].panes[pi]
+                                            .editor
+                                            .view()
+                                            .lines()
+                                            .nth(pos.line)
+                                            .unwrap_or("")
+                                            .to_owned();
+                                        let sel = footer_mouse::line_selection(pos, &line_text);
+                                        lumen_editor::EditAction::SetSelection(sel)
+                                    }
+                                };
+
+                                // 将 lumen_editor::EditAction 包装为 app 层 Action
+                                // 单击时记录锚点（拖选用）
+                                let app_action = lumen_editor_action_to_app_action(action);
+                                state.dispatch(app_action, ti, pi);
+
+                                // 记录拖选锚点（单击/双击/三击都可能继续拖）
+                                let new_anchor =
+                                    state.tabs[ti].panes[pi].editor.view().selection().anchor;
+                                state.footer_drag_anchor = new_anchor;
+                                state.footer_dragging = true;
+                            }
+                            return;
+                        }
+
+                        // 鼠标上报开启（且非 Shift）：本次按下交给程序处理，不建本地
+                        // 选区（已在上面完成聚焦该窗格）。显式 !is_mirror_active() 守卫：
+                        // 镜像态恒不触发本地上报，与左右键 Released / 中键四处一致——镜像
+                        // 态点击在上面镜像分支处理；若镜像未命中（标题栏/窗格间隙/几何
+                        // 错位）也绝不穿透写本地 PTY、卡住单边 held。
+                        if !state.is_mirror_active()
+                            && state.report_mouse_button(MouseButton::Left, true)
                         {
-                            let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-                            // 像素 → 编辑器位置
-                            let pos = footer_mouse::pixel_to_position(
-                                rel_x, rel_y, cell_w, cell_h, fp, &line_refs,
-                            );
-                            // 显示列（用于 click-count 位移检测）
-                            let display_col = (rel_x / cell_w.max(1.0)).floor() as usize;
-                            let row = pos.line;
-                            let kind = state.footer_click_state.record_click(
-                                row,
-                                display_col,
-                                std::time::Instant::now(),
-                            );
-
-                            let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
-
-                            let action = match kind {
-                                footer_mouse::ClickKind::Single => {
-                                    let shift = state.modifiers.shift_key();
-                                    let cur_anchor =
-                                        state.tabs[ti].panes[pi].editor.view().selection().anchor;
-                                    footer_mouse::single_click_action(pos, shift, cur_anchor)
-                                }
-                                footer_mouse::ClickKind::Double => {
-                                    let line_text =
-                                        lines.get(pos.line).map(|s| s.as_str()).unwrap_or("");
-                                    let sel = footer_mouse::word_selection(pos, line_text);
-                                    lumen_editor::EditAction::SetSelection(sel)
-                                }
-                                footer_mouse::ClickKind::Triple => {
-                                    let line_text =
-                                        lines.get(pos.line).map(|s| s.as_str()).unwrap_or("");
-                                    let sel = footer_mouse::line_selection(pos, line_text);
-                                    lumen_editor::EditAction::SetSelection(sel)
-                                }
-                            };
-
-                            // 将 lumen_editor::EditAction 包装为 app 层 Action
-                            // 单击时记录锚点（拖选用）
-                            let app_action = lumen_editor_action_to_app_action(action);
-                            state.dispatch(app_action, ti, pi);
-
-                            // 记录拖选锚点（单击/双击/三击都可能继续拖）
-                            let new_anchor =
-                                state.tabs[ti].panes[pi].editor.view().selection().anchor;
-                            state.footer_drag_anchor = new_anchor;
-                            state.footer_dragging = true;
-                        }
-                        return;
-                    }
-
-                    // 鼠标上报开启（且非 Shift）：本次按下交给程序处理，不建本地
-                    // 选区（已在上面完成聚焦该窗格）。显式 !is_mirror_active() 守卫：
-                    // 镜像态恒不触发本地上报，与左右键 Released / 中键四处一致——镜像
-                    // 态点击在上面镜像分支处理；若镜像未命中（标题栏/窗格间隙/几何
-                    // 错位）也绝不穿透写本地 PTY、卡住单边 held。
-                    if !state.is_mirror_active()
-                        && state.report_mouse_button(MouseButton::Left, true)
-                    {
-                        return;
-                    }
-
-                    // 选区在点中的窗格（即新焦点窗格）建立。
-                    let Some(p) = state.sel_point_at_mouse() else {
-                        return;
-                    };
-                    let pane_id = state.focused_pane().id;
-                    // 新拖选起手：复位边缘 auto-scroll 方向，绝不继承上次拖选的陈旧值。
-                    state.autoscroll_drag = 0;
-                    state.autoscroll_at = None;
-                    // Shift+左键 = 范围快选：从上次（本窗格）普通左键点位扩展选区到此处、
-                    // 保留锚点。仅当三条都满足才扩展：① **非鼠标上报终端**——上报态（Claude
-                    // 全屏）Shift 是「逃生到本地选区」、应按普通拖选以按下点为锚，不做范围
-                    // 扩展（否则第二次拖选锚点错乱）；② 记忆点位是本窗格的；③ 锚点绝对行仍落在
-                    // 当前 grid 有效区间内（跨备用屏 / 主屏切换、或滚出 scrollback 则失效，避免
-                    // 坐标系串台高亮错范围）。否则退化为新建。普通左键 = 新建空选区并记锚点。
-                    let reporting = state.focused_pane().term.mouse_protocol().is_on();
-                    let prev = state.last_left_click.filter(|&(id, a)| {
-                        id == pane_id
-                            && state
-                                .focused_pane()
-                                .term
-                                .grid()
-                                .line_by_abs(a.line)
-                                .is_some()
-                    });
-                    let shift_extend = !reporting && state.modifiers.shift_key() && prev.is_some();
-                    let anchor = if shift_extend {
-                        prev.map_or(p, |(_, a)| a)
-                    } else {
-                        p
-                    };
-                    {
-                        let s = state.focused_pane_mut();
-                        s.selecting = true;
-                        s.selection = Some(Selection { anchor, head: p });
-                        // 范围扩展：清掉单击锚点时选中的命令块，避免块高亮与文本选区并存、
-                        // 或复制取了块而非选区文本。
-                        if shift_extend {
-                            s.selected_block = None;
-                        }
-                    }
-                    // 仅普通点击更新记忆锚点（Shift 扩展保持原锚点供连续扩展）。
-                    if !shift_extend {
-                        state.last_left_click = Some((pane_id, p));
-                    }
-                    state.window.request_redraw();
-                }
-                (MouseButton::Left, ElementState::Released) => {
-                    // footer 拖选结束（input-editor feature）。
-                    #[cfg(feature = "input-editor")]
-                    if state.footer_dragging {
-                        state.footer_dragging = false;
-                        return;
-                    }
-
-                    // 镜像态：鼠标上报开 → 左键释放编码转发给被控端（与按下配对，
-                    // 上报未开 / 该键未上报按住时返 false，落到下面镜像拖选收尾）。
-                    if state.is_mirror_active()
-                        && state.report_mirror_mouse_button(MouseButton::Left, false)
-                    {
-                        return;
-                    }
-                    // F10：镜像态 Ctrl+Click 落在 URL 链接上 → 本地浏览器打开（**只放
-                    // URL**，见 mirror_link_at_mouse）。Ctrl 让位后释放落到这里
-                    // （report_mirror_mouse_button 对未 held 键返 false）。先于
-                    // copy-on-select / sel_end：命中即开、并清掉起手的空拖选。
-                    // `!has_mirror_active_selection()`：只在空选区（未拖动）时开，与本地
-                    // `if selection.is_empty()` 对称——Ctrl+拖出一段非空选区不误开链接。
-                    if state.is_mirror_active()
-                        && state.modifiers.control_key()
-                        && !state.remote_ws.has_mirror_active_selection()
-                    {
-                        if let Some(link) = state.mirror_link_at_mouse() {
-                            log::info!("F10：镜像 Ctrl+Click 打开链接 {:?}", link.target);
-                            links::open(&link.target);
-                            if state.remote_ws.mirror_pane_selecting() {
-                                state.remote_ws.mirror_pane_sel_end();
-                            }
-                            state.window.request_redraw();
                             return;
                         }
-                    }
-                    // 镜像 Shift+拖选松手**不自动复制**（海风哥 2026-07 要求去掉 copy-on-select）：
-                    // 只选中、保留高亮，复制交给 Ctrl+C / 右键。
-                    // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
-                    if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
-                        state.remote_ws.mirror_pane_sel_end();
-                        state.autoscroll_drag = 0;
-                        state.autoscroll_at = None;
-                        state.window.request_redraw();
-                        return;
-                    }
-                    if state.is_mirror_active() && state.remote_ws.mirror_selecting() {
-                        state.remote_ws.mirror_sel_end();
-                        state.autoscroll_drag = 0;
-                        state.autoscroll_at = None;
-                        state.window.request_redraw();
-                        return;
-                    }
-                    // 本地态：鼠标上报开启（且非 Shift）→ 把释放编码发给程序。
-                    if !state.is_mirror_active()
-                        && state.report_mouse_button(MouseButton::Left, false)
-                    {
-                        return;
-                    }
 
-                    // 本次按下不在窗格上（点的是 egui 面板）则与终端无关。
-                    if !state.focused_pane().selecting {
-                        return;
+                        // 选区在点中的窗格（即新焦点窗格）建立。
+                        let Some(p) = state.sel_point_at_mouse() else {
+                            return;
+                        };
+                        let pane_id = state.focused_pane().id;
+                        // 新拖选起手：复位边缘 auto-scroll 方向，绝不继承上次拖选的陈旧值。
+                        state.autoscroll_drag = 0;
+                        state.autoscroll_at = None;
+                        // Shift+左键 = 范围快选：从上次（本窗格）普通左键点位扩展选区到此处、
+                        // 保留锚点。仅当三条都满足才扩展：① **非鼠标上报终端**——上报态（Claude
+                        // 全屏）Shift 是「逃生到本地选区」、应按普通拖选以按下点为锚，不做范围
+                        // 扩展（否则第二次拖选锚点错乱）；② 记忆点位是本窗格的；③ 锚点绝对行仍落在
+                        // 当前 grid 有效区间内（跨备用屏 / 主屏切换、或滚出 scrollback 则失效，避免
+                        // 坐标系串台高亮错范围）。否则退化为新建。普通左键 = 新建空选区并记锚点。
+                        let reporting = state.focused_pane().term.mouse_protocol().is_on();
+                        let prev = state.last_left_click.filter(|&(id, a)| {
+                            id == pane_id
+                                && state
+                                    .focused_pane()
+                                    .term
+                                    .grid()
+                                    .line_by_abs(a.line)
+                                    .is_some()
+                        });
+                        let shift_extend =
+                            !reporting && state.modifiers.shift_key() && prev.is_some();
+                        let anchor = if shift_extend {
+                            prev.map_or(p, |(_, a)| a)
+                        } else {
+                            p
+                        };
+                        {
+                            let s = state.focused_pane_mut();
+                            s.selecting = true;
+                            s.selection = Some(Selection { anchor, head: p });
+                            // 范围扩展：清掉单击锚点时选中的命令块，避免块高亮与文本选区并存、
+                            // 或复制取了块而非选区文本。
+                            if shift_extend {
+                                s.selected_block = None;
+                            }
+                        }
+                        // 仅普通点击更新记忆锚点（Shift 扩展保持原锚点供连续扩展）。
+                        if !shift_extend {
+                            state.last_left_click = Some((pane_id, p));
+                        }
+                        state.window.request_redraw();
                     }
-                    state.focused_pane_mut().selecting = false;
-                    // 拖选结束：停掉边缘 auto-scroll。
-                    state.autoscroll_drag = 0;
-                    state.autoscroll_at = None;
-                    // Shift+拖选松手**不自动复制**（海风哥 2026-07 要求去掉 copy-on-select）：
-                    // 只选中、保留高亮，复制交给 Ctrl+C / 右键。普通单击(空选区)才清块/开链接。
-                    if state.focused_pane().selection.is_some_and(|s| s.is_empty()) {
-                        // F10：**Ctrl+单击**落在可点击链接上 → 用系统默认
-                        // 程序/浏览器打开（对齐 VSCode 终端 Ctrl+Click 惯例）。
-                        // 普通单击保持「选中/清除命令块」，不误触开链接
-                        // （海风哥反馈：只 click 就开体验不好）。
-                        if state.modifiers.control_key() {
-                            if let Some(link) = state.link_at_mouse() {
-                                log::info!("F10：Ctrl+Click 打开链接 {:?}", link.target);
+                    (MouseButton::Left, ElementState::Released) => {
+                        // footer 拖选结束（input-editor feature）。
+                        #[cfg(feature = "input-editor")]
+                        if state.footer_dragging {
+                            state.footer_dragging = false;
+                            return;
+                        }
+
+                        // 镜像态：鼠标上报开 → 左键释放编码转发给被控端（与按下配对，
+                        // 上报未开 / 该键未上报按住时返 false，落到下面镜像拖选收尾）。
+                        if state.is_mirror_active()
+                            && state.report_mirror_mouse_button(MouseButton::Left, false)
+                        {
+                            return;
+                        }
+                        // F10：镜像态 Ctrl+Click 落在 URL 链接上 → 本地浏览器打开（**只放
+                        // URL**，见 mirror_link_at_mouse）。Ctrl 让位后释放落到这里
+                        // （report_mirror_mouse_button 对未 held 键返 false）。先于
+                        // copy-on-select / sel_end：命中即开、并清掉起手的空拖选。
+                        // `!has_mirror_active_selection()`：只在空选区（未拖动）时开，与本地
+                        // `if selection.is_empty()` 对称——Ctrl+拖出一段非空选区不误开链接。
+                        if state.is_mirror_active()
+                            && state.modifiers.control_key()
+                            && !state.remote_ws.has_mirror_active_selection()
+                        {
+                            if let Some(link) = state.mirror_link_at_mouse() {
+                                log::info!("F10：镜像 Ctrl+Click 打开链接 {:?}", link.target);
                                 links::open(&link.target);
-                                state.focused_pane_mut().selection = None;
+                                if state.remote_ws.mirror_pane_selecting() {
+                                    state.remote_ws.mirror_pane_sel_end();
+                                }
                                 state.window.request_redraw();
                                 return;
                             }
                         }
-                        // 单击（未拖动）：选中/清除所在命令块。
-                        // 备用屏幕下块行号坐标系不可用，不做块选中。
-                        let p = state.sel_point_at_mouse();
-                        let s = state.focused_pane_mut();
-                        s.selection = None;
-                        if let Some(p) = p {
-                            if !s.term.is_alt_screen() {
-                                let hit = s.term.block_at_line(p.line).map(|b| b.id);
-                                s.selected_block = if hit == s.selected_block { None } else { hit };
-                            }
+                        // 镜像 Shift+拖选松手**不自动复制**（海风哥 2026-07 要求去掉 copy-on-select）：
+                        // 只选中、保留高亮，复制交给 Ctrl+C / 右键。
+                        // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
+                        if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
+                            state.remote_ws.mirror_pane_sel_end();
+                            state.autoscroll_drag = 0;
+                            state.autoscroll_at = None;
+                            state.window.request_redraw();
+                            return;
                         }
-                        state.window.request_redraw();
-                    }
-                }
-                (MouseButton::Right, ElementState::Pressed) => {
-                    // 镜像态**有非空选区 → 右键优先本地复制**，抢在 report_mirror 转发之前
-                    // （对齐本地右键 7046：修 Claude 等全屏 TUI 里右键被鼠标上报吃掉、下面
-                    // 复制那条路根本走不到——「镜像里选中却复制不了」的直接成因）。仅命中镜像
-                    // 区时拦截（与下方粘贴同门控、与本地「右键须在终端区」对称）。写剪贴板成功
-                    // → 清选区 + 弹「已复制」toast；失败/不可用则保留选区便于重试。
-                    if state.is_mirror_active()
-                        && state.remote_ws.has_mirror_active_selection()
-                        && (state.mirror_pane_at_mouse().is_some()
-                            || state.mirror_cell_at_mouse().is_some())
-                    {
-                        if let Some(text) = state.remote_ws.copy_mirror_active() {
-                            match state.clipboard.as_mut().map(|c| c.set_text(text.clone())) {
-                                Some(Ok(())) => {
-                                    state.remote_ws.clear_mirror_active_selection();
-                                    state.show_copied_toast(&text);
-                                }
-                                Some(Err(e)) => error!("写剪贴板失败: {e}"),
-                                None => log::warn!("剪贴板不可用，复制跳过"),
-                            }
+                        if state.is_mirror_active() && state.remote_ws.mirror_selecting() {
+                            state.remote_ws.mirror_sel_end();
+                            state.autoscroll_drag = 0;
+                            state.autoscroll_at = None;
+                            state.window.request_redraw();
+                            return;
                         }
-                        state.window.request_redraw();
-                        return;
-                    }
-                    // 无选区：鼠标上报开（Claude/codex 全屏，程序可能用右键弹自己的菜单）
-                    // → 右键按下转发给被控端，不走本地粘贴（上报未开返 false，落到下面
-                    // 镜像右键粘贴）。
-                    if state.is_mirror_active()
-                        && state.report_mirror_mouse_button(MouseButton::Right, true)
-                    {
-                        return;
-                    }
-                    // M5.3 part4b 镜像右键无选区（上报未开）→ 粘贴转发给被控端（沿用本地
-                    // 终端右键惯例）。仅命中镜像区时拦截。
-                    if state.is_mirror_active()
-                        && (state.mirror_pane_at_mouse().is_some()
-                            || state.mirror_cell_at_mouse().is_some())
-                    {
-                        if let Some(Ok(text)) = state.clipboard.as_mut().map(|c| c.get_text()) {
-                            state.remote_ws.send_paste(&text);
-                        }
-                        state.window.request_redraw();
-                        return;
-                    }
-                    // 右键也按「点击窗格聚焦」仲裁（F5）：复制/粘贴作用
-                    // 于点中的窗格。
-                    let Some(pidx) = state.pane_under_mouse() else {
-                        return;
-                    };
-                    state.focus_pane(pidx);
-                    state.terminal_focused = true;
-
-                    // ── footer 区域右键：弹出编辑器上下文菜单（第十一轮）─
-                    #[cfg(feature = "input-editor")]
-                    if state.mouse_on_footer() {
-                        // 记录弹出位置，egui 帧内渲染菜单（见 RedrawRequested 处理）
-                        state.footer_context_menu_at = Some(state.mouse_pos);
-                        state.window.request_redraw();
-                        return;
-                    }
-
-                    // 右键（终端区，Windows Terminal 惯例）。字段级下标：clipboard 需同时可变借用。
-                    let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
-                    // **有非空选区 → 右键优先本地复制**，哪怕鼠标上报开启（修 Claude 等全屏 TUI
-                    // 里右键被上报吃掉、下面的复制那条路根本走不到——正是「Claude 里选中却复制不了」
-                    // 的直接成因）。复制成功清选区 + 弹「已复制」toast。
-                    if state.tabs[ti].panes[pi]
-                        .selection
-                        .is_some_and(|s| !s.is_empty())
-                    {
-                        if let Some(text) =
-                            state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard)
+                        // 本地态：鼠标上报开启（且非 Shift）→ 把释放编码发给程序。
+                        if !state.is_mirror_active()
+                            && state.report_mouse_button(MouseButton::Left, false)
                         {
-                            state.tabs[ti].panes[pi].selection = None;
-                            state.show_copied_toast(&text);
+                            return;
                         }
-                        state.window.request_redraw();
-                        return;
+
+                        // 本次按下不在窗格上（点的是 egui 面板）则与终端无关。
+                        if !state.focused_pane().selecting {
+                            return;
+                        }
+                        state.focused_pane_mut().selecting = false;
+                        // 拖选结束：停掉边缘 auto-scroll。
+                        state.autoscroll_drag = 0;
+                        state.autoscroll_at = None;
+                        // Shift+拖选松手**不自动复制**（海风哥 2026-07 要求去掉 copy-on-select）：
+                        // 只选中、保留高亮，复制交给 Ctrl+C / 右键。普通单击(空选区)才清块/开链接。
+                        if state.focused_pane().selection.is_some_and(|s| s.is_empty()) {
+                            // F10：**Ctrl+单击**落在可点击链接上 → 用系统默认
+                            // 程序/浏览器打开（对齐 VSCode 终端 Ctrl+Click 惯例）。
+                            // 普通单击保持「选中/清除命令块」，不误触开链接
+                            // （海风哥反馈：只 click 就开体验不好）。
+                            if state.modifiers.control_key() {
+                                if let Some(link) = state.link_at_mouse() {
+                                    log::info!("F10：Ctrl+Click 打开链接 {:?}", link.target);
+                                    links::open(&link.target);
+                                    state.focused_pane_mut().selection = None;
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                            }
+                            // 单击（未拖动）：选中/清除所在命令块。
+                            // 备用屏幕下块行号坐标系不可用，不做块选中。
+                            let p = state.sel_point_at_mouse();
+                            let s = state.focused_pane_mut();
+                            s.selection = None;
+                            if let Some(p) = p {
+                                if !s.term.is_alt_screen() {
+                                    let hit = s.term.block_at_line(p.line).map(|b| b.id);
+                                    s.selected_block =
+                                        if hit == s.selected_block { None } else { hit };
+                                }
+                            }
+                            state.window.request_redraw();
+                        }
                     }
-                    // 无选区 + 鼠标上报开启（非镜像）→ 右键交给程序（其自有右键菜单）。
-                    if !state.is_mirror_active()
-                        && state.report_mouse_button(MouseButton::Right, true)
-                    {
-                        return;
-                    }
-                    // 无选区 → 粘贴（Windows Terminal 惯例）。
-                    state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
-                }
-                (MouseButton::Right, ElementState::Released) if !state.is_mirror_active() => {
-                    // 镜像态不走本地上报（远程右键在 Pressed 已处理并 return；
-                    // 镜像态此分支不匹配，落到 `_ => {}`）。
-                    state.report_mouse_button(MouseButton::Right, false);
-                }
-                (MouseButton::Middle, ElementState::Pressed) if !state.is_mirror_active() => {
-                    // 镜像态（远程视图）中键不处理（落到 `_ => {}`）；本地态与左/右
-                    // 键一致先做焦点仲裁（F5）再上报，否则中键上报会写给非焦点窗格、
-                    // 且释放回退焦点窗格时与按下目标对不齐（留下幻影按住）。点在
-                    // egui 面板上则不聚焦。
-                    if let Some(pidx) = state.pane_under_mouse() {
+                    (MouseButton::Right, ElementState::Pressed) => {
+                        // 镜像态**有非空选区 → 右键优先本地复制**，抢在 report_mirror 转发之前
+                        // （对齐本地右键 7046：修 Claude 等全屏 TUI 里右键被鼠标上报吃掉、下面
+                        // 复制那条路根本走不到——「镜像里选中却复制不了」的直接成因）。仅命中镜像
+                        // 区时拦截（与下方粘贴同门控、与本地「右键须在终端区」对称）。写剪贴板成功
+                        // → 清选区 + 弹「已复制」toast；失败/不可用则保留选区便于重试。
+                        if state.is_mirror_active()
+                            && state.remote_ws.has_mirror_active_selection()
+                            && (state.mirror_pane_at_mouse().is_some()
+                                || state.mirror_cell_at_mouse().is_some())
+                        {
+                            if let Some(text) = state.remote_ws.copy_mirror_active() {
+                                match state.clipboard.as_mut().map(|c| c.set_text(text.clone())) {
+                                    Some(Ok(())) => {
+                                        state.remote_ws.clear_mirror_active_selection();
+                                        state.show_copied_toast(&text);
+                                    }
+                                    Some(Err(e)) => error!("写剪贴板失败: {e}"),
+                                    None => log::warn!("剪贴板不可用，复制跳过"),
+                                }
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
+                        // 无选区：鼠标上报开（Claude/codex 全屏，程序可能用右键弹自己的菜单）
+                        // → 右键按下转发给被控端，不走本地粘贴（上报未开返 false，落到下面
+                        // 镜像右键粘贴）。
+                        if state.is_mirror_active()
+                            && state.report_mirror_mouse_button(MouseButton::Right, true)
+                        {
+                            return;
+                        }
+                        // M5.3 part4b 镜像右键无选区（上报未开）→ 粘贴转发给被控端（沿用本地
+                        // 终端右键惯例）。仅命中镜像区时拦截。
+                        if state.is_mirror_active()
+                            && (state.mirror_pane_at_mouse().is_some()
+                                || state.mirror_cell_at_mouse().is_some())
+                        {
+                            if let Some(Ok(text)) = state.clipboard.as_mut().map(|c| c.get_text()) {
+                                state.remote_ws.send_paste(&text);
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
+                        // 右键也按「点击窗格聚焦」仲裁（F5）：复制/粘贴作用
+                        // 于点中的窗格。
+                        let Some(pidx) = state.pane_under_mouse() else {
+                            return;
+                        };
                         state.focus_pane(pidx);
                         state.terminal_focused = true;
+
+                        // ── footer 区域右键：弹出编辑器上下文菜单（第十一轮）─
+                        #[cfg(feature = "input-editor")]
+                        if state.mouse_on_footer() {
+                            // 记录弹出位置，egui 帧内渲染菜单（见 RedrawRequested 处理）
+                            state.footer_context_menu_at = Some(state.mouse_pos);
+                            state.window.request_redraw();
+                            return;
+                        }
+
+                        // 右键（终端区，Windows Terminal 惯例）。字段级下标：clipboard 需同时可变借用。
+                        let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                        // **有非空选区 → 右键优先本地复制**，哪怕鼠标上报开启（修 Claude 等全屏 TUI
+                        // 里右键被上报吃掉、下面的复制那条路根本走不到——正是「Claude 里选中却复制不了」
+                        // 的直接成因）。复制成功清选区 + 弹「已复制」toast。
+                        if state.tabs[ti].panes[pi]
+                            .selection
+                            .is_some_and(|s| !s.is_empty())
+                        {
+                            if let Some(text) =
+                                state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard)
+                            {
+                                state.tabs[ti].panes[pi].selection = None;
+                                state.show_copied_toast(&text);
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
+                        // 无选区 + 鼠标上报开启（非镜像）→ 右键交给程序（其自有右键菜单）。
+                        if !state.is_mirror_active()
+                            && state.report_mouse_button(MouseButton::Right, true)
+                        {
+                            return;
+                        }
+                        // 无选区 → 粘贴（Windows Terminal 惯例）。
+                        state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
                     }
-                    state.report_mouse_button(MouseButton::Middle, true);
-                }
-                (MouseButton::Middle, ElementState::Released) if !state.is_mirror_active() => {
-                    state.report_mouse_button(MouseButton::Middle, false);
-                }
-                // 镜像态（控制端）：上报开时转发右键释放 / 中键按下·释放给被控端，与
-                // 各自按下配对（上报未开 / 该键未上报按住时 report_mirror 返 false、无
-                // 副作用——镜像右键复制粘贴已在 Right Pressed 处理）。
-                (MouseButton::Right, ElementState::Released) if state.is_mirror_active() => {
-                    state.report_mirror_mouse_button(MouseButton::Right, false);
-                }
-                (MouseButton::Middle, ElementState::Pressed) if state.is_mirror_active() => {
-                    state.report_mirror_mouse_button(MouseButton::Middle, true);
-                }
-                (MouseButton::Middle, ElementState::Released) if state.is_mirror_active() => {
-                    state.report_mirror_mouse_button(MouseButton::Middle, false);
-                }
+                    (MouseButton::Right, ElementState::Released) if !state.is_mirror_active() => {
+                        // 镜像态不走本地上报（远程右键在 Pressed 已处理并 return；
+                        // 镜像态此分支不匹配，落到 `_ => {}`）。
+                        state.report_mouse_button(MouseButton::Right, false);
+                    }
+                    (MouseButton::Middle, ElementState::Pressed) if !state.is_mirror_active() => {
+                        // 镜像态（远程视图）中键不处理（落到 `_ => {}`）；本地态与左/右
+                        // 键一致先做焦点仲裁（F5）再上报，否则中键上报会写给非焦点窗格、
+                        // 且释放回退焦点窗格时与按下目标对不齐（留下幻影按住）。点在
+                        // egui 面板上则不聚焦。
+                        if let Some(pidx) = state.pane_under_mouse() {
+                            state.focus_pane(pidx);
+                            state.terminal_focused = true;
+                        }
+                        state.report_mouse_button(MouseButton::Middle, true);
+                    }
+                    (MouseButton::Middle, ElementState::Released) if !state.is_mirror_active() => {
+                        state.report_mouse_button(MouseButton::Middle, false);
+                    }
+                    // 镜像态（控制端）：上报开时转发右键释放 / 中键按下·释放给被控端，与
+                    // 各自按下配对（上报未开 / 该键未上报按住时 report_mirror 返 false、无
+                    // 副作用——镜像右键复制粘贴已在 Right Pressed 处理）。
+                    (MouseButton::Right, ElementState::Released) if state.is_mirror_active() => {
+                        state.report_mirror_mouse_button(MouseButton::Right, false);
+                    }
+                    (MouseButton::Middle, ElementState::Pressed) if state.is_mirror_active() => {
+                        state.report_mirror_mouse_button(MouseButton::Middle, true);
+                    }
+                    (MouseButton::Middle, ElementState::Released) if state.is_mirror_active() => {
+                        state.report_mirror_mouse_button(MouseButton::Middle, false);
+                    }
                     _ => {}
                 }
             }
@@ -12231,9 +12297,7 @@ impl ApplicationHandler<PtyWake> for App {
             WindowEvent::Ime(Ime::Commit(text)) => {
                 if state.settings.layout.view_mode.is_ssh() {
                     if state.routes_input_to_ssh() {
-                        if let Err(error) =
-                            state.ssh_runtime.send_input(text.into_bytes())
-                        {
+                        if let Err(error) = state.ssh_runtime.send_input(text.into_bytes()) {
                             log::warn!("SSH IME 文本发送失败: {error}");
                         } else {
                             state.last_key_at = Some(Instant::now());
@@ -12454,8 +12518,7 @@ impl ApplicationHandler<PtyWake> for App {
                     let Some(lock_out) = state.render_app_lock() else {
                         // Surface Lost/Outdated 的恢复不能依赖偶发后续事件；
                         // 锁屏是安全帧，失败后主动补排，直到覆盖旧业务帧。
-                        state.egui_repaint_at =
-                            Some(Instant::now() + Duration::from_millis(16));
+                        state.egui_repaint_at = Some(Instant::now() + Duration::from_millis(16));
                         state.window.request_redraw();
                         return;
                     };
@@ -12740,8 +12803,7 @@ impl ApplicationHandler<PtyWake> for App {
                     .collect();
                 let was_renaming = state.shell_state.renaming.is_some();
                 let was_pane_renaming = state.shell_state.pane_renaming.is_some();
-                let was_ssh_session_renaming =
-                    state.shell_state.ssh_session_renaming.is_some();
+                let was_ssh_session_renaming = state.shell_state.ssh_session_renaming.is_some();
                 // 文件树输入：焦点窗格的 cwd（OSC 9;9 上报）与空闲态
                 // （cd 注入闸门，见 Terminal::shell_waiting_input）。
                 // 焦点窗格 cwd：先取 OSC 9;9 上报值（Windows shell 集成）。
@@ -12761,6 +12823,40 @@ impl ApplicationHandler<PtyWake> for App {
                 });
                 #[cfg(not(unix))]
                 let active_cwd = osc_cwd;
+                // LLM HUD 只读取焦点 CLI 已画在终端中的模型/上下文状态；
+                // 不注入探测命令，也不从账号配置估算 token。
+                let llm_hud = if !state.settings.layout.view_mode.is_remote()
+                    && !state.settings.layout.view_mode.is_ssh()
+                {
+                    let pane = tab.focused_pane();
+                    pane.llm_cli
+                        .or_else(|| llm_cli::detect(None, &pane.term))
+                        .map(|kind| {
+                            let metrics = llm_cli::hud_metrics(&pane.term, kind);
+                            #[cfg(feature = "input-editor")]
+                            let bottom_inset =
+                                pane.footer_committed_h / state.egui_ctx.pixels_per_point();
+                            #[cfg(not(feature = "input-editor"))]
+                            let bottom_inset = 0.0;
+                            shell::hud::HudView {
+                                session_id: pane.id,
+                                kind,
+                                model: metrics.model,
+                                context: metrics.context,
+                                project_path: active_cwd
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
+                                foreground_pid: pane.llm_foreground_pid,
+                                busy: pane.is_busy(),
+                                session_elapsed: pane
+                                    .llm_started_at
+                                    .map_or(Duration::ZERO, |started| started.elapsed()),
+                                bottom_inset,
+                            }
+                        })
+                } else {
+                    None
+                };
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 let remote_shell_idle = state.remote_ws.focused_mirror_shell_idle();
                 let ssh_shell_idle = state.ssh_runtime.active_shell_idle();
@@ -12867,10 +12963,9 @@ impl ApplicationHandler<PtyWake> for App {
                 // M5.2：已登录但远程线程未起（启动时已登录 / 刚登录）→ 启动；
                 // 每帧收取后台心跳/设备列表回包。M5.3：远程控制 WS 同生命周期。
                 if !state.remote.is_running() {
-                    if let (Some(auth), Some(server_origin)) = (
-                        state.auth_token.clone(),
-                        account_server_origin.as_ref(),
-                    ) {
+                    if let (Some(auth), Some(server_origin)) =
+                        (state.auth_token.clone(), account_server_origin.as_ref())
+                    {
                         let exp = state.profile.as_ref().map_or(0, |p| p.token_expires_at);
                         let ctx = state.egui_ctx.clone();
                         // 传 proxy + wake_pending：设备列表后台线程拉到新数据后须唤醒空闲 winit 循环
@@ -12888,10 +12983,9 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 if !state.remote_ws.is_running() {
-                    if let (Some(auth), Some(server_origin)) = (
-                        state.auth_token.clone(),
-                        account_server_origin.as_ref(),
-                    ) {
+                    if let (Some(auth), Some(server_origin)) =
+                        (state.auth_token.clone(), account_server_origin.as_ref())
+                    {
                         match state.remote_ws.start(
                             server_origin.clone(),
                             auth,
@@ -13046,12 +13140,11 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     state.renderer.ensure_offscreen(SSH_OFFSCREEN_ID, 1, 1);
                     if let Some(view) = state.renderer.offscreen_view(SSH_OFFSCREEN_ID) {
-                        state.ssh_texture =
-                            Some(state.egui_renderer.register_native_texture(
-                                state.renderer.device(),
-                                view,
-                                wgpu::FilterMode::Nearest,
-                            ));
+                        state.ssh_texture = Some(state.egui_renderer.register_native_texture(
+                            state.renderer.device(),
+                            view,
+                            wgpu::FilterMode::Nearest,
+                        ));
                     }
                 }
                 let ssh_runtime_view = state.ssh_runtime.active_view();
@@ -13092,10 +13185,7 @@ impl ApplicationHandler<PtyWake> for App {
                     bg_image,
                     // 底部状态栏所需：当前有效输入模式 + 经典直通开关（M4.1 批E）
                     #[cfg(feature = "input-editor")]
-                    input_mode: effective_session_mode(
-                        tab.focused_pane(),
-                        state.force_fallback,
-                    ),
+                    input_mode: effective_session_mode(tab.focused_pane(), state.force_fallback),
                     #[cfg(feature = "input-editor")]
                     force_fallback: state.force_fallback,
                     transfer: transfer_status.as_ref(),
@@ -13126,6 +13216,7 @@ impl ApplicationHandler<PtyWake> for App {
                     completion_view: completion_view_owned,
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
+                    llm_hud,
                     remote_devices: &state.remote.devices,
                     ssh_inventory: state
                         .ssh_store
@@ -13270,10 +13361,8 @@ impl ApplicationHandler<PtyWake> for App {
                             // set_min_size 会令横向 ScrollArea 把整块高度占满，
                             // 从而遮住文字输入区。先精确分配附件栏矩形，再把
                             // 背景、子 UI 和 clip 全部锁在该矩形内。
-                            let (strip_rect, _) = ui.allocate_exact_size(
-                                overlay.rect.size(),
-                                egui::Sense::hover(),
-                            );
+                            let (strip_rect, _) =
+                                ui.allocate_exact_size(overlay.rect.size(), egui::Sense::hover());
                             let painter = ui.painter().with_clip_rect(strip_rect);
                             painter.rect_filled(strip_rect, 0.0, modal_pal.bg_dark);
                             painter.rect_stroke(
@@ -13283,14 +13372,11 @@ impl ApplicationHandler<PtyWake> for App {
                                 egui::StrokeKind::Inside,
                             );
 
-                            let content_rect =
-                                strip_rect.shrink2(egui::vec2(6.0, 4.0));
+                            let content_rect = strip_rect.shrink2(egui::vec2(6.0, 4.0));
                             let mut content_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(content_rect)
-                                    .layout(egui::Layout::left_to_right(
-                                        egui::Align::Min,
-                                    )),
+                                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
                             );
                             content_ui.set_clip_rect(content_rect);
                             egui::ScrollArea::horizontal()
@@ -13336,10 +13422,8 @@ impl ApplicationHandler<PtyWake> for App {
                                                         .on_hover_text("移除图片")
                                                         .clicked()
                                                     {
-                                                        remove_attachment_req = Some((
-                                                            overlay.session_id,
-                                                            item.id,
-                                                        ));
+                                                        remove_attachment_req =
+                                                            Some((overlay.session_id, item.id));
                                                     }
                                                 });
                                             });
@@ -13357,57 +13441,61 @@ impl ApplicationHandler<PtyWake> for App {
                     // ── 「回到底部」浮动按钮（窗格上滚超过一整屏时，底部
                     // 居中的圆形向下箭头；点击回到最新输出）──
                     for target in &scroll_to_bottom_targets {
-                        let resp = egui::Area::new(egui::Id::new((
-                            "lumen_scroll_to_bottom",
-                            target.sid,
-                        )))
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(target.rect.min)
-                            .show(ui.ctx(), |ui| {
-                                let (r, resp) = ui.allocate_exact_size(
-                                    target.rect.size(),
-                                    egui::Sense::click(),
-                                );
-                                let hovered = resp.hovered();
-                                let p = ui.painter();
-                                let c = r.center();
-                                let radius = r.width() / 2.0;
-                                // 圆底：平时弹层灰、hover 强调色（Warp 式白底）。
-                                p.circle_filled(
-                                    c,
-                                    radius,
-                                    if hovered {
-                                        modal_pal.accent
+                        let resp =
+                            egui::Area::new(egui::Id::new(("lumen_scroll_to_bottom", target.sid)))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(target.rect.min)
+                                .show(ui.ctx(), |ui| {
+                                    let (r, resp) = ui.allocate_exact_size(
+                                        target.rect.size(),
+                                        egui::Sense::click(),
+                                    );
+                                    let hovered = resp.hovered();
+                                    let p = ui.painter();
+                                    let c = r.center();
+                                    let radius = r.width() / 2.0;
+                                    // 圆底：平时弹层灰、hover 强调色（Warp 式白底）。
+                                    p.circle_filled(
+                                        c,
+                                        radius,
+                                        if hovered {
+                                            modal_pal.accent
+                                        } else {
+                                            modal_pal.bg_panel
+                                        },
+                                    );
+                                    p.circle_stroke(
+                                        c,
+                                        radius,
+                                        egui::Stroke::new(1.0_f32, modal_pal.panel_outline),
+                                    );
+                                    // 向下箭头（竖杆 + 两撇箭头头），hover 反相配色。
+                                    let arrow = if hovered {
+                                        modal_pal.accent_fg
                                     } else {
-                                        modal_pal.bg_panel
-                                    },
-                                );
-                                p.circle_stroke(
-                                    c,
-                                    radius,
-                                    egui::Stroke::new(1.0_f32, modal_pal.panel_outline),
-                                );
-                                // 向下箭头（竖杆 + 两撇箭头头），hover 反相配色。
-                                let arrow = if hovered {
-                                    modal_pal.accent_fg
-                                } else {
-                                    modal_pal.fg
-                                };
-                                let st = egui::Stroke::new(2.0_f32, arrow);
-                                p.line_segment(
-                                    [egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 5.0)],
-                                    st,
-                                );
-                                p.line_segment(
-                                    [egui::pos2(c.x - 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
-                                    st,
-                                );
-                                p.line_segment(
-                                    [egui::pos2(c.x + 4.5, c.y + 0.5), egui::pos2(c.x, c.y + 5.0)],
-                                    st,
-                                );
-                                resp
-                            });
+                                        modal_pal.fg
+                                    };
+                                    let st = egui::Stroke::new(2.0_f32, arrow);
+                                    p.line_segment(
+                                        [egui::pos2(c.x, c.y - 6.0), egui::pos2(c.x, c.y + 5.0)],
+                                        st,
+                                    );
+                                    p.line_segment(
+                                        [
+                                            egui::pos2(c.x - 4.5, c.y + 0.5),
+                                            egui::pos2(c.x, c.y + 5.0),
+                                        ],
+                                        st,
+                                    );
+                                    p.line_segment(
+                                        [
+                                            egui::pos2(c.x + 4.5, c.y + 0.5),
+                                            egui::pos2(c.x, c.y + 5.0),
+                                        ],
+                                        st,
+                                    );
+                                    resp
+                                });
                         if resp.inner.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
@@ -13925,8 +14013,7 @@ impl ApplicationHandler<PtyWake> for App {
                     state.terminal_focused = false;
                 } else if (was_renaming && shell_out.rename_ended_by_key)
                     || (was_pane_renaming && shell_out.pane_rename_ended_by_key)
-                    || (was_ssh_session_renaming
-                        && shell_out.ssh_session_rename_ended_by_key)
+                    || (was_ssh_session_renaming && shell_out.ssh_session_rename_ended_by_key)
                     || shell_out.rename_device_ended_by_key
                 {
                     state.terminal_focused = state.terminal_focus_allowed();
@@ -13950,8 +14037,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
-                    && (!state.shell_state.completion.open
-                        || state.shell_state.completion.passive)
+                    && (!state.shell_state.completion.open || state.shell_state.completion.passive)
                     && !state.shell_state.text_editor.is_visible()
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
@@ -14583,9 +14669,7 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // 弹窗打开期间键盘归 egui（终端不收键盘）。
                 #[cfg(feature = "input-editor")]
-                if state.shell_state.completion.open
-                    && !state.shell_state.completion.passive
-                {
+                if state.shell_state.completion.open && !state.shell_state.completion.passive {
                     state.terminal_focused = false;
                 }
 
@@ -14627,39 +14711,25 @@ impl ApplicationHandler<PtyWake> for App {
                         shell::settings_ui::SecurityAction::Disable {
                             mut current_password,
                         } => {
-                            if !state
-                                .app_lock
-                                .retry_remaining(Instant::now())
-                                .is_zero()
-                            {
+                            if !state.app_lock.retry_remaining(Instant::now()).is_zero() {
                                 use zeroize::Zeroize as _;
                                 current_password.zeroize();
                             } else if let Some(verifier) = state.app_lock.protected_verifier() {
                                 state.spawn_lock_crypto(
-                                    app_lock::CryptoRequest::disable(
-                                        current_password,
-                                        verifier,
-                                    ),
+                                    app_lock::CryptoRequest::disable(current_password, verifier),
                                     false,
                                 );
                             } else {
                                 use zeroize::Zeroize as _;
                                 current_password.zeroize();
-                                state
-                                    .shell_state
-                                    .settings
-                                    .security_operation_failed();
+                                state.shell_state.settings.security_operation_failed();
                             }
                         }
                         shell::settings_ui::SecurityAction::ChangePassword {
                             mut current_password,
                             mut new_password,
                         } => {
-                            if !state
-                                .app_lock
-                                .retry_remaining(Instant::now())
-                                .is_zero()
-                            {
+                            if !state.app_lock.retry_remaining(Instant::now()).is_zero() {
                                 use zeroize::Zeroize as _;
                                 current_password.zeroize();
                                 new_password.zeroize();
@@ -14676,19 +14746,13 @@ impl ApplicationHandler<PtyWake> for App {
                                 use zeroize::Zeroize as _;
                                 current_password.zeroize();
                                 new_password.zeroize();
-                                state
-                                    .shell_state
-                                    .settings
-                                    .security_operation_failed();
+                                state.shell_state.settings.security_operation_failed();
                             }
                         }
                         shell::settings_ui::SecurityAction::UpdatePreferences(prefs) => {
                             if let Err(e) = state.app_lock.apply_preferences(prefs) {
                                 log::error!("应用锁偏好写盘失败: {e}");
-                                state
-                                    .shell_state
-                                    .settings
-                                    .security_operation_failed();
+                                state.shell_state.settings.security_operation_failed();
                             }
                             state.window.request_redraw();
                         }
@@ -14750,13 +14814,12 @@ impl ApplicationHandler<PtyWake> for App {
                     false
                 };
                 // SSH 服务器栏显隐：与远程设备栏交互一致，但状态独立持久化。
-                let ssh_server_list_changed =
-                    if let Some(v) = shell_out.toggle_ssh_server_list {
-                        state.settings.layout.ssh_server_list_visible = v;
-                        true
-                    } else {
-                        false
-                    };
+                let ssh_server_list_changed = if let Some(v) = shell_out.toggle_ssh_server_list {
+                    state.settings.layout.ssh_server_list_visible = v;
+                    true
+                } else {
+                    false
+                };
                 // 第十九轮：顶栏② 文件树显隐——写入 settings 并触发存盘。
                 // shell/mod.rs 已在 toggle_filetree 信号路径同步更新
                 // ShellState::filetree.visible（两入口共享同一状态源）；
@@ -15125,9 +15188,7 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.request_redraw();
                 }
                 if let Some((session_id, path, is_dir)) = shell_out.ssh_delete {
-                    if let Err(error) =
-                        state.ssh_runtime.delete_entry(session_id, path, is_dir)
-                    {
+                    if let Err(error) = state.ssh_runtime.delete_entry(session_id, path, is_dir) {
                         state
                             .shell_state
                             .toast
@@ -15137,10 +15198,9 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // SSH 菜单：重命名确认 → SFTP rename（同目录；撞名由服务端回 Conflict）。
                 if let Some((session_id, path, new_name, is_dir)) = shell_out.ssh_rename {
-                    if let Err(error) =
-                        state
-                            .ssh_runtime
-                            .rename_entry(session_id, path, is_dir, &new_name)
+                    if let Err(error) = state
+                        .ssh_runtime
+                        .rename_entry(session_id, path, is_dir, &new_name)
                     {
                         state
                             .shell_state
@@ -15190,10 +15250,7 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.settings.layout.view_mode.is_ssh() {
                     state.ssh_rect_px = shell_out.ssh_terminal_rect.and_then(|rect| {
                         let (width, height) = (rect.width(), rect.height());
-                        (width.is_finite()
-                            && height.is_finite()
-                            && width >= 1.0
-                            && height >= 1.0)
+                        (width.is_finite() && height.is_finite() && width >= 1.0 && height >= 1.0)
                             .then(|| {
                                 let x0 = (rect.min.x * ppp).round();
                                 let y0 = (rect.min.y * ppp).round();
@@ -15222,9 +15279,8 @@ impl ApplicationHandler<PtyWake> for App {
                                 );
                             }
                         }
-                        let (rows, columns) = state
-                            .renderer
-                            .grid_size_for(texture_width, texture_height);
+                        let (rows, columns) =
+                            state.renderer.grid_size_for(texture_width, texture_height);
                         state.ssh_runtime.resize_active(rows, columns);
                     }
                 } else {
@@ -15453,8 +15509,15 @@ impl ApplicationHandler<PtyWake> for App {
                                     None, // ghost 仅用于渲染，resize 高度计算不需要
                                 );
                                 cv.attachment_count = pane.attachments.len();
-                                let (_, cell_h) = state.renderer.cell_size();
+                                let (cell_w, cell_h) = state.renderer.cell_size();
                                 let fp = state.renderer.padding() * 0.4;
+                                cv.soft_wrap(
+                                    lumen_renderer::composer_view::footer_wrap_columns(
+                                        tw as f32,
+                                        cell_w,
+                                        fp,
+                                    ),
+                                );
                                 let max_h = th as f32 / 3.0;
                                 let target_h = lumen_renderer::composer_view::footer_height_px(
                                     Some(&cv),
@@ -15614,6 +15677,18 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                         }
                         let ghost = state.ghost_cache.1.clone();
+                        let footer_wrap_cols = {
+                            let pane_width = state
+                                .focused_pane_rect_px()
+                                .map_or(state.window.inner_size().width as f32, |(_, _, w, _)| w);
+                            let (cell_width, _) = state.renderer.cell_size();
+                            let footer_padding = state.renderer.padding() * 0.4;
+                            lumen_renderer::composer_view::footer_wrap_columns(
+                                pane_width,
+                                cell_width,
+                                footer_padding,
+                            )
+                        };
                         let focused = state.focused_pane();
                         let mode = effective_session_mode(focused, state.force_fallback);
                         let mut view = composer::compose_view_for_mode(
@@ -15634,6 +15709,7 @@ impl ApplicationHandler<PtyWake> for App {
                         {
                             view.highlight.clear();
                         }
+                        view.soft_wrap(footer_wrap_cols);
                         view
                     };
 
@@ -15696,20 +15772,12 @@ impl ApplicationHandler<PtyWake> for App {
                     if let Some(terminal) = state.ssh_runtime.active_terminal_mut() {
                         terminal.grid_mut().take_dirty();
                     }
-                    let cursor = state
-                        .ssh_runtime
-                        .active_cursor()
-                        .unwrap_or((0, 0, false));
+                    let cursor = state.ssh_runtime.active_cursor().unwrap_or((0, 0, false));
                     let (renderer, runtime) = (&mut state.renderer, &state.ssh_runtime);
                     if let Some(terminal) = runtime.active_terminal() {
-                        if let Err(error) = renderer.render(
-                            SSH_OFFSCREEN_ID,
-                            terminal,
-                            None,
-                            cursor,
-                            None,
-                            None,
-                        ) {
+                        if let Err(error) =
+                            renderer.render(SSH_OFFSCREEN_ID, terminal, None, cursor, None, None)
+                        {
                             log::error!("SSH 终端渲染失败: {error:#}");
                         } else {
                             rendered += 1;
@@ -15996,16 +16064,15 @@ impl ApplicationHandler<PtyWake> for App {
 mod tests {
     use super::{
         canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
-        controller_owned_pane_grid, drain_order, estimate_restored_pane_px, load_icon,
-        maximized_overflow, profile_auth_token, profile_origin_requires_reauth,
-        profile_server_origin, scroll_to_bottom_action,
-        should_apply_ssh_sync_event, should_continue_ssh_sync,
-        should_trigger_ssh_sync_after_local_change, ssh_profile_matches_test_target,
-        ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
-        ssh_sync_identity, ssh_test_profile, filetree_clipboard_shortcut,
-        next_ssh_clipboard_generation, ssh_clipboard_batch_directory,
-        ssh_clipboard_export_is_current, view_mode_shortcut, width_worth_persisting,
-        FileTreeClipboardShortcut, PaneLayout, ScrollToBottomAction,
+        controller_owned_pane_grid, drain_order, estimate_restored_pane_px,
+        filetree_clipboard_shortcut, load_icon, maximized_overflow, next_ssh_clipboard_generation,
+        profile_auth_token, profile_origin_requires_reauth, profile_server_origin,
+        scroll_to_bottom_action, should_apply_ssh_sync_event, should_continue_ssh_sync,
+        should_trigger_ssh_sync_after_local_change, ssh_clipboard_batch_directory,
+        ssh_clipboard_export_is_current, ssh_host_key_confirmation_is_current,
+        ssh_private_key_submission_is_valid, ssh_profile_matches_test_target, ssh_sync_identity,
+        ssh_test_profile, view_mode_shortcut, width_worth_persisting, FileTreeClipboardShortcut,
+        PaneLayout, ScrollToBottomAction,
     };
     use winit::event::ElementState;
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -16151,11 +16218,7 @@ mod tests {
     fn 文件树复制粘贴不抢终端组合键和文本输入控件() {
         for (repeat, modifiers, available) in [
             (true, ModifiersState::CONTROL, true),
-            (
-                false,
-                ModifiersState::CONTROL | ModifiersState::SHIFT,
-                true,
-            ),
+            (false, ModifiersState::CONTROL | ModifiersState::SHIFT, true),
             (false, ModifiersState::CONTROL, false),
         ] {
             assert_eq!(
@@ -16256,10 +16319,8 @@ mod tests {
             Some(std::env::temp_dir().as_path()),
         ));
 
-        let key_path = std::env::temp_dir().join(format!(
-            "lumen-main-key-validation-{}",
-            std::process::id()
-        ));
+        let key_path =
+            std::env::temp_dir().join(format!("lumen-main-key-validation-{}", std::process::id()));
         std::fs::write(&key_path, b"test-key").expect("创建临时私钥");
         assert!(ssh_private_key_submission_is_valid(
             &draft,
@@ -16388,9 +16449,7 @@ mod tests {
         assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
         profile.auth_origin = Some("https://lumen.example".to_owned());
         profile.user_id = Some("not-a-canonical-account".to_owned());
-        assert!(
-            canonical_ssh_account_id(Some(&profile), "https://lumen.example").is_none()
-        );
+        assert!(canonical_ssh_account_id(Some(&profile), "https://lumen.example").is_none());
         assert!(ssh_sync_identity(Some(&profile), "https://lumen.example").is_none());
     }
 
@@ -16787,10 +16846,9 @@ mod tests {
 
         #[test]
         fn kimi_单行斜杠命令使用括号粘贴避免二次补全() {
-            let payload = encode_llm_submit("/yolo", Some(LlmCliKind::Kimi));
+            let payload = encode_llm_submit("/yolo", Some(LlmCliKind::Kimi), false);
             assert_eq!(
-                payload,
-                b"\x1b[200~/yolo\x1b[201~\r",
+                payload, b"\x1b[200~/yolo\x1b[201~\r",
                 "Kimi 单行命令必须原子粘贴后再提交"
             );
         }
@@ -16803,8 +16861,16 @@ mod tests {
                 Some(LlmCliKind::Codex),
                 Some(LlmCliKind::Gemini),
             ] {
-                assert_eq!(encode_llm_submit("/help", kind), b"/help\r");
+                assert_eq!(encode_llm_submit("/help", kind, false), b"/help\r");
             }
+        }
+
+        #[test]
+        fn codex_win32输入模式一次enter直接提交() {
+            assert_eq!(
+                encode_llm_submit("hello", Some(LlmCliKind::Codex), true),
+                b"hello\x1b[13;0;13;1;0;1_\x1b[13;0;13;0;0;1_"
+            );
         }
     }
 }

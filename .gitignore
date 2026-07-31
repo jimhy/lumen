@@ -4,6 +4,8 @@
 **/*.rs.bk
 *.pdb
 /.engram/
+# Lumen 智能输入框的本地图片附件与会话草稿，不进入源码仓库。
+/.lumen/
 .playwright-mcp/
 
 # agent 验证日志（纪律：不入库，放 target/ 下）

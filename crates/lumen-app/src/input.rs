@@ -148,6 +148,35 @@ pub(crate) fn encode_plain_end(win32_input: bool) -> Vec<u8> {
     bytes
 }
 
+/// 斜杠菜单后台扫描使用的无修饰向下键。DEC 9001 开启时必须发送
+/// Win32 按下+抬起；新版 Claude 会忽略普通 `CSI B` 字符流。
+pub(crate) fn encode_plain_arrow_down(win32_input: bool) -> Vec<u8> {
+    let mods = ModifiersState::default();
+    if !win32_input {
+        return encode_named(NamedKey::ArrowDown, mods).expect("ArrowDown 必须有 VT 编码");
+    }
+
+    let (vk, uc) =
+        win32_named_key(NamedKey::ArrowDown).expect("ArrowDown 必须有 win32 编码");
+    let mut bytes = encode_win32_key(vk, uc, mods, true);
+    bytes.extend_from_slice(&encode_win32_key(vk, uc, mods, false));
+    bytes
+}
+
+/// 本地编辑器提交 LLM 输入时使用的 Enter。Codex/Claude 开启 DEC 9001
+/// 后，普通 CR 只会上屏文本，必须补完整的 Win32 按下+抬起才会执行。
+pub(crate) fn encode_plain_enter(win32_input: bool) -> Vec<u8> {
+    let mods = ModifiersState::default();
+    if !win32_input {
+        return encode_named(NamedKey::Enter, mods).expect("Enter 必须有 VT 编码");
+    }
+
+    let (vk, uc) = win32_named_key(NamedKey::Enter).expect("Enter 必须有 win32 编码");
+    let mut bytes = encode_win32_key(vk, uc, mods, true);
+    bytes.extend_from_slice(&encode_win32_key(vk, uc, mods, false));
+    bytes
+}
+
 fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
     let seq: &[u8] = match key {
         NamedKey::Enter => b"\r",
@@ -190,7 +219,9 @@ fn encode_named(key: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_alternate_scroll, encode_plain_end};
+    use super::{
+        encode_alternate_scroll, encode_plain_arrow_down, encode_plain_end, encode_plain_enter,
+    };
 
     #[test]
     fn alternate_scroll_编码上下方向与档数() {
@@ -209,6 +240,24 @@ mod tests {
         assert_eq!(
             encode_plain_end(true),
             b"\x1b[35;0;0;1;0;1_\x1b[35;0;0;0;0;1_"
+        );
+    }
+
+    #[test]
+    fn 斜杠菜单下移按当前输入协议编码() {
+        assert_eq!(encode_plain_arrow_down(false), b"\x1b[B");
+        assert_eq!(
+            encode_plain_arrow_down(true),
+            b"\x1b[40;0;0;1;0;1_\x1b[40;0;0;0;0;1_"
+        );
+    }
+
+    #[test]
+    fn llm提交回车按当前输入协议编码() {
+        assert_eq!(encode_plain_enter(false), b"\r");
+        assert_eq!(
+            encode_plain_enter(true),
+            b"\x1b[13;0;13;1;0;1_\x1b[13;0;13;0;0;1_"
         );
     }
 }

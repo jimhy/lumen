@@ -271,6 +271,162 @@ impl ComposerView {
     pub fn is_visible(&self) -> bool {
         self.kind != FooterKind::Hidden
     }
+
+    /// 按 footer 可用列数生成仅用于绘制的软换行视图。
+    ///
+    /// 该操作不会修改编辑器文档，只把 `lines`、光标、选区和高亮转换为
+    /// 对应的视觉行。因此发送给 PTY 的正文仍保留用户原始输入，不会混入
+    /// 自动换行产生的 `\n`。
+    pub fn soft_wrap(&mut self, max_cols: usize) {
+        if self.kind != FooterKind::Composer {
+            return;
+        }
+
+        let wrapped = soft_wrap_lines(&self.lines, max_cols);
+        if wrapped.is_empty() {
+            return;
+        }
+
+        self.cursor = wrapped_position_for_source(&wrapped, self.cursor);
+        self.selection = self.selection.map(|selection| FooterSelection {
+            start: wrapped_position_for_source(&wrapped, selection.start),
+            end: wrapped_position_for_source(&wrapped, selection.end),
+        });
+
+        let source_highlight = std::mem::take(&mut self.highlight);
+        self.highlight = wrapped
+            .iter()
+            .map(|row| {
+                source_highlight
+                    .get(row.source_line)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|span| {
+                        let start = span.start.max(row.source_start);
+                        let end = span.end.min(row.source_end);
+                        (start < end).then_some(FooterSpan {
+                            start: start - row.source_start,
+                            end: end - row.source_start,
+                            kind: span.kind,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        self.lines = wrapped.into_iter().map(|row| row.text).collect();
+    }
+}
+
+/// 一条软换行后的视觉行及其在原编辑器文档中的位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedFooterLine {
+    /// 视觉行正文。
+    pub text: String,
+    /// 对应的原始逻辑行。
+    pub source_line: usize,
+    /// 视觉行首在原始逻辑行中的字节偏移。
+    pub source_start: usize,
+    /// 视觉行尾在原始逻辑行中的字节偏移（exclusive）。
+    pub source_end: usize,
+}
+
+/// 根据 footer 的物理宽度计算正文一行可容纳的终端显示列数。
+pub fn footer_wrap_columns(footer_width: f32, cell_width: f32, footer_padding: f32) -> usize {
+    let cell_width = cell_width.max(1.0);
+    let content_width = (footer_width - footer_padding * 2.0).max(cell_width);
+    ((content_width / cell_width).floor() as usize).max(1)
+}
+
+/// 将逻辑行按显示列宽拆成视觉行。CJK/emoji 按 grapheme 整体换行，
+/// 不会把 UTF-8 字符或 emoji 字素簇截断。
+pub fn soft_wrap_lines(lines: &[String], max_cols: usize) -> Vec<WrappedFooterLine> {
+    use unicode_width::UnicodeWidthStr;
+
+    let max_cols = max_cols.max(1);
+    let mut wrapped = Vec::new();
+    for (source_line, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            wrapped.push(WrappedFooterLine {
+                text: String::new(),
+                source_line,
+                source_start: 0,
+                source_end: 0,
+            });
+            continue;
+        }
+
+        let mut start = 0usize;
+        let mut width = 0usize;
+        for (byte, grapheme) in line.grapheme_indices(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if byte > start && width.saturating_add(grapheme_width) > max_cols {
+                wrapped.push(WrappedFooterLine {
+                    text: line[start..byte].to_owned(),
+                    source_line,
+                    source_start: start,
+                    source_end: byte,
+                });
+                start = byte;
+                width = 0;
+            }
+            width = width.saturating_add(grapheme_width);
+        }
+        wrapped.push(WrappedFooterLine {
+            text: line[start..].to_owned(),
+            source_line,
+            source_start: start,
+            source_end: line.len(),
+        });
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(WrappedFooterLine {
+            text: String::new(),
+            source_line: 0,
+            source_start: 0,
+            source_end: 0,
+        });
+    }
+    wrapped
+}
+
+/// 把原编辑器文档位置映射为软换行后的视觉位置。
+pub fn wrapped_position_for_source(
+    wrapped: &[WrappedFooterLine],
+    source: (usize, usize),
+) -> (usize, usize) {
+    let (source_line, source_byte) = source;
+    for (index, row) in wrapped.iter().enumerate() {
+        if row.source_line != source_line {
+            continue;
+        }
+        let is_last_for_source = wrapped
+            .get(index + 1)
+            .is_none_or(|next| next.source_line != source_line);
+        if source_byte < row.source_end || is_last_for_source {
+            let byte = source_byte.clamp(row.source_start, row.source_end) - row.source_start;
+            return (index, byte);
+        }
+    }
+
+    let index = wrapped.len().saturating_sub(1);
+    let byte = wrapped.get(index).map_or(0, |row| row.text.len());
+    (index, byte)
+}
+
+/// 把软换行视觉位置还原为编辑器文档的逻辑位置，供 footer 鼠标命中使用。
+pub fn source_position_for_wrapped(
+    wrapped: &[WrappedFooterLine],
+    visual: (usize, usize),
+) -> (usize, usize) {
+    let index = visual.0.min(wrapped.len().saturating_sub(1));
+    let Some(row) = wrapped.get(index) else {
+        return (0, 0);
+    };
+    (
+        row.source_line,
+        row.source_start + visual.1.min(row.text.len()),
+    )
 }
 
 /// 计算 footer 占用的物理像素高度。
@@ -858,5 +1014,60 @@ mod tests {
             (sel_right - cursor_x).abs() < 0.01,
             "选区右边缘 ({sel_right}) 应与光标 x ({cursor_x}) 重合"
         );
+    }
+
+    #[test]
+    fn footer软换行_ascii且光标映射到下一视觉行() {
+        let mut view = ComposerView::compose_empty();
+        view.lines = vec!["abcde".to_owned()];
+        view.cursor = (0, 4);
+
+        view.soft_wrap(4);
+
+        assert_eq!(view.lines, vec!["abcd", "e"]);
+        assert_eq!(view.cursor, (1, 0));
+        assert_eq!(view.line_count(), 2);
+    }
+
+    #[test]
+    fn footer软换行_cjk按显示宽度且不拆字素簇() {
+        let wrapped = soft_wrap_lines(&["中文测试".to_owned()], 4);
+        assert_eq!(
+            wrapped.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            vec!["中文", "测试"]
+        );
+        assert_eq!(source_position_for_wrapped(&wrapped, (1, 3)), (0, 9));
+    }
+
+    #[test]
+    fn footer软换行同步映射选区和高亮() {
+        let mut view = ComposerView::compose_empty();
+        view.lines = vec!["abcdef".to_owned()];
+        view.cursor = (0, 6);
+        view.selection = Some(FooterSelection {
+            start: (0, 2),
+            end: (0, 5),
+        });
+        view.highlight = vec![vec![FooterSpan {
+            start: 1,
+            end: 6,
+            kind: FooterTokenKind::StringLit,
+        }]];
+
+        view.soft_wrap(4);
+
+        assert_eq!(view.lines, vec!["abcd", "ef"]);
+        assert_eq!(view.cursor, (1, 2));
+        assert_eq!(
+            view.selection,
+            Some(FooterSelection {
+                start: (0, 2),
+                end: (1, 1),
+            })
+        );
+        assert_eq!(view.highlight[0][0].start, 1);
+        assert_eq!(view.highlight[0][0].end, 4);
+        assert_eq!(view.highlight[1][0].start, 0);
+        assert_eq!(view.highlight[1][0].end, 2);
     }
 }
