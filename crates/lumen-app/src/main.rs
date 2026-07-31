@@ -1399,8 +1399,12 @@ fn effective_session_mode(pane: &Session, force_fallback: bool) -> mode::InputMo
 /// 紧随其后的 Enter 会再次接受当前候选，形成 `/yoyolo`。括号粘贴走
 /// Kimi 编辑器的原子 paste 路径，不触发补全，然后末尾 CR 只负责提交。
 #[cfg(feature = "input-editor")]
-fn encode_llm_submit(text: &str, kind: Option<llm_cli::LlmCliKind>) -> Vec<u8> {
-    if kind == Some(llm_cli::LlmCliKind::Kimi) && text.lines().count() <= 1 {
+fn encode_llm_submit(
+    text: &str,
+    kind: Option<llm_cli::LlmCliKind>,
+    win32_input: bool,
+) -> Vec<u8> {
+    let mut buf = if kind == Some(llm_cli::LlmCliKind::Kimi) && text.lines().count() <= 1 {
         let mut buf = Vec::with_capacity(text.len() + 14);
         buf.extend_from_slice(b"\x1b[200~");
         buf.extend_from_slice(text.as_bytes());
@@ -1408,7 +1412,13 @@ fn encode_llm_submit(text: &str, kind: Option<llm_cli::LlmCliKind>) -> Vec<u8> {
         buf
     } else {
         encode_submit(text)
+    };
+    if win32_input {
+        debug_assert_eq!(buf.last(), Some(&b'\r'));
+        buf.pop();
+        buf.extend_from_slice(&input::encode_plain_enter(true));
     }
+    buf
 }
 
 /// LLM CLI 的本地编辑器为空时，方向键/Esc 应留给 CLI 自己的交互
@@ -4682,6 +4692,24 @@ impl AppState {
     }
 
     #[cfg(feature = "input-editor")]
+    fn write_llm_slash_probe_next(
+        &mut self,
+        ti: usize,
+        pi: usize,
+        steps: usize,
+        context: &str,
+    ) -> bool {
+        let win32_input = self.tabs[ti].panes[pi].term.win32_input()
+            && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
+        let bytes = input::encode_plain_arrow_down(win32_input).repeat(steps.max(1));
+        if let Err(error) = self.tabs[ti].panes[pi].write_user_input(&bytes) {
+            log::error!("{context}: {error:#}");
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "input-editor")]
     fn begin_llm_slash_probe_clear(
         &mut self,
         ti: usize,
@@ -4693,6 +4721,7 @@ impl AppState {
             return false;
         }
         let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+        probe.stop_scan();
         probe.clearing = true;
         probe.escape_sent = false;
         probe.clear_at = Some(Instant::now() + LLM_SLASH_CLEAR_STAGE_DELAY);
@@ -4703,8 +4732,9 @@ impl AppState {
     }
 
     /// 把本地编辑器中的 `/prefix` 临时镜像给 CLI，从 CLI 自己的菜单
-    /// 采集命令。采集完成立即 Ctrl+U 清掉影子输入；后续前缀优先筛选
-    /// 会话缓存，不让 CLI 原生菜单与 Lumen 弹层长期重叠。
+    /// 自动遍历原生菜单并累计全部命令。遍历完成立即 Ctrl+U 清掉影子
+    /// 输入；后续前缀优先筛选完整会话缓存，不让 CLI 原生菜单与 Lumen
+    /// 弹层长期重叠。
     #[cfg(feature = "input-editor")]
     fn sync_llm_slash_probe(&mut self, ti: usize, pi: usize) {
         if ti >= self.tabs.len() || pi >= self.tabs[ti].panes.len() {
@@ -4723,6 +4753,25 @@ impl AppState {
             None
         };
         let current = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
+        let probe_active = {
+            let probe = &self.tabs[ti].panes[pi].slash_probe;
+            probe.scanning() || probe.clearing
+        };
+        let can_filter_active_probe =
+            llm_cli::can_filter_active_probe(probe_active, &current, next.as_deref());
+        if can_filter_active_probe {
+            // 裸 `/` 的全量扫描尚未结束时，继续输入字符只改变 Lumen
+            // 本地筛选条件。不要中断扫描后对 Kimi 执行 Ctrl+U→Esc→
+            // 重新探测，否则每输入一个字符都会让编辑器短暂停住。
+            let prefix = next.as_deref().expect("活动扫描筛选必须有斜杠前缀");
+            self.completion_req_id = 0;
+            self.completion_candidates.clear();
+            self.shell_state.completion.open = false;
+            self.shell_state.completion.passive = false;
+            self.show_cached_llm_slash_candidates(ti, pi, prefix);
+            self.window.request_redraw();
+            return;
+        }
         if next.as_deref() == (!current.is_empty()).then_some(current.as_str()) {
             return;
         }
@@ -4745,7 +4794,11 @@ impl AppState {
             self.completion_candidates.clear();
             self.shell_state.completion.open = false;
             self.shell_state.completion.passive = false;
-            if self.show_cached_llm_slash_candidates(ti, pi, &prefix) {
+            let prefix_complete = self.tabs[ti].panes[pi]
+                .slash_probe
+                .prefix_complete(&prefix);
+            if prefix_complete {
+                self.show_cached_llm_slash_candidates(ti, pi, &prefix);
                 return;
             }
             if let Err(error) =
@@ -4770,7 +4823,8 @@ impl AppState {
         self.close_passive_completion();
     }
 
-    /// PTY 输出更新后从 CLI 当前可视菜单刷新被动斜杠候选。
+    /// PTY 输出更新后累计 CLI 当前可视菜单；第一次拿到菜单时启动自动
+    /// 下移扫描，直到精确页码到尾、选中项回环或兜底停止条件触发。
     #[cfg(feature = "input-editor")]
     fn refresh_llm_slash_candidates(&mut self, ti: usize, pi: usize) {
         let prefix = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
@@ -4781,34 +4835,135 @@ impl AppState {
             let pane = &self.tabs[ti].panes[pi];
             pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term))
         };
-        let commands = kind.map_or_else(Vec::new, |kind| {
-            llm_cli::slash_commands(&self.tabs[ti].panes[pi].term, &prefix, kind)
+        let snapshot = kind.map(|kind| {
+            llm_cli::slash_menu(&self.tabs[ti].panes[pi].term, &prefix, kind)
         });
         if self.tabs[ti].panes[pi].slash_probe.clearing {
             return;
         }
-        if commands.is_empty() {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        if snapshot.commands.is_empty() {
             return;
         }
-        self.tabs[ti].panes[pi]
-            .slash_probe
-            .merge_commands(commands);
-        if !self.begin_llm_slash_probe_clear(
-            ti,
-            pi,
-            true,
-            "清理已采集的 LLM CLI 斜杠菜单失败",
-        ) {
-            self.tabs[ti].panes[pi].slash_probe.clear_active();
-            self.window.request_redraw();
+        let commands_changed = {
+            let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+            let commands_changed = probe.merge_commands(snapshot.commands.clone());
+            if !probe.scanning() {
+                let now = Instant::now();
+                let command_count = probe.commands.len();
+                probe.begin_scan(
+                    &snapshot,
+                    command_count,
+                    now + LLM_SLASH_SCAN_INTERVAL,
+                    now + LLM_SLASH_SCAN_TIMEOUT,
+                );
+            }
+            commands_changed
+        };
+        if commands_changed
+            || !self.shell_state.completion.open
+            || !self.shell_state.completion.passive
+        {
+            // 首屏拿到即展示，后台滚动只负责持续追加。扫描无论是否能识别
+            // 页码，都不能再阻塞菜单与本地编辑器。
+            let display_prefix = {
+                let text = self.tabs[ti].panes[pi].editor.view().text();
+                llm_cli::slash_prefix(&text)
+                    .map(str::to_owned)
+                    .unwrap_or(prefix)
+            };
+            self.show_cached_llm_slash_candidates(ti, pi, &display_prefix);
         }
     }
 
-    /// 定时推进斜杠探测清理。不能依赖 PTY 再产出一帧：Kimi 处理
-    /// Ctrl+U/Esc 后可能没有任何输出，纯输出驱动会永久保留 shadow，
-    /// 让终端纹理看起来卡死。
+    /// 定时推进斜杠菜单全量扫描与探测清理。扫描不能只依赖 PTY 输出：
+    /// 下一次方向键需要稳定节拍；Ctrl+U/Esc 后也可能没有任何回显，
+    /// 纯输出驱动会永久保留 shadow，让终端纹理看起来卡死。
     #[cfg(feature = "input-editor")]
     fn poll_llm_slash_probe_clear(&mut self, now: Instant) -> Option<Instant> {
+        let scan_due = self
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, tab)| {
+                tab.panes
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(pi, pane)| {
+                        (!pane.slash_probe.clearing
+                            && pane
+                                .slash_probe
+                                .scan_at
+                                .is_some_and(|at| now >= at))
+                        .then_some((ti, pi))
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (ti, pi) in scan_due {
+            let prefix = self.tabs[ti].panes[pi].slash_probe.shadow.clone();
+            let kind = {
+                let pane = &self.tabs[ti].panes[pi];
+                pane.llm_cli.or_else(|| llm_cli::detect(None, &pane.term))
+            };
+            let Some(kind) = kind else {
+                self.tabs[ti].panes[pi].slash_probe.stop_scan();
+                continue;
+            };
+            let snapshot =
+                llm_cli::slash_menu(&self.tabs[ti].panes[pi].term, &prefix, kind);
+            let decision = {
+                let probe = &mut self.tabs[ti].panes[pi].slash_probe;
+                probe.merge_commands(snapshot.commands.clone());
+                let command_count = probe.commands.len();
+                probe.observe_scan(
+                    &snapshot,
+                    command_count,
+                    now,
+                    LLM_SLASH_SCAN_MAX_STEPS,
+                    LLM_SLASH_SCAN_MAX_STAGNANT_STEPS,
+                )
+            };
+            match decision {
+                llm_cli::SlashScanDecision::Advance => {
+                    let steps = llm_cli::slash_scan_advance_steps(kind, &snapshot);
+                    if self.write_llm_slash_probe_next(
+                        ti,
+                        pi,
+                        steps,
+                        "遍历 LLM CLI 斜杠菜单失败",
+                    ) {
+                        self.tabs[ti].panes[pi]
+                            .slash_probe
+                            .schedule_scan(now + LLM_SLASH_SCAN_INTERVAL);
+                    } else if !self.begin_llm_slash_probe_clear(
+                        ti,
+                        pi,
+                        false,
+                        "取消未完成的 LLM CLI 斜杠菜单扫描失败",
+                    ) {
+                        self.tabs[ti].panes[pi].slash_probe.clear_active();
+                        self.close_passive_completion();
+                    }
+                }
+                llm_cli::SlashScanDecision::Finish => {
+                    self.tabs[ti].panes[pi]
+                        .slash_probe
+                        .mark_prefix_complete(prefix);
+                    if !self.begin_llm_slash_probe_clear(
+                        ti,
+                        pi,
+                        true,
+                        "清理已完整采集的 LLM CLI 斜杠菜单失败",
+                    ) {
+                        self.tabs[ti].panes[pi].slash_probe.clear_active();
+                        self.window.request_redraw();
+                    }
+                }
+            }
+        }
+
         let timed_out = self
             .tabs
             .iter()
@@ -4891,6 +5046,7 @@ impl AppState {
                 [
                     pane.slash_probe.clear_at,
                     pane.slash_probe.probe_deadline,
+                    pane.slash_probe.scan_at,
                 ]
                 .into_iter()
                 .flatten()
@@ -4997,8 +5153,11 @@ impl AppState {
                                 pane.llm_cli
                                     .or_else(|| llm_cli::detect(None, &pane.term))
                             };
+                            let win32_input = self.tabs[ti].panes[pi].term.win32_input()
+                                && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
                             self.clear_llm_slash_shadow(ti, pi);
-                            let payload = encode_llm_submit(&compiled_text, llm_kind);
+                            let payload =
+                                encode_llm_submit(&compiled_text, llm_kind, win32_input);
                             // 步骤 3：滚动到底 + 写 PTY
                             self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
                             if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
@@ -9960,6 +10119,12 @@ const LLM_CLI_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// LLM CLI 的原生候选可能异步生成；在截止时间内允许任意数量的局部
 /// PTY 重绘，不能用“无结果帧数”提前判定失败。
 const LLM_SLASH_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+/// 原生菜单每次移动一项。间隔需覆盖常见 TUI 的局部重绘；Kimi 有精确
+/// 总数，其他 CLI 在选中项回环或连续多次无新增时结束。
+const LLM_SLASH_SCAN_INTERVAL: Duration = Duration::from_millis(40);
+const LLM_SLASH_SCAN_TIMEOUT: Duration = Duration::from_secs(90);
+const LLM_SLASH_SCAN_MAX_STEPS: u16 = 2048;
+const LLM_SLASH_SCAN_MAX_STAGNANT_STEPS: u16 = 256;
 /// Ctrl+U 与 Kimi 的 Esc 必须分成两个 ConPTY 写入；每阶段留出一个
 /// 很短的处理窗口，同时由 about_to_wait 定时唤醒，绝不等待 CLI 回显。
 const LLM_SLASH_CLEAR_STAGE_DELAY: Duration = Duration::from_millis(60);
@@ -16787,7 +16952,7 @@ mod tests {
 
         #[test]
         fn kimi_单行斜杠命令使用括号粘贴避免二次补全() {
-            let payload = encode_llm_submit("/yolo", Some(LlmCliKind::Kimi));
+            let payload = encode_llm_submit("/yolo", Some(LlmCliKind::Kimi), false);
             assert_eq!(
                 payload,
                 b"\x1b[200~/yolo\x1b[201~\r",
@@ -16803,8 +16968,16 @@ mod tests {
                 Some(LlmCliKind::Codex),
                 Some(LlmCliKind::Gemini),
             ] {
-                assert_eq!(encode_llm_submit("/help", kind), b"/help\r");
+                assert_eq!(encode_llm_submit("/help", kind, false), b"/help\r");
             }
+        }
+
+        #[test]
+        fn codex_win32输入模式一次enter直接提交() {
+            assert_eq!(
+                encode_llm_submit("hello", Some(LlmCliKind::Codex), true),
+                b"hello\x1b[13;0;13;1;0;1_\x1b[13;0;13;0;0;1_"
+            );
         }
     }
 }

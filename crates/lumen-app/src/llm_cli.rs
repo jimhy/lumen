@@ -139,6 +139,21 @@ pub struct SlashCommand {
     pub description: String,
 }
 
+/// CLI 当前画出的斜杠菜单快照。命令列表只包含可见页；扫描器通过
+/// `selected_command` 或 `position` 驱动菜单逐项滚动并累计所有页。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashMenuSnapshot {
+    pub commands: Vec<SlashCommand>,
+    pub selected_command: Option<String>,
+    pub position: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashScanDecision {
+    Advance,
+    Finish,
+}
+
 /// 为唤起 CLI 原生命令菜单而临时镜像进 PTY 的斜杠前缀。
 #[derive(Debug, Default)]
 pub struct SlashProbeState {
@@ -160,9 +175,25 @@ pub struct SlashProbeState {
     /// 等待 CLI 异步生成斜杠候选的截止时间。不能按 PTY 更新次数取消：
     /// Kimi 会先产生多次局部重绘，再异步返回真正的筛选结果。
     pub probe_deadline: Option<Instant>,
+    /// 自动遍历原生命令菜单的下一次下移时刻与硬截止时间。
+    pub scan_at: Option<Instant>,
+    pub scan_deadline: Option<Instant>,
+    /// 扫描停止条件：总步数兜底、连续无新增页计数、选中项回环。
+    pub scan_steps: u16,
+    pub scan_stagnant_steps: u16,
+    pub scan_last_command_count: usize,
+    pub scan_origin_selected: Option<String>,
+    pub scan_saw_other_selected: bool,
+    /// 不依赖高亮字符的翻页判定：Codex 等菜单仅以背景色标记选中项，
+    /// 但滚动一圈后可见命令页一定会回到首屏。
+    pub scan_origin_page: Vec<String>,
+    pub scan_saw_other_page: bool,
     /// 本会话从 CLI 原生菜单累计发现的命令。影子输入清除后仍保留，
     /// 后续前缀优先在本地缓存中筛选。
     pub commands: Vec<SlashCommand>,
+    /// 已完成全量遍历的前缀。较短前缀覆盖其所有更长前缀：
+    /// 完整扫描 `/` 后，`/re` 可直接从完整缓存筛选。
+    pub complete_prefixes: Vec<String>,
 }
 
 impl SlashProbeState {
@@ -173,38 +204,171 @@ impl SlashProbeState {
         self.clear_at = None;
         self.resume_after_clear = false;
         self.probe_deadline = None;
+        self.stop_scan();
     }
 
     pub fn clear(&mut self) {
         self.clear_active();
         self.commands.clear();
+        self.complete_prefixes.clear();
     }
 
-    pub fn merge_commands(&mut self, commands: Vec<SlashCommand>) {
+    pub fn merge_commands(&mut self, commands: Vec<SlashCommand>) -> bool {
+        let mut changed = false;
         for command in commands {
             if let Some(existing) = self
                 .commands
                 .iter_mut()
                 .find(|existing| existing.command == command.command)
             {
-                *existing = command;
+                if *existing != command {
+                    *existing = command;
+                    changed = true;
+                }
             } else {
                 self.commands.push(command);
+                changed = true;
             }
         }
         self.commands
             .sort_by(|left, right| left.command.cmp(&right.command));
+        changed
     }
 
     pub fn begin_probe(&mut self, prefix: String, deadline: Instant) {
         self.shadow = prefix;
         self.probe_deadline = Some(deadline);
+        self.stop_scan();
     }
 
     pub fn probe_timed_out(&self, now: Instant) -> bool {
         !self.clearing
             && !self.shadow.is_empty()
             && self.probe_deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    pub fn scanning(&self) -> bool {
+        self.scan_at.is_some()
+    }
+
+    pub fn begin_scan(
+        &mut self,
+        snapshot: &SlashMenuSnapshot,
+        command_count: usize,
+        next_at: Instant,
+        deadline: Instant,
+    ) {
+        self.probe_deadline = None;
+        self.scan_at = Some(next_at);
+        self.scan_deadline = Some(deadline);
+        self.scan_steps = 0;
+        self.scan_stagnant_steps = 0;
+        self.scan_last_command_count = command_count;
+        self.scan_origin_selected = snapshot.selected_command.clone();
+        self.scan_saw_other_selected = false;
+        self.scan_origin_page = snapshot
+            .commands
+            .iter()
+            .map(|item| item.command.clone())
+            .collect();
+        self.scan_saw_other_page = false;
+    }
+
+    pub fn observe_scan(
+        &mut self,
+        snapshot: &SlashMenuSnapshot,
+        command_count: usize,
+        now: Instant,
+        max_steps: u16,
+        max_stagnant_steps: u16,
+    ) -> SlashScanDecision {
+        if command_count > self.scan_last_command_count {
+            self.scan_stagnant_steps = 0;
+        } else {
+            self.scan_stagnant_steps = self.scan_stagnant_steps.saturating_add(1);
+        }
+        self.scan_last_command_count = command_count;
+
+        let visible_page = snapshot
+            .commands
+            .iter()
+            .map(|item| item.command.as_str())
+            .collect::<Vec<_>>();
+        if !visible_page.is_empty() {
+            let is_origin_page = visible_page
+                .iter()
+                .copied()
+                .eq(self.scan_origin_page.iter().map(String::as_str));
+            if is_origin_page && self.scan_saw_other_page {
+                return SlashScanDecision::Finish;
+            }
+            if !is_origin_page {
+                self.scan_saw_other_page = true;
+            }
+        }
+
+        if let Some(selected) = snapshot.selected_command.as_deref() {
+            match self.scan_origin_selected.as_deref() {
+                None => self.scan_origin_selected = Some(selected.to_owned()),
+                Some(origin) if selected != origin => self.scan_saw_other_selected = true,
+                Some(_) if self.scan_saw_other_selected => return SlashScanDecision::Finish,
+                Some(_) => {}
+            }
+        }
+
+        // 如果菜单本身小于一屏，可见页不会变化；走过“首屏条数+少量余量”
+        // 后即可确认已回环。全局上限仍防御异常超大菜单。
+        let page_stagnant_limit = u16::try_from(self.scan_origin_page.len().saturating_add(4))
+            .unwrap_or(u16::MAX)
+            .max(8)
+            .min(max_stagnant_steps);
+        if snapshot
+            .position
+            .is_some_and(|(selected, total)| selected >= total)
+            || self
+                .scan_deadline
+                .is_some_and(|deadline| now >= deadline)
+            || self.scan_steps >= max_steps
+            || self.scan_stagnant_steps >= page_stagnant_limit
+        {
+            return SlashScanDecision::Finish;
+        }
+
+        self.scan_steps = self.scan_steps.saturating_add(1);
+        SlashScanDecision::Advance
+    }
+
+    pub fn schedule_scan(&mut self, next_at: Instant) {
+        self.scan_at = Some(next_at);
+    }
+
+    pub fn stop_scan(&mut self) {
+        self.scan_at = None;
+        self.scan_deadline = None;
+        self.scan_steps = 0;
+        self.scan_stagnant_steps = 0;
+        self.scan_last_command_count = 0;
+        self.scan_origin_selected = None;
+        self.scan_saw_other_selected = false;
+        self.scan_origin_page.clear();
+        self.scan_saw_other_page = false;
+    }
+
+    pub fn mark_prefix_complete(&mut self, prefix: String) {
+        if !self
+            .complete_prefixes
+            .iter()
+            .any(|complete| prefix.starts_with(complete))
+        {
+            self.complete_prefixes.push(prefix);
+            self.complete_prefixes.sort();
+        }
+    }
+
+    pub fn prefix_complete(&self, prefix: &str) -> bool {
+        self.complete_prefixes
+            .iter()
+            .any(|complete| prefix.starts_with(complete))
     }
 }
 
@@ -217,18 +381,42 @@ pub fn composer_ready(term: &Terminal, kind: LlmCliKind) -> bool {
     kind != LlmCliKind::Kimi || kimi_editor_visible(visible_rows(term).iter().map(String::as_str))
 }
 
-/// 从终端当前可视网格中提取原生斜杠菜单。
-pub fn slash_commands(
+/// 从终端当前可视网格中提取原生斜杠菜单快照。
+pub fn slash_menu(
     term: &Terminal,
     prefix: &str,
     kind: LlmCliKind,
-) -> Vec<SlashCommand> {
+) -> SlashMenuSnapshot {
     let rows = visible_rows(term);
-    let rows = rows.iter().map(String::as_str);
-    match kind {
-        LlmCliKind::Kimi => parse_kimi_slash_commands(rows, prefix),
-        _ => parse_slash_commands(rows, prefix),
+    let row_refs = || rows.iter().map(String::as_str);
+    let commands = match kind {
+        LlmCliKind::Kimi => parse_kimi_slash_commands(row_refs(), prefix),
+        _ => parse_slash_commands(row_refs(), prefix),
+    };
+    let selected_command = match kind {
+        LlmCliKind::Kimi => kimi_selected_command(row_refs(), prefix),
+        _ => selected_slash_command(row_refs(), prefix),
+    };
+    // Kimi、Gemini 等 TUI 都会在候选末尾画 `(当前位置/总数)`。
+    // 取屏幕上最后一个，避免聊天历史里偶然出现的同形文本抢占菜单页码。
+    let position = row_refs().filter_map(slash_menu_position).next_back();
+    SlashMenuSnapshot {
+        commands,
+        selected_command,
+        position,
     }
+}
+
+/// Kimi 的菜单固定围绕选中项显示一个可见窗口。一次批量移动一个
+/// 可见页，并在最后一批按 `(当前位置/总数)` 截断，既减少重绘也不越过末项。
+pub fn slash_scan_advance_steps(kind: LlmCliKind, snapshot: &SlashMenuSnapshot) -> usize {
+    if kind != LlmCliKind::Kimi {
+        return 1;
+    }
+    let page_size = snapshot.commands.len().max(1);
+    snapshot.position.map_or(1, |(selected, total)| {
+        page_size.min(total.saturating_sub(selected)).max(1)
+    })
 }
 
 fn visible_rows(term: &Terminal) -> Vec<String> {
@@ -337,7 +525,7 @@ fn parse_kimi_slash_commands<'a>(
         .iter()
         .position(|row| {
             let line = row.trim();
-            kimi_menu_position(line).is_some()
+            slash_menu_position(line).is_some()
                 || !(line.starts_with('│') && line.ends_with('│'))
         })
         .map_or(rows.len(), |offset| selected_row + offset);
@@ -399,7 +587,50 @@ fn kimi_selected_menu_row(row: &str) -> bool {
         })
 }
 
-fn kimi_menu_position(row: &str) -> Option<(usize, usize)> {
+fn kimi_selected_command<'a>(
+    rows: impl IntoIterator<Item = &'a str>,
+    prefix: &str,
+) -> Option<String> {
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    rows.into_iter().rev().find_map(|row| {
+        let inner = row
+            .trim()
+            .strip_prefix('│')?
+            .strip_suffix('│')?
+            .trim_start()
+            .strip_prefix('→')?
+            .trim_start();
+        let token = inner.split_whitespace().next()?;
+        let command = format!("/{token}");
+        (command.len() > 1 && command.starts_with(prefix)).then_some(command)
+    })
+}
+
+fn selected_slash_command<'a>(
+    rows: impl IntoIterator<Item = &'a str>,
+    prefix: &str,
+) -> Option<String> {
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    rows.into_iter().rev().find_map(|row| {
+        let line = row
+            .trim()
+            .trim_start_matches(['│', '┃', '┆', '┊'])
+            .trim_start();
+        let marker = line.chars().next()?;
+        if !matches!(marker, '>' | '❯' | '›' | '→') {
+            return None;
+        }
+        let content = line[marker.len_utf8()..].trim_start();
+        let token = content.split_whitespace().next()?;
+        (token.len() > 1
+            && token.starts_with('/')
+            && token != prefix
+            && token.starts_with(prefix))
+        .then(|| token.to_owned())
+    })
+}
+
+fn slash_menu_position(row: &str) -> Option<(usize, usize)> {
     row.split_whitespace().find_map(|part| {
         let part = part.trim_matches(['│', '(', ')']);
         let (selected, total) = part.split_once('/')?;
@@ -448,6 +679,15 @@ pub fn slash_prefix(text: &str) -> Option<&str> {
     }
 }
 
+/// 活动探测（扫描或收尾清理）的前缀比本地新前缀更宽时，可继续当前
+/// 流程并仅在本地过滤。例如 PTY 保持裸 `/`，本地输入到 `/re` 时
+/// 无需重启 CLI 菜单。
+pub fn can_filter_active_probe(active: bool, shadow: &str, next: Option<&str>) -> bool {
+    active
+        && !shadow.is_empty()
+        && next.is_some_and(|prefix| prefix.starts_with(shadow))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +721,16 @@ mod tests {
         assert_eq!(slash_prefix("/"), Some("/"));
         assert_eq!(slash_prefix("/compact now"), None);
         assert_eq!(slash_prefix("please /compact"), None);
+    }
+
+    #[test]
+    fn active_root_scan_accepts_local_narrowing_without_reprobe() {
+        assert!(can_filter_active_probe(true, "/", Some("/y")));
+        assert!(can_filter_active_probe(true, "/", Some("/resume")));
+        assert!(can_filter_active_probe(true, "/res", Some("/resume")));
+        assert!(!can_filter_active_probe(false, "/", Some("/y")));
+        assert!(!can_filter_active_probe(true, "/resume", Some("/res")));
+        assert!(!can_filter_active_probe(true, "/", None));
     }
 
     #[test]
@@ -597,5 +847,195 @@ mod tests {
             !probe.probe_timed_out(started + std::time::Duration::from_secs(2)),
             "进入清理阶段后不能重复触发探测超时"
         );
+    }
+
+    #[test]
+    fn parses_selected_command_and_kimi_exact_position() {
+        let kimi_rows = [
+            " │   → yolo        Toggle YOLO mode              │",
+            " │     model       Switch LLM model              │",
+            " │     (1/74)                                    │",
+        ];
+        assert_eq!(
+            kimi_selected_command(kimi_rows, "/"),
+            Some("/yolo".to_owned())
+        );
+        assert_eq!(
+            kimi_rows.into_iter().find_map(slash_menu_position),
+            Some((1, 74))
+        );
+        assert_eq!(
+            selected_slash_command(
+                [
+                    "  ❯ /compact   Compact conversation",
+                    "    /config    Open settings",
+                ],
+                "/"
+            ),
+            Some("/compact".to_owned())
+        );
+    }
+
+    #[test]
+    fn kimi_scan_finishes_at_reported_last_command() {
+        let started = Instant::now();
+        let mut probe = SlashProbeState::default();
+        let first = SlashMenuSnapshot {
+            commands: Vec::new(),
+            selected_command: Some("/yolo".to_owned()),
+            position: Some((1, 74)),
+        };
+        probe.begin_scan(
+            &first,
+            5,
+            started,
+            started + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            probe.observe_scan(&first, 5, started, 100, 20),
+            SlashScanDecision::Advance
+        );
+
+        let last = SlashMenuSnapshot {
+            commands: Vec::new(),
+            selected_command: Some("/version".to_owned()),
+            position: Some((74, 74)),
+        };
+        assert_eq!(
+            probe.observe_scan(&last, 74, started, 100, 20),
+            SlashScanDecision::Finish
+        );
+    }
+
+    #[test]
+    fn generic_scan_finishes_when_selection_wraps_to_origin() {
+        let started = Instant::now();
+        let mut probe = SlashProbeState::default();
+        let first = SlashMenuSnapshot {
+            commands: Vec::new(),
+            selected_command: Some("/compact".to_owned()),
+            position: None,
+        };
+        probe.begin_scan(
+            &first,
+            4,
+            started,
+            started + std::time::Duration::from_secs(30),
+        );
+
+        let second = SlashMenuSnapshot {
+            commands: Vec::new(),
+            selected_command: Some("/config".to_owned()),
+            position: None,
+        };
+        assert_eq!(
+            probe.observe_scan(&second, 5, started, 100, 20),
+            SlashScanDecision::Advance
+        );
+        assert_eq!(
+            probe.observe_scan(&first, 5, started, 100, 20),
+            SlashScanDecision::Finish
+        );
+    }
+
+    #[test]
+    fn scan_finishes_when_visible_page_wraps_without_selection_marker() {
+        let started = Instant::now();
+        let command = |name: &str| SlashCommand {
+            command: name.to_owned(),
+            description: String::new(),
+        };
+        let first = SlashMenuSnapshot {
+            commands: vec![command("/model"), command("/permissions")],
+            selected_command: None,
+            position: None,
+        };
+        let mut probe = SlashProbeState::default();
+        probe.begin_scan(
+            &first,
+            2,
+            started,
+            started + std::time::Duration::from_secs(30),
+        );
+
+        let second = SlashMenuSnapshot {
+            commands: vec![command("/permissions"), command("/resume")],
+            selected_command: None,
+            position: None,
+        };
+        assert_eq!(
+            probe.observe_scan(&second, 3, started, 100, 20),
+            SlashScanDecision::Advance
+        );
+        assert_eq!(
+            probe.observe_scan(&first, 3, started, 100, 20),
+            SlashScanDecision::Finish
+        );
+    }
+
+    #[test]
+    fn kimi_scan_batches_one_visible_page_without_skipping_last_position() {
+        let commands = (1..=5)
+            .map(|index| SlashCommand {
+                command: format!("/command-{index}"),
+                description: String::new(),
+            })
+            .collect();
+        let middle = SlashMenuSnapshot {
+            commands,
+            selected_command: Some("/command-1".to_owned()),
+            position: Some((1, 74)),
+        };
+        assert_eq!(slash_scan_advance_steps(LlmCliKind::Kimi, &middle), 5);
+
+        let near_end = SlashMenuSnapshot {
+            commands: middle.commands.clone(),
+            selected_command: Some("/command-71".to_owned()),
+            position: Some((71, 74)),
+        };
+        assert_eq!(slash_scan_advance_steps(LlmCliKind::Kimi, &near_end), 3);
+        assert_eq!(slash_scan_advance_steps(LlmCliKind::Claude, &middle), 1);
+    }
+
+    #[test]
+    fn scan_stagnation_resets_on_new_commands_and_complete_prefix_is_reused() {
+        let started = Instant::now();
+        let snapshot = SlashMenuSnapshot {
+            commands: Vec::new(),
+            selected_command: None,
+            position: None,
+        };
+        let mut probe = SlashProbeState::default();
+        probe.begin_scan(
+            &snapshot,
+            3,
+            started,
+            started + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            probe.observe_scan(&snapshot, 3, started, 100, 2),
+            SlashScanDecision::Advance
+        );
+        assert_eq!(
+            probe.observe_scan(&snapshot, 4, started, 100, 2),
+            SlashScanDecision::Advance
+        );
+        assert_eq!(probe.scan_stagnant_steps, 0);
+        assert_eq!(
+            probe.observe_scan(&snapshot, 4, started, 100, 2),
+            SlashScanDecision::Advance
+        );
+        assert_eq!(
+            probe.observe_scan(&snapshot, 4, started, 100, 2),
+            SlashScanDecision::Finish
+        );
+
+        probe.mark_prefix_complete("/".to_owned());
+        assert!(probe.prefix_complete("/"));
+        assert!(probe.prefix_complete("/resume"));
+        probe.clear_active();
+        assert!(probe.prefix_complete("/config"));
+        probe.clear();
+        assert!(!probe.prefix_complete("/"));
     }
 }
