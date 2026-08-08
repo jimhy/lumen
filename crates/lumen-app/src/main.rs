@@ -13368,7 +13368,7 @@ impl ApplicationHandler<PtyWake> for App {
                             painter.rect_stroke(
                                 strip_rect,
                                 0.0,
-                                egui::Stroke::new(1.0, modal_pal.panel_outline),
+                                egui::Stroke::new(1.0_f32, modal_pal.panel_outline),
                                 egui::StrokeKind::Inside,
                             );
 

@@ -178,7 +178,7 @@ pub fn show(
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(pal.bg_panel)
-                .stroke(egui::Stroke::new(1.0, pal.panel_outline))
+                .stroke(egui::Stroke::new(1.0_f32, pal.panel_outline))
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
@@ -252,7 +252,7 @@ fn collapsed_button(
             ui.painter().rect_stroke(
                 rect,
                 egui::CornerRadius::same(6),
-                egui::Stroke::new(1.0, pal.panel_outline),
+                egui::Stroke::new(1.0_f32, pal.panel_outline),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
@@ -403,7 +403,7 @@ fn resize_handle(
 ) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(13.0, 17.0), egui::Sense::drag());
     let stroke = egui::Stroke::new(
-        1.0,
+        1.0_f32,
         if response.hovered() || response.dragged() {
             pal.accent
         } else {
@@ -942,7 +942,7 @@ fn separator(ui: &mut egui::Ui, pal: &Palette) {
             egui::pos2(rect.left(), rect.top()),
             egui::pos2(rect.right(), rect.top()),
         ],
-        egui::Stroke::new(1.0, pal.bg_highlight),
+        egui::Stroke::new(1.0_f32, pal.bg_highlight),
     );
     ui.add_space(6.0);
 }
