@@ -1,0 +1,22 @@
+{
+  "note": "已知 op + **未知字段**：字段被静默丢弃（serde 默认不 deny_unknown_fields）。这条定死了两端的一致行为——Dart 侧**不得**把未知键塞进一个 extra map 再原样回显，那等于给「白名单转发」开了后门（PC→手机的 hook 输出泄漏正是这么发生的）。",
+  "expect_variant": "Hello",
+  "frame": {
+    "op": "Hello",
+    "llm_proto": 1,
+    "caps": [
+      "perm"
+    ],
+    "future_field": {
+      "x": 1
+    },
+    "another": "ignored"
+  },
+  "reserialized": {
+    "op": "Hello",
+    "llm_proto": 1,
+    "caps": [
+      "perm"
+    ]
+  }
+}

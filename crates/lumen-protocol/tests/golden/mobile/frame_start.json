@@ -1,0 +1,24 @@
+{
+  "note": "控→被：启动一个 headless 对话（满载全部可选字段）。cwd 是被控端本机路径（LlmPath，Debug 脱敏，线上仍是普通字符串）；fork_session 是裸 bool + #[serde(default)]，永远序列化。",
+  "expect_variant": "Start",
+  "frame": {
+    "op": "Start",
+    "req_id": 3,
+    "agent": "Claude",
+    "cwd": "F:\\projects\\lumen",
+    "model": "claude-opus-5",
+    "permission_mode": "Plan",
+    "resume": "11111111-2222-3333-4444-555555555555",
+    "fork_session": true,
+    "append_system_prompt": "你是 Lumen 的代码助手，回答用中文。",
+    "allowed_tools": [
+      "Read",
+      "Grep",
+      "Bash"
+    ],
+    "origin": {
+      "tab_id": 2,
+      "session_id": 9
+    }
+  }
+}

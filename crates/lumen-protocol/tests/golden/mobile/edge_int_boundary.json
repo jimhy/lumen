@@ -1,0 +1,27 @@
+{
+  "note": "整数边界。**语料的硬规矩：任何整数都不得超过 i64::MAX**——Rust 侧 seq / bytes / len / cost_micro_usd 是 u64，而 Dart 的 int 是 64 位**有符号**，jsonDecode 遇到 >i64::MAX 会退化成 double 并丢精度，两端从此静默不一致。mobile_golden.rs 里有一条 lint 会扫全部语料执行这条规矩。本条**逐字段**取的值：conv_id / conv_generation / seq = i64::MAX；turn = u32::MAX；cost_micro_usd / context_used = 2^53−1（dart2js/JS 的安全整数上限，若日后跑 Web 端会用到）；ended_ms = −1（1969 年，时间戳是 i64 不是 u64）。注意 conv_id 那个 i64::MAX 是唯一一个把「Dart 模型把整数存成 double」当场露馅的叶子——double 表示不了 9223372036854775807。⚠ LlmDeltaItem::Dropped.bytes 与 block_id 的边界值**本条不覆盖**（那是 Delta 帧的字段，不在 TurnEnded 里），要覆盖请另开一条 edge_ 语料。",
+  "expect_variant": "TurnEnded",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 9223372036854775807,
+    "conv_generation": 9223372036854775807,
+    "seq": 9223372036854775807,
+    "turn": 4294967295,
+    "stop": "MaxTokens",
+    "outcome": {
+      "is_error": false
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 9007199254740991,
+      "context_used": 9007199254740991,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": -1,
+    "truncated": false
+  }
+}

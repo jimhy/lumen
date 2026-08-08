@@ -1,0 +1,40 @@
+{
+  "note": "被→控：基线帧。attach_dir 是本对话的附件暂存目录（控制端先用 PutBegin/PutChunk/PutEnd 把图传到这里，再在 Send 里按绝对路径引用）；seq 是本对话增量水位起点，控制端丢弃 seq 不大于它的迟到 Delta。",
+  "expect_variant": "ConvStarted",
+  "frame": {
+    "op": "ConvStarted",
+    "req_id": 3,
+    "meta": {
+      "conv_id": 11,
+      "conv_generation": 3,
+      "agent": "Claude",
+      "cwd": "F:\\projects\\lumen",
+      "title": "重构渲染器：把 glyph 缓存换成 LRU",
+      "state": {
+        "kind": "Running"
+      },
+      "model": "claude-opus-5",
+      "permission_mode": "AcceptEdits",
+      "cli_session_id": "11111111-2222-3333-4444-555555555555",
+      "origin": {
+        "tab_id": 2,
+        "session_id": 9
+      },
+      "cur_turn": 4,
+      "created_ms": 1786210000000,
+      "updated_ms": 1786211000000,
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 24,
+        "cache_read_tokens": 53883,
+        "cache_write_tokens": 18013,
+        "cost_micro_usd": 240262,
+        "context_used": 38342,
+        "context_limit": 1000000,
+        "max_output_tokens": 64000
+      }
+    },
+    "attach_dir": "F:\\projects\\lumen\\.lumen\\llm-attach\\11",
+    "seq": 100
+  }
+}

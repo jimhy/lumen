@@ -1,0 +1,68 @@
+{
+  "note": "同帧内三种情况并存：已知项照常解析、未知**块类型**降级成 LlmBlock::Unknown（外层 BlockStart 还在，气泡流只少一块）、未知**增量项**整项降级成 LlmDeltaItem::Unknown。items 长度必须保持 4——「未知项让同帧其余项消失」是最容易写出来的 Dart bug。",
+  "expect_variant": "Delta",
+  "frame": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 106,
+    "turn": 4,
+    "items": [
+      {
+        "kind": "TextAppend",
+        "block_id": 1,
+        "text": "hi"
+      },
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 2,
+          "block": {
+            "kind": "Audio",
+            "pcm": "AA",
+            "rate": 48000
+          }
+        }
+      },
+      {
+        "kind": "AudioAppend",
+        "block_id": 9,
+        "pcm": "AA"
+      },
+      {
+        "kind": "BlockEnd",
+        "block_id": 1
+      }
+    ]
+  },
+  "reserialized": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 106,
+    "turn": 4,
+    "items": [
+      {
+        "kind": "TextAppend",
+        "block_id": 1,
+        "text": "hi"
+      },
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 2,
+          "block": {
+            "kind": "Unknown"
+          }
+        }
+      },
+      {
+        "kind": "Unknown"
+      },
+      {
+        "kind": "BlockEnd",
+        "block_id": 1
+      }
+    ]
+  }
+}

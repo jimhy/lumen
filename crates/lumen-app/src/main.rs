@@ -41,6 +41,18 @@ mod links;
 mod llm_attachments;
 mod llm_cli;
 mod llm_hud;
+// M7 片 2：PC 端 headless LLM runner（进程 + 行解析 + 白名单 + 适配接口）。
+// 片 2/片 3 只落地底座与 Claude 适配器，与远程帧的分发接线在片 4，故此刻大量公开项
+// 尚无调用点——与 `mod cloud` 同样的脚手架处置（非真死代码）。
+//
+// **`cfg_attr(not(test), …)` 是刻意的**：allow 只在**非测试**构建里生效。
+// 于是 `cargo clippy -p lumen-app --all-targets`（带 `cfg(test)`）里，
+// 「既没被生产代码调用、也没被任何测试碰过」的项**仍然会报死代码**——那正是片 3/片 4
+// 开发期唯一能发现「写错了、没接上」的信号。整块无条件 allow 会把这个信号一起关掉
+// （3000 行的 claude.rs 全在它的覆盖范围内）。
+// **片 4 接完线后请把这一行整个去掉。**
+#[cfg_attr(not(test), allow(dead_code))]
+mod llm_runner;
 mod mode;
 /// unix：从系统读 shell 进程实时 cwd（bash/zsh 无 OSC 9;9 cwd 上报时文件树的兜底）。
 #[cfg(unix)]
@@ -1016,6 +1028,10 @@ struct AppState {
     next_session_id: SessionId,
     /// tab id 自增分配器（同上，关闭不回收）。
     next_tab_id: TabId,
+    /// M7：headless LLM runner 容器。**与 `tabs` 平行的独立容器**，对齐
+    /// [`ssh_runtime::SshRuntime`] 的既有范式；**绝不塞进 `Tab.panes`**（七条硬伤逐条写在
+    /// [`llm_runner`] 的模块文档里）。每帧由 [`AppState::pump_llm_runners`] 推进。
+    llm_runners: llm_runner::LlmRunnerManager,
     /// 与转发线程共享的「wake 已挂起」标志，用于事件去重（全局一个，
     /// 任一会话的转发线程都可触发，唤醒协议与单会话时代零变化）。
     wake_pending: Arc<AtomicBool>,
@@ -1884,6 +1900,36 @@ impl AppState {
     /// 焦点窗格（可变）。
     fn focused_pane_mut(&mut self) -> &mut Session {
         self.tabs[self.active_tab].focused_pane_mut()
+    }
+
+    /// M7：推进全部 headless LLM runner（排空读线程事件 → 非阻塞收尸 → 停止宽限 /
+    /// 空闲回收 → 回收已退出且读完的 runner）。
+    ///
+    /// **调用点约束（两条，都踩过）**：
+    /// 1. 必须在 `wake_pending.store(false, SeqCst)` **之后**——否则读线程在清标志前 swap 到
+    ///    `true` 而事件还没被 drain，就是一次丢唤醒。
+    /// 2. 必须在 `if let Some(sub_id) = self.remote_ws.sub_target()` 那层嵌套**之外**——
+    ///    headless 会话与手机订阅哪个 tab 完全无关，塞进去会让「手机切走 tab 后 LLM 事件停摆」。
+    ///
+    /// 片 2 只把泵接上：事件在这里被排空、状态机与环形缓冲被推进（这是 §6.7「手机断线不杀
+    /// 进程、事件进带 seq 的缓冲」硬契约成立的前提），**上行分发在片 4**（`remote_ws.rs:7095`
+    /// 那个显式 no-op 臂）。返回是否产生了事件，供调用方决定要不要请求重绘。
+    ///
+    /// **本方法刻意插在 `pump_remote` 的那段长注释之前**：那段以「唯一状态变更入口」开头、
+    /// 含一节「返回值」的注释是仓库既有的、挂在 `pump_remote` 头上的历史遗留块，
+    /// 从它中间插一个函数会把它劈成两半、改掉既有函数的文档归属。
+    fn pump_llm_runners(&mut self) -> bool {
+        let events = self.llm_runners.pump();
+        if events.is_empty() {
+            return false;
+        }
+        for (id, seq, ev) in &events {
+            // 片 4 之前先只记 trace：`RunnerEvent` 的 `Debug` 已按 `lumen_protocol::llm` 的
+            // 脱敏包装（`LlmText` 只打字符数、`LlmPath` 打 `<redacted>`、`LlmToolInput` 只打
+            // 字段数与字节数）产出，不会把对话正文写进日志。
+            log::trace!("{id} seq={seq} {ev:?}");
+        }
+        true
     }
 
     /// 唯一状态变更入口（M4.1 批B）——设计稿 §6。
@@ -9729,6 +9775,14 @@ impl App {
             active_tab: active_idx,
             next_session_id,
             next_tab_id,
+            // M7：**必须写在 `wake_pending` 之前** —— 结构体字面量按书写顺序求值，
+            // 写在后面就会用到已经被 move 进字段的 `wake_pending`。
+            // 传的是 `AppState` 那个**全局**唤醒标志（不能另起一个，否则会丢唤醒，
+            // 理由见 `llm_runner::LlmRunnerManager::new`）。
+            llm_runners: llm_runner::LlmRunnerManager::new(llm_runner::Waker::new(
+                self.proxy.clone(),
+                wake_pending.clone(),
+            )),
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
@@ -10061,6 +10115,14 @@ impl ApplicationHandler<PtyWake> for App {
         // M5.3：先处理远程控制 WS（失焦也经此路径，bug2）——收帧 + 应用远程输入 +
         // 整屏快照转发。置于 PTY drain 之前，保证「快照先于实时增量」。
         state.pump_remote();
+
+        // M7：headless LLM runner 泵。紧跟 pump_remote，且**在 `remote_ws.sub_target()` 的
+        // 任何嵌套之外**——headless 会话与手机订阅哪个 tab 无关（见 `pump_llm_runners` 文档）。
+        // 有事件即重绘：桌面图标的两个计数（在线手机数 · 运行中任务数）挂在这上面，
+        // ControlFlow::Wait 下不重绘就永远停在旧数字。
+        if state.pump_llm_runners() {
+            state.window.request_redraw();
+        }
 
         // M5.2 设备列表：后台 worker 拉到新列表后经 PtyWake 唤醒到此（ControlFlow::Wait 下
         // request_repaint 单独叫不醒空闲循环）。**必须在此排空 + 重绘**——否则该 PtyWake 不带 PTY

@@ -1,0 +1,46 @@
+{
+  "note": "老被控端发来的 TurnEnded：没有 outcome、没有 truncated。两者都带 #[serde(default)]，解释成「正常收尾 + 没丢过增量」。加字段不破坏兼容这件事，就靠这条守着。",
+  "expect_variant": "TurnEnded",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 111,
+    "turn": 7,
+    "stop": "EndTurn",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 0,
+      "context_used": 0,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": 1786211400000
+  },
+  "reserialized": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 111,
+    "turn": 7,
+    "stop": "EndTurn",
+    "outcome": {
+      "is_error": false
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 0,
+      "context_used": 0,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": 1786211400000,
+    "truncated": false
+  }
+}

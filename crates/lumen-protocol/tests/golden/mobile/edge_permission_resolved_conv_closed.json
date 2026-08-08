@@ -1,0 +1,16 @@
+{
+  "note": "对话被关闭 / 进程退出导致审批作废。Deny **不带 reason**（Option + skip → 键缺席），与 reason 为空串是两件事。",
+  "expect_variant": "PermissionResolved",
+  "frame": {
+    "op": "PermissionResolved",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 46,
+    "decision": {
+      "kind": "Deny"
+    },
+    "by": {
+      "kind": "ConvClosed"
+    }
+  }
+}

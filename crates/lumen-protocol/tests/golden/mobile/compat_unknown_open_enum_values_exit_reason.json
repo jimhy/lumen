@@ -1,0 +1,13 @@
+{
+  "note": "开放枚举 Other 的第 4 组：LlmExitReason。对话终态帧认不出退出原因时**仍然必须落地**——否则手机端会把一个已经死掉的对话一直显示成「运行中」，用户对着一个永远不回话的会话干等。code 是进程退出码（Option<i32>，可为负：unix 上被信号杀死时是负值），与 reason 是两件事，不得互相推导。",
+  "expect_variant": "ConvExited",
+  "frame": {
+    "op": "ConvExited",
+    "conv_id": 12,
+    "conv_generation": 1,
+    "seq": 300,
+    "reason": "OomKilled",
+    "code": -9,
+    "message": "claude 被系统杀死（内存不足）"
+  }
+}

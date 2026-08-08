@@ -1,0 +1,17 @@
+{
+  "note": "被→控：该审批已被裁决。控制端据此收起审批 UI，**不依赖自己是否发过 PermissionReply**（那条可能在直连↔中继翻转中丢了）。本条 by=User + Deny{reason}。**注意 by 是对象 {\"kind\":\"User\"} 不是裸字符串**——LlmPermissionResolvedBy 走 tag=\"kind\"，与同帧里 code / stop / agent 那些开放式 C 型枚举（线上就是裸字符串）机制完全不同，同一个 JSON 里两种形态并存，Dart 侧最容易在这里写成一种。",
+  "expect_variant": "PermissionResolved",
+  "frame": {
+    "op": "PermissionResolved",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 42,
+    "decision": {
+      "kind": "Deny",
+      "reason": "这条命令会动生产库"
+    },
+    "by": {
+      "kind": "User"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "note": "被→控：子进程已退出（终态）。实测认证失败时退出码是 1 且 stderr 为空——手机端别只按 code 编文案，真正的原因在之前那些帧里。",
+  "expect_variant": "ConvExited",
+  "frame": {
+    "op": "ConvExited",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 200,
+    "reason": "ProcessExited",
+    "code": 1,
+    "message": "claude 退出，退出码 1"
+  }
+}

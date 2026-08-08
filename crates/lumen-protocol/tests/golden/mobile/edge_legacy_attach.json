@@ -1,0 +1,15 @@
+{
+  "note": "首次订阅的 Attach：三个 known_* 全缺 → 全部补 0。known_generation=0 是**哨兵**（一定不匹配 → 被控端回全量基线），不是「代号 0 的那一代」。",
+  "expect_variant": "Attach",
+  "frame": {
+    "op": "Attach",
+    "conv_id": 11
+  },
+  "reserialized": {
+    "op": "Attach",
+    "conv_id": 11,
+    "known_generation": 0,
+    "known_seq": 0,
+    "known_turn": 0
+  }
+}

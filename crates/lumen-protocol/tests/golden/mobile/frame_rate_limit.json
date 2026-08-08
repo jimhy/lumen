@@ -1,0 +1,18 @@
+{
+  "note": "被→控：账号额度播报（上游 rate_limit_event 的归一化落点）。**本帧刻意没有 seq 字段**——领了 seq 控制端每收一条就会看见 Delta 序列「断裂」并触发一次整轮拉取。去乱序靠 observed_ms 做 latest-wins。resets_at_secs 单位是**秒**，本模块其余时间戳都是毫秒，换算必须走 checked_mul。",
+  "expect_variant": "RateLimit",
+  "frame": {
+    "op": "RateLimit",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "observed_ms": 1786211000000,
+    "info": {
+      "status": "Allowed",
+      "window": "FiveHour",
+      "resets_at_secs": 1786211400,
+      "overage_status": "Rejected",
+      "overage_disabled_reason": "OutOfCredits",
+      "using_overage": false
+    }
+  }
+}

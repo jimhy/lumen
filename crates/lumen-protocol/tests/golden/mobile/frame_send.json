@@ -1,0 +1,19 @@
+{
+  "note": "控→被：发一条用户消息。附件**字节不在本帧内**，只带被控端绝对路径 + 元数据；单张手机照片 base64 后就会顶穿服务端 4 MiB 单帧上限。",
+  "expect_variant": "Send",
+  "frame": {
+    "op": "Send",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 4,
+    "text": "看下这张截图里的报错，然后跑一遍测试",
+    "attachments": [
+      {
+        "path": "F:\\projects\\lumen\\.lumen\\llm-attach\\11\\shot-1.png",
+        "name": "报错截图.png",
+        "mime": "image/png",
+        "len": 348219
+      }
+    ]
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "note": "被→控：agent 清单。四条覆盖 LlmAgentKind 的四个已知值；permission_modes 数组把 6 个 LlmPermissionMode 全覆盖到（Vec 字段能一次覆盖多个 C 型枚举值，成本最低）。末条 available=false 且 省略 version，演示「装了才有版本号」——省略的 Option 在线上就是**键不存在**，不是 null。",
+  "expect_variant": "AgentList",
+  "frame": {
+    "op": "AgentList",
+    "req_id": 1,
+    "agents": [
+      {
+        "agent": "Claude",
+        "available": true,
+        "version": "2.1.226",
+        "models": [
+          "claude-opus-5",
+          "claude-sonnet-4-5"
+        ],
+        "permission_modes": [
+          "Manual",
+          "AcceptEdits",
+          "Auto"
+        ],
+        "features": {
+          "streaming": true,
+          "thinking": true,
+          "thinking_text": false,
+          "interactive_permission": false,
+          "resume": true,
+          "attachments": true,
+          "interrupt": true
+        }
+      },
+      {
+        "agent": "Codex",
+        "available": true,
+        "version": "0.9.1",
+        "models": [],
+        "permission_modes": [
+          "Auto",
+          "Bypass"
+        ],
+        "features": {
+          "streaming": true,
+          "thinking": false,
+          "thinking_text": false,
+          "interactive_permission": false,
+          "resume": false,
+          "attachments": false,
+          "interrupt": false
+        }
+      },
+      {
+        "agent": "Gemini",
+        "available": true,
+        "version": "1.2.0",
+        "models": [
+          "gemini-3-pro"
+        ],
+        "permission_modes": [
+          "DontAsk",
+          "Plan"
+        ],
+        "features": {
+          "streaming": true,
+          "thinking": false,
+          "thinking_text": false,
+          "interactive_permission": false,
+          "resume": false,
+          "attachments": true,
+          "interrupt": false
+        }
+      },
+      {
+        "agent": "Kimi",
+        "available": false,
+        "models": [],
+        "permission_modes": [],
+        "features": {
+          "streaming": false,
+          "thinking": false,
+          "thinking_text": false,
+          "interactive_permission": false,
+          "resume": false,
+          "attachments": false,
+          "interrupt": false
+        }
+      }
+    ]
+  }
+}

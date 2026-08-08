@@ -1,0 +1,139 @@
+{
+  "note": "被→控：单轮定稿快照，基线语义（控制端整体覆盖该轮本地状态）。本条是**块模型的总覆盖**：Text / Image / Thinking{Omitted} / Thinking{Redacted} / ToolUse（带 title、带 truncated_bytes 两种）/ ToolResult（Ok+File 摘要、Error 无摘要两种）/ Error 块。ToolResult 的 output 空串 + truncated_bytes 12272 + detail 是「只发元数据、正文一字节不推」的范式。blocks_omitted 非 0 = 本帧为满足字节预算主动删过块，手机端必须把它显示出来。",
+  "expect_variant": "TurnSnapshot",
+  "frame": {
+    "op": "TurnSnapshot",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 7,
+    "seq": 105,
+    "record": {
+      "turn": 4,
+      "user": [
+        {
+          "block_id": 0,
+          "block": {
+            "kind": "Text",
+            "text": "帮我读一下 README 并跑测试 ✅"
+          }
+        },
+        {
+          "block_id": 1,
+          "block": {
+            "kind": "Image",
+            "attachment": {
+              "path": "F:\\projects\\lumen\\.lumen\\llm-attach\\11\\shot-1.png",
+              "name": "报错截图.png",
+              "mime": "image/png",
+              "len": 348219
+            }
+          }
+        }
+      ],
+      "assistant": [
+        {
+          "block_id": 2,
+          "block": {
+            "kind": "Thinking",
+            "content": {
+              "kind": "Omitted"
+            }
+          }
+        },
+        {
+          "block_id": 3,
+          "block": {
+            "kind": "Thinking",
+            "content": {
+              "kind": "Redacted"
+            }
+          }
+        },
+        {
+          "block_id": 4,
+          "block": {
+            "kind": "ToolUse",
+            "call_id": "toolu_FAKE0001",
+            "name": "Read",
+            "title": "读取 README.md",
+            "input": {
+              "file_path": "F:\\projects\\lumen\\README.md"
+            }
+          }
+        },
+        {
+          "block_id": 5,
+          "parent_call_id": "toolu_FAKE0001",
+          "block": {
+            "kind": "ToolResult",
+            "call_id": "toolu_FAKE0001",
+            "status": {
+              "kind": "Ok"
+            },
+            "output": "",
+            "truncated_bytes": 12272,
+            "detail": {
+              "kind": "File",
+              "path": "F:\\projects\\lumen\\README.md",
+              "start_line": 1,
+              "line_count": 165,
+              "total_lines": 165
+            }
+          }
+        },
+        {
+          "block_id": 6,
+          "block": {
+            "kind": "ToolUse",
+            "call_id": "toolu_FAKE0002",
+            "name": "Write",
+            "input": {
+              "file_path": "F:\\projects\\lumen\\out.txt",
+              "content": "<裁剪：5 MiB 正文>"
+            },
+            "truncated_bytes": 5242880
+          }
+        },
+        {
+          "block_id": 7,
+          "block": {
+            "kind": "ToolResult",
+            "call_id": "toolu_FAKE0002",
+            "status": {
+              "kind": "Error"
+            },
+            "output": "EACCES: permission denied"
+          }
+        },
+        {
+          "block_id": 8,
+          "block": {
+            "kind": "Error",
+            "code": "AuthRequired",
+            "message": "Failed to authenticate. API Error: 403 Request not allowed"
+          }
+        }
+      ],
+      "stop": "Error",
+      "outcome": {
+        "is_error": true,
+        "terminal_reason": "ApiError",
+        "api_error_status": 403
+      },
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 24,
+        "cache_read_tokens": 53883,
+        "cache_write_tokens": 18013,
+        "cost_micro_usd": 240262,
+        "context_used": 38342,
+        "context_limit": 1000000,
+        "max_output_tokens": 64000
+      },
+      "started_ms": 1786211100000,
+      "ended_ms": 1786211126000,
+      "complete": false,
+      "blocks_omitted": 3
+    }
+  }
+}

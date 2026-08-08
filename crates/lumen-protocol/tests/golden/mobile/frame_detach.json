@@ -1,0 +1,9 @@
+{
+  "note": "控→被：取消订阅（手机切走该对话），被控端停发增量但**不结束**对话。",
+  "expect_variant": "Detach",
+  "frame": {
+    "op": "Detach",
+    "conv_id": 11,
+    "conv_generation": 3
+  }
+}

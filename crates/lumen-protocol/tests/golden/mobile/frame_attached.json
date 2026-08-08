@@ -1,0 +1,39 @@
+{
+  "note": "被→控：基线帧，必先于该对话任何 Delta 到达。resync_required=true ⇒ 控制端清空本地对话状态后用 HistoryReq / TurnFetch 重建。",
+  "expect_variant": "Attached",
+  "frame": {
+    "op": "Attached",
+    "meta": {
+      "conv_id": 11,
+      "conv_generation": 3,
+      "agent": "Claude",
+      "cwd": "F:\\projects\\lumen",
+      "title": "重构渲染器：把 glyph 缓存换成 LRU",
+      "state": {
+        "kind": "Running"
+      },
+      "model": "claude-opus-5",
+      "permission_mode": "AcceptEdits",
+      "cli_session_id": "11111111-2222-3333-4444-555555555555",
+      "origin": {
+        "tab_id": 2,
+        "session_id": 9
+      },
+      "cur_turn": 4,
+      "created_ms": 1786210000000,
+      "updated_ms": 1786211000000,
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 24,
+        "cache_read_tokens": 53883,
+        "cache_write_tokens": 18013,
+        "cost_micro_usd": 240262,
+        "context_used": 38342,
+        "context_limit": 1000000,
+        "max_output_tokens": 64000
+      }
+    },
+    "seq": 101,
+    "resync_required": true
+  }
+}

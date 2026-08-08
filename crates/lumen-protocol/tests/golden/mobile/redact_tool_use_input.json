@@ -1,0 +1,33 @@
+{
+  "note": "工具入参是全模块唯一的 serde_json::Value 口子（每个工具 schema 自定义、归一化必然追不上），Write / Edit / Bash 的入参里装的就是文件正文与命令行——设计初稿把它写成裸 Value 是被对抗验证点名的漏洞。Rust 侧 LlmToolInput 的 Debug 只打 {fields, bytes}；Dart 侧的 toString 必须同样只打字段数与字节数，不能 jsonEncode 整个 map。title 是 LlmText，同样脱敏。",
+  "expect_variant": "Delta",
+  "frame": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 114,
+    "turn": 10,
+    "items": [
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 0,
+          "block": {
+            "kind": "ToolUse",
+            "call_id": "toolu_FAKE0006",
+            "name": "Bash",
+            "title": "写入 .env（含密钥）",
+            "input": {
+              "command": "export LUMEN_FAKE_TOKEN=hunter2 && echo ok"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "debug_forbidden": [
+    "hunter2",
+    "LUMEN_FAKE_TOKEN",
+    "写入 .env"
+  ]
+}

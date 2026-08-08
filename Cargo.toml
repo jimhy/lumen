@@ -95,6 +95,15 @@ windows-sys = { version = "0.61", features = [
     # P0 应用锁：DPAPI 保护本机密码校验值。
     "Win32_Security_Cryptography",
     "Win32_System_Threading",
+    # M7 片 2 headless LLM runner 进程树清理（llm_runner/proc.rs）：CreateJobObjectW /
+    # AssignProcessToJobObject / SetInformationJobObject / TerminateJobObject +
+    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE。claude 会 spawn bash/pwsh/node，只 kill 父进程
+    # 会留孤儿继续改用户文件；KILL_ON_JOB_CLOSE 还能兜住「Lumen 崩溃/被强杀」。
+    # 注：JOBOBJECT_EXTENDED_LIMIT_INFORMATION 内嵌 IO_COUNTERS，windows-sys 0.61 把它
+    # gated 在上面已启用的 Win32_System_Threading 上，无需再补 feature。
+    # windows-sys 在 lumen-app 是 [target.'cfg(windows)'.dependencies]，本改动只影响
+    # Windows 目标（会让缓存失效，但不是全平台依赖树改动）。
+    "Win32_System_JobObjects",
     # P0 应用锁：GetLastInputInfo + GetTickCount 读取系统级空闲时长。
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",

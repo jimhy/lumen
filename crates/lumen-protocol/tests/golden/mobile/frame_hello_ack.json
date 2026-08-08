@@ -1,0 +1,78 @@
+{
+  "note": "被→控握手应答（满载）：一次带回 agent 清单 + 对话清单 + 额度基线。rate_limit 与 rate_limit_observed_ms 必须成对出现，控制端拿 observed_ms 与 RateLimit 播报帧比大小做 latest-wins。",
+  "expect_variant": "HelloAck",
+  "frame": {
+    "op": "HelloAck",
+    "llm_proto": 1,
+    "caps": [
+      "perm",
+      "attach"
+    ],
+    "agents": [
+      {
+        "agent": "Claude",
+        "available": true,
+        "version": "2.1.226",
+        "models": [
+          "claude-opus-5",
+          "claude-sonnet-4-5"
+        ],
+        "permission_modes": [
+          "Manual",
+          "AcceptEdits",
+          "Auto"
+        ],
+        "features": {
+          "streaming": true,
+          "thinking": true,
+          "thinking_text": false,
+          "interactive_permission": false,
+          "resume": true,
+          "attachments": true,
+          "interrupt": true
+        }
+      }
+    ],
+    "convs": [
+      {
+        "conv_id": 11,
+        "conv_generation": 3,
+        "agent": "Claude",
+        "cwd": "F:\\projects\\lumen",
+        "title": "重构渲染器：把 glyph 缓存换成 LRU",
+        "state": {
+          "kind": "Running"
+        },
+        "model": "claude-opus-5",
+        "permission_mode": "AcceptEdits",
+        "cli_session_id": "11111111-2222-3333-4444-555555555555",
+        "origin": {
+          "tab_id": 2,
+          "session_id": 9
+        },
+        "cur_turn": 4,
+        "created_ms": 1786210000000,
+        "updated_ms": 1786211000000,
+        "usage": {
+          "input_tokens": 3,
+          "output_tokens": 24,
+          "cache_read_tokens": 53883,
+          "cache_write_tokens": 18013,
+          "cost_micro_usd": 240262,
+          "context_used": 38342,
+          "context_limit": 1000000,
+          "max_output_tokens": 64000
+        }
+      }
+    ],
+    "rate_limit": {
+      "status": "Allowed",
+      "window": "FiveHour",
+      "resets_at_secs": 1786211400,
+      "overage_status": "Rejected",
+      "overage_disabled_reason": "OutOfCredits",
+      "using_overage": false
+    },
+    "rate_limit_observed_ms": 1786211000000
+  }
+}

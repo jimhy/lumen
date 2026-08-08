@@ -1,0 +1,29 @@
+{
+  "note": "开放式 C 型枚举（线上是**裸字符串**）的未知**值**：不降级、**原样保留**，往返恒等。这是 #[serde(other)] 兜不住的那一层——Dart 侧必须用 sealed class{Known|Other(String)} 或等价形状，把 stop / terminal_reason 直接映射成 Dart enum 会在这里丢原文并抛异常。同时注意：连 stop 都不认识时，成败判定照样只看 outcome.is_error。",
+  "expect_variant": "TurnEnded",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 109,
+    "turn": 6,
+    "stop": "BudgetExceeded",
+    "outcome": {
+      "is_error": true,
+      "terminal_reason": "quota_exhausted",
+      "api_error_status": 429
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 0,
+      "context_used": 0,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": 1786211300000,
+    "truncated": false
+  }
+}

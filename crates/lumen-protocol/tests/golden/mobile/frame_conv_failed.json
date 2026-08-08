@@ -1,0 +1,10 @@
+{
+  "note": "被→控：启动失败。与 ConvStarted **互斥**（不是并列的 Option<err>），类型上就排除「两个都在时听谁的」。",
+  "expect_variant": "ConvFailed",
+  "frame": {
+    "op": "ConvFailed",
+    "req_id": 3,
+    "code": "AgentNotFound",
+    "message": "找不到 claude 可执行文件，请确认已安装并在 PATH 中"
+  }
+}

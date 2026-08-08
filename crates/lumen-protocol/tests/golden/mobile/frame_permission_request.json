@@ -1,0 +1,18 @@
+{
+  "note": "被→控：请求用户批准一次工具调用。仅当该 agent 的 features.interactive_permission=true 时才可能出现（Claude 当前实测为 false）。input 是 LlmToolInput（Debug 脱敏），preview 是给人看的一行影响预览。",
+  "expect_variant": "PermissionRequest",
+  "frame": {
+    "op": "PermissionRequest",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 42,
+    "turn": 5,
+    "tool": "Bash",
+    "input": {
+      "command": "cargo test --workspace",
+      "timeout": 600000
+    },
+    "preview": "将在 F:\\projects\\lumen 执行 cargo test --workspace",
+    "expires_in_secs": 120
+  }
+}

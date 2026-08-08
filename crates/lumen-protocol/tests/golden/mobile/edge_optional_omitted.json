@@ -1,0 +1,17 @@
+{
+  "note": "只写必填字段的 Start：六个 Option 全部键缺席（往返后仍缺席），而 fork_session 带 #[serde(default)] 且**没有** skip —— 输入缺它、输出必须把 false 补出来。这就是「缺省字段被补上默认值算等价」这条规则的样板：等价判定不是靠规则隐式放过，而是把补完的结果**明写**在 reserialized 里，改协议时 diff 一眼可见。",
+  "expect_variant": "Start",
+  "frame": {
+    "op": "Start",
+    "req_id": 10,
+    "agent": "Claude",
+    "cwd": "F:\\projects\\lumen"
+  },
+  "reserialized": {
+    "op": "Start",
+    "req_id": 10,
+    "agent": "Claude",
+    "cwd": "F:\\projects\\lumen",
+    "fork_session": false
+  }
+}

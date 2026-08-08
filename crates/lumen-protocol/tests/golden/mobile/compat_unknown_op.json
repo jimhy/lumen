@@ -1,0 +1,20 @@
+{
+  "note": "**前向兼容的根**：未知 op（哪怕带任意嵌套 body）降级成 Unknown，而不是让整帧报废。reserialized 只剩 {\"op\":\"Unknown\"} —— 未知 body 被**整个丢弃**，不保留、不回显。Dart 侧 decode 遇到不认识的 op 必须返回 LlmUnknown（不是 null、不是 throw）。",
+  "expect_variant": "Unknown",
+  "frame": {
+    "op": "VoiceInput",
+    "conv_id": 3,
+    "deep": {
+      "a": [
+        1,
+        2
+      ],
+      "b": {
+        "c": null
+      }
+    }
+  },
+  "reserialized": {
+    "op": "Unknown"
+  }
+}

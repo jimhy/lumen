@@ -1,0 +1,8 @@
+{
+  "note": "控→被：列出可用 agent。req_id 与 PermissionRequest 的 request_id 是两个 id 空间，别混用。",
+  "expect_variant": "ListAgents",
+  "frame": {
+    "op": "ListAgents",
+    "req_id": 1
+  }
+}

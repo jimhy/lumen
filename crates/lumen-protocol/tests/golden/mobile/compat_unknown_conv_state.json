@@ -1,0 +1,63 @@
+{
+  "note": "未知对话态降级成 LlmConvState::Unknown，同一条 meta 的其余字段照常。手机端对 Unknown 态应显示「状态未知」，**不得**默认当成 Idle 而放开输入框。",
+  "expect_variant": "ConvList",
+  "frame": {
+    "op": "ConvList",
+    "req_id": 3,
+    "convs": [
+      {
+        "conv_id": 14,
+        "conv_generation": 1,
+        "agent": "Claude",
+        "cwd": "F:\\projects\\lumen",
+        "title": "休眠中",
+        "state": {
+          "kind": "Hibernating",
+          "since_ms": 1
+        },
+        "cur_turn": 1,
+        "created_ms": 1786210000000,
+        "updated_ms": 1786211000000,
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost_micro_usd": 0,
+          "context_used": 0,
+          "context_limit": 0,
+          "max_output_tokens": 0
+        }
+      }
+    ]
+  },
+  "reserialized": {
+    "op": "ConvList",
+    "req_id": 3,
+    "convs": [
+      {
+        "conv_id": 14,
+        "conv_generation": 1,
+        "agent": "Claude",
+        "cwd": "F:\\projects\\lumen",
+        "title": "休眠中",
+        "state": {
+          "kind": "Unknown"
+        },
+        "cur_turn": 1,
+        "created_ms": 1786210000000,
+        "updated_ms": 1786211000000,
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost_micro_usd": 0,
+          "context_used": 0,
+          "context_limit": 0,
+          "max_output_tokens": 0
+        }
+      }
+    ]
+  }
+}

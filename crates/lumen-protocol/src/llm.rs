@@ -134,6 +134,14 @@ use serde::{Deserialize, Serialize};
 /// **与 `(TabId, SessionId)` 完全正交、独立 id 空间**：LLM 对话不是终端窗格，绝不复用
 /// [`crate::remote::SessionId`]——app 侧离屏纹理回收、`pane_textures`、附件纹理键
 /// `(session_id, attachment_id)` 全部按 `SessionId` 挂账，共用 id 空间会静默串台 / 误删纹理。
+///
+/// # 分配方必须把取值留在 `i64::MAX` 以内
+/// 类型是 `u64`，但**控制端是 Dart，`int` 是 64 位有符号**：`jsonDecode` 遇到超过 `i64::MAX`
+/// 的字面量会退化成 `double` 并丢精度，两端从此静默不一致。自增计数器实际撞不到 2^63，
+/// 但这条约束属于**分配方**（被控端 `crates/lumen-app/src/llm_runner/`），必须写在类型旁边而不是
+/// 只写在测试里——`tests/mobile_golden.rs` 的 `语料自身的硬规矩` 有一条 lint 对**语料**执行它，
+/// 但那条 lint 管不到运行时真分配出来的值。同样适用于 [`ConvGeneration`] 与各处 `seq` /
+/// `cost_micro_usd`。
 pub type ConvId = u64;
 
 /// 对话代（generation）。被控端每次**重建**该对话的运行时（进程重启 / 恢复 / 换 CLI）即换新值。
@@ -141,6 +149,8 @@ pub type ConvId = u64;
 /// 照抄 v3 内置编辑器 `session_generation` 的陈旧应答守卫：控制端重挂、换对端、或被控端重启后，
 /// 迟到的旧代应答必须被丢弃，否则会落到新对话上。**收到的 `conv_generation` 不等于本地记录的帧
 /// 一律丢弃**（不是「尽量丢」——这条是不变量，漏一处就串台）。
+///
+/// 取值同样必须留在 `i64::MAX` 以内，理由见 [`ConvId`]。
 pub type ConvGeneration = u64;
 
 /// 轮次号（一次用户提交 → 一次停止 为一轮）。同一对话内自 1 起自增、不复用；`0` 是「尚无任何一轮」

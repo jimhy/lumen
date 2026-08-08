@@ -1,0 +1,96 @@
+{
+  "note": "工具结果里的两个可增长枚举各自降级：status → LlmToolStatus::Unknown、detail → LlmToolResultDetail::Unknown，而 output / call_id / truncated_bytes 照常解析（卡片退回纯文本样式，不是整块消失）。Bash / Edit 的 tool_use_result 形状**未采样**，日后补变体走的就是这条路。",
+  "expect_variant": "TurnSnapshot",
+  "frame": {
+    "op": "TurnSnapshot",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 9,
+    "seq": 108,
+    "record": {
+      "turn": 6,
+      "user": [],
+      "assistant": [
+        {
+          "block_id": 0,
+          "block": {
+            "kind": "ToolResult",
+            "call_id": "toolu_FAKE0005",
+            "status": {
+              "kind": "PartiallyOk",
+              "done": 3,
+              "total": 5
+            },
+            "output": "3/5 完成",
+            "truncated_bytes": 8,
+            "detail": {
+              "kind": "Diff",
+              "added": 3,
+              "removed": 1
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "is_error": false
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_micro_usd": 0,
+        "context_used": 0,
+        "context_limit": 0,
+        "max_output_tokens": 0
+      },
+      "started_ms": 1786211200000,
+      "complete": true,
+      "blocks_omitted": 0
+    }
+  },
+  "reserialized": {
+    "op": "TurnSnapshot",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 9,
+    "seq": 108,
+    "record": {
+      "turn": 6,
+      "user": [],
+      "assistant": [
+        {
+          "block_id": 0,
+          "block": {
+            "kind": "ToolResult",
+            "call_id": "toolu_FAKE0005",
+            "status": {
+              "kind": "Unknown"
+            },
+            "output": "3/5 完成",
+            "truncated_bytes": 8,
+            "detail": {
+              "kind": "Unknown"
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "is_error": false
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_micro_usd": 0,
+        "context_used": 0,
+        "context_limit": 0,
+        "max_output_tokens": 0
+      },
+      "started_ms": 1786211200000,
+      "complete": true,
+      "blocks_omitted": 0
+    }
+  }
+}

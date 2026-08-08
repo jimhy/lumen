@@ -1,0 +1,10 @@
+{
+  "note": "控→被：中断进行中的一轮。带 conv_generation，代不匹配一律丢弃。",
+  "expect_variant": "Interrupt",
+  "frame": {
+    "op": "Interrupt",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 5
+  }
+}

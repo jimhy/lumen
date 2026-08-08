@@ -1,0 +1,64 @@
+{
+  "note": "被→控：一批流式增量——手机端最高频的帧，也是 Dart 归约器的主战场。本条覆盖 LlmDeltaItem 的四个已知项：BlockStart / TextAppend / BlockEnd（带终态块与不带两种形态）/ Dropped，块侧覆盖 LlmBlock::Text 与 LlmBlock::Thinking{Text}。注意 BlockEnd 不带 block 是常态（省流量，按本地拼接结果定稿）。",
+  "expect_variant": "Delta",
+  "frame": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 102,
+    "turn": 4,
+    "items": [
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 2,
+          "block": {
+            "kind": "Text",
+            "text": "我先看一下 "
+          }
+        }
+      },
+      {
+        "kind": "TextAppend",
+        "block_id": 2,
+        "text": "render/glyph.rs"
+      },
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 3,
+          "parent_call_id": "toolu_FAKE_PARENT_0001",
+          "block": {
+            "kind": "Thinking",
+            "content": {
+              "kind": "Text",
+              "text": "先读 README"
+            }
+          }
+        }
+      },
+      {
+        "kind": "TextAppend",
+        "block_id": 3,
+        "text": "，再决定改哪里"
+      },
+      {
+        "kind": "BlockEnd",
+        "block_id": 3
+      },
+      {
+        "kind": "BlockEnd",
+        "block_id": 2,
+        "block": {
+          "kind": "Text",
+          "text": "我先看一下 render/glyph.rs"
+        }
+      },
+      {
+        "kind": "Dropped",
+        "block_id": 2,
+        "bytes": 4096
+      }
+    ]
+  }
+}

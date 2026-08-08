@@ -1,0 +1,17 @@
+{
+  "note": "超时自动拒绝（LLM_PERMISSION_TIMEOUT_SECS=120 未回复）。by=Timeout ⇒ 手机端文案是「已超时自动拒绝」，与用户主动拒绝要能分开。",
+  "expect_variant": "PermissionResolved",
+  "frame": {
+    "op": "PermissionResolved",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 44,
+    "decision": {
+      "kind": "Deny",
+      "reason": "审批超时"
+    },
+    "by": {
+      "kind": "Timeout"
+    }
+  }
+}

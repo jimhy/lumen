@@ -1,0 +1,12 @@
+{
+  "note": "控→被：向前翻历史。max_turns 会被被控端夹到 LLM_HISTORY_MAX_TURNS_PER_PAGE=20，**且字节预算先于轮数生效**，故返回的页常常短于请求量。",
+  "expect_variant": "HistoryReq",
+  "frame": {
+    "op": "HistoryReq",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 8,
+    "before_turn": 5,
+    "max_turns": 20
+  }
+}

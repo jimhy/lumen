@@ -1,0 +1,22 @@
+{
+  "note": "审批帧同时携带待批准的入参与给人看的预览——正是「用户会盯着看、日志也会记」的一帧。input 与 preview 都必须脱敏；tool（\"Bash\"）是定长机器标识，可以进 Debug。",
+  "expect_variant": "PermissionRequest",
+  "frame": {
+    "op": "PermissionRequest",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 47,
+    "turn": 10,
+    "tool": "Bash",
+    "input": {
+      "command": "curl -H 'Authorization: Bearer FAKE-BEARER-hunter2' https://internal.invalid/admin"
+    },
+    "preview": "将向 internal.invalid 发送一条带凭证的请求",
+    "expires_in_secs": 120
+  },
+  "debug_forbidden": [
+    "hunter2",
+    "FAKE-BEARER",
+    "internal.invalid"
+  ]
+}
