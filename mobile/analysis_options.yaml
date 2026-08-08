@@ -1,0 +1,60 @@
+# Lumen 移动端静态分析配置。
+#
+# 这份文件是移动端的**第一道质量门**，和 Rust 侧 `cargo clippy -- -D warnings` 同级：
+# CI（.github/workflows/mobile.yml）跑的是 `flutter analyze --fatal-infos`，
+# 所以下面开的每一条严格性都会**阻塞合并**，不是建议。
+#
+# 为什么要比 flutter_lints 默认更严：移动端手写协议模型（§4.2 拍板不用
+# flutter_rust_bridge），Dart 没有 Rust 的穷尽 match 兜底，类型上的松懈会直接变成
+# 线格式漂移。下面 analyzer.language 那三条把「dynamic 悄悄溜进来」这条路堵死。
+
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    # 禁止从 dynamic 隐式向下转型。这一条是为 protocol/ 层开的：
+    # `b['seq']` 的静态类型是 dynamic，不开这条时 `int seq = b['seq'];` 编译通过、
+    # 运行时才炸；开了之后必须写 `b['seq'] as int`，错误在写代码时就暴露。
+    strict-casts: true
+    # 禁止类型推断退化成 dynamic（如空 collection 字面量无上下文时）。
+    strict-inference: true
+    # 禁止裸泛型（`List` 而不是 `List<String>`）。
+    strict-raw-types: true
+
+  errors:
+    # 对**类枚举**的 switch 漏分支直接判错。
+    # 注意边界：sealed class 的穷尽性由编译器保证（漏一个子类是编译错误），
+    # 这条管的是 enum 与 sealed 之外的场景，两者互补、都需要。
+    exhaustive_cases: error
+    # TODO 注释降级为「不报」。理由：CI 跑的是 `flutter analyze --fatal-infos`，
+    # 而 analyzer 把 `// TODO` 当 info 级提示 —— 不关掉它，任何一条留给下一片的
+    # TODO 标记都会直接把 CI 判红，逼着人用「稍后处理」之类看不见的说法代替 TODO，
+    # 那比 TODO 本身糟糕得多。真正该阻塞的是上面 language 那三条类型严格性。
+    todo: ignore
+
+  exclude:
+    # 生成物与平台壳工程不参与分析。
+    - "build/**"
+    - "ios/**"
+    - "android/**"
+
+linter:
+  rules:
+    # ── 与「无声降级禁令」（§14-6）对齐的几条 ───────────────────────────────
+    # 空的 catch 块 = 静默吞异常，本仓库最不能忍的形态。
+    avoid_empty_else: true
+    # 忘记 await 的 Future 会让错误消失在 microtask 队列里；确实不等的地方
+    # 必须显式写 `unawaited(...)`（§7.6 的落库调用就是这么写的）。
+    unawaited_futures: true
+    # ── 协议层相关 ─────────────────────────────────────────────────────────
+    # 手写 sealed class 的 == / hashCode 要成对。
+    hash_and_equals: true
+    # 常量能 const 就 const：流式渲染每帧重建的 Widget 树对此敏感（§7.6 性能三招）。
+    prefer_const_constructors: true
+    prefer_const_declarations: true
+    prefer_final_locals: true
+    # 公开 API 必须有类型标注（protocol/ 层是给另一半人读的契约）。
+    always_declare_return_types: true
+    # 相对 import 在 lib/ 内统一用 package: 形式，避免同一文件被两种路径各加载一次
+    # （Dart 会当成两个不同的类型，sealed 的穷尽性检查会莫名其妙失效）。
+    always_use_package_imports: true

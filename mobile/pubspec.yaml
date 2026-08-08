@@ -1,0 +1,102 @@
+## Lumen 移动端（M7）。分层选型见设计蓝图 §4.1 与 §7.2；每条依赖为什么是它、
+## 否决了谁，写在下面对应的注释里——**改依赖前先读那几行**。
+##
+## 版本口径：
+## - 常规包用 caret（`^`）；`pubspec.lock` **入库**（App 而非 library，锁定可复现构建，
+##   §15.2-6 的未决项在此拍板），所以 caret 只在有人主动跑 `flutter pub upgrade` 时才生效。
+## - **渲染相关包用精确版本、不用 caret**（R14：官方 flutter_markdown 已归档，社区 fork
+##   生态不稳，一个 patch 版就可能改渲染行为）。目前只有 flutter_markdown_plus 一条。
+##
+## 安装依赖必须走镜像（本机常驻 http 代理，直连 pub.dev 会卡死）：
+##   $env:PUB_HOSTED_URL = 'https://pub.flutter-io.cn'; flutter pub get
+## 完整的三条代理坑见 README.md「本机环境三个坑」。
+##
+## ⚠ **`pubspec.lock` 里的 `url` 必须是 `https://pub.dev`，一条都不许留镜像地址。**
+## `PUB_HOSTED_URL` 只该影响**下载源**，但 pub 会把它写回 lock 的每一条 `url`，而 pub 把
+## hosted URL 当作依赖身份的一部分 —— CI 的 `flutter pub get --enforce-lockfile` 不设这个
+## 变量，url 一不同就报「Unable to satisfy pubspec.yaml using pubspec.lock」，第一步必红。
+## 所以**别裸敲 `flutter pub get`**，走 `tool/test.ps1 -Pub` / `tool/test.sh --pub`：
+## 它们在 pub get 之后会自动把 lock 归一化回 pub.dev。
+## 兜底断言在 `test/pubspec_lock_test.dart`（本地跑测试就会红，不用等推上去）。
+
+name: lumen_mobile
+description: "Lumen 移动端：把手机变成 Lumen 远程控制协议的第三种控制端（只看结构化 AI 对话，不看终端画面）。"
+# 私有 App，永不发 pub.dev。
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  # Flutter 3.38.3 自带 Dart 3.10.1。⚠ PATH 里另有一个独立的 dart 3.4.3
+  # （D:\backup\flutterSdk\...），用它跑 `dart pub` 会解析出与本约束不符的版本并报
+  # 误导性错误 —— **一律用 `flutter pub` / `flutter test`**（§7.2 已知本机坑①）。
+  sdk: ^3.10.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── 状态管理 ─────────────────────────────────────────────────────────────
+  # Riverpod 3，**手写 Notifier、不引 build_runner**：本 App 形态是「一条长生命周期 WS 流
+  # 扇出成很多派生视图」，provider 图 + ref.watch 正是这种扇出的原生表达；ProviderScope
+  # override 让归约逻辑能在纯 Dart 单测里跑。
+  # 否决：flutter_bloc（30+ 个 Event 样板类）、裸 ChangeNotifier（手工订阅管理）、
+  #       riverpod_generator（引入 analyzer/source_gen 版本冲突面，模型只有十几个不值）。
+  flutter_riverpod: ^3.3.2
+
+  # ── 路由 ─────────────────────────────────────────────────────────────────
+  # go_router：/login /devices /pair/:id /pick/:id /chat/:conv（§7.2）。
+  go_router: ^17.4.0
+
+  # ── 网络 ─────────────────────────────────────────────────────────────────
+  # REST（登录 / 设备列表 / refresh）。选 dio 是为了 401→refresh→retry 拦截器，
+  # 裸 http 包要自己写一遍重放逻辑。
+  dio: ^5.11.0
+  # WS 长连接。必须能自定义 Authorization 头（服务端 ws.rs 明确不接受 query token，
+  # 理由是避免反代日志泄漏）——IOWebSocketChannel.connect(headers:) 支持。
+  # 否决：裸 dart:io HttpClient 升级（要自己做帧解析）。
+  # ⚠ 这条依赖同时是「将来出 Web 版」的硬阻塞点（§7.4 注）。
+  web_socket_channel: ^3.0.3
+  # 「连通性变化 → 立刻重连、不等退避」（§7.4 差异点 1 的 kick()）。
+  connectivity_plus: ^7.3.1
+
+  # ── 本地持久化（§7.7 三张表：conversations / events / outbox）──────────────
+  # sqflite + 手写 DAO + 手写 SQL：消息日志是「只追加 + 按 (conv_id, seq) 分页倒查」的
+  # 典型 SQL 负载，手写让迁移完全可控。
+  # 否决：drift（强依赖 build_runner）、Isar/Hive（维护状态不稳）、纯 JSONL（分页去重要自己再实现一遍）。
+  # ⚠ sqflite 走 platform channel，在 `flutter test` 的 Dart VM 里**不可用**：DAO 必须藏在
+  #   抽象接口后，单测用内存实现或 dev 依赖里的 sqflite_common_ffi。
+  sqflite: ^2.4.2+1
+  path: ^1.9.1
+  # 偏好项（非敏感）。
+  shared_preferences: ^2.5.5
+  # JWT 必须进 Keychain / Keystore，**不是** SharedPreferences：服务端 JWT 无 jti、无版本号、
+  # 改密码不失效，默认 TTL 7 天，唯一撤销手段是删设备行，泄漏代价高（§7.7）。
+  flutter_secure_storage: ^11.0.0
+
+  # ── 设备身份 ─────────────────────────────────────────────────────────────
+  # hw_id = sha256(origin || 0x00 || vendorId)（§7.2 device_identity.dart）。
+  # ⚠ iOS 的 identifierForVendor 卸载重装即变 → 新 device_id → 旧 pair 永久残留（R18）。
+  device_info_plus: ^13.2.0
+  crypto: ^3.0.7
+  # outbox 的 client_msg_id（乐观发送 + PC 侧幂等去重，§7.6）。
+  uuid: ^4.6.0
+
+  # ── 工具 ─────────────────────────────────────────────────────────────────
+  collection: ^1.19.1
+
+  # ── Markdown 渲染 ────────────────────────────────────────────────────────
+  # ⚠ **精确版本，刻意不写 caret**（R14）。官方 flutter_markdown 已归档，社区 fork 各有取舍；
+  # 全 App 只有 lib/ui/common/markdown_view.dart 一个文件 import 它，换实现只改那一处。
+  # 换包时请连同这行注释一起更新，并说明换的理由。
+  flutter_markdown_plus: 1.0.12
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  # 让 DAO 的真实 SQL 能在 `flutter test`（Dart VM）里跑：sqflite 本体走 platform channel，
+  # 在测试环境没有实现（§7.7 的 ⚠）。用它可以避免「为了能测而把持久化写进 widget test」。
+  sqflite_common_ffi: ^2.4.0+3
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,78 @@
+# Lumen 移动端（Flutter）持续集成 —— M7 片 0b 建立。
+#
+# 守住两件事：`flutter analyze` 零告警、`flutter test` 全绿。它与 ci.yml 是**互补**关系：
+# ci.yml 加了 `paths-ignore: [mobile/**, docs/**]`，纯移动端改动不再触发 Rust 全量编译；
+# 反过来本 workflow 只在移动端相关路径变更时跑。
+#
+# ── 为什么 paths 里有 golden 语料 ────────────────────────────────────────────
+# `crates/lumen-protocol/tests/golden/mobile/*.json` 是 Rust 与 Dart **两端共用的唯一事实源**。
+# 改语料 = 改协议契约，Dart 侧必须跟着刷。不把它列进 paths，就会出现「Rust 侧改完自己绿了，
+# Dart 侧要等到有人真的在手机上点到那个新功能才发现没实现」——正是语料机制要消灭的那个静默洞。
+#
+# ── 关于本机的代理坑：这里刻意**不**照抄 ─────────────────────────────────────
+# 作者本机有常驻 http 代理，`flutter test` 会因此无输出卡死，所以本地必须用
+# `mobile/tool/test.ps1`（内部 `env -u *_proxy`）。**CI runner 上没有代理**，
+# 这里直接跑 flutter 原命令即可。两边都成立：`env -u` 在无代理环境下是无操作，
+# 本地脚本与本文件跑的是同一组 flutter 命令、同一组参数（`--fatal-infos`），不存在分叉。
+# 同理 `PUB_HOSTED_URL` 镜像也**只在本机需要**，CI 上用默认源更快更稳。
+
+name: mobile
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - 'crates/lumen-protocol/tests/golden/**'
+      - '.github/workflows/mobile.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - 'crates/lumen-protocol/tests/golden/**'
+      - '.github/workflows/mobile.yml'
+
+# 同一分支新推送取消尚在跑的旧 run，省 CI 额度（与 ci.yml 同策略，group 名不同以免互相取消）。
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-and-test:
+    # ubuntu 足够：analyze 与 test 都跑在 Dart VM 上，与宿主平台无关。
+    # 出 APK / IPA 是发布流水线的事，不在本 workflow 里做（P0 只发 Android，
+    # 且签名密钥不入库，见 mobile/README.md）。
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - uses: actions/checkout@v4
+        # 注意：**必须是完整仓库检出**，不能只 sparse-checkout mobile/。
+        # test/protocol/golden_corpus_path_test.dart 按相对路径读
+        # ../crates/lumen-protocol/tests/golden/mobile/，少了那半边会直接红。
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Flutter 版本 pin 死，不追滚动 stable —— 与 ci.yml 把 Rust 工具链 pin 到 1.97.0
+          # 完全同一个理由：滚动版本会因新工具引入的 lint / 行为变化让 main 无端变红，
+          # 与代码改动无关。要升级：改这里 + 本地同版跑一遍 tool/test.ps1 后再提。
+          # 同时要同步 mobile/pubspec.yaml 的 `environment.sdk` 与 mobile/README.md。
+          flutter-version: '3.38.3'
+          channel: stable
+          cache: true
+
+      - name: 装依赖（按 pubspec.lock 精确复现）
+        # --enforce-lockfile：解析结果与入库的 pubspec.lock 不一致就直接失败，
+        # 而不是"顺手升个版本再继续"。这是 lock 入库这条拍板的执行者——
+        # 没有它，lock 只是一份没人验证的文件，CI 跑的依赖版本可能与本地不同。
+        run: flutter pub get --enforce-lockfile
+
+      - name: 静态分析（零告警）
+        # --fatal-infos 不可省：analysis_options.yaml 里开的 strict-casts /
+        # strict-inference / strict-raw-types 报的是 **info** 级，
+        # 不加这个参数它们全都不阻塞，等于白开。
+        run: flutter analyze --fatal-infos
+
+      - name: 测试
+        run: flutter test --reporter expanded
