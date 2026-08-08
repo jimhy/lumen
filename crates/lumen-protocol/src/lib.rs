@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod llm;
 pub mod remote;
 pub mod ssh_sync;
 
@@ -23,12 +24,32 @@ pub mod ssh_sync;
 /// 一次性切到「`(TabId, SessionId)` 双 id 多会话」`OutputWithId`/`ResizeWithId`/
 /// `SubscriptionStarted`（K2：不双发灰度）。旧 v1 客户端收新帧 `from_value` 失败即丢弃、
 /// 镜像空白，故须配 [`MIN_SUPPORTED_VERSION`] 版本门把 v1 挡在配对前。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// **v4（M7 移动端 LLM 远程控制）**：新增 [`remote::RemoteFrame::Llm`] 数据面变体，整套 LLM
+/// 子协议见 [`llm`]。[`MIN_SUPPORTED_VERSION`] **不上调**（保持 3）——LLM 是**纯增量**能力，
+/// v3 桌面端的终端镜像 / 文件传输完全不受影响，没有理由把它们判死。这是首次
+/// `PROTOCOL_VERSION > MIN_SUPPORTED_VERSION`。
+///
+/// # ⚠ 这次 bump **没有**任何阻断效果，别指望它挡住谁
+/// 如实记账：仓库内**没有版本门实现**。`AuthResponse::protocol_version` 在客户端零消费者；
+/// `crates/lumen-app/src/remote_ws.rs:7192-7212` 只有两条 `log::warn!`——既不断连、也不禁配对，
+/// 服务端更是零版本校验。且 `MIN_SUPPORTED_VERSION` 保持 3 意味着那两条分支恒为 false，
+/// **正常路径连一行版本日志都不打**，升到 4 之后依然无从区分对端有没有 LLM 面。
+///
+/// 真正**可执行**的门是 [`llm::LlmFrame::Hello`] / [`llm::LlmFrame::HelloAck`] 能力握手：
+/// 老 PC 不认识 `RemoteFrame::Llm` → 整帧丢弃、不回任何东西 → 控制端
+/// [`llm::LLM_HELLO_TIMEOUT_SECS`] 秒收不到 `HelloAck` 即判定「对端不支持」并提示升级。
+/// 本常量此处仅作版本记账，**不得**被写成任何分支条件的依据。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 服务端仍兼容的最低客户端协议版本（M5.3 WebSocket `Welcome` 下发；低于此
-/// 的客户端应提示用户升级）。当前 = [`PROTOCOL_VERSION`]，破坏性裁撤旧消息时上调。
+/// 的客户端应提示用户升级）。破坏性裁撤旧消息时上调。
 ///
 /// part3d Phase 1 上调至 2：part3d 双 id 数据面与 v1 单焦点镜像不兼容，两端须同为 ≥2。
+///
+/// **v4 起不再等于 [`PROTOCOL_VERSION`]**：M7 的 LLM 数据面是纯增量能力，v3 桌面端继续正常使用
+/// 终端镜像，无需被挡在配对前；何况上调它也挡不住任何东西（见 [`PROTOCOL_VERSION`] 的说明——
+/// 现存「版本门」只有两条 `log::warn!`）。
 pub const MIN_SUPPORTED_VERSION: u32 = 3;
 
 /// REST 端点路径（客户端与服务端共用，避免字符串漂移）。

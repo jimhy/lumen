@@ -763,6 +763,40 @@ pub enum RemoteFrame {
     /// 阻塞、流无法建立。本帧仅用于解除对端 `accept_bi` 阻塞 + 标记数据面流就绪，**收端 no-op**。
     /// 走 QUIC 直连流（非中继），与其它数据面帧同 length-prefix 分帧。
     P2pStreamHello,
+    /// **M7 移动端 LLM 远程控制数据面（双向）**：headless LLM CLI 的结构化对话流。整套子协议见
+    /// [`crate::llm::LlmFrame`]（控制端发 `Hello`/`Send`/`Interrupt`/`PermissionReply`，被控端发
+    /// `HelloAck`/`Delta`/`TurnEnded`/`PermissionRequest` 等）。
+    ///
+    /// # 为什么整套 LLM 子协议只加这**一个**变体
+    /// 本枚举是 serde 默认的 **externally tagged** 表示（变体名作为 JSON 对象唯一 key，unit 变体
+    /// 序列化成裸字符串），serde **不支持**在这种表示上加 `#[serde(other)]` 兜底变体——未知变体名
+    /// 一定让整帧 [`Self::from_value`] 失败。而 [`crate::llm::LlmFrame`] 是 **internally tagged**
+    /// （`#[serde(tag = "op")]`）+ `#[serde(other)]`：未知 `op` 降级成
+    /// [`crate::llm::LlmFrame::Unknown`] 而非整帧报废。
+    ///
+    /// 于是「新增变体炸老对端」这个代价**只付一次**（就是本变体），此后 LLM 子协议无论怎么长都
+    /// **不再需要动本枚举**，服务端盲转与 QUIC 通路同样零改动。
+    ///
+    /// 否决的替代：① 把 20+ 个 LLM 帧平铺进本枚举——每加一个都是一次破坏性变更，永远还不完；
+    /// ② 把本枚举整体改成内部标签以便加 `other`——要动全部现存变体的线格式，且
+    /// [`Self::Output`]`(Vec<u8>)` / [`Self::Echo`]`(String)` 这类 newtype 变体在内部标签下
+    /// **根本无法表达**（内部标签要求变体内容是 map），是彻底重写；③ 用裸 `serde_json::Value`
+    /// 传 LLM 载荷——放弃两端强类型，与本 crate 立身之本相悖。
+    ///
+    /// **本变体自身对 v3 及更早对端仍不可识别**（丢帧、无回应），由
+    /// [`crate::llm::LlmFrame::Hello`] 的握手超时兜底提示升级——这也是整个 M7 唯一**可执行**的
+    /// 版本门（[`crate::PROTOCOL_VERSION`] 那个门只有 `log::warn!`，不阻断）。
+    ///
+    /// # 为什么是 `Box`
+    /// 实测：不装箱时 [`crate::llm::LlmFrame`] 自身 312 B（最大变体是内联了 272 B
+    /// [`crate::llm::LlmConvMeta`] 的 `ConvStarted` / `Attached`），会把整个 `RemoteFrame` 从
+    /// **144 B 顶到 312 B**——此后每一个 `RemoteFrame` 值都按 312 B 在栈上搬运，包括最高频的
+    /// [`Self::Output`]`(Vec<u8>)`。装箱后 `RemoteFrame` 退回 144 B。
+    ///
+    /// `Box` 对 serde **完全透明**（`Box<T>` 按 `T` 序列化 / 反序列化），**线格式一字节不变**，
+    /// 故这不是协议变更、也不需要动版本号。clippy 的 `large_enum_variant` 在这里**不会报**
+    /// （最大变体与次大变体之差不足阈值），别把「没报 lint」当成「没变大」。
+    Llm(Box<crate::llm::LlmFrame>),
 }
 
 /// part3d Phase 4 [`RemoteFrame::PaneOp`] 的操作种类。

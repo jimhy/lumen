@@ -7092,6 +7092,10 @@ impl RemoteWs {
             }
             // P2P 直连数据面首帧（仅解除对端 accept_bi 阻塞 + 标记流就绪）：收端 no-op。
             RemoteFrame::P2pStreamHello => {}
+            // M7 片 0：协议地基先落地，分发在片 4（`apply_llm_frame`）。此处显式 no-op，
+            // **不用通配臂**——通配会让今后新增 `RemoteFrame` 变体不再触发 E0004 编译提醒，
+            // 而这条穷尽 match 正是「新增数据面变体必须显式决定怎么处理」的唯一强制点。
+            RemoteFrame::Llm(_) => {}
         }
     }
 
