@@ -806,6 +806,11 @@ pub struct Strings {
     pub remote_toast_reconnecting: &'static str,
     /// toast：断线宽限重挂成功（会话已自动恢复）
     pub remote_toast_restored: &'static str,
+    /// toast：M7 对端 Lumen 不支持 LLM 远程控制面（`LlmFrame::Hello` 5 秒无 `HelloAck`）
+    ///
+    /// **文案必须点明「终端功能不受影响」**：LLM 是纯增量能力（`MIN_SUPPORTED_VERSION`
+    /// 因此保持 3），只说「版本过低」会让用户以为整条远程链路坏了、去做无谓的排查。
+    pub remote_toast_llm_peer_too_old: &'static str,
     /// 状态栏链路指示：P2P 直连（短标签）
     pub statusbar_link_direct: &'static str,
     /// 状态栏链路指示：中继转发（短标签）

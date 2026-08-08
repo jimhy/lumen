@@ -518,6 +518,7 @@ pub static STRINGS: Strings = Strings {
     remote_toast_p2p_relay: "已回退到中繼轉發",
     remote_toast_reconnecting: "遠端連線中斷，正在自動重連…",
     remote_toast_restored: "遠端工作階段已自動恢復",
+    remote_toast_llm_peer_too_old: "對端 Lumen 版本過低，AI 遠端控制不可用（終端與檔案功能不受影響），請升級對端",
     statusbar_link_direct: "直連",
     statusbar_link_relay: "中繼",
     statusbar_link_reconnecting: "重連中",

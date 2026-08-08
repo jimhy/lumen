@@ -1705,6 +1705,12 @@ pub const LLM_DELTA_FLUSH_MS: u64 = 33;
 
 /// 单个 [`LlmFrame::Delta`] 的 JSON 字节夹紧上限。达到即立刻 flush 并开新帧。
 /// 128 KiB 远低于服务端 4 MiB 单帧上限（`server/lumen-server/src/ws.rs` 的 `MAX_WS_MESSAGE`）。
+///
+/// # 它是**每帧上限**，不是「攒到这么多就发一次」的触发阈值
+/// 两者听起来像同一件事，落到实现上差一个数量级：只当触发阈值用的话，一次
+/// `pump` 排空整条 runner 事件通道（cap 4096）后仍然只产出**一帧**，字节数不设防，
+/// 直接顶穿 `MAX_WS_MESSAGE` 把整条 WS 打断（终端镜像一起断）。被控端侧的落点是
+/// `remote_ws/llm.rs` 的 `LlmPlane::flush_conv`——它按本常量**拆帧**，每批各领一个 `seq`。
 pub const LLM_DELTA_MAX_BYTES: usize = 128 * 1024;
 
 /// 在途未 ACK 的 [`LlmFrame::Delta`] 帧数窗口（背压）。对齐 [`crate::remote::FETCH_WINDOW`]
@@ -1724,7 +1730,16 @@ pub const LLM_DELTA_WINDOW: u32 = 16;
 ///
 /// **不可改成「停止读子进程 stdout」**：那会填满管道缓冲区并卡死 CLI 进程本身
 /// （见 [`LlmFrame::DeltaAck`] 的长注释）。
-pub const LLM_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024;
+///
+/// # 为什么是 2 MiB 而不是和 `MAX_WS_MESSAGE` 一样的 4 MiB
+/// 原值就是 4 MiB，与 `server/lumen-server/src/ws.rs` 的 `MAX_WS_MESSAGE` **恰好相等**。
+/// 两个上限取值相等是个陷阱：积压削到上限之内（`shed_backlog` 只削到本值的一半，且终态项
+/// 无条件保留，故实际驻留可到 ~2 MiB+）之后，ACK 一到就要把这堆东西发出去，JSON 转义还会
+/// 再放大一截——「刚好合规的积压」直接长成「超限的帧」。
+///
+/// 现在 flush 侧已按 [`LLM_DELTA_MAX_BYTES`] 拆帧，单帧不会再超限；本值降到 2 MiB 是**第二道**
+/// ——让积压总量本身就明显低于单帧上限，两道防线不共用同一个数字。
+pub const LLM_BACKLOG_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// 单页历史最多轮数（被控端对 [`LlmFrame::HistoryReq`] 的 `max_turns` 的硬夹紧）。
 pub const LLM_HISTORY_MAX_TURNS_PER_PAGE: u16 = 20;

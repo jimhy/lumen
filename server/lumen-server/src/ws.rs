@@ -85,6 +85,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, user_id: String, 
                                 let paired = is_paired(&state, &user_id, &device_id, &target).await;
                                 state.hub.request_control(&device_id, conn_id, &target, paired);
                             }
+                            // M7 片 4b：手机端发起隐藏会话。**恒传 paired = false**，
+                            // 即隐藏会话每次都要念配对码，绝不复用 device_pairs 里那行
+                            // 为**镜像**会话建立的信任。
+                            //
+                            // 理由与另一半（submit_pairing 在 Hidden 分支恒返回 None、
+                            // 故隐藏配对也不写 device_pairs）写在 hub.rs 的 submit_pairing 里。
+                            // 一句话：device_pairs 没有会话种类列，共用一行信任会让
+                            // 「手机为跟 LLM 说话念的那次码」顺带授出**镜像**权限，
+                            // 反向则让老的镜像信任静默开出一条**无横幅、无指示器**的隐藏通道。
+                            // 代价只是多念一次码，换掉的是一条静默提权路径。
+                            //
+                            // 完整方案（device_pairs 加 kind 列）落地前，**这两处必须同时成立**。
+                            Ok(RemoteC2S::OpenHidden { target }) => {
+                                state.hub.open_hidden(&device_id, conn_id, &target, false);
+                            }
                             Ok(RemoteC2S::SubmitPairing { target, code }) => {
                                 // 配对成功 → 持久化这对设备信任，之后免重输（直到一端被删）。
                                 if let Some((a, b)) =
@@ -93,6 +108,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, user_id: String, 
                                     persist_pair(&state, &user_id, &a, &b).await;
                                 }
                             }
+                            // 其余（含片 4b 的 ClientHello / RelayTo / EndHidden，它们
+                            // 不需要 DB）走这条兜底臂，无需新增分支。
                             Ok(msg) => state.hub.handle(&device_id, conn_id, msg),
                             Err(e) => {
                                 // 非法 JSON：不外泄消息体内容，仅记错误类型后继续读。

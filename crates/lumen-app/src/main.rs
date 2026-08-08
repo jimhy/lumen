@@ -1911,25 +1911,28 @@ impl AppState {
     /// 2. 必须在 `if let Some(sub_id) = self.remote_ws.sub_target()` 那层嵌套**之外**——
     ///    headless 会话与手机订阅哪个 tab 完全无关，塞进去会让「手机切走 tab 后 LLM 事件停摆」。
     ///
-    /// 片 2 只把泵接上：事件在这里被排空、状态机与环形缓冲被推进（这是 §6.7「手机断线不杀
-    /// 进程、事件进带 seq 的缓冲」硬契约成立的前提），**上行分发在片 4**（`remote_ws.rs:7095`
-    /// 那个显式 no-op 臂）。返回是否产生了事件，供调用方决定要不要请求重绘。
+    /// 片 2 把泵接上：事件在这里被排空、状态机与环形缓冲被推进（这是 §6.7「手机断线不杀
+    /// 进程、事件进带 seq 的缓冲」硬契约成立的前提）。**片 4 接上了上行分发**：
+    /// `remote_ws.rs` 那个显式 no-op 臂已换成 `apply_llm_frame`，两个方向都收在
+    /// `RemoteWs::pump_llm` 里（见下）。返回是否有动作，供调用方决定要不要请求重绘。
     ///
     /// **本方法刻意插在 `pump_remote` 的那段长注释之前**：那段以「唯一状态变更入口」开头、
     /// 含一节「返回值」的注释是仓库既有的、挂在 `pump_remote` 头上的历史遗留块，
     /// 从它中间插一个函数会把它劈成两半、改掉既有函数的文档归属。
     fn pump_llm_runners(&mut self) -> bool {
         let events = self.llm_runners.pump();
-        if events.is_empty() {
-            return false;
-        }
         for (id, seq, ev) in &events {
-            // 片 4 之前先只记 trace：`RunnerEvent` 的 `Debug` 已按 `lumen_protocol::llm` 的
-            // 脱敏包装（`LlmText` 只打字符数、`LlmPath` 打 `<redacted>`、`LlmToolInput` 只打
-            // 字段数与字节数）产出，不会把对话正文写进日志。
+            // `RunnerEvent` 的 `Debug` 已按 `lumen_protocol::llm` 的脱敏包装
+            //（`LlmText` 只打字符数、`LlmPath` 打 `<redacted>`、`LlmToolInput` 只打字段数与
+            // 字节数）产出，不会把对话正文写进日志。
             log::trace!("{id} seq={seq} {ev:?}");
         }
-        true
+        // ★ M7 片 4 在 main.rs 上的**唯一一处接线**：入站 LLM 指令 → runner 操作、
+        // runner 事件 → LlmFrame 上行。`remote_ws` 与 `llm_runners` 是本结构的两个
+        // **不相交字段**，借用检查器允许同时可变借出。逻辑全在
+        // `remote_ws/llm.rs`（见其模块文档一：为什么执行点必须在这里而不在 `apply_relay`）。
+        let piped = self.remote_ws.pump_llm(&mut self.llm_runners, &events);
+        piped || !events.is_empty()
     }
 
     /// 唯一状态变更入口（M4.1 批B）——设计稿 §6。
@@ -9305,6 +9308,12 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
         // 断线宽限重挂：中断提示（黄）+ 自动恢复成功（蓝）。
         Notice::SessionReconnecting => (ToastKind::Warn, s.remote_toast_reconnecting.to_string()),
         Notice::SessionRestored => (ToastKind::Info, s.remote_toast_restored.to_string()),
+        // M7 片 4：对端不支持 LLM 面（Hello 5 秒无 HelloAck）。**Warn 而非 Info**——
+        // 它是一次功能不可用，不是状态播报；但终端镜像与文件传输照常，文案里点明了。
+        Notice::LlmPeerTooOld => (
+            ToastKind::Warn,
+            s.remote_toast_llm_peer_too_old.to_string(),
+        ),
     }
 }
 

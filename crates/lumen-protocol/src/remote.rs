@@ -20,6 +20,34 @@
 //! 状态增量（grid delta / block / 布局）与操作指令（Action）变体时，**服务端
 //! 中继代码零改动**——这是分期推进不返工的关键。
 //!
+//! # M7 片 4b：镜像会话与隐藏会话是**两个桶**
+//! 在 part1~M6 里「一台设备至多一条会话」是结构性事实（服务端 `sessions` 表以
+//! `device_id` 为键）。M7 之后不再是：手机端接入被控 PC 时建立的是**隐藏会话**
+//! —— 它不是 Tab、不是窗格、被控端 UI 不展示（只有一个带计数的图标），与桌面
+//! 控制端的**镜像会话**在服务端分属两个互不排斥的桶。落到本模块就是四对新变体：
+//! [`RemoteC2S::ClientHello`] / [`RemoteC2S::OpenHidden`] / [`RemoteC2S::RelayTo`] /
+//! [`RemoteC2S::EndHidden`] 与 [`RemoteS2C::HiddenControlRequested`] /
+//! [`RemoteS2C::HiddenSessionStarted`] / [`RemoteS2C::HiddenSessionEnded`] /
+//! [`RemoteS2C::RelayTo`]。
+//!
+//! **数据面铁律不变**：[`RemoteC2S::RelayTo`] 的 `payload` 依然是不透明
+//! [`serde_json::Value`]，服务端照样不反序列化。多出来的 `session_id` 在**信封**
+//! 上而不在载荷里——服务端读信封做路由是它本来就在做的事（`Relay` 的信封就是
+//! 「发送者 device_id」），读载荷才是越界。
+//!
+//! **为什么是新增变体而不是给 [`RemoteC2S::RequestControl`] 加一个 `kind` 字段**：
+//! 本 crate 全文件**没有** `deny_unknown_fields`，未知字段会被 serde 静默忽略。
+//! 新手机发一条带 `kind:"Llm"` 的 `RequestControl` 给老服务端，老服务端会把它当成
+//! 一次**普通镜像请求**照常执行成功——手机凭空占住那台 PC 的独占位，且两端都察觉
+//! 不到。反过来，未知**变体**在外部标签枚举下是整条 `from_str` 失败、被丢弃，
+//! 状态零污染，配一个超时就能变成一句人话。**「整条丢弃」可以救，「字段被忽略后
+//! 照常执行」救不回来** —— 这是本次控制面扩展的写死原则。
+//!
+//! **同版发布要求**：控制面新变体在老端是「整条解析失败」，没有任何数据面那样的
+//! 兜底通道（数据面有 `LlmFrame::Hello` 5 秒超时可判定）。故隐藏会话能力要求
+//! **服务端与被控端 PC 同版发布**；发起方（桌面控制端）不受影响，它的
+//! `RequestControl` 线格式一个字节没变。
+//!
 //! # 安全要点（part1 已落实，详见 `docs/M5远程控制设计.md` §6）
 //! - WS 升级走 `Authorization: Bearer` 头鉴权（复用 REST 的 JWT），不走 query
 //!   参数，避免反代日志泄漏 token。
@@ -43,9 +71,23 @@ pub enum Role {
 pub enum DenyReason {
     /// 目标设备当前不在线（无活跃 WS 连接）。
     Offline,
-    /// 目标设备已被其他控制端独占。
+    /// 目标设备该**类**会话的名额已满。
+    ///
+    /// 镜像桶：目标已被另一个桌面控制端独占（名额恒为 1）。
+    /// 隐藏桶（M7 片 4b）：目标的隐藏会话数已达
+    /// [`MAX_HIDDEN_SESSIONS_PER_TARGET`]。两桶互不影响——桌面镜像开着时手机
+    /// 仍可接入，反之亦然。手机端文案须给出具体数字（「该电脑的手机会话已达上限
+    /// （2）」），只说「已被占用」会让用户去找那个并不存在的占用者。
+    ///
+    /// **刻意不为隐藏桶新增拒因变体**：`DenyReason` 随
+    /// [`RemoteS2C::ControlDenied`] 下行，新变体会让老客户端整条 `from_str` 失败，
+    /// 丢掉的正是它**唯一的拒绝回执** —— UI 永久转圈。数据面加变体有超时兜底，
+    /// 控制面加拒因没有，二者不可类比。
     AlreadyControlled,
-    /// 控制端自己已在控制另一台设备（控制端同一时刻只控一台）。
+    /// 发起方自己已占着该**类**会话的名额（同一时刻只连一台）。
+    ///
+    /// 镜像桶：控制端已在控制另一台设备。
+    /// 隐藏桶（M7 片 4b）：本手机已有到该 PC 的隐藏会话，或已连着另一台 PC。
     ControllerBusy,
     /// 目标设备正在与他人配对中（已有未决配对请求）。
     TargetPairing,
@@ -86,6 +128,19 @@ pub enum EndReason {
     /// 本设备在别处重新登录，当前连接被新连接取代。
     Replaced,
 }
+
+/// 隐藏会话 id（M7 片 4b）：服务端分配、**进程内单调递增且不复用**。
+///
+/// # 不变量
+/// - **`0` 保留为哨兵**，服务端永不分配（对齐仓库既有 `req_id` 的 0 哨兵纪律）。
+///   客户端可用 `0` 表示「尚未分配 / 无效」而无需再包一层 `Option`。
+/// - 它是**信封上的路由键**，不是载荷内容——服务端读它做转发，仍然不看
+///   [`RemoteC2S::RelayTo::payload`] 一个字节。
+/// - **可被同账户任一设备猜中**（全局单调 u64）。服务端 `hub.rs` 的 `CrossUser`
+///   只挡跨账户，同账户内本就无隔离，所以**服务端必须对每条
+///   [`RemoteC2S::RelayTo`] 做会话成员校验**：隐藏会话的载荷里含「向 LLM 发消息」
+///   这种指令，漏了这道校验就等于任一同账户设备都能往别人 PC 上投喂 prompt。
+pub type HiddenSessionId = u64;
 
 /// 会话(tab)唯一标识——镜像 `lumen-app` 侧 `session::TabId`（自增 `u64`、关闭后不复用）。
 /// 协议 crate 不依赖 app，故在此独立别名；两端同为 `u64`，边界零转换。**part3d 起数据面按
@@ -1107,6 +1162,32 @@ pub const LIST_DIR_RECURSIVE_MAX_DEPTH: u32 = 20;
 /// （32 × ~600 B）≈ 19 KB << 4 MiB 单帧上限。
 pub const REMOTE_MAX_SESSIONS: u32 = 32;
 
+/// M7 片 4b：一台被控端可并存的 LLM **隐藏会话**数上限（与镜像会话的名额相互独立）。
+///
+/// 超限时服务端对 [`RemoteC2S::OpenHidden`] 回
+/// [`ControlDenied`](RemoteS2C::ControlDenied)`{`[`AlreadyControlled`](DenyReason::AlreadyControlled)`}`。
+/// 放在协议 crate 而非只留在服务端，是为了让手机 UI 能在文案里写出**具体数字**。
+///
+/// # 取 2 的三条理由（不是拍脑袋）
+/// 1. 被控端 headless runner 上限是 4，会话数超过 runner 数没有意义。
+/// 2. 服务端出站通道当前是**无界** mpsc 且丢弃 send 结果 ⇒ **零背压**。每多一条
+///    隐藏会话就多一路指向同一台 PC 的无界队列，N 越大放大越狠。有界化是后续
+///    独立事项，在它落地前这个上限必须保守。
+/// 3. 被控端只有一个图标做指示，「2」这个量级用户才数得过来。
+pub const MAX_HIDDEN_SESSIONS_PER_TARGET: usize = 2;
+
+/// M7 片 4b：[`RemoteC2S::ClientHello::caps`] 里表示「本端可承载隐藏会话」的能力位。
+///
+/// # 为什么定义在协议 crate 而不是各端各写一遍字面量
+/// 这是**线格式的一部分**：被控端写进 `caps`、服务端逐字符比对。两边各写一个
+/// `"hidden"` 字面量，任何一次手滑改名都会变成「服务端把所有新版 PC 都判成老端、
+/// 手机永远连不上」，而且编译器一声不吭。放在这里，改名是一次编译期的全仓库同步。
+///
+/// 服务端未收到含此位的 `ClientHello` 时，会在**生成配对码之前**就把
+/// [`RemoteC2S::OpenHidden`] 回成 [`ControlDenied`](RemoteS2C::ControlDenied)`{`
+/// [`Offline`](DenyReason::Offline)`}`。
+pub const HIDDEN_CAP: &str = "hidden";
+
 /// 文件块字节在 JSON 里的 base64 编解码（`#[serde(with = "b64")]`）。原始 `Vec<u8>` 经 serde
 /// 会序列化成 JSON 数字数组（每字节形如 `123,` ≈ 4 字符）、膨胀约 4 倍；base64 仅膨胀 ~1.33x，
 /// 等量数据传输量降到约 1/3、接近原始二进制。app / server 对此无感知（字段仍是 `Vec<u8>`，
@@ -1166,10 +1247,72 @@ pub enum RemoteC2S {
     DeclineControl,
     /// 任一端主动结束当前活跃会话。
     EndSession,
-    /// 数据面：把不透明帧盲转给会话对端（载荷由 [`RemoteFrame`] 序列化而来）。
+    /// 数据面：把不透明帧盲转给**镜像**会话对端（载荷由 [`RemoteFrame`] 序列化而来）。
     Relay(serde_json::Value),
     /// 应用层心跳：保活 + 刷新在线状态，服务端回 [`RemoteS2C::Pong`]。
     Ping,
+
+    // ───────────────────────── M7 片 4b：隐藏会话（纯加法，上方 6 个变体一字未动）───────────────
+    /// 连接建立后**第一条**发出的控制面握手：上报本端协议版本与能力位。
+    ///
+    /// 服务端把 `caps` 记进该连接的 peer 句柄，用于在生成配对码**之前**判定目标
+    /// PC 是否支持隐藏会话（不支持就直接回
+    /// [`Offline`](DenyReason::Offline)，省掉一个念了也没用的配对码横幅和 120 秒
+    /// 干等）。`protocol_version` 只进服务端日志——这是服务端第一次能在排障时区分
+    /// 客户端版本。
+    ///
+    /// # 命名警告
+    /// 这是**控制面**握手（服务端消费）。数据面另有一个 LLM 子协议握手（对端 PC
+    /// 消费，走 `Relay` 载荷）。两者层次不同、消费者不同，**不要把两层能力位搅在
+    /// 一起**。
+    ///
+    /// # 老服务端行为
+    /// 整条 `from_str` 失败 → 记一条 debug 后**继续读**，不断连。故新客户端连老
+    /// 服务端时这一条只是白发，没有副作用。
+    ClientHello {
+        /// 本端协议版本（[`crate::PROTOCOL_VERSION`]）。
+        protocol_version: u32,
+        /// 能力位（当前只有 `"hidden"` = 支持作为被控端承载隐藏会话）。
+        /// 用字符串而非 bitflags：新增能力时老服务端只是不认识那个字符串，
+        /// 不会像位宽变化那样出现语义漂移。
+        caps: Vec<String>,
+    },
+    /// 手机端发起一条到 `target` 的**隐藏会话**（不是镜像会话）。
+    ///
+    /// # 为什么不复用 [`RequestControl`](Self::RequestControl) 加字段
+    /// 老服务端会静默忽略未知字段，把它当成一次普通镜像请求**执行成功**，手机凭空
+    /// 占住那台 PC 的镜像独占位，且没有任何一端能察觉（详见模块头注释）。新增变体
+    /// 则在老服务端整条丢弃，手机侧靠**发起超时**判定「服务器版本过低」。
+    ///
+    /// **该超时是硬验收项**：老服务端对这条消息完全无回音，不实现超时就是无限转圈。
+    OpenHidden {
+        /// 目标（被控端）设备 id。
+        target: String,
+    },
+    /// 隐藏会话数据面盲转：把不透明帧转给 `session_id` 这条会话的对端。
+    ///
+    /// `payload` 与 [`Relay`](Self::Relay) 同为不透明 [`serde_json::Value`]，
+    /// **服务端绝不反序列化**；`session_id` 在信封上，因为一台 PC 上可能同时挂着
+    /// 多条隐藏会话，仅凭「发送者是谁」已无法确定唯一对端（这正是 `Relay` 的路由
+    /// 方式，它在多会话下结构性失效）。
+    ///
+    /// 服务端转发前**必须校验发送者是该会话的成员**，不命中**静默丢弃且不回执**
+    /// （回执会变成探测「哪些 `session_id` 存在」的旁路）。
+    RelayTo {
+        /// 目标隐藏会话 id。
+        session_id: HiddenSessionId,
+        /// 不透明载荷。
+        payload: serde_json::Value,
+    },
+    /// 任一端主动结束一条隐藏会话（对端收
+    /// [`HiddenSessionEnded`](RemoteS2C::HiddenSessionEnded)）。
+    ///
+    /// 与 [`EndSession`](Self::EndSession) 的区别：那条是 unit 变体、拆的是本设备
+    /// 唯一的镜像会话；这条必须带 id，因为一台 PC 上可能有多条隐藏会话。
+    EndHidden {
+        /// 要结束的隐藏会话 id。
+        session_id: HiddenSessionId,
+    },
 }
 
 /// 服务端 → 客户端的远程控制消息。
@@ -1237,10 +1380,72 @@ pub enum RemoteS2C {
         /// 机器可读原因。
         reason: EndReason,
     },
-    /// 数据面：来自会话对端的不透明帧（用 [`RemoteFrame::from_value`] 还原）。
+    /// 数据面：来自**镜像**会话对端的不透明帧（用 [`RemoteFrame::from_value`] 还原）。
     Relay(serde_json::Value),
     /// 心跳应答。
     Pong,
+
+    // ───────────────────────── M7 片 4b：隐藏会话（纯加法，上方 10 个变体一字未动）──────────────
+    /// 发给**被控端**：有手机请求建立隐藏会话，展示配对码供其转述输入。
+    ///
+    /// # 为什么连 [`ControlRequested`](Self::ControlRequested) 也不复用
+    /// 复用的话，老被控端会展示一个码、用户念完之后**收不到自己认识的
+    /// [`SessionStarted`](Self::SessionStarted)**（服务端发的是
+    /// [`HiddenSessionStarted`](Self::HiddenSessionStarted)，老端整条丢弃）——
+    /// 横幅永久残留；更糟的是用户点「拒绝」会得到「我拒绝成功了」的错觉，而实际
+    /// 上会话早已建立。**那是安全误导，不可接受。**
+    ///
+    /// 被控端 UI 必须**另开一个横幅槽**承载它，不要和镜像配对横幅共用一个字段，
+    /// 否则两个配对流程会互相覆盖。
+    HiddenControlRequested {
+        /// 发起方（手机）设备 id。
+        controller_device_id: String,
+        /// 发起方设备显示名。
+        controller_name: String,
+        /// 9 位配对码（被控端醒目展示）。
+        pairing_code: String,
+        /// 配对有效期（秒），UI 可倒计时。
+        expires_in_secs: u32,
+    },
+    /// 隐藏会话已建立（双方各收一份）。
+    ///
+    /// # ★ 实施铁律：这一臂**绝不允许**与 [`SessionStarted`](Self::SessionStarted)
+    /// 合并处理
+    /// 被控端处理 `SessionStarted` 时会**无条件**重置镜像态：清配对态、清历史缓存、
+    /// 推进编辑代次、清远程文件树、重建 `mirror`、重启 P2P 引擎。若隐藏会话复用
+    /// 那条消息下发给一台**正在被桌面镜像**的 PC，表现就是「手机一连上，桌面镜像
+    /// 立刻黑屏」。
+    ///
+    /// 走独立变体，是靠**类型系统**保证这件事不可能发生，而不是靠某个
+    /// `if kind == …` 的运行时判断——这正是隐藏会话选择「新增变体」而非「加字段」
+    /// 的全部意义。后人若来「顺手合并两条臂消重复」，这段注释就是拦他的那道门。
+    HiddenSessionStarted {
+        /// 本条隐藏会话的 id（后续 [`RemoteC2S::RelayTo`] / [`RemoteC2S::EndHidden`] 的路由键）。
+        session_id: HiddenSessionId,
+        /// 对端设备 id。
+        peer_device_id: String,
+        /// 对端设备显示名。
+        peer_name: String,
+        /// 本端在这条隐藏会话里的角色（手机 = [`Role::Controller`]，PC = [`Role::Controlled`]）。
+        role: Role,
+    },
+    /// 隐藏会话已结束（仍在线的一端收到；发起拆除的一端不回执）。
+    HiddenSessionEnded {
+        /// 已结束的隐藏会话 id。
+        session_id: HiddenSessionId,
+        /// 机器可读原因（复用镜像会话那套：对端主动结束 / 对端断线 / 被新连接顶替）。
+        reason: EndReason,
+    },
+    /// 隐藏会话数据面：来自该会话对端的不透明帧。
+    ///
+    /// **必须带回 `session_id`**：对端 PC 上同时挂着 N 条隐藏会话，没有 id 就无法
+    /// 路由到对应的那条会话。
+    RelayTo {
+        /// 来源隐藏会话 id。
+        session_id: HiddenSessionId,
+        /// 不透明载荷。
+        payload: serde_json::Value,
+    },
 }
 
 #[cfg(test)]
@@ -1267,6 +1472,293 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("序列化");
         let back: RemoteS2C = serde_json::from_str(&json).expect("反序列化");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn 隐藏会话控制面消息往返() {
+        // 片 4b：8 个新变体逐个走一遍 JSON 往返，钉死线格式。
+        // 特别覆盖 RelayTo：session_id 在**信封**上、payload 保持不透明 —— 服务端
+        // 读得到 id、读不到（也不该读）载荷结构。
+        let frame = RemoteFrame::Echo("hi".into()).to_value().expect("to_value");
+        let c2s = [
+            RemoteC2S::ClientHello {
+                protocol_version: crate::PROTOCOL_VERSION,
+                caps: vec!["hidden".into()],
+            },
+            RemoteC2S::OpenHidden {
+                target: "pc-1".into(),
+            },
+            RemoteC2S::RelayTo {
+                session_id: 7,
+                payload: frame.clone(),
+            },
+            RemoteC2S::EndHidden { session_id: 7 },
+        ];
+        for msg in c2s {
+            let json = serde_json::to_string(&msg).expect("序列化");
+            let back: RemoteC2S = serde_json::from_str(&json).expect("反序列化");
+            assert_eq!(back, msg);
+        }
+        let s2c = [
+            RemoteS2C::HiddenControlRequested {
+                controller_device_id: "phone-1".into(),
+                controller_name: "海风的手机".into(),
+                pairing_code: "123456789".into(),
+                expires_in_secs: 120,
+            },
+            RemoteS2C::HiddenSessionStarted {
+                session_id: 7,
+                peer_device_id: "pc-1".into(),
+                peer_name: "工作站".into(),
+                role: Role::Controller,
+            },
+            RemoteS2C::HiddenSessionEnded {
+                session_id: 7,
+                reason: EndReason::PeerDisconnected,
+            },
+            RemoteS2C::RelayTo {
+                session_id: 7,
+                payload: frame.clone(),
+            },
+        ];
+        for msg in &s2c {
+            let json = serde_json::to_string(msg).expect("序列化");
+            let back: RemoteS2C = serde_json::from_str(&json).expect("反序列化");
+            assert_eq!(back, *msg);
+        }
+        // 信封/载荷分层：取出 payload 仍能还原成强类型帧，且不需要服务端认识它。
+        let RemoteS2C::RelayTo { session_id, payload } = &s2c[3] else {
+            panic!("应为 RelayTo");
+        };
+        assert_eq!(*session_id, 7);
+        assert_eq!(
+            RemoteFrame::from_value(payload).expect("还原"),
+            RemoteFrame::Echo("hi".into())
+        );
+    }
+
+    #[test]
+    fn 全部既有控制面变体的线格式钉子() {
+        // 本片是「服务端会反序列化」的最高风险改动，而上一条测试只钉住了 16 个既有变体里的
+        // 4 个（RequestControl / EndSession / Relay / SessionStarted）。剩下 12 个已发布变体
+        // 一旦被改名或改字段名，**全仓库照样编译通过、全部 hub 测试照样绿**，而所有已发布
+        // 客户端当场失联。数据面那道守门（tests/mobile_golden.rs 的
+        // 「协议源文件的可增长点数目未变」）只读 src/llm.rs，覆盖不到本文件。
+        //
+        // 所以这里逐条用**手写 JSON 字面量**钉线格式 —— 不能用
+        // `to_string(&构造出来的值)`，那会跟着代码一起变，钉不住任何东西。
+        //
+        // 新增变体不必往这里加：新变体没有「已发布的老端」要兼容。**改名/改字段才要来这里**，
+        // 而那时本测试会红，这正是它存在的意义。
+
+        // ── C2S：客户端 → 服务端（老客户端发、新服务端必须收得下）──
+        let submit: RemoteC2S =
+            serde_json::from_str(r#"{"SubmitPairing":{"target":"pc-1","code":"123456789"}}"#)
+                .expect("老 SubmitPairing");
+        assert_eq!(
+            submit,
+            RemoteC2S::SubmitPairing {
+                target: "pc-1".into(),
+                code: "123456789".into()
+            }
+        );
+        // 两个 unit 变体：线格式是**裸字符串**。任何一次「顺手加个字段」都会让老端发出的
+        // 这行整条解析失败。
+        assert_eq!(
+            serde_json::from_str::<RemoteC2S>(r#""DeclineControl""#).expect("老 DeclineControl"),
+            RemoteC2S::DeclineControl
+        );
+        assert_eq!(
+            serde_json::from_str::<RemoteC2S>(r#""Ping""#).expect("老 Ping"),
+            RemoteC2S::Ping
+        );
+
+        // ── S2C：服务端 → 客户端（新服务端发、老客户端必须认得）──
+        let welcome: RemoteS2C = serde_json::from_str(
+            r#"{"Welcome":{"protocol_version":4,"min_supported_version":3,"device_id":"d1"}}"#,
+        )
+        .expect("老 Welcome");
+        assert!(matches!(
+            welcome,
+            RemoteS2C::Welcome {
+                protocol_version: 4,
+                min_supported_version: 3,
+                ..
+            }
+        ));
+        let requested: RemoteS2C = serde_json::from_str(
+            r#"{"ControlRequested":{"controller_device_id":"c1","controller_name":"n",
+                "pairing_code":"123456789","expires_in_secs":120}}"#,
+        )
+        .expect("老 ControlRequested");
+        assert!(matches!(
+            requested,
+            RemoteS2C::ControlRequested { ref pairing_code, expires_in_secs: 120, .. }
+                if pairing_code == "123456789"
+        ));
+        let needed: RemoteS2C = serde_json::from_str(
+            r#"{"PairingNeeded":{"target_device_id":"t1","target_name":"n","expires_in_secs":120}}"#,
+        )
+        .expect("老 PairingNeeded");
+        assert!(matches!(
+            needed,
+            RemoteS2C::PairingNeeded {
+                expires_in_secs: 120,
+                ..
+            }
+        ));
+        // 三个枚举字段（PairingFailReason / DenyReason / EndReason）的**取值名**同样是线格式
+        // 的一部分：改一个变体名，老端的 UI 分支就静默走空。
+        let result: RemoteS2C =
+            serde_json::from_str(r#"{"PairingResult":{"reason":"InvalidCode","attempts_left":4}}"#)
+                .expect("老 PairingResult");
+        assert_eq!(
+            result,
+            RemoteS2C::PairingResult {
+                reason: PairingFailReason::InvalidCode,
+                attempts_left: 4
+            }
+        );
+        let denied: RemoteS2C = serde_json::from_str(
+            r#"{"ControlDenied":{"target_device_id":"t1","reason":"AlreadyControlled"}}"#,
+        )
+        .expect("老 ControlDenied");
+        assert_eq!(
+            denied,
+            RemoteS2C::ControlDenied {
+                target_device_id: "t1".into(),
+                reason: DenyReason::AlreadyControlled
+            }
+        );
+        let cancelled: RemoteS2C =
+            serde_json::from_str(r#"{"PairingCancelled":{"reason":"ControllerLeft"}}"#)
+                .expect("老 PairingCancelled");
+        assert_eq!(
+            cancelled,
+            RemoteS2C::PairingCancelled {
+                reason: DenyReason::ControllerLeft
+            }
+        );
+        let ended: RemoteS2C = serde_json::from_str(r#"{"SessionEnded":{"reason":"PeerLeft"}}"#)
+            .expect("老 SessionEnded");
+        assert_eq!(
+            ended,
+            RemoteS2C::SessionEnded {
+                reason: EndReason::PeerLeft
+            }
+        );
+        let relay: RemoteS2C =
+            serde_json::from_str(r#"{"Relay":{"Echo":"x"}}"#).expect("老 S2C Relay");
+        let RemoteS2C::Relay(v) = relay else {
+            panic!("应为 Relay");
+        };
+        assert_eq!(
+            RemoteFrame::from_value(&v).expect("还原"),
+            RemoteFrame::Echo("x".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<RemoteS2C>(r#""Pong""#).expect("老 Pong"),
+            RemoteS2C::Pong
+        );
+    }
+
+    #[test]
+    fn 老端缺字段的_requestcontrol_仍可解析() {
+        // 片 4b 兼容矩阵「新服务端 × 老客户端」的那一格：老桌面控制端发出的
+        // RequestControl / EndSession / Relay 线格式在本次扩展后**一个字节没变**，
+        // 新服务端必须原样解析成功。这里用**手写字面量**而不是 to_string(&构造出来的值)
+        // —— 后者会跟着代码一起变，钉不住线格式。
+        let old_request: RemoteC2S =
+            serde_json::from_str(r#"{"RequestControl":{"target":"pc-1"}}"#).expect("老 RequestControl");
+        assert_eq!(
+            old_request,
+            RemoteC2S::RequestControl {
+                target: "pc-1".into()
+            }
+        );
+        // EndSession 是 unit 变体：线格式是裸字符串。若当初给它加字段改成 struct
+        // 变体，这一行就会失败——那正是「加字段」方案的第四处硬伤。
+        let old_end: RemoteC2S = serde_json::from_str(r#""EndSession""#).expect("老 EndSession");
+        assert_eq!(old_end, RemoteC2S::EndSession);
+        // Relay 是 newtype 变体：载荷直接就是帧本身，中间没有任何包装层。
+        let old_relay: RemoteC2S =
+            serde_json::from_str(r#"{"Relay":{"Echo":"x"}}"#).expect("老 Relay");
+        let RemoteC2S::Relay(v) = old_relay else {
+            panic!("应为 Relay");
+        };
+        assert_eq!(
+            RemoteFrame::from_value(&v).expect("还原"),
+            RemoteFrame::Echo("x".into())
+        );
+        // 反向：老客户端解析新服务端下发的**老** S2C 变体，同样零变化。
+        let old_started: RemoteS2C = serde_json::from_str(
+            r#"{"SessionStarted":{"peer_device_id":"pc-1","peer_name":"n","role":"Controlled"}}"#,
+        )
+        .expect("老 SessionStarted");
+        assert!(matches!(
+            old_started,
+            RemoteS2C::SessionStarted {
+                role: Role::Controlled,
+                ..
+            }
+        ));
+        // 而**新**变体在老端是整条失败（不是字段被忽略）：这正是本方案要的降级形态。
+        // 用一个只含老变体的替身枚举模拟「老客户端的 RemoteS2C」。
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum 老版RemoteS2C {
+            SessionStarted {
+                peer_device_id: String,
+                peer_name: String,
+                role: Role,
+            },
+            Pong,
+        }
+        let hidden_json = serde_json::to_string(&RemoteS2C::HiddenSessionStarted {
+            session_id: 1,
+            peer_device_id: "pc-1".into(),
+            peer_name: "n".into(),
+            role: Role::Controlled,
+        })
+        .expect("序列化");
+        assert!(
+            serde_json::from_str::<老版RemoteS2C>(&hidden_json).is_err(),
+            "隐藏会话变体在老端必须整条解析失败（而非被静默当成 SessionStarted 执行）"
+        );
+
+        // 兼容矩阵「老服务端 × 新客户端」那一格（⚠ 无回音、靠客户端超时兜底）：
+        // 新客户端发的 ClientHello / OpenHidden 在**老服务端**同样是整条解析失败，
+        // 于是被 debug 记一笔后丢弃、连接不断。这里用只含老变体的替身枚举模拟。
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum 老版RemoteC2S {
+            RequestControl { target: String },
+            EndSession,
+            Relay(serde_json::Value),
+            Ping,
+        }
+        for msg in [
+            RemoteC2S::ClientHello {
+                protocol_version: crate::PROTOCOL_VERSION,
+                caps: vec!["hidden".into()],
+            },
+            RemoteC2S::OpenHidden {
+                target: "pc-1".into(),
+            },
+            RemoteC2S::RelayTo {
+                session_id: 1,
+                payload: serde_json::Value::Null,
+            },
+            RemoteC2S::EndHidden { session_id: 1 },
+        ] {
+            let json = serde_json::to_string(&msg).expect("序列化");
+            assert!(
+                serde_json::from_str::<老版RemoteC2S>(&json).is_err(),
+                "{msg:?} 在老服务端必须整条解析失败（无回音，由客户端超时判定服务器版本过低）"
+            );
+        }
+        // 而老客户端**照常**能被老服务端解析——新增变体对老路径零影响。
+        assert!(serde_json::from_str::<老版RemoteC2S>(r#""Ping""#).is_ok());
     }
 
     #[test]

@@ -441,8 +441,19 @@ impl Transcript {
 
     /// 控制端声明"我已消费到 `known_seq`"，是否存在**补不齐的缺口**。
     ///
-    /// 有缺口时片 4 必须回 `Attached{resync_required: true}` 让手机清空本地状态重建，
-    /// 而不是从缓冲里能发多少发多少——后者会拼出一段静默错位的对话。
+    /// 有缺口就绝不能"从缓冲里能发多少发多少"——那会拼出一段静默错位的对话。
+    ///
+    /// # 片 4 的落地与本方法的现状（如实记账）
+    /// 片 2 写这个方法时设想的是「片 4 用 transcript 补发、补不齐才要求重建」。片 4 落地时
+    /// 选了另一条路：`LlmPlane::attach` **只要不是严格同步就回
+    /// `Attached{resync_required: true}`**，控制端走 `HistoryReq` / `TurnFetch` 从被控端的
+    /// 定稿轮记录整体重建。理由写在 `remote_ws/llm.rs` 的 `LlmPlane::attach` 上，一句话是：
+    /// 轮记录与连接状态无关且更完整，而按 seq 补发要重跑有状态、不幂等的 `on_runner_event`。
+    ///
+    /// 于是本方法**当前没有生产调用点**（`replay_from` 同）。刻意保留而不删：它是
+    /// transcript 「截断即声明、绝不假装完整」这条不变量的可执行表述，并且真要做增量补发时
+    /// 这就是那道判据。**不要**把它当成「片 4 漏了没接」。
+    #[allow(dead_code)]
     #[must_use]
     pub fn has_gap_after(&self, known_seq: u64) -> bool {
         // `saturating_add` 而不是裸 `+`：`known_seq` 来自控制端帧，是**对端可控**值，
@@ -451,6 +462,10 @@ impl Transcript {
     }
 
     /// 补发 `known_seq` 之后的全部事件。
+    ///
+    /// **当前无生产调用点**，理由与去向见 [`Self::has_gap_after`] 的「片 4 的落地与本方法的
+    /// 现状」一节。
+    #[allow(dead_code)]
     pub fn replay_from(&self, known_seq: u64) -> impl Iterator<Item = &TranscriptEntry> {
         self.entries.iter().filter(move |e| e.seq > known_seq)
     }

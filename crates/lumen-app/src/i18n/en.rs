@@ -518,6 +518,7 @@ pub static STRINGS: Strings = Strings {
     remote_toast_p2p_relay: "Fell back to relay forwarding",
     remote_toast_reconnecting: "Remote connection lost, reconnecting…",
     remote_toast_restored: "Remote session restored automatically",
+    remote_toast_llm_peer_too_old: "Peer Lumen is too old for AI remote control (terminal and file transfer still work) — please update it",
     statusbar_link_direct: "Direct",
     statusbar_link_relay: "Relay",
     statusbar_link_reconnecting: "Reconnecting",
