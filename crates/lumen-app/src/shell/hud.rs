@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::theme::Palette;
-use crate::llm_cli::{HudContext, HudContextKind, LlmCliKind};
+use crate::llm_cli::{HudContext, HudContextKind, HudUsageWindow, LlmCliKind};
 use crate::llm_hud::{
     CliNativeDetails, CollectRequest, ConfigCounts, GitStatus, HudDetails, ToolSummary,
 };
@@ -33,6 +33,8 @@ pub struct HudView {
     pub kind: LlmCliKind,
     pub model: Option<String>,
     pub context: Option<HudContext>,
+    /// 从状态行刮到的额度窗口。Claude 只有这一条通路。
+    pub usage: Vec<HudUsageWindow>,
     pub project_path: Option<String>,
     pub foreground_pid: Option<u32>,
     pub busy: bool,
@@ -201,8 +203,8 @@ pub fn show(
                             project_line(ui, view, details, pal);
                             ui.add_space(8.0);
                             context_section(ui, view, details, pal);
+                            usage_section(ui, view, details, pal);
                             if let Some(details) = details {
-                                usage_section(ui, details, pal);
                                 token_section(ui, details, pal);
                                 tool_section(ui, details, pal);
                                 agent_section(ui, details, pal);
@@ -527,32 +529,69 @@ fn context_section(ui: &mut egui::Ui, view: &HudView, details: Option<&HudDetail
     );
 }
 
-fn usage_section(ui: &mut egui::Ui, details: &HudDetails, pal: &Palette) {
-    if details.usage_windows.is_empty() {
+/// 额度窗口的两条来源：后台采集的 JSON（Codex/Kimi）与状态行刮取
+/// （Claude 只有这一条）。JSON 是结构化原值，优先；画面刮取只在没有
+/// JSON 时兜底，免得一次误匹配盖掉一份准确数据。
+fn usage_windows(
+    view: &HudView,
+    details: Option<&HudDetails>,
+) -> Vec<(String, f32, Option<Duration>)> {
+    let from_json: Vec<_> = details
+        .map(|details| {
+            details
+                .usage_windows
+                .iter()
+                .map(|window| {
+                    (
+                        window.label.clone(),
+                        window.used_percent,
+                        window.resets_at_ms.and_then(remaining_until_ms),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !from_json.is_empty() {
+        return from_json;
+    }
+    view.usage
+        .iter()
+        .map(|window| {
+            (
+                window.label.to_owned(),
+                window.used_percent,
+                window.resets_in,
+            )
+        })
+        .collect()
+}
+
+fn usage_section(ui: &mut egui::Ui, view: &HudView, details: Option<&HudDetails>, pal: &Palette) {
+    let windows = usage_windows(view, details);
+    if windows.is_empty() {
         return;
     }
     ui.add_space(9.0);
     section_label(ui, crate::i18n::strings().hud_usage, pal);
     ui.add_space(3.0);
-    for window in &details.usage_windows {
-        let reset = window.resets_at_ms.and_then(remaining_until_ms);
+    for (label, used_percent, reset) in windows {
         let compact = ui.available_width() < 300.0;
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(&window.label)
+                egui::RichText::new(&label)
                     .monospace()
                     .size(9.5)
                     .color(pal.fg_dim),
             );
-            let color = percent_color(window.used_percent, pal);
+            let color = percent_color(used_percent, pal);
             ui.add_space(3.0);
             let reset_inline = reset.is_some() && !compact;
             let reserved = if reset_inline { 116.0 } else { 38.0 };
             let width = (ui.available_width() - reserved).max(32.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
-            paint_progress(ui, rect, window.used_percent, color, pal);
+            paint_progress(ui, rect, used_percent, color, pal);
             ui.label(
-                egui::RichText::new(format!("{:.0}%", window.used_percent))
+                egui::RichText::new(format!("{used_percent:.0}%"))
                     .monospace()
                     .size(9.5)
                     .color(color),
@@ -1075,6 +1114,7 @@ mod tests {
             kind: LlmCliKind::Claude,
             model: None,
             context: None,
+            usage: Vec::new(),
             project_path: None,
             foreground_pid: None,
             busy: false,

@@ -12914,6 +12914,7 @@ impl ApplicationHandler<PtyWake> for App {
                                 kind,
                                 model: metrics.model,
                                 context: metrics.context,
+                                usage: metrics.usage,
                                 project_path: active_cwd
                                     .as_ref()
                                     .map(|path| path.display().to_string()),
