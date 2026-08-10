@@ -3,8 +3,8 @@
 这个目录里的 `*.json` 不是 Rust 的测试夹具，是**协议本身的可执行规格**。
 
 - Rust 侧 `crates/lumen-protocol/tests/mobile_golden.rs` 断言「语料 ⇄ `LlmFrame`」一致；
-- Dart 侧 `mobile/test/protocol/golden_test.dart`（**M7 片 1-Dart，尚未落地**）**将**读同一批文件
-  断言「语料 ⇄ Dart 模型」一致。在它落地之前，只有 Rust 半边有保证。
+- Dart 侧 `mobile/test/protocol/golden_test.dart`（**已落地**，M7 片 1-Dart）读同一批文件
+  断言「语料 ⇄ Dart 模型」一致。
 
 两条**合起来**把**线格式的形状**钉死。只做一边等于没做：改 Rust 变体名会让 Rust 侧红，
 但 Dart 少实现一个变体只有 Dart 侧红得出来。
