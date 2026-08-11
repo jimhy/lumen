@@ -47,6 +47,24 @@ pub struct HudView {
 pub struct HudState {
     session_id: Option<u64>,
     open: bool,
+    /// 用户**显式**点过关闭的会话。
+    ///
+    /// # 为什么必须单独记一份，而不是只靠 [`Self::open`]
+    /// [`HudState::sync_session`] 在 `session_id` 变化时会把 `open` 重置成默认值，
+    /// 而「切换视图」正好会让它变两次：焦点挪到别的窗格 ⇒ `view` 变成 `None` ⇒
+    /// `session_id` 变 `None`；切回来 ⇒ 又变回 `Some(id)`。老实现在这一步无条件
+    /// `open = next.is_some()`，于是**用户关掉的 HUD 每切一次视图就自己弹回来一次**
+    /// （海风哥 2026-08-11 报）。
+    ///
+    /// 关闭是用户的显式意图，它必须活得比「焦点在哪个窗格」更久；而「新会话第一次
+    /// 显示 HUD」也仍然是产品意图——两者的分界正是这份集合：**只有被显式关过的会话
+    /// 才默认收起**。
+    ///
+    /// # 不做清理的取舍
+    /// 会话 id 单调递增且**不复用**（`session::SessionId` 的不变量），所以残留条目
+    /// 不会误伤任何新会话，只是白占内存——一条 8 字节，反复开关上万次也才几十 KB。
+    /// 为它引一套「会话已消失」的通知反而要在 `main.rs` 与这里之间多一条耦合。
+    dismissed: std::collections::HashSet<u64>,
     details: Option<HudDetails>,
     details_rx: Option<mpsc::Receiver<HudDetails>>,
     last_refresh: Option<Instant>,
@@ -59,6 +77,7 @@ impl Default for HudState {
         Self {
             session_id: None,
             open: false,
+            dismissed: std::collections::HashSet::new(),
             details: None,
             details_rx: None,
             last_refresh: None,
@@ -78,7 +97,9 @@ impl HudState {
         let next = view.map(|view| view.session_id);
         if next != self.session_id {
             self.session_id = next;
-            self.open = next.is_some();
+            // 默认展开，但**用户关过的会话保持收起**——切换视图会让 session_id 变两次
+            // （挪走变 None、切回变 Some），不查这一份记忆就会每切一次弹一次。
+            self.open = next.is_some_and(|id| !self.dismissed.contains(&id));
             self.details = None;
             self.details_rx = None;
             self.last_refresh = None;
@@ -279,6 +300,8 @@ fn collapsed_button(
         .clicked()
     {
         state.open = true;
+        // 重新点开 = 撤销上次的关闭意图，之后切换视图要跟着保持展开。
+        state.dismissed.remove(&view.session_id);
         state.last_refresh = None;
     }
 }
@@ -345,6 +368,8 @@ fn header(
     }
     if close.clicked() {
         state.open = false;
+        // 记住这次关闭：否则切走窗格再切回来，sync_session 会把它当成「新会话」重新展开。
+        state.dismissed.insert(view.session_id);
     }
     ui.add_space(3.0);
     ui.horizontal_wrapped(|ui| {
@@ -1107,9 +1132,9 @@ fn truncate_tail(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_llm_session_reopens_hud_and_clears_details() {
-        let view = |session_id| HudView {
+    /// 一份最小的 HUD 即时数据（只有 `session_id` 参与本组测试的判定）。
+    fn view(session_id: u64) -> HudView {
+        HudView {
             session_id,
             kind: LlmCliKind::Claude,
             model: None,
@@ -1120,7 +1145,24 @@ mod tests {
             busy: false,
             session_elapsed: Duration::ZERO,
             bottom_inset: 0.0,
-        };
+        }
+    }
+
+    /// 用户点关闭按钮（等价于 [`header`] 里那两行）。
+    fn user_closes(state: &mut HudState, session_id: u64) {
+        state.open = false;
+        state.dismissed.insert(session_id);
+    }
+
+    /// 用户点折叠按钮重新打开（等价于 [`collapsed_button`] 里那三行）。
+    fn user_reopens(state: &mut HudState, session_id: u64) {
+        state.open = true;
+        state.dismissed.remove(&session_id);
+        state.last_refresh = None;
+    }
+
+    #[test]
+    fn new_llm_session_reopens_hud_and_clears_details() {
         let mut state = HudState::default();
         let first = view(1);
         state.sync_session(Some(&first));
@@ -1134,6 +1176,68 @@ mod tests {
         assert!(state.details.is_none());
         state.sync_session(None);
         assert!(!state.open);
+    }
+
+    /// **回归**（海风哥 2026-08-11 报）：关掉 HUD 之后，切换视图它又自己弹回来。
+    ///
+    /// 根因是 `sync_session` 在 `session_id` 变化时无条件 `open = next.is_some()`，
+    /// 而「切走再切回」恰好让它变**两次**：`Some(1)` → `None`（焦点窗格没跑 LLM）
+    /// → `Some(1)`。老测试只走了 `1→1` / `1→2` / `2→None` 三条路，正好绕开了它。
+    #[test]
+    fn 关闭后切换视图不再自己弹回来() {
+        let mut state = HudState::default();
+        let first = view(1);
+        state.sync_session(Some(&first));
+        assert!(state.open, "首次遇到会话应当展开");
+
+        user_closes(&mut state, 1);
+
+        // 切到别的窗格（那里没跑 LLM），再切回来。
+        state.sync_session(None);
+        assert!(!state.open);
+        state.sync_session(Some(&first));
+        assert!(!state.open, "切回同一个会话不该把用户关掉的 HUD 重新展开");
+
+        // 新会话仍然默认展开——那是产品意图，不是这次要修的东西。
+        let second = view(2);
+        state.sync_session(Some(&second));
+        assert!(state.open);
+
+        // 在两个会话之间来回切，被关掉的那个始终保持收起。
+        state.sync_session(Some(&first));
+        assert!(!state.open);
+        state.sync_session(Some(&second));
+        assert!(state.open);
+    }
+
+    /// 重新点开要**撤销**关闭意图，否则用户只能关不能开。
+    #[test]
+    fn 重新点开之后切换视图保持展开() {
+        let mut state = HudState::default();
+        let first = view(1);
+        state.sync_session(Some(&first));
+        user_closes(&mut state, 1);
+        user_reopens(&mut state, 1);
+
+        state.sync_session(None);
+        state.sync_session(Some(&first));
+        assert!(state.open, "撤销关闭之后，切换视图要跟着保持展开");
+    }
+
+    /// 关闭状态下**不采集**：后台采集线程与 2 秒轮询都挂在 `open` 上。
+    ///
+    /// 这条不是装饰——收起时仍然每 2 秒起一次线程去读 transcript / 跑 git，
+    /// 是用户看不见的持续开销，而他刚刚明确表示不想要这个面板。
+    #[test]
+    fn 收起时不再起后台采集() {
+        let mut state = HudState::default();
+        let first = view(1);
+        state.sync_session(Some(&first));
+        user_closes(&mut state, 1);
+
+        let ctx = egui::Context::default();
+        state.poll_details(&ctx, &first);
+        assert!(state.details_rx.is_none(), "收起状态不该起采集线程");
     }
 
     #[test]
