@@ -36,6 +36,7 @@ import 'dart:async';
 import 'package:lumen_mobile/core/log.dart';
 import 'package:lumen_mobile/net/scheduler.dart';
 import 'package:lumen_mobile/net/ws_client.dart';
+import 'package:lumen_mobile/protocol/pairing_qr.dart';
 import 'package:lumen_mobile/protocol/remote_c2s.dart';
 import 'package:lumen_mobile/protocol/remote_s2c.dart';
 
@@ -180,6 +181,7 @@ enum LinkFailure {
 final class LinkController {
   LinkController({
     required WsClient ws,
+    required this.origin,
     Scheduler scheduler = const RealScheduler(),
     this.openTimeout = kOpenHiddenTimeout,
   })  : _ws = ws,
@@ -191,6 +193,9 @@ final class LinkController {
   final WsClient _ws;
   final TimerSlot _openSlot;
   final Duration openTimeout;
+
+  /// 本机登录的规范化 origin。扫码时用它做第一重身份校验（ForeignServer）。
+  final String origin;
 
   late final StreamSubscription<RemoteS2C> _inboundSub;
   late final StreamSubscription<WsStatus> _statusSub;
@@ -242,6 +247,48 @@ final class LinkController {
       return false;
     }
     return _ws.send(C2SSubmitPairing(target: s.target, code: code));
+  }
+
+  /// 提交一个**扫到的二维码**。返回 null = 校验通过且已提交；非 null = 拒绝原因。
+  ///
+  /// ## 五重闸门，这里是后四重
+  ///
+  /// **第一重是状态闸，就在下面那个 `is! LinkPairing`**：相机页只在配对态存在，
+  /// 一张钓鱼码在别的时刻根本无处可用。剩下四重是载荷校验（服务器 / 账户 / 目标 / 格式），
+  /// 逐条对应一句**不同**的 UI 文案——合并成「二维码无效」，用户就永远分不清自己是
+  /// 扫错了设备、扫了别人的码，还是遇到了钓鱼。
+  ///
+  /// 即使这五重全被绕过，服务端仍要求提交者是当初发起配对的那台设备
+  /// （`hub.rs` 的 `p_owner` 校验），那才是配对强度的真正所在。
+  PairingQrError? submitScannedQr(
+    String text, {
+    required String userFingerprint,
+  }) {
+    final LinkState s = _state;
+    if (s is! LinkPairing) {
+      logWarn(_tag, '不在配对态却收到扫码结果，已丢弃');
+      return PairingQrError.malformed;
+    }
+    final PairingQrPayload payload;
+    try {
+      payload = PairingQrPayload.parse(text);
+    } on Object catch (e) {
+      // 随手扫到的任意二维码都会走到这里，属于常态，不是错误。
+      logDebug(_tag, '扫到的不是 Lumen 配对码：$e');
+      return PairingQrError.malformed;
+    }
+    final PairingQrError? verdict = payload.validate(
+      expectedOrigin: origin,
+      expectedUserFingerprint: userFingerprint,
+      expectedTarget: s.target,
+    );
+    if (verdict != null) {
+      // 拒绝要留痕：ForeignServer 尤其——那是钓鱼信号，不是用户操作失误。
+      logWarn(_tag, '扫码被拒：${verdict.code}');
+      return verdict;
+    }
+    _ws.send(C2SSubmitPairing(target: s.target, code: payload.code));
+    return null;
   }
 
   /// 主动结束当前会话。

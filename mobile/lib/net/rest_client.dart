@@ -93,6 +93,7 @@ final class RestClient {
         expiresAt: value.expiresAt,
         deviceId: value.deviceId,
         origin: endpoint.origin,
+        userId: value.user.id,
       ));
     }
     return parsed;
@@ -178,6 +179,7 @@ final class RestClient {
           expiresAt: value.expiresAt,
           deviceId: cur.deviceId,
           origin: cur.origin,
+          userId: cur.userId,
         ));
         return true;
       case Err<RefreshResponse, NetError>(:final NetError error):

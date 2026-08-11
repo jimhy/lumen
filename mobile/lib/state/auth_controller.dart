@@ -153,7 +153,9 @@ final class AuthController {
     _emit(AuthLoggedIn(
       // 恢复路径拿不到 UserInfo（服务端只在登录时回传），用邮箱占位——
       // 它只用于展示，真正的身份判据是 token 与 deviceId。
-      user: const UserInfo(id: '', email: '', displayName: ''),
+      // 恢复路径拿不到邮箱与展示名（服务端只在登录时回传 UserInfo），但 **id 必须有**
+      // ——扫码校验要用它算账户指纹。id 存在 SessionTokens 里，见那边的注释。
+      user: UserInfo(id: saved.userId, email: '', displayName: ''),
       deviceId: saved.deviceId,
     ));
   }

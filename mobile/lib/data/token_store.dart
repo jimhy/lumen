@@ -24,6 +24,7 @@ final class SessionTokens {
     required this.expiresAt,
     required this.deviceId,
     required this.origin,
+    required this.userId,
   });
 
   /// Bearer token（JWT）。
@@ -35,6 +36,14 @@ final class SessionTokens {
   /// 服务端分配的本设备 id。**必须持久化**：丢了它下次登录就会长出一台幽灵设备
   /// （`hw_id` 能兜住，但那是第二道防线）。
   final String deviceId;
+
+  /// 账户 id。
+  ///
+  /// 存它是为了**扫码校验**：二维码里的 `u` 是 sha256(user_id) 的前 16 位，
+  /// 手机端要算出同一个值才比得了。服务端只在**登录**时回传 UserInfo，
+  /// 冷启动恢复登录态那条路径拿不到它——不存下来，重启 App 之后扫码就会一律
+  /// 判成 ForeignAccount，而那看起来像「扫码功能坏了」。
+  final String userId;
 
   /// 这份凭据属于哪台服务器（规范化后的 origin）。
   ///

@@ -104,6 +104,7 @@ void main() {
         expiresAt: expiresAt,
         deviceId: 'phone-1',
         origin: endpoint.origin,
+        userId: 'user-1',
       ));
 
   group('登录', () {

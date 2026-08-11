@@ -114,7 +114,10 @@ final Provider<LinkController?> linkControllerProvider =
     Provider<LinkController?>((Ref ref) {
   final WsClient? ws = ref.watch(wsClientProvider);
   if (ws == null) return null;
-  final LinkController controller = LinkController(ws: ws);
+  final ServerEndpoint? endpoint = ref.watch(serverEndpointProvider);
+  if (endpoint == null) return null;
+  final LinkController controller =
+      LinkController(ws: ws, origin: endpoint.origin);
   ref.onDispose(() => controller.dispose());
   return controller;
 });

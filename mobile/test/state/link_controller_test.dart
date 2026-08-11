@@ -13,6 +13,7 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lumen_mobile/net/backoff.dart';
 import 'package:lumen_mobile/net/ws_client.dart';
+import 'package:lumen_mobile/protocol/pairing_qr.dart';
 import 'package:lumen_mobile/protocol/remote_c2s.dart';
 import 'package:lumen_mobile/protocol/remote_s2c.dart';
 import 'package:lumen_mobile/state/link_controller.dart';
@@ -36,7 +37,11 @@ void main() {
       scheduler: clock,
       backoff: Backoff(baseMs: 1000, maxMs: 1000),
     );
-    link = LinkController(ws: ws, scheduler: clock);
+    link = LinkController(
+      ws: ws,
+      origin: 'https://lumen.example.com',
+      scheduler: clock,
+    );
     ws.start();
     await pumpEventQueue();
   });
@@ -323,6 +328,119 @@ void main() {
       link.sessionFrames.listen(frames.add);
       await serverSend(const S2CRelayTo(sessionId: 1, payload: <String, Object?>{}));
       expect(frames, isEmpty);
+    });
+  });
+
+  group('扫码（五重闸门里的后四重）', () {
+    const String myOrigin = 'https://lumen.example.com';
+    const String myFingerprint = 'a3a9e1ed9732cab2';
+
+    /// 造一张二维码的文本。默认全部匹配。
+    String qrText({
+      String magic = kPairingQrMagic,
+      String origin = myOrigin,
+      String fingerprint = myFingerprint,
+      String target = 'pc-1',
+      String code = '012345678',
+    }) =>
+        jsonEncode(PairingQrPayload(
+          magic: magic,
+          origin: origin,
+          userFingerprint: fingerprint,
+          target: target,
+          code: code,
+          expiresAt: 1786342908,
+        ).toJson());
+
+    /// 走到「等输码」为止。
+    Future<void> reachPairing() async {
+      link.open('pc-1');
+      await serverSend(const S2CPairingNeeded(
+        targetDeviceId: 'pc-1',
+        targetName: 'PC',
+        expiresInSecs: 120,
+      ));
+    }
+
+    test('全部匹配 ⇒ 通过并把码提交上去', () async {
+      await reachPairing();
+      expect(
+        link.submitScannedQr(qrText(), userFingerprint: myFingerprint),
+        isNull,
+      );
+      expect(sentVariants(), <String>['OpenHidden', 'SubmitPairing']);
+    });
+
+    test('★ 第一重是状态闸：不在配对态时扫码无处可用', () async {
+      // 相机页只在配对态存在，所以一张钓鱼码在别的时刻根本没有入口。
+      expect(
+        link.submitScannedQr(qrText(), userFingerprint: myFingerprint),
+        PairingQrError.malformed,
+      );
+      expect(sentVariants(), isEmpty);
+    });
+
+    test('★ 别的服务器 ⇒ ForeignServer，且**不提交**', () async {
+      await reachPairing();
+      expect(
+        link.submitScannedQr(
+          qrText(origin: 'https://evil.example.com'),
+          userFingerprint: myFingerprint,
+        ),
+        PairingQrError.foreignServer,
+      );
+      expect(sentVariants(), <String>['OpenHidden'], reason: '拒绝就是不发出去');
+    });
+
+    test('别人的账户 ⇒ ForeignAccount', () async {
+      await reachPairing();
+      expect(
+        link.submitScannedQr(
+          qrText(fingerprint: 'c91724cad3fbbf79'),
+          userFingerprint: myFingerprint,
+        ),
+        PairingQrError.foreignAccount,
+      );
+    });
+
+    test('扫到另一台电脑的码 ⇒ WrongTarget', () async {
+      await reachPairing();
+      expect(
+        link.submitScannedQr(
+          qrText(target: 'pc-OTHER'),
+          userFingerprint: myFingerprint,
+        ),
+        PairingQrError.wrongTarget,
+      );
+    });
+
+    test('魔数不对 / 随手扫到的二维码 ⇒ Malformed', () async {
+      await reachPairing();
+      expect(
+        link.submitScannedQr(
+          qrText(magic: 'something.else'),
+          userFingerprint: myFingerprint,
+        ),
+        PairingQrError.malformed,
+      );
+      expect(
+        link.submitScannedQr('https://www.example.com/一个普通网址',
+            userFingerprint: myFingerprint),
+        PairingQrError.malformed,
+      );
+      expect(sentVariants(), <String>['OpenHidden']);
+    });
+
+    test('码不是 9 位纯数字 ⇒ Malformed（别浪费用户的 5 次尝试）', () async {
+      await reachPairing();
+      expect(
+        link.submitScannedQr(
+          qrText(code: '01234567x'),
+          userFingerprint: myFingerprint,
+        ),
+        PairingQrError.malformed,
+      );
+      expect(sentVariants(), <String>['OpenHidden']);
     });
   });
 

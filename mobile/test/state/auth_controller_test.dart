@@ -67,6 +67,7 @@ void main() {
         expiresAt: 4102444800,
         deviceId: '别的服务器上的-id',
         origin: 'https://other.example.com',
+        userId: 'user-1',
       ));
       final AuthController auth = build();
       await auth.login(email: 'a@b.c', password: 'pw');
@@ -79,6 +80,7 @@ void main() {
         expiresAt: 4102444800,
         deviceId: 'phone-1',
         origin: endpoint.origin,
+        userId: 'user-1',
       ));
       final AuthController auth = build();
       await auth.login(email: 'a@b.c', password: 'pw');
@@ -140,6 +142,7 @@ void main() {
         expiresAt: 4102444800,
         deviceId: 'phone-1',
         origin: 'https://other.example.com',
+        userId: 'user-1',
       ));
       final AuthController auth = build();
       await auth.restore();
@@ -154,6 +157,7 @@ void main() {
         expiresAt: 4102444800,
         deviceId: 'phone-1',
         origin: endpoint.origin,
+        userId: 'user-1',
       ));
       final AuthController auth = build();
       await auth.restore();
@@ -168,6 +172,7 @@ void main() {
         expiresAt: 4102444800,
         deviceId: 'phone-1',
         origin: endpoint.origin,
+        userId: 'user-1',
       ));
       final AuthController auth = build();
       await auth.logout();
