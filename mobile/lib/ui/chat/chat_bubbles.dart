@@ -214,6 +214,93 @@ class GapTile extends StatelessWidget {
   }
 }
 
+/// **乐观发送中的用户消息**（片 10）。
+///
+/// ## 三态各自说什么
+///
+/// | 状态 | 角标 | 为什么这么说 |
+/// |---|---|---|
+/// | [OutboxDelivery.queued] | 「待发送」+ 时钟 | 还没连上，**对方一定没收到**，重连会自动发 |
+/// | [OutboxDelivery.sent] | 一个空心勾 | 已送出，等对方确认。**不是「成功」** |
+/// | [OutboxDelivery.uncertain] | 「送达状态未知」+ 重发 / 删除 | 见下 |
+///
+/// ★ [OutboxDelivery.uncertain] 的文案**必须说出「对方可能已经收到」**。
+/// 写成「发送失败」是错的：那会让用户放心地再发一遍，而实际上对方很可能已经执行过一次
+/// ——「让 PC 跑一遍 Bash」这种事重复执行的代价是真的。
+class PendingTile extends StatelessWidget {
+  const PendingTile({
+    required this.item,
+    this.onResend,
+    this.onDiscard,
+    super.key,
+  });
+
+  final ChatPending item;
+  final void Function(ChatPending item)? onResend;
+  final void Function(ChatPending item)? onDiscard;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Text(item.text),
+        const SizedBox(height: 4),
+        switch (item.state) {
+          OutboxDelivery.queued => _hint(scheme, Icons.schedule, '待发送 · 连上后自动发出'),
+          OutboxDelivery.sent => _hint(scheme, Icons.done, '已送出'),
+          OutboxDelivery.uncertain => _uncertain(context, scheme),
+        },
+      ],
+    );
+  }
+
+  Widget _hint(ColorScheme scheme, IconData icon, String text) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(icon, size: 13, color: scheme.outline),
+          const SizedBox(width: 4),
+          Text(text, style: TextStyle(fontSize: 12, color: scheme.outline)),
+        ],
+      );
+
+  Widget _uncertain(BuildContext context, ColorScheme scheme) => Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(Icons.help_outline, size: 13, color: scheme.error),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  // ★ 不写「发送失败」——见类文档。
+                  '送达状态未知，对方可能已经收到过',
+                  style: TextStyle(fontSize: 12, color: scheme.error),
+                ),
+              ),
+            ],
+          ),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              TextButton(
+                onPressed: onResend == null ? null : () => onResend!(item),
+                child: const Text('再发一次'),
+              ),
+              TextButton(
+                onPressed: onDiscard == null ? null : () => onDiscard!(item),
+                child: const Text('删除'),
+              ),
+            ],
+          ),
+        ],
+      );
+}
+
 /// 本版本不认识的块。
 ///
 /// 画出来而不是跳过：跳过等于让用户读到一段少了东西的回复却毫不知情。

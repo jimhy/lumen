@@ -1441,6 +1441,33 @@ pub enum LlmFrame {
         text: LlmText,
         #[serde(default)]
         attachments: Vec<LlmAttachment>,
+        /// 控制端给本条消息起的**幂等键**（建议 UUIDv4）。被控端按它去重，并随本消息产生的那一轮
+        /// 的 [`Self::TurnStarted`] **原样回带**，控制端据此把本地 outbox 里那条标记为已送达。
+        ///
+        /// # 为什么不能拿 `req_id` 当幂等键
+        /// `req_id` 由**每个控制端各自**从自己的 `RemoteWs::next_req_id()` 分配，而被控端的对话表
+        /// 是**全端共用**的（一台 PC 上可以同时挂着桌面镜像控制端与最多两部手机）。两个控制端的
+        /// `req_id` 空间完全重叠，拿它去重会把**另一个控制端的正常消息**误判成重复丢掉——一个
+        /// 不报错、只会让消息凭空消失的 bug。
+        ///
+        /// # 为什么这条必须存在（不是「优化」）
+        /// 控制端断线重连后无法区分「消息没发出去」与「发出去了但回执没回来」，只能重发。没有
+        /// 幂等键，被控端就会把同一句话第二次喂给 CLI：用户看到自己的话被回答两遍，且**两端都
+        /// 不会报任何错**。
+        ///
+        /// # 三条处置规则（被控端）
+        /// 1. `None`（老控制端不带）⇒ **照常处理**，只是失去去重能力。这条路径必须一直走得通。
+        /// 2. 超过 [`LLM_CLIENT_MSG_ID_MAX_BYTES`] ⇒ **当作没带**（见该常量文档），不报错。
+        /// 3. 命中去重表 ⇒ **丢弃整条 `Send`，不回错误帧**。重发方要的确认是 `TurnStarted` 的回带，
+        ///    补发一条错误帧只会让它把一次成功的送达显示成失败。
+        ///
+        /// # ⚠ 它是本模块唯一**故意不脱敏**的字符串
+        /// 裸 `String`、会原样进 `Debug` 与日志——这正是它的用途（排障时对账「哪条消息去哪了」）。
+        /// 故控制端**不得**把用户内容（消息正文、文件名、路径）塞进来当「顺便捎带的上下文」：
+        /// 那等于自己把内容写进对端的日志文件。这条靠契约，类型上刻意不设防，因为包一层脱敏
+        /// 包装会让它在排障时也读不出来，唯一的用途随之消失。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
     },
     /// 控→被：中断进行中的一轮。
     Interrupt {
@@ -1539,6 +1566,20 @@ pub enum LlmFrame {
         turn: TurnNo,
         user: Vec<LlmBlockEntry>,
         started_ms: i64,
+        /// 触发本轮的那条 [`Self::Send`] 的 `client_msg_id`，**原样回带**。
+        ///
+        /// 这是控制端**唯一**能确知「我那条消息已被接收」的信号：控制端据此把本地 outbox 里那条
+        /// 从「在途」标记为已送达并删除，此后不再重发。
+        ///
+        /// # 为什么不能靠「按文本比对」或「FIFO 出队」代替
+        /// 按文本比对在用户把同一句话发两遍时必然错配；FIFO 出队则默认了「本对话只有我一个控制端
+        /// 在发消息」——而对话表是全端共用的（见 [`Self::Send::client_msg_id`] 的第一段）。
+        /// 两种代替方案都是不报错、只在特定顺序下才错的形态。
+        ///
+        /// `None` 有三种情形，控制端**都不得据此判失败**：本轮由别的控制端发起、由 PC 本地发起、
+        /// 或对方是不带本字段的老被控端（此时 outbox 只能靠用户手动重试，见移动端 `outbox` 文档）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
     },
     /// 被→控：一轮结束，带停止原因、成败判定与用量 / 花费。
     ///
@@ -1816,6 +1857,27 @@ pub const LLM_HELLO_TIMEOUT_SECS: u64 = 5;
 /// 权限审批未回复的自动拒绝超时秒数。
 pub const LLM_PERMISSION_TIMEOUT_SECS: u32 = 120;
 
+/// [`LlmFrame::Send::client_msg_id`] 的字节上限（超长即视同**没带**，见该字段文档）。
+///
+/// 它是**对端可控的字符串**，会被被控端存进每对话的去重表并随 [`LlmFrame::TurnStarted`] 回带，
+/// 不封顶就是一条「控制端可以让被控端替它保存任意长文本」的路径——白名单转发铁律的同款漏洞，
+/// 只不过这次是反方向。128 字节对 UUIDv4（36 字符）绰绰有余，也容得下别的客户端用别的 id 方案。
+///
+/// **接收侧的处置是「忽略」不是「报错」**：与 [`LLM_ENUM_WIRE_MAX_BYTES`] 那条相反——枚举值超长
+/// 时留着原文比整帧丢弃好，而这里超长的 id 留着毫无用处（本端只拿它做等值比较），丢掉它退化成
+/// 「老控制端没带 id」这条**本来就必须走通**的路径，代价可控。
+pub const LLM_CLIENT_MSG_ID_MAX_BYTES: usize = 128;
+
+/// 每个对话记住多少个最近的 [`LlmFrame::Send::client_msg_id`] 用于幂等去重。
+///
+/// 控制端断线重连后会把 outbox 里未确认的消息**原样重发**（带同一个 `client_msg_id`），被控端
+/// 靠这张表把重复的那条丢掉——否则用户会看到自己的一句话被模型回答两遍，而两端都没有任何报错。
+///
+/// **为什么 32 就够**：需要去重的窗口是「控制端发出 → 收到 [`LlmFrame::TurnStarted`] 回带确认」
+/// 这一小段，正常只有个位数条消息在途。表满即淘汰最老的一条，代价是**极老的重发会漏过去**
+/// （用户离线一整天、期间发了 33 条消息才重连）——那种情况下重复一条远好过无界增长的表。
+pub const LLM_CLIENT_MSG_DEDUP_MAX: usize = 32;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2011,6 +2073,11 @@ mod tests {
                 mime: "image/png".into(),
                 len: 9,
             }],
+            // ★ 幂等键**刻意是裸 `String`、刻意会原样进 `Debug`**：它是机器生成的 UUID，
+            // 本来就该能写进日志用来对账「哪条消息去哪了」。反过来说，控制端往这里塞用户内容
+            // 就等于自己把内容写进对端日志——契约写在字段文档里，类型上不设防（包一层脱敏类型
+            // 会让它在排障时也读不出来，那正好毁掉它唯一的用途）。
+            client_msg_id: Some("018f1d2c-0000-7000-8000-abcdefabcdef".into()),
         });
         assert_eq!(
             RemoteFrame::from_value(&send.to_value().expect("to_value")).expect("from_value"),
@@ -2019,6 +2086,13 @@ mod tests {
         let dbg = format!("{send:?}");
         assert!(!dbg.contains("hunter2"), "正文/附件名泄漏进 Debug: {dbg}");
         assert!(!dbg.contains("secret"), "路径泄漏进 Debug: {dbg}");
+        // ★ 反向断言：`client_msg_id` **必须**可见。这条守的是「日后有人顺手把它包进
+        // `LlmText` 去『统一脱敏』」——那样做不会有任何测试变红（本文件其余断言全是
+        // 「不许出现」），而排障时对账消息去向的唯一手段会就此消失。
+        assert!(
+            dbg.contains("018f1d2c"),
+            "client_msg_id 被脱敏了，它是刻意可见的机器生成 id：{dbg}"
+        );
 
         // ② PermissionRequest.input（初稿漏洞之一）。
         let perm = 装帧(LlmFrame::PermissionRequest {
@@ -2306,6 +2380,7 @@ mod tests {
                     mime: "image/png".into(),
                     len: 7,
                 }],
+                client_msg_id: Some("018f1d2c-0000-7000-8000-abcdefabcdef".into()),
             },
             LlmFrame::Interrupt {
                 conv_id: 11,
@@ -2382,6 +2457,7 @@ mod tests {
                 turn: 5,
                 user: vec![entry],
                 started_ms: 10,
+                client_msg_id: Some("018f1d2c-0000-7000-8000-abcdefabcdef".into()),
             },
             LlmFrame::TurnEnded {
                 conv_id: 11,

@@ -41,17 +41,34 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:lumen_mobile/core/log.dart';
+import 'package:lumen_mobile/data/chat_store.dart';
 import 'package:lumen_mobile/domain/chat_item.dart';
 import 'package:lumen_mobile/net/scheduler.dart';
 import 'package:lumen_mobile/protocol/llm_frame.dart';
 import 'package:lumen_mobile/protocol/codec.dart';
 import 'package:lumen_mobile/protocol/llm_enums.dart';
 import 'package:lumen_mobile/protocol/llm_model.dart';
+import 'package:lumen_mobile/state/outbox.dart';
 import 'package:lumen_mobile/state/streaming_tail.dart';
 
 const String _tag = 'conv';
+
+/// 水位线的落库节流窗口（片 10）。
+///
+/// ## ★ 水位线**宁可偏低，不可偏高**
+///
+/// 流式期间 `lastSeq` 每 33 ms 就变一次，每次都写库等于给手机加一个 30 Hz 的磁盘写。
+/// 所以按秒节流——代价是崩溃时最多丢 1 秒的水位线推进。
+///
+/// 这个代价之所以可接受，是因为**方向是安全的**：水位线偏低 ⇒ 重连时 `Attach{known_seq}`
+/// 会多补一段已经有的内容，而归约器的幂等规则（`seq <= lastSeq` 丢）正好把它吸收掉。
+/// 反过来「偏高」才是灾难：那一段内容永远补不回来，两端都没有任何迹象。
+///
+/// ⇒ 所以只在**内容真的落库之后**才推水位线，绝不能反过来。
+const Duration kWatermarkFlushWindow = Duration(seconds: 1);
 
 /// 把一帧发给被控端。返回 false = 没连上、这帧被丢弃。
 typedef LlmFrameSender = bool Function(LlmFrame frame);
@@ -70,6 +87,7 @@ const int kNoSeqYet = -1;
 final class ConversationSnapshot {
   const ConversationSnapshot({
     this.items = const <ChatItem>[],
+    this.pending = const <ChatPending>[],
     this.lastSeq = kNoSeqYet,
     this.meta,
     this.thinking = false,
@@ -80,6 +98,17 @@ final class ConversationSnapshot {
 
   /// 定稿条目，按 `(turn, blockId)` 升序。
   final List<ChatItem> items;
+
+  /// 乐观发送中、还没被确认的用户消息（片 10）。
+  ///
+  /// **与 [items] 分开存**：它们的生命周期完全不同（被确认后消失，由 `TurnStarted.user`
+  /// 里的真实块顶上），而且它们**不落 events 表**——outbox 表才是它们的家。
+  /// 混进 `items` 会让「归约器只处理协议帧」这条边界破掉，测试也就没法单独断言归约结果。
+  final List<ChatPending> pending;
+
+  /// 渲染用的完整列表：定稿在前，乐观气泡在后（[kPendingTurn] 保证它们排在最后）。
+  List<ChatItem> get visibleItems =>
+      pending.isEmpty ? items : <ChatItem>[...items, ...pending];
 
   /// 已消费到的增量水位线。[kNoSeqYet] = 一帧都还没收到。
   final int lastSeq;
@@ -111,6 +140,7 @@ final class ConversationSnapshot {
 
   ConversationSnapshot copyWith({
     List<ChatItem>? items,
+    List<ChatPending>? pending,
     int? lastSeq,
     LlmConvMeta? meta,
     bool? thinking,
@@ -120,6 +150,7 @@ final class ConversationSnapshot {
   }) =>
       ConversationSnapshot(
         items: items ?? this.items,
+        pending: pending ?? this.pending,
         lastSeq: lastSeq ?? this.lastSeq,
         meta: meta ?? this.meta,
         thinking: thinking ?? this.thinking,
@@ -129,8 +160,8 @@ final class ConversationSnapshot {
       );
 
   @override
-  String toString() =>
-      'ConversationSnapshot(${items.length} 条, seq=$lastSeq, thinking=$thinking)';
+  String toString() => 'ConversationSnapshot(${items.length} 条 + '
+      '${pending.length} 在途, seq=$lastSeq, thinking=$thinking)';
 }
 
 /// 一条对话的归约器。
@@ -139,13 +170,31 @@ final class ConversationController {
     required this.convId,
     required LlmFrameSender send,
     Scheduler scheduler = const RealScheduler(),
+    ChatStore? store,
+    Outbox? outbox,
   })  : _send = send,
+        _store = store,
+        _outbox = outbox,
+        _watermark = TimerSlot(scheduler),
         tail = StreamingTail(scheduler: scheduler);
 
   /// 本控制器负责的对话。
   final int convId;
 
   final LlmFrameSender _send;
+
+  /// 本地存档。**null = 不落库**——归约逻辑的单测大多不需要库，
+  /// 而真机上 `openDatabase` 失败时也要能退化成「这次不落库，对话照常」。
+  final ChatStore? _store;
+
+  /// 发件箱。null = 本对话只读（还没接输入框时就是这样）。
+  final Outbox? _outbox;
+
+  /// 水位线的节流写盘槽，见 [kWatermarkFlushWindow]。
+  final TimerSlot _watermark;
+
+  /// 有没有还没写下去的水位线 / meta 变化。
+  bool _convDirty = false;
 
   /// 流式末块。**高频变化，与 [snapshots] 分开订阅**，否则每次增量都会重建整表。
   final StreamingTail tail;
@@ -167,6 +216,18 @@ final class ConversationController {
   Stream<ConversationSnapshot> get snapshots => _snapshots.stream;
 
   ConversationSnapshot get state => _state;
+
+  /// 当前对话代次。发件箱装 `Send` 时要用——**它只有这一个权威副本**。
+  int get generation => _generation;
+
+  /// 下一个请求号。
+  ///
+  /// 与桌面端的 `RemoteWs::next_req_id()` 同一个角色：**每个控制端各自**的空间，
+  /// 只用来把错误回执关联回请求。**绝不能拿它当幂等键**——被控端的对话表是全端共用的，
+  /// 两个控制端的 `req_id` 完全重叠（这正是 `clientMsgId` 存在的理由）。
+  int nextReqId() => ++_reqSeq;
+
+  int _reqSeq = 0;
 
   /// 喂一帧进来。**这是唯一入口。**
   void applyFrame(LlmFrame frame) {
@@ -213,7 +274,104 @@ final class ConversationController {
     }
   }
 
+  /// 发一条用户消息（片 10）。没有发件箱时返回 null（本对话只读）。
+  ///
+  /// 气泡**立刻**出现（乐观），送达状态由 [ChatPending.state] 画出来。
+  Future<String?> submit(String text, {required int nowMs}) async {
+    final Outbox? outbox = _outbox;
+    if (outbox == null) {
+      logWarn(_tag, '本对话没有发件箱，消息未发出');
+      return null;
+    }
+    final String id = await outbox.submit(text, nowMs: nowMs);
+    _emitPending();
+    return id;
+  }
+
+  /// 挂载到被控端并请求补齐离线期间的增量（片 10）。
+  ///
+  /// **必须在 [restore] 之后调用**：`knownSeq` 用的是恢复出来的水位线，
+  /// 早一步调就会从 0 开始补——被控端要么整段重发（浪费），要么已经淘汰了那段
+  /// transcript 而回一个 `resync_required`（用户看到历史被整个重建）。
+  bool attach() => _send(LlmAttach(
+        convId: convId,
+        knownGeneration: _generation,
+        knownSeq: _wireSeq(_state.lastSeq),
+      ));
+
+  /// 会话（重新）建立后：把还没确认的消息再送一遍。
+  ///
+  /// 重发带的是**原来的** `clientMsgId`，被控端按它去重（协议 `Send.client_msg_id`）。
+  Future<void> flushOutbox() async {
+    final Outbox? outbox = _outbox;
+    if (outbox == null) return;
+    await outbox.flush();
+    _emitPending();
+  }
+
+  /// 用户手动重发一条「送达状态未知」的消息。**用新 id**，见 [Outbox.resendByUser]。
+  Future<void> resendByUser(String clientMsgId, {required int nowMs}) async {
+    await _outbox?.resendByUser(clientMsgId, nowMs: nowMs);
+    _emitPending();
+  }
+
+  /// 用户放弃一条消息。
+  Future<void> discardPending(String clientMsgId) async {
+    await _outbox?.discard(clientMsgId);
+    _emitPending();
+  }
+
+  /// 从本地存档恢复：历史条目 + 水位线 + 未确认的消息。
+  ///
+  /// **必须在开始喂帧之前调用**（`ConversationSession` 保证这个顺序）。它自带一道保护：
+  /// 已经收到过基线帧就整个跳过——在线数据永远是权威，恢复出来的历史不许覆盖它。
+  Future<void> restore() async {
+    final ChatStore? store = _store;
+    if (store == null) return;
+    if (_state.meta != null) {
+      logWarn(_tag, '已经有在线数据了，跳过本地恢复');
+      return;
+    }
+    try {
+      final StoredConv? conv = await store.loadConv(convId);
+      await _outbox?.restore();
+      if (conv == null) {
+        _emitPending();
+        return;
+      }
+      final List<StoredItem> rows = await store.loadItems(convId);
+      final List<ChatItem> items = <ChatItem>[];
+      for (final StoredItem row in rows) {
+        final ChatItem? item = _itemFromStored(row);
+        // 解不出来的那一条**跳过**、其余照常——一行坏数据不该顶掉整段历史。
+        if (item != null) items.add(item);
+      }
+      _generation = conv.generation;
+      _emit(ConversationSnapshot(
+        items: items,
+        pending: _outbox?.pendingItems() ?? const <ChatPending>[],
+        lastSeq: conv.lastSeq,
+        meta: conv.decodeMeta(),
+        rateLimit: _state.rateLimit,
+      ));
+      logInfo(_tag, '从本地恢复了 ${items.length} 条历史（水位 ${conv.lastSeq}）');
+    } on Object catch (e) {
+      // 存档读不出来 ⇒ 当作没有历史继续跑。**不能让它把对话页整个挡住。**
+      logWarn(_tag, '本地存档恢复失败，按空历史继续', error: e);
+    }
+  }
+
+  /// 把攒着的水位线立刻写下去（进后台 / 断开 / 退出前调用）。
+  Future<void> flushPersistence() async {
+    _watermark.cancel();
+    await _writeConv();
+  }
+
   Future<void> dispose() async {
+    _watermark.cancel();
+    // dispose 是最后一次落库的机会：节流窗口里还攒着的水位线丢了，
+    // 下次重连就要多补一段（安全但浪费）。
+    await _writeConv();
     tail.dispose();
     await _snapshots.close();
   }
@@ -240,12 +398,7 @@ final class ConversationController {
     if (strict && seq > _state.lastSeq + 1) {
       // 不变量 2：**先补齐再说**，不能先应用。
       logWarn(_tag, '增量出现空洞（收到 $seq，本地 ${_state.lastSeq}），请求补齐');
-      _send(LlmAttach(
-        convId: convId,
-        knownGeneration: _generation,
-        // 协议里 knownSeq 的 0 是「尚未同步」哨兵，负数不是合法线格式。
-        knownSeq: _state.lastSeq < 0 ? 0 : _state.lastSeq,
-      ));
+      attach();
       return false;
     }
     return true;
@@ -273,12 +426,17 @@ final class ConversationController {
           _onBlockEnd(frame.turn, blockId, block);
         case LlmDeltaDropped(:final int blockId, :final int bytes):
           // 让降级可见：画成「内容有缺口，点击补齐」。
-          _upsert(ChatGap(
-            turn: frame.turn,
-            blockId: blockId,
-            role: ChatRole.assistant,
-            bytes: bytes,
-          ));
+          // 缺口**也要落库**：不落的话重开 App 后读到的是一段「看起来完整、其实少了
+          // 中间几句」的回复，且再无任何迹象（§14-6 无声降级禁令）。
+          _upsert(
+            ChatGap(
+              turn: frame.turn,
+              blockId: blockId,
+              role: ChatRole.assistant,
+              bytes: bytes,
+            ),
+            payload: encodeGapPayload(bytes),
+          );
         case LlmDeltaUnknown():
           break; // 前向兼容：同帧其余项照常。
       }
@@ -294,7 +452,8 @@ final class ConversationController {
     }
     // 文本块的正文靠 TextAppend 流进来，这里先不落条目（落了会与末块重复画一份）。
     if (entry.block is LlmBlockText) return;
-    _upsert(_itemOf(turn, entry, ChatRole.assistant));
+    _upsert(_itemOf(turn, entry, ChatRole.assistant),
+        payload: encodeItemPayload(entry));
   }
 
   void _onBlockEnd(int turn, int blockId, LlmBlock? block) {
@@ -306,36 +465,57 @@ final class ConversationController {
     final String tailText = tail.blockId == blockId ? tail.takeAndClear() : '';
     if (block != null) {
       // 被控端声明本块降级过，带来了终态：**用它覆盖**本地拼接结果。
-      _upsert(_itemOf(turn, LlmBlockEntry(blockId: blockId, block: block),
-          ChatRole.assistant));
+      final LlmBlockEntry entry = LlmBlockEntry(blockId: blockId, block: block);
+      _upsert(_itemOf(turn, entry, ChatRole.assistant),
+          payload: encodeItemPayload(entry));
       return;
     }
     if (tailText.isEmpty) return; // 非文本块的 BlockEnd，条目在 BlockStart 时已落。
-    _upsert(ChatText(
-      turn: turn,
+    _commitText(turn, blockId, tailText);
+  }
+
+  /// 把流式拼接出来的文本定稿成条目并落库。
+  ///
+  /// 落库时**合成**一个协议块（`LlmBlock::Text`）而不是给 `ChatText` 写一套自己的序列化：
+  /// 存的是协议原文，重建走的是 `_itemOf` —— 两条已经被 golden 语料与现有测试守着的通路，
+  /// 不新增第三条映射。
+  void _commitText(int turn, int blockId, String markdown) {
+    final LlmBlockEntry entry = LlmBlockEntry(
       blockId: blockId,
-      role: ChatRole.assistant,
-      markdown: tailText,
-    ));
+      block: LlmBlockText(LlmText(markdown)),
+    );
+    _upsert(
+      ChatText(
+        turn: turn,
+        blockId: blockId,
+        role: ChatRole.assistant,
+        markdown: markdown,
+      ),
+      payload: encodeItemPayload(entry),
+    );
   }
 
   void _applyTurnStarted(LlmTurnStarted frame) {
     for (final LlmBlockEntry entry in frame.user) {
-      _upsert(_itemOf(frame.turn, entry, ChatRole.user));
+      _upsert(_itemOf(frame.turn, entry, ChatRole.user),
+          payload: encodeItemPayload(entry));
     }
     _emit(_state.copyWith(lastSeq: frame.seq, turnRunning: true, thinking: false));
+    // ★ 销账：这一轮是我发的那条消息触发的 ⇒ 乐观气泡功成身退，
+    // `frame.user` 里的真实块顶上来（上面那个循环刚落的就是它）。
+    final String? acked = frame.clientMsgId;
+    if (acked != null) {
+      _fireAndForget(() async {
+        if (await _outbox?.ack(acked) ?? false) _emitPending();
+      });
+    }
   }
 
   void _applyTurnEnded(LlmTurnEnded frame) {
     // 末块可能还没等到 BlockEnd 就轮结束了（被控端崩了/被中断），先定稿再收尾。
     final String leftover = tail.takeAndClear();
     if (leftover.isNotEmpty) {
-      _upsert(ChatText(
-        turn: _tailTurn,
-        blockId: tail.blockId ?? 0,
-        role: ChatRole.assistant,
-        markdown: leftover,
-      ));
+      _commitText(_tailTurn, tail.blockId ?? 0, leftover);
     }
     final LlmConvMeta? meta = _state.meta;
     _emit(_state.copyWith(
@@ -346,6 +526,9 @@ final class ConversationController {
       // 轮末的 usage 是**真值**（分母来自上游的 contextWindow，不是我们猜的）。
       meta: meta == null ? null : _withUsage(meta, frame.usage),
     ));
+    // 轮末是个天然的落盘点：这一轮的内容全定稿了，且此后可能长时间没有帧
+    // （节流窗口靠新事件驱动，闲下来就永远不到期）。
+    _fireAndForget(flushPersistence);
     if (frame.truncated) {
       // 本轮曾因积压丢过增量 ⇒ 拉整轮快照覆盖重建。
       logWarn(_tag, '第 ${frame.turn} 轮被截断过，请求整轮快照');
@@ -363,16 +546,28 @@ final class ConversationController {
     final List<ChatItem> kept = _state.items
         .where((ChatItem i) => i.turn != record.turn)
         .toList(growable: true);
+    final List<StoredItem> rows = <StoredItem>[];
     for (final LlmBlockEntry entry in record.user) {
       kept.add(_itemOf(record.turn, entry, ChatRole.user));
+      rows.add(_rowOf(record.turn, entry, ChatRole.user));
     }
     for (final LlmBlockEntry entry in record.assistant) {
       kept.add(_itemOf(record.turn, entry, ChatRole.assistant));
+      rows.add(_rowOf(record.turn, entry, ChatRole.assistant));
     }
     if (tail.blockId != null && _tailTurn == record.turn) {
       // 快照是权威，末块的半成品作废——留着会与快照里的定稿块重复。
       tail.clear();
     }
+    // ★ 落库也必须是**整轮覆盖**：只 upsert 不删，快照里少掉的那个块会永远留在本地，
+    // 表现为「历史里多出一个别处都没有的气泡」。内存里那个 `where(turn != …)` 的
+    // 对应物就是这条 DELETE。
+    _fireAndForget(() async {
+      final ChatStore? store = _store;
+      if (store == null) return;
+      await store.deleteTurn(convId, record.turn);
+      await store.upsertItems(convId, rows);
+    });
     _emit(_state.copyWith(
       items: sortAfter ? _sorted(kept) : kept,
       blocksOmitted: record.blocksOmitted,
@@ -473,7 +668,10 @@ final class ConversationController {
   }
 
   /// 插入或覆盖同 key 的条目。覆盖时 revision 自增，memo 缓存据此失效。
-  void _upsert(ChatItem item) {
+  ///
+  /// [payload] 是这个条目的落库载荷（见 `data/chat_store.dart`）。**给了才落库**——
+  /// 归约器里有几处 upsert 是纯 UI 状态（不该进 events 表）。
+  void _upsert(ChatItem item, {String? payload}) {
     final List<ChatItem> next = List<ChatItem>.of(_state.items);
     final int at = next.indexWhere((ChatItem i) => i.key == item.key);
     if (at < 0) {
@@ -483,7 +681,88 @@ final class ConversationController {
     } else {
       next[at] = item;
     }
+    if (payload != null) {
+      final StoredItem row = StoredItem(
+        turn: item.turn,
+        blockId: item.blockId,
+        role: item.role,
+        payloadJson: payload,
+      );
+      _fireAndForget(() async => _store?.upsertItems(convId, <StoredItem>[row]));
+    }
     _emit(_state.copyWith(items: next));
+  }
+
+  /// 落库行（快照那条路径要一次攒一整轮，不逐条 upsert）。
+  StoredItem _rowOf(int turn, LlmBlockEntry entry, ChatRole role) => StoredItem(
+        turn: turn,
+        blockId: entry.blockId,
+        role: role,
+        payloadJson: encodeItemPayload(entry),
+      );
+
+  /// 从存档行重建一个条目。**解不出来返回 null**（跳过这一条，别丢整段历史）。
+  ChatItem? _itemFromStored(StoredItem row) {
+    final ItemPayload? payload = decodeItemPayload(row.payloadJson);
+    return switch (payload) {
+      BlockPayload(:final LlmBlockEntry entry) =>
+        _itemOf(row.turn, entry, row.role),
+      GapPayload(:final int bytes) => ChatGap(
+          turn: row.turn,
+          blockId: row.blockId,
+          role: row.role,
+          bytes: bytes,
+        ),
+      null => null,
+    };
+  }
+
+  /// 把当前的乐观气泡推给 UI。
+  void _emitPending() =>
+      _emit(_state.copyWith(pending: _outbox?.pendingItems() ?? const <ChatPending>[]));
+
+  /// 水位线 + meta 的节流落库。见 [kWatermarkFlushWindow]。
+  void _markConvDirty() {
+    if (_store == null) return;
+    _convDirty = true;
+    // 已经在等的那一枪不重置——重置会让「持续不断的流」永远等不到落盘时刻
+    // （每次 delta 都把 deadline 往后推 1 秒 = 一轮跑完之前一次都不写）。
+    if (_watermark.isActive) return;
+    _watermark.set(kWatermarkFlushWindow, () => _fireAndForget(_writeConv));
+  }
+
+  Future<void> _writeConv() async {
+    final ChatStore? store = _store;
+    if (store == null || !_convDirty) return;
+    final LlmConvMeta? meta = _state.meta;
+    // 还没有 meta 就没什么可存的：`conv_id` 之外一个字段都填不出来，
+    // 存一行空壳只会让下次 restore 拿到一个 meta 为 null 的「有效」存档。
+    if (meta == null) return;
+    _convDirty = false;
+    await store.saveConv(StoredConv(
+      convId: convId,
+      generation: _generation,
+      lastSeq: _state.lastSeq,
+      metaJson: jsonEncode(meta.toJson()),
+      updatedMs: meta.updatedMs,
+    ));
+  }
+
+  /// 本地水位线 → 线格式。
+  ///
+  /// 协议里 `knownSeq` 的 0 是「尚未同步」哨兵，**负数不是合法线格式**，
+  /// 而本地的 [kNoSeqYet] 恰恰是 -1（那是片 7 为了区分「真的收到过 seq=0」才引入的）。
+  /// 少了这一步转换，第一次 `Attach` 会发出 `known_seq: -1`。
+  static int _wireSeq(int local) => local < 0 ? 0 : local;
+
+  /// 跑一个不等结果的异步副作用。**异常只记日志**。
+  ///
+  /// 落库失败不该把归约打断：手机上磁盘满 / 权限被回收是真实存在的，
+  /// 那时正确的行为是「这次没存上，对话照常」，而不是对话页整个挂掉。
+  void _fireAndForget(Future<void> Function() work) {
+    unawaited(work().catchError((Object e, StackTrace s) {
+      logWarn(_tag, '本地存档写入失败（对话不受影响）', error: e);
+    }));
   }
 
   List<ChatItem> _sorted(List<ChatItem> items) {
@@ -517,11 +796,24 @@ final class ConversationController {
     _generation = generation;
     _rateLimitObservedMs = -1;
     tail.clear();
+    // ★ 存档也要一起清。代次前进 = 被控端重建了对话（进程重启等），旧条目与新对话
+    // 拼在一起就是两条对话的混合体——而它在**重开 App 之后**才会现形，那时已经没人
+    // 记得中间发生过一次代次前进。
+    _fireAndForget(() async => _store?.clearItems(convId));
     // 额度是**账号级**的，跨代次仍然有效——清它等于把一条刚播报的限流状态抹掉。
-    _state = ConversationSnapshot(rateLimit: _state.rateLimit);
+    // 在途消息同理：它们还没送到，与被控端重建对话无关，**不能跟着一起清**。
+    _state = ConversationSnapshot(
+      rateLimit: _state.rateLimit,
+      pending: _state.pending,
+    );
   }
 
   void _emit(ConversationSnapshot next) {
+    // 水位线或 meta 动了就排一次落库。**放在这里而不是各个 apply 里**：
+    // 少写一处的症状是「某条路径下水位线永远不前进」，而它只在那条路径上才现形。
+    if (next.lastSeq != _state.lastSeq || !identical(next.meta, _state.meta)) {
+      _markConvDirty();
+    }
     _state = next;
     if (!_snapshots.isClosed) _snapshots.add(next);
   }

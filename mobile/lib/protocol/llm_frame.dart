@@ -93,6 +93,7 @@ sealed class LlmFrame {
           reqId: readInt(m, 'req_id'),
           text: LlmText(readString(m, 'text')),
           attachments: readListOr(m, 'attachments', LlmAttachment.fromJson),
+          clientMsgId: readStringOpt(m, 'client_msg_id'),
         ),
     'Interrupt': (JsonMap m) => LlmInterrupt(
           convId: readInt(m, 'conv_id'),
@@ -146,6 +147,7 @@ sealed class LlmFrame {
           turn: readInt(m, 'turn'),
           user: readList(m, 'user', LlmBlockEntry.fromJson),
           startedMs: readInt(m, 'started_ms'),
+          clientMsgId: readStringOpt(m, 'client_msg_id'),
         ),
     'TurnEnded': (JsonMap m) => LlmTurnEnded(
           convId: readInt(m, 'conv_id'),
@@ -523,6 +525,7 @@ final class LlmSend extends LlmFrame {
     required this.reqId,
     required this.text,
     this.attachments = const <LlmAttachment>[],
+    this.clientMsgId,
   });
 
   final int convId;
@@ -531,23 +534,36 @@ final class LlmSend extends LlmFrame {
   final LlmText text;
   final List<LlmAttachment> attachments;
 
+  /// 本条消息的**幂等键**（outbox 行的 id）。被控端按它去重，并随 [LlmTurnStarted] 回带。
+  ///
+  /// ★ **不能拿 [reqId] 代替**：`req_id` 是每个控制端各自分配的，而被控端的对话表全端共用
+  /// （一台 PC 上可能同时挂着桌面镜像控制端与另一部手机），两个空间完全重叠。
+  ///
+  /// ⚠ 它**故意不脱敏**（裸 `String`、原样进 `toString()` 与日志），所以**绝不能**往里塞
+  /// 消息正文之类的用户内容——那等于把内容写进对端的日志文件。
+  final String? clientMsgId;
+
   @override
   String get variantName => 'Send';
 
   @override
-  JsonMap toJson() => <String, Object?>{
-        'op': 'Send',
-        'conv_id': convId,
-        'conv_generation': convGeneration,
-        'req_id': reqId,
-        'text': text.toJson(),
-        'attachments': attachments.map((LlmAttachment a) => a.toJson()).toList(),
-      };
+  JsonMap toJson() {
+    final JsonMap out = <String, Object?>{
+      'op': 'Send',
+      'conv_id': convId,
+      'conv_generation': convGeneration,
+      'req_id': reqId,
+      'text': text.toJson(),
+      'attachments': attachments.map((LlmAttachment a) => a.toJson()).toList(),
+    };
+    writeOpt(out, 'client_msg_id', clientMsgId);
+    return out;
+  }
 
   @override
   String toString() => 'LlmFrame.Send(convId: $convId, '
       'convGeneration: $convGeneration, reqId: $reqId, text: $text, '
-      'attachments: $attachments)';
+      'attachments: $attachments, clientMsgId: $clientMsgId)';
 }
 
 /// 控→被：中断进行中的一轮。
@@ -821,6 +837,7 @@ final class LlmTurnStarted extends LlmFrame {
     required this.turn,
     required this.user,
     required this.startedMs,
+    this.clientMsgId,
   });
 
   final int convId;
@@ -830,24 +847,36 @@ final class LlmTurnStarted extends LlmFrame {
   final List<LlmBlockEntry> user;
   final int startedMs;
 
+  /// 触发本轮的那条 [LlmSend] 的幂等键，被控端原样回带。
+  ///
+  /// 这是本端**唯一**能确知「我那条消息已被接收」的信号 —— outbox 据此销账、停止重发。
+  ///
+  /// **null 不等于失败**：本轮由别的控制端发起、由 PC 本地发起、或对端是不带本字段的老被控端
+  /// 时它都缺席。此时 outbox 只能退回「用户手动重试」，绝不能把它当成「发送失败」自动重发。
+  final String? clientMsgId;
+
   @override
   String get variantName => 'TurnStarted';
 
   @override
-  JsonMap toJson() => <String, Object?>{
-        'op': 'TurnStarted',
-        'conv_id': convId,
-        'conv_generation': convGeneration,
-        'seq': seq,
-        'turn': turn,
-        'user': user.map((LlmBlockEntry e) => e.toJson()).toList(),
-        'started_ms': startedMs,
-      };
+  JsonMap toJson() {
+    final JsonMap out = <String, Object?>{
+      'op': 'TurnStarted',
+      'conv_id': convId,
+      'conv_generation': convGeneration,
+      'seq': seq,
+      'turn': turn,
+      'user': user.map((LlmBlockEntry e) => e.toJson()).toList(),
+      'started_ms': startedMs,
+    };
+    writeOpt(out, 'client_msg_id', clientMsgId);
+    return out;
+  }
 
   @override
   String toString() => 'LlmFrame.TurnStarted(convId: $convId, '
       'convGeneration: $convGeneration, seq: $seq, turn: $turn, user: $user, '
-      'startedMs: $startedMs)';
+      'startedMs: $startedMs, clientMsgId: $clientMsgId)';
 }
 
 /// 被→控：一轮结束。**成败看 [outcome]，不看 [stop]。**

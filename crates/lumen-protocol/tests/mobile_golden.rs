@@ -925,7 +925,7 @@ fn 协议源文件的可增长点数目未变() {
     );
     assert_eq!(
         属性行数(&源, "skip_serializing_if"),
-        33,
+        35,
         "可选字段数目变了。给已有变体加 Option + skip 时**本 harness 不会替你发现**——\
          必须同时改一条已有 frame_* 语料把新字段填上 Some，见 README §5 第 4 步"
     );

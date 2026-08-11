@@ -85,9 +85,10 @@ use lumen_protocol::llm::{
     BlockId, ConvGeneration, ConvId, LlmAgentInfo, LlmAgentKind, LlmBlock, LlmBlockEntry,
     LlmConvMeta, LlmConvState, LlmDeltaItem, LlmErrorCode, LlmExitReason, LlmFrame, LlmPath,
     LlmPermissionMode, LlmRateLimit, LlmText, LlmTurnOutcome, LlmTurnRecord, LlmUsage, TurnNo,
-    LLM_BACKLOG_MAX_BYTES, LLM_DELTA_FLUSH_MS, LLM_DELTA_MAX_BYTES, LLM_DELTA_WINDOW,
-    LLM_HELLO_TIMEOUT_SECS, LLM_HISTORY_MAX_TURNS_PER_PAGE, LLM_HISTORY_PAGE_MAX_BYTES,
-    LLM_MAX_CONVS, LLM_PROTO_VERSION, LLM_TURN_SNAPSHOT_MAX_BYTES,
+    LLM_BACKLOG_MAX_BYTES, LLM_CLIENT_MSG_DEDUP_MAX, LLM_CLIENT_MSG_ID_MAX_BYTES,
+    LLM_DELTA_FLUSH_MS, LLM_DELTA_MAX_BYTES, LLM_DELTA_WINDOW, LLM_HELLO_TIMEOUT_SECS,
+    LLM_HISTORY_MAX_TURNS_PER_PAGE, LLM_HISTORY_PAGE_MAX_BYTES, LLM_MAX_CONVS, LLM_PROTO_VERSION,
+    LLM_TURN_SNAPSHOT_MAX_BYTES,
 };
 use lumen_protocol::remote::Role;
 
@@ -220,6 +221,19 @@ struct PendingItem {
     tseq: u64,
 }
 
+/// [`LlmPlane::on_send`] 的入参打包。
+///
+/// 打成结构体而不是四个平铺参数：`on_send` 加上 `client_msg_id` 后会是 8 个入参（含 `self`
+/// 与 `ctx`），越过《代码大全》「参数 ≤ 7」那条线。四个字段本来就同属「一条待投递的消息」。
+struct SendReq {
+    req_id: u64,
+    text: LlmText,
+    attachments: Vec<lumen_protocol::llm::LlmAttachment>,
+    /// 控制端的幂等键。**未经 [`sane_client_msg_id`] 规范化**（长度未校验），
+    /// 用之前必须先过一遍那个函数。
+    client_msg_id: Option<String>,
+}
+
 /// 被控端持有的一个对话。
 #[derive(Debug)]
 struct Conv {
@@ -282,6 +296,24 @@ struct Conv {
     stale_replies: u32,
     /// 被白名单挡掉的上游行数（**只计数、不记内容**，进本地日志，不上行）。
     dropped_lines: u64,
+    /// 最近见过的 `Send.client_msg_id`，用于**幂等去重**（上限
+    /// [`LLM_CLIENT_MSG_DEDUP_MAX`]，满则淘汰最老的）。
+    ///
+    /// # 为什么这张表是必需的
+    /// 控制端断线后无法区分「消息没发出去」与「发出去了但回执没回来」，只能重发。没有这张表，
+    /// 同一句话会被第二次喂给 CLI —— 用户看到自己的话被回答两遍，**两端都不报错**。
+    ///
+    /// 用 `VecDeque` 而不是 `HashSet` 是因为它同时要做**先进先出的淘汰**；条目数以 32 计，
+    /// 线性查找比维护「集合 + 淘汰队列」两份结构更不容易写错。
+    seen_client_msgs: VecDeque<String>,
+    /// 已 submit、等着被下一个 `TurnStarted` 认领并回带的 `client_msg_id`（FIFO）。
+    ///
+    /// **为什么不是单个 `Option`**：用户可以连发两条，而 CLI 的回显是异步的——第二条的 id 会把
+    /// 第一条挤掉，于是第一条永远等不到确认、控制端每次重连都重发它一遍。
+    ///
+    /// 同样封顶 [`LLM_CLIENT_MSG_DEDUP_MAX`]：CLI 若一直不回显（进程卡死 / 上游异常），
+    /// 这里是另一条会随时间无界增长的路径。
+    pending_client_msgs: VecDeque<String>,
 }
 
 impl Conv {
@@ -294,6 +326,46 @@ impl Conv {
     const fn window_full(&self) -> bool {
         self.inflight >= LLM_DELTA_WINDOW
     }
+
+    /// 记下一个刚被接受的 `client_msg_id`：进去重表，并排队等 `TurnStarted` 回带。
+    fn accept_client_msg(&mut self, id: String) {
+        push_bounded(&mut self.seen_client_msgs, id.clone());
+        push_bounded(&mut self.pending_client_msgs, id);
+    }
+
+    /// 取出下一个待回带的 `client_msg_id`（没有则 `None`，那是 PC 本地发起的轮）。
+    fn take_client_msg(&mut self) -> Option<String> {
+        self.pending_client_msgs.pop_front()
+    }
+}
+
+/// 往有界队列里压一条，满则丢最老的。
+fn push_bounded(q: &mut VecDeque<String>, v: String) {
+    if q.len() >= LLM_CLIENT_MSG_DEDUP_MAX {
+        q.pop_front();
+    }
+    q.push_back(v);
+}
+
+/// 规范化控制端发来的 `client_msg_id`：**超长即视同没带**。
+///
+/// 见 [`LLM_CLIENT_MSG_ID_MAX_BYTES`]：它是对端可控的字符串，本端要把它存进两条队列
+/// 并回带，不封顶就是「控制端可以让被控端替它保存任意长文本」。丢掉它退化成「老控制端
+/// 没带 id」这条**本来就必须走通**的路径，所以处置是忽略、不是报错。
+fn sane_client_msg_id(id: Option<String>) -> Option<String> {
+    let id = id?;
+    if id.len() > LLM_CLIENT_MSG_ID_MAX_BYTES {
+        log::warn!(
+            "client_msg_id 超长（{} 字节 > {LLM_CLIENT_MSG_ID_MAX_BYTES}），按未携带处理",
+            id.len()
+        );
+        return None;
+    }
+    // 空串是「带了但没内容」——拿它做等值比较会让两条不同消息互相认领，比没带更糟。
+    if id.is_empty() {
+        return None;
+    }
+    Some(id)
 }
 
 // ── 泵的上下文 ────────────────────────────────────────────────────────────────
@@ -726,7 +798,18 @@ impl LlmPlane {
                 req_id,
                 text,
                 attachments,
-            } => self.on_send(conv_id, conv_generation, req_id, &text, &attachments, ctx),
+                client_msg_id,
+            } => self.on_send(
+                conv_id,
+                conv_generation,
+                &SendReq {
+                    req_id,
+                    text,
+                    attachments,
+                    client_msg_id,
+                },
+                ctx,
+            ),
             LlmFrame::Interrupt {
                 conv_id,
                 conv_generation,
@@ -950,6 +1033,8 @@ impl LlmPlane {
             turns: VecDeque::new(),
             stale_replies: 0,
             dropped_lines: 0,
+            seen_client_msgs: VecDeque::new(),
+            pending_client_msgs: VecDeque::new(),
         };
         self.convs.insert(conv_id, conv);
         self.by_runner.insert(runner, conv_id);
@@ -997,17 +1082,32 @@ impl LlmPlane {
         &mut self,
         conv_id: ConvId,
         generation: ConvGeneration,
-        req_id: u64,
-        text: &LlmText,
-        attachments: &[lumen_protocol::llm::LlmAttachment],
+        req: &SendReq,
         ctx: &mut PumpCtx<'_>,
     ) {
+        let req_id = req.req_id;
         let Some(conv) = self.checked_mut(conv_id, generation, Some(req_id)) else {
             return;
         };
-        let rejected = attachments_outside_fence(&conv.attach_dir, attachments);
+        // ★ 幂等去重先于一切校验：重复的那一条**不该**再跑一遍附件围栏检查并回一条错误帧
+        // ——控制端会把一次成功的送达显示成失败。
+        let client_msg_id = sane_client_msg_id(req.client_msg_id.clone());
+        if let Some(id) = client_msg_id.as_ref() {
+            if conv.seen_client_msgs.contains(id) {
+                // 正常的重连重发路径，不是异常：控制端无法区分「没发出去」与「发了没回执」。
+                // 用 info 而不是 warn，否则一次弱网重连会在日志里刷成一片红。
+                log::info!("LLM 对话 {conv_id} 丢弃重复的 Send（client_msg_id={id}）");
+                return;
+            }
+        }
+        let rejected = attachments_outside_fence(&conv.attach_dir, &req.attachments);
         if !rejected {
-            submit_message(conv, ctx.runners, text, attachments);
+            // **先记账再 submit**：submit 内部可能失败，但那时消息已经交给 CLI 与否是不确定的，
+            // 而重复执行的代价（回答两遍）比漏掉一次确认的代价（用户手动重试）大得多。
+            if let Some(id) = client_msg_id {
+                conv.accept_client_msg(id);
+            }
+            submit_message(conv, ctx.runners, &req.text, &req.attachments);
             return;
         }
         log::warn!("LLM 对话 {conv_id} 的 Send 含越界附件路径，整条拒绝");
@@ -1639,6 +1739,9 @@ impl LlmPlane {
         conv.meta.state = LlmConvState::Running;
         conv.meta.updated_ms = started_ms;
         let (conv_id_v, generation, seq) = (conv.meta.conv_id, conv.generation, conv.watermark());
+        // 认领这一轮是哪条 `Send` 触发的，原样回带。**取不到就是 None**——这一轮由 PC 本地
+        // 或别的控制端发起，控制端那边不得据此判失败（见协议 `TurnStarted::client_msg_id`）。
+        let client_msg_id = conv.take_client_msg();
         self.emit_stream(
             conv_id,
             LlmFrame::TurnStarted {
@@ -1648,6 +1751,7 @@ impl LlmPlane {
                 turn,
                 user,
                 started_ms,
+                client_msg_id,
             },
         );
     }
@@ -2583,6 +2687,8 @@ mod tests {
                 turns: VecDeque::new(),
                 stale_replies: 0,
                 dropped_lines: 0,
+                seen_client_msgs: VecDeque::new(),
+                pending_client_msgs: VecDeque::new(),
             },
         );
         plane.by_runner.insert(runner, conv_id);
@@ -3970,6 +4076,7 @@ mod tests {
                     mime: "application/octet-stream".to_owned(),
                     len: 1,
                 }],
+                client_msg_id: None,
             },
             now,
         );
@@ -3985,6 +4092,177 @@ mod tests {
             ),
             "越界附件必须整条拒绝并带 req_id，实际 {frames:?}"
         );
+    }
+
+    // ── 片 10：outbox 幂等键 ─────────────────────────────────────────────────
+
+    /// 造一条最小的 `Send`（无附件，走 `submit_message` 那条路）。
+    fn send_with(conv_id: ConvId, req_id: u64, id: Option<&str>) -> LlmFrame {
+        LlmFrame::Send {
+            conv_id,
+            conv_generation: 3,
+            req_id,
+            text: LlmText::new("跑一下测试"),
+            attachments: Vec::new(),
+            client_msg_id: id.map(str::to_owned),
+        }
+    }
+
+    /// CLI 回吐用户消息 ⇒ 开一轮（生产上 `TurnStarted` 就是从这里发出去的）。
+    fn user_echo(turn: u64) -> (RunnerId, u64, RunnerEvent) {
+        (
+            RunnerId(1),
+            1,
+            RunnerEvent::TurnUserEcho {
+                turn,
+                blocks: vec![text_block(0, "跑一下测试")],
+            },
+        )
+    }
+
+    #[test]
+    fn 片10_重复的send被幂等丢弃() {
+        // 控制端断线后无法区分「没发出去」与「发了没回执」，只能重发。没有这道闸，
+        // 用户会看到自己的一句话被模型回答两遍，而**两端都不报错**。
+        let mut plane = LlmPlane::default();
+        let now = Instant::now();
+        seed_conv(&mut plane, 1, 3);
+
+        plane.enqueue(send_with(1, 7, Some("msg-A")), now);
+        // 重发：req_id 变了（控制端每次发都会取新号），client_msg_id 不变。
+        plane.enqueue(send_with(1, 8, Some("msg-A")), now);
+        let frames = pump(&mut plane, Some(Role::Controlled), now);
+
+        assert!(
+            frames.is_empty(),
+            "重复的 Send 必须**静默**丢弃：补一条错误帧会让控制端把一次成功的送达显示成失败，实际 {frames:?}"
+        );
+        let conv = &plane.convs[&1];
+        assert_eq!(
+            conv.pending_client_msgs.len(),
+            1,
+            "同一个 client_msg_id 只该排队等一次回带"
+        );
+        assert_eq!(conv.seen_client_msgs.len(), 1);
+    }
+
+    #[test]
+    fn 片10_turnstarted原样回带触发它的那条send的id() {
+        let mut plane = LlmPlane::default();
+        let now = Instant::now();
+        seed_conv(&mut plane, 1, 3);
+
+        plane.enqueue(send_with(1, 7, Some("msg-A")), now);
+        let _ = pump(&mut plane, Some(Role::Controlled), now);
+        let frames = pump_events(&mut plane, now, &[user_echo(1)]);
+
+        let [LlmFrame::TurnStarted { client_msg_id, .. }] = frames.as_slice() else {
+            panic!("应发出轮头，实际 {frames:?}");
+        };
+        assert_eq!(
+            client_msg_id.as_deref(),
+            Some("msg-A"),
+            "这是控制端唯一能确知「我那条消息已送达」的信号；丢了它 outbox 就永远销不了账"
+        );
+    }
+
+    #[test]
+    fn 片10_连发两条各自回带自己的id而不是后者挤掉前者() {
+        // 用单个 `Option` 存待回带 id 时，第二条会把第一条挤掉 —— 第一条永远等不到确认，
+        // 控制端每次重连都重发它一遍。这个 bug 只在「用户连发两条」时出现。
+        let mut plane = LlmPlane::default();
+        let now = Instant::now();
+        seed_conv(&mut plane, 1, 3);
+
+        plane.enqueue(send_with(1, 7, Some("msg-A")), now);
+        plane.enqueue(send_with(1, 8, Some("msg-B")), now);
+        let _ = pump(&mut plane, Some(Role::Controlled), now);
+
+        let first = pump_events(&mut plane, now, &[user_echo(1)]);
+        let second = pump_events(&mut plane, now, &[user_echo(2)]);
+
+        let 两轮: Vec<LlmFrame> = first.into_iter().chain(second).collect();
+        let ids: Vec<Option<&str>> = 两轮
+            .iter()
+            .filter_map(|f| match f {
+                LlmFrame::TurnStarted { client_msg_id, .. } => Some(client_msg_id.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("msg-A"), Some("msg-B")],
+            "必须 FIFO 一一对应"
+        );
+    }
+
+    #[test]
+    fn 片10_超长与空的id视同没带且不占去重表() {
+        // 它是对端可控的字符串，本端要把它存进两条队列并回带 —— 不封顶就是
+        // 「控制端可以让被控端替它保存任意长文本」。
+        let mut plane = LlmPlane::default();
+        let now = Instant::now();
+        seed_conv(&mut plane, 1, 3);
+
+        let 超长 = "x".repeat(LLM_CLIENT_MSG_ID_MAX_BYTES + 1);
+        plane.enqueue(send_with(1, 7, Some(&超长)), now);
+        plane.enqueue(send_with(1, 8, Some("")), now);
+        let _ = pump(&mut plane, Some(Role::Controlled), now);
+
+        let conv = &plane.convs[&1];
+        assert!(conv.seen_client_msgs.is_empty(), "超长/空串不得进去重表");
+        assert!(conv.pending_client_msgs.is_empty());
+
+        // 且**消息本身照常投递**：处置是「当作没带 id」，不是「拒绝这条消息」。
+        let frames = pump_events(&mut plane, now, &[user_echo(1)]);
+        let [LlmFrame::TurnStarted { client_msg_id, .. }] = frames.as_slice() else {
+            panic!("消息必须照常开轮，实际 {frames:?}");
+        };
+        assert_eq!(*client_msg_id, None);
+    }
+
+    #[test]
+    fn 片10_老控制端不带id时整条链路照常() {
+        // 这条路径必须一直走得通：新被控端 + 老控制端是发布期的常态组合。
+        let mut plane = LlmPlane::default();
+        let now = Instant::now();
+        seed_conv(&mut plane, 1, 3);
+
+        plane.enqueue(send_with(1, 7, None), now);
+        let _ = pump(&mut plane, Some(Role::Controlled), now);
+        let frames = pump_events(&mut plane, now, &[user_echo(1)]);
+
+        let [LlmFrame::TurnStarted { client_msg_id, .. }] = frames.as_slice() else {
+            panic!("应发出轮头，实际 {frames:?}");
+        };
+        assert_eq!(
+            *client_msg_id, None,
+            "不带 id ⇒ 回带也是 None，不许编一个出来"
+        );
+    }
+
+    #[test]
+    fn 片10_去重表有界且淘汰最老的() {
+        // 没有上限，它就是又一条随会话时长无界增长的内存路径。
+        let mut plane = LlmPlane::default();
+        let now = Instant::now();
+        seed_conv(&mut plane, 1, 3);
+
+        for i in 0..=LLM_CLIENT_MSG_DEDUP_MAX {
+            let id = format!("msg-{i}");
+            plane.enqueue(send_with(1, i as u64, Some(&id)), now);
+        }
+        let _ = pump(&mut plane, Some(Role::Controlled), now);
+
+        let conv = &plane.convs[&1];
+        assert_eq!(conv.seen_client_msgs.len(), LLM_CLIENT_MSG_DEDUP_MAX);
+        assert!(
+            !conv.seen_client_msgs.contains(&"msg-0".to_owned()),
+            "最老的一条必须被淘汰"
+        );
+        assert!(conv
+            .seen_client_msgs
+            .contains(&format!("msg-{LLM_CLIENT_MSG_DEDUP_MAX}")));
     }
 
     // ── 链路翻转不重复弹「对端太老」──────────────────────────────────────

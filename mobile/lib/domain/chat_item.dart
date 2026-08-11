@@ -222,6 +222,70 @@ final class ChatGap extends ChatItem {
   String toString() => 'ChatGap($key, $bytes 字节)';
 }
 
+/// **乐观发送的用户消息**：本端已经发出、被控端还没确认（片 10）。
+///
+/// ## 它为什么必须是一个条目，而不是输入框上的一个小转圈
+///
+/// 用户点了发送，气泡就得**立刻**出现——否则在弱网下的观感是「我按了没反应」，
+/// 用户会再按一次。乐观气泡把这个不确定性显式画出来：内容在、状态标着。
+///
+/// ## key 用哨兵轮号 [kPendingTurn]
+///
+/// 它还没有真正的轮号（轮号是被控端在 `TurnStarted` 里给的）。用一个**大于任何真实轮号**
+/// 的哨兵，排序时它天然落在最后，也就是列表最底部——正是「我刚发的」该在的位置。
+/// 被控端确认后本条目消失，`TurnStarted.user` 里的真实块顶上来。
+final class ChatPending extends ChatItem {
+  const ChatPending({
+    required super.blockId,
+    required this.clientMsgId,
+    required this.text,
+    required this.state,
+    super.revision,
+  }) : super(turn: kPendingTurn, role: ChatRole.user);
+
+  /// 幂等键，与 outbox 行、`LlmSend.clientMsgId`、`LlmTurnStarted.clientMsgId` 同一个值。
+  final String clientMsgId;
+
+  final String text;
+
+  /// 送达状态。**三态，不是「发送中 / 失败」两态**——见 `data/chat_store.dart` 的
+  /// `OutboxState`：少了「未知」那一态，就只能在无限重发与静默丢弃之间二选一。
+  final OutboxDelivery state;
+
+  /// 状态变了要让 memo 缓存失效（气泡上的角标要重画）。
+  ChatPending withState(OutboxDelivery next) => ChatPending(
+        blockId: blockId,
+        clientMsgId: clientMsgId,
+        text: text,
+        state: next,
+        revision: revision + 1,
+      );
+
+  @override
+  String toString() => 'ChatPending($clientMsgId, ${state.name}, r$revision)';
+}
+
+/// [ChatPending] 的哨兵轮号：**大于任何真实轮号**，于是乐观气泡恒排在最后。
+///
+/// 取 2^31-1 而不是 `-1`：负数轮号会排在最前（列表顶部），那是「最老的消息」的位置——
+/// 用户刚发的话跑到历史最上面去，比不显示还费解。
+const int kPendingTurn = 0x7FFFFFFF;
+
+/// [ChatPending] 在 UI 上的送达状态。
+///
+/// 与 `OutboxState` 一一对应，但**刻意是两个类型**：`domain/` 不依赖 `data/`
+/// （渲染层不该因为换了个存储实现就要改）。转换在 `state/outbox.dart` 一处。
+enum OutboxDelivery {
+  /// 还没送出去（没连上）。重连后自动重发是安全的。
+  queued,
+
+  /// 已送出，等被控端确认。
+  sent,
+
+  /// 自动重发够了次数仍未确认。**UI 必须说出「对方可能已经收到过」**。
+  uncertain,
+}
+
 /// 本端不认识的块。
 ///
 /// 画一行「本版本不支持的内容」而不是**跳过**：跳过等于让用户读到一段少了东西的回复

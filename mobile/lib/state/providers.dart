@@ -21,7 +21,10 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lumen_mobile/core/env.dart';
+import 'package:lumen_mobile/core/log.dart';
+import 'package:lumen_mobile/data/chat_store.dart';
 import 'package:lumen_mobile/data/device_identity.dart';
+import 'package:lumen_mobile/data/memory_chat_store.dart';
 import 'package:lumen_mobile/data/token_store.dart';
 import 'package:lumen_mobile/net/io_ws_socket.dart';
 import 'package:lumen_mobile/net/rest_client.dart';
@@ -30,6 +33,8 @@ import 'package:lumen_mobile/state/auth_controller.dart';
 import 'package:lumen_mobile/state/conversation_session.dart';
 import 'package:lumen_mobile/state/device_list_controller.dart';
 import 'package:lumen_mobile/state/link_controller.dart';
+import 'package:lumen_mobile/state/outbox.dart';
+import 'package:uuid/uuid.dart';
 
 /// 当前服务器（规范化后的 origin）。未选定为 null。
 final NotifierProvider<ServerEndpointNotifier, ServerEndpoint?>
@@ -125,6 +130,28 @@ final Provider<LinkController?> linkControllerProvider =
   return controller;
 });
 
+/// 本地存档（片 10）。**默认是内存实现**，真机在 `main.dart` 覆盖成 sqflite。
+///
+/// 与 `tokenStoreProvider` / `rawMachineIdProvider` 同款注入点，理由也一样：
+/// `sqflite` 走 platform channel，把它设成默认值就等于 `flutter test` 全得起
+/// platform channel。
+///
+/// ⚠ **它的默认实现是「能跑但不持久」**：内存版一关 App 就没了。真机忘了覆盖的症状
+/// 不是崩溃、而是「杀进程重开历史空了」——所以 `main.dart` 那处覆盖有一条测试钉着
+/// （`test/app_boot_test.dart`）。
+final Provider<ChatStore> chatStoreProvider =
+    Provider<ChatStore>((Ref ref) => MemoryChatStore());
+
+/// 幂等键生成器。**必须全局唯一**——它是被控端去重表的键。
+///
+/// 做成 provider 是为了测试能换成可预测的序列（`msg-1` / `msg-2`…）；
+/// 断言里出现一个真 UUID 就只能写成正则，一眼看不出哪条是哪条。
+final Provider<ClientMsgIdGen> clientMsgIdProvider =
+    Provider<ClientMsgIdGen>((Ref ref) {
+  const Uuid uuid = Uuid();
+  return uuid.v4;
+});
+
 /// 当前隐藏会话上的对话。没有活跃会话时为 null。
 ///
 /// **会话建立即创建、断开即销毁**：LinkActive 里的 sessionId 是 RelayTo 的路由键，
@@ -133,6 +160,10 @@ final Provider<LinkController?> linkControllerProvider =
 ///
 /// convId 暂时写死 1：片 7 只做单对话，多对话列表与切换是 P1（蓝图 §10.2）。
 /// 真正的 convId 由被控端在 ConvStarted 里给出——接多对话时改这里为「按 convId 建一组」。
+///
+/// ★ **`start()` 在这里 fire-and-forget**（片 10）：它要 await 落盘，而 provider 的
+/// 构造必须是同步的。中途失败只记日志——恢复不了历史时正确的行为是「按空历史继续」，
+/// 而不是让对话页整个打不开。
 final Provider<ConversationSession?> conversationSessionProvider =
     Provider<ConversationSession?>((Ref ref) {
   final LinkController? link = ref.watch(linkControllerProvider);
@@ -145,7 +176,12 @@ final Provider<ConversationSession?> conversationSessionProvider =
     ws: ws,
     convId: 1,
     sessionId: state.sessionId,
+    store: ref.watch(chatStoreProvider),
+    newClientMsgId: ref.watch(clientMsgIdProvider),
   );
+  unawaited(session.start().catchError((Object e) {
+    logWarn('providers', '对话启动失败（历史与补齐可能不完整）', error: e);
+  }));
   ref.onDispose(() => session.dispose());
   return session;
 });

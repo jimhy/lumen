@@ -367,9 +367,24 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     post_install::wait_for_installer_if_requested();
 
-    // stderr + 文件双写：release 是 windows_subsystem="windows"（无控制台），不落盘等于没日志。
-    let log_path = applog::init();
-    match &log_path {
+    // 先只装 logger（纯 stderr），**不碰日志文件**——文件落盘要等单实例判定之后，见下。
+    applog::init();
+    // F8 单实例限制（事件循环创建前检测）：release 默认单开——已有
+    // 实例在跑时通知其前台化、本实例静默退出；debug 构建与
+    // --multi-instance / LUMEN_MULTI_INSTANCE=1 放行多开。
+    // `instance` 持有命名互斥量，必须存活到 main 结束（单实例锁覆盖
+    // 整个运行期）。
+    let instance = single_instance::acquire();
+    if matches!(instance, single_instance::InstanceCheck::AlreadyRunning) {
+        // **在接文件之前就返回**：第二实例（用户双击图标想前台化，是正常路径）一旦碰日志文件，
+        // 就会把主实例正在写的 lumen.log 轮转成 .old——rename 对已打开句柄照样成功，主实例
+        // 毫不知情地继续往 .old 里追加，下次轮转再覆盖掉它，攒了几天的现场就此消失。
+        info!("已有 Lumen 实例在运行，已通知其前台化，本实例退出");
+        return Ok(());
+    }
+    // 本实例会继续运行 → 现在才接上文件双写。release 是 windows_subsystem="windows"
+    //（无控制台），不落盘等于没日志。
+    match applog::attach_file() {
         Some(p) => log::info!("日志落盘 → {}", p.display()),
         None => log::warn!("日志无法落盘（数据目录不可用），本次运行仅输出到 stderr"),
     }
@@ -379,16 +394,6 @@ fn main() -> Result<()> {
     log::info!(
         "[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16"
     );
-    // F8 单实例限制（事件循环创建前检测）：release 默认单开——已有
-    // 实例在跑时通知其前台化、本实例静默退出；debug 构建与
-    // --multi-instance / LUMEN_MULTI_INSTANCE=1 放行多开。
-    // `instance` 持有命名互斥量，必须存活到 main 结束（单实例锁覆盖
-    // 整个运行期）。
-    let instance = single_instance::acquire();
-    if matches!(instance, single_instance::InstanceCheck::AlreadyRunning) {
-        info!("已有 Lumen 实例在运行，已通知其前台化，本实例退出");
-        return Ok(());
-    }
     let event_loop = EventLoop::<PtyWake>::with_user_event()
         .build()
         .context("创建事件循环失败")?;

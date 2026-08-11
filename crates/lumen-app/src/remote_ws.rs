@@ -24,7 +24,6 @@
 /// 「哪些字段属于哪条通路」再也说不清——`RemoteWs` 的 60 多个字段就是这么来的。
 mod llm;
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -110,12 +109,6 @@ const DOWNLOAD_MAX_FILES: usize = 4;
 const DOWNLOAD_MAX_LISTDIR: usize = 6;
 /// part3c-2 #7/上传 递归深度上限（防 junction / symlink 成环；超深的子树跳过）。
 const TRANSFER_MAX_DEPTH: usize = 64;
-/// 控制端**输入方向**切到 P2P 直连所需的中继静默时长（见 [`RemoteWs::input_direct_open`]）。
-///
-/// 取值依据：这段时间必须**远大于中继单程时延**，才能保证「中继上已无在飞的输入帧」。
-/// 中继单程国内跨省常态 30–60 ms、劣化到 150 ms 也仍在 300 ms 之内；再大就白白拖慢切换。
-/// 用户打字的自然停顿（想下一条命令、看回显）轻易跨过这个窗口，实测按几个键就会切过去。
-const INPUT_DIRECT_QUIET: Duration = Duration::from_millis(300);
 
 /// 控制端待配对态：已发起请求、正等用户输入被控端展示的配对码。
 #[derive(Debug, Clone)]
@@ -198,15 +191,6 @@ struct Reattach {
     target: String,
     /// 上次发 `RequestControl` 的时刻（`None`=尚未试过，WS 一连上立即首试）。
     last_try: Option<Instant>,
-}
-
-/// 该帧是否属于**必须严格保序**的输入流（最终写进被控端 PTY 的 VT 字节）。
-///
-/// 只有这些帧经中继发出时会刷新 [`RemoteWs::input_direct_open`] 的静默计时。其余控制端→被控端
-/// 的帧要么幂等（`HistoryReq` 是纯查询）、要么自带重发/重组自愈（`SubViewport` 有变更检测、
-/// 文件块带 seq），乱序无害；若把它们也计入静默判据，控制端后台一有帧在发，闸门就永远开不了。
-fn is_ordered_input(frame: &RemoteFrame) -> bool {
-    matches!(frame, RemoteFrame::Input(_) | RemoteFrame::InputWithId { .. })
 }
 
 /// part3d Phase 3 尺寸同步：订阅会话各窗格的目标尺寸列表 `(session_id, rows, cols)`。
@@ -534,13 +518,6 @@ pub struct RemoteWs {
     /// 任一端：数据面是否已处于直连态（去重 `DataPlaneUp`/`Down` 事件，避免重复 toast / 重订阅风暴）。
     /// 控制端据此重订阅重建镜像、被控端据此把输出切到 QUIC；两端各自维护。
     p2p_data_active: bool,
-    /// 控制端：最后一帧**输入**经中继发出的时刻（[`Self::input_direct_open`] 的静默判据）。
-    /// `Cell` 是因为 [`Self::send_frame`] 只拿 `&self`（被大量 `&self` 的渲染/输入路径调用），
-    /// 为一个时间戳把整条调用链改成 `&mut self` 不值当。
-    input_relay_last: Cell<Option<Instant>>,
-    /// 控制端：输入方向是否已切到直连。一旦打开就保持到直连断开（`DataPlaneDown` 复位），
-    /// 不来回摆动——摆动本身就会制造它要防的那种乱序。
-    input_direct: Cell<bool>,
     /// M7 片 4：LLM 数据面状态机（握手 / 对话注册表 / seq 水位 / ACK 窗口 / 合并窗口）。
     ///
     /// **只有协议侧状态在这里**：headless 子进程本体挂在 `AppState.llm_runners` 上，与
@@ -2080,10 +2057,6 @@ impl RemoteWs {
         // M6：会话结束 / 断连 → 停 P2P 引擎（Drop 发停机信号）+ 复位直连态。
         self.p2p = None;
         self.p2p_data_active = false;
-        // 输入闸门连同静默计时一起清：新会话没有任何在飞的中继输入帧，旧会话的时间戳
-        // 留着只会让下一条会话的闸门判据基于一个不相干的时刻。
-        self.input_direct.set(false);
-        self.input_relay_last.set(None);
     }
 
     /// 控制端：多窗格镜像各窗格（渲染序）；空 = 单窗格模式（走 [`Self::mirror_render`]）。
@@ -2318,13 +2291,6 @@ impl RemoteWs {
                 }
             }
             P2pEvent::DataPlaneDown => {
-                // 关输入闸门放在 `if` **外面**（幂等复位）：闸门是安全默认为「走中继」的东西，
-                // 任何一条 Down 都该把它关上，不能因为去重条件没进就漏关。
-                //
-                // **刻意不清 `input_relay_last`**：直连若稍后重连成功，中继上可能正有在飞的输入
-                // 帧，清成 `None` 会让闸门立刻重开、直接撞上它本要防的乱序。让它继续被中继发送
-                // 自然刷新才是对的。
-                self.input_direct.set(false);
                 if self.p2p_data_active {
                     self.p2p_data_active = false;
                     log::info!("P2P 数据面已回退中继");
@@ -6369,18 +6335,25 @@ impl RemoteWs {
         self.send_input(&payload);
     }
 
-    /// 把数据面帧投出：M6 Phase 3 选路 + M6.1 输入方向直连。
-    ///
-    /// # 两个方向的差别
-    /// - **被控端→控制端（输出方向）**：直连就绪即走 QUIC。输出乱序由切换时的整屏快照重建自愈、
-    ///   文件块带 seq 重组，天然安全。
-    /// - **控制端→被控端（输入方向）**：过 [`Self::input_direct_open`] 闸门后才走 QUIC。M6 原本把
-    ///   这个方向**钉死在中继**上，因为切换瞬间 QUIC 帧可越过在飞的中继输入帧、致被控端 PTY 收到
-    ///   乱序字节，且输入方向没有快照可自愈（docs/M6 §5）。代价是「按键→回显」的**去程永远绕
-    ///   服务器**，直连白建了一半。闸门用中继静默窗口消掉那个乱序窗口，见其文档。
-    ///
-    /// `P2pSignal` 信令**恒走中继**（直连断时才能协商回退，绝不能跟着直连一起断）。直连未就绪 /
+    /// 把数据面帧投出：M6 Phase 3 选路。**仅被控端→控制端「输出方向」走 QUIC 直连**（输出乱序由切换时
+    /// 的整屏快照重建自愈、文件块带 seq 重组，故走直连安全）；**控制端→被控端「输入方向」恒走中继**——
+    /// 输入若走 QUIC，切换瞬间 QUIC 帧可越过在飞的中继输入帧、致被控端 PTY 收到乱序字节且无快照可自愈
+    /// （审查发现，见 docs/M6 §5）。`P2pSignal` 信令亦必走中继（直连断时才能协商回退）。直连未就绪 /
     /// 通道断则回退中继。序列化失败仅记日志、不断连。
+    ///
+    /// # 为什么「输入方向也走直连」不能靠本端计时器放开（2026-08-11 实现过一版又回退）
+    /// 试过用「距最后一帧输入经中继发出已静默 300ms」当切换屏障，被对抗性审查按住三条独立的证伪：
+    /// ① 计时器打的是**入队时刻**——`send()` 只是塞进无界 mpsc，真正写 socket 在 WS 线程，
+    ///    而同一条队列上 `put_send_worker` 会绕过本函数直投 8×256 KiB 的 `PutChunk`，
+    ///    上传时输入帧要在队列里排 1–4 秒才上线，300ms 窗口被整体架空；
+    /// ② 中继是**两跳 TCP**，任一腿一次丢包重传（RTOmin 200ms，退避 400/800ms）就超窗；
+    /// ③ 更根本的：直连本身是**有损**路径——`try_send_frame` 只是投进 unbounded channel，
+    ///    返回 true 不代表送达，而 QUIC 路径黑洞要 `P2P_MAX_IDLE`=30 秒才被判死，
+    ///    这 30 秒里每一次按键都进虚空，且输入方向**没有快照、没有 ACK、没有重传**可以补救。
+    ///
+    /// 结论：本端任何计时器都无法推断「一条自己看不见、无确认、无序号的远端队列已排空」。
+    /// 要放开必须有**带内屏障 + 输入侧可靠投递**（往中继发标记帧、等被控端回执后再切；
+    /// 并给输入帧加 seq/ACK 让丢帧可检测可重传）。那是一个需要正经设计的特性，不是一个开关。
     fn send_frame(&self, frame: &RemoteFrame) {
         let v = match frame.to_value() {
             Ok(v) => v,
@@ -6389,62 +6362,15 @@ impl RemoteWs {
                 return;
             }
         };
-        // 信令永不走直连；其余按方向定闸：输出方向恒开，输入方向看静默闸门。
-        let may_direct = !matches!(frame, RemoteFrame::P2pSignal { .. })
-            && (self.is_controlled() || self.input_direct_open());
-        if may_direct {
+        // 仅被控端的非信令数据帧（即输出方向）在直连就绪时走 QUIC；发送失败（通道断）回退中继。
+        if self.is_controlled() && !matches!(frame, RemoteFrame::P2pSignal { .. }) {
             if let Some(p2p) = &self.p2p {
                 if p2p.is_data_ready() && p2p.try_send_frame(v.clone()) {
                     return;
                 }
-                // 直连投递失败（通道已死）：本帧改走中继，同时**立刻关输入闸门**。不关的话下一帧
-                // 又会去试直连，正好制造「中继帧在飞、直连帧后发先至」——闸门要防的就是这个。
-                // 随后到达的 `DataPlaneDown` 会做完整复位，这里只是把窗口收到最小。
-                self.input_direct.set(false);
             }
         }
-        // 输入帧经中继发出 → 刷新静默计时（闸门判据）。只认真正需要严格保序的输入流：
-        // 其余控制帧（尺寸/历史/文件）幂等或自带 seq 重组，若也计入，控制端后台一有帧
-        // 闸门就永远开不了。
-        if !self.is_controlled() && is_ordered_input(frame) {
-            self.input_relay_last.set(Some(Instant::now()));
-        }
         self.send(RemoteC2S::Relay(v));
-    }
-
-    /// 控制端**输入方向**的直连闸门：现在可以把输入帧投到 QUIC 直连吗？
-    ///
-    /// # 为什么不能一就绪就切
-    /// 直连就绪 ≠ 中继已排空。中继（TCP）上可能还有在飞的输入帧，此刻发出的 QUIC 帧会**越过**
-    /// 它们先到被控端，PTY 于是收到乱序字节——而输入方向没有整屏快照可以自愈（输出方向有，
-    /// 所以输出可以直接切）。M6 §5 因此把输入方向整个钉死在中继上。
-    ///
-    /// # 静默窗口
-    /// 这里用「距最后一帧经中继发出的输入已过 [`INPUT_DIRECT_QUIET`]」放开限制：该时长远大于
-    /// 中继单程时延，静默满足时中继上就**不可能**还有在飞的输入帧，此刻切换严格安全，不需要
-    /// 任何协议改动（这正是选它而非「输入帧加序号 + 收端重排」的原因：后者要改
-    /// [`RemoteFrame`]，而它是 externally-tagged 枚举，加变体会让**未升级的对端直接解析失败、
-    /// 输入全丢**，得先做版本门）。用户打字的自然停顿轻易跨过这个窗口。
-    ///
-    /// 闸门一旦打开就保持到直连断开（`DataPlaneDown` 复位），不来回摆动——摆动本身就会制造
-    /// 它要防的那种乱序。
-    fn input_direct_open(&self) -> bool {
-        if !self.p2p_data_active {
-            return false;
-        }
-        if self.input_direct.get() {
-            return true;
-        }
-        // `None` = 直连就绪后压根没经中继发过输入 → 中继上无在飞输入帧，可以直接切。
-        let quiet = self
-            .input_relay_last
-            .get()
-            .is_none_or(|t| t.elapsed() >= INPUT_DIRECT_QUIET);
-        if quiet {
-            log::info!("P2P 输入方向切到直连（中继已静默 ≥{INPUT_DIRECT_QUIET:?}）");
-            self.input_direct.set(true);
-        }
-        quiet
     }
 
     /// 投递一条出站命令（未连接则静默丢弃）。
@@ -7541,10 +7467,6 @@ impl RemoteWs {
         // 服务端侧会话已拆：P2P 引擎失去信令与对端，一并拆除（重挂成功随新会话重建）。
         self.p2p = None;
         self.p2p_data_active = false;
-        // 重挂期间输入本就被丢弃（见 send_input），重挂成功是一条**全新**的直连协商：
-        // 闸门与静默计时一起清，不让上一段会话的时刻影响新会话的判据。
-        self.input_direct.set(false);
-        self.input_relay_last.set(None);
         self.advance_edit_generation(true);
         // M7 片 4 第 6 个清理点（断线进入宽限重挂）：订阅态与握手态一起清。
         // 重挂成功后 `SessionStarted` 那一臂会重发 `Hello` 并让手机重新 `Attach`。
@@ -8476,101 +8398,6 @@ mod tests {
         assert_eq!(ws.p2p_link_state(), Some(P2pLink::Direct));
         ws.p2p_data_active = false;
         assert_eq!(ws.p2p_link_state(), Some(P2pLink::Relay));
-    }
-
-    /// 闸门的两个「必须关」前提：数据面没就绪、以及中继上可能还有在飞输入帧。
-    #[test]
-    fn 输入直连闸门_数据面未就绪恒关() {
-        let ws = RemoteWs::default();
-        assert!(!ws.input_direct_open(), "数据面未就绪不得开闸");
-        // 未就绪时即便中继早已静默也不得开（直连根本不存在，投过去就是丢帧）。
-        ws.input_relay_last
-            .set(Instant::now().checked_sub(INPUT_DIRECT_QUIET * 10));
-        assert!(!ws.input_direct_open(), "数据面未就绪时静默也不得开闸");
-        assert!(!ws.input_direct.get(), "未开闸不得置位");
-    }
-
-    /// 直连建立后从未经中继发过输入 → 中继上无在飞帧，可立即切换（无需空等一个静默窗口）。
-    #[test]
-    fn 输入直连闸门_无在飞输入帧立即开() {
-        let ws = RemoteWs {
-            p2p_data_active: true,
-            ..Default::default()
-        };
-        assert_eq!(ws.input_relay_last.get(), None, "前置：从未经中继发过输入");
-        assert!(ws.input_direct_open(), "无在飞输入帧应立即开闸");
-        assert!(ws.input_direct.get(), "开闸后应置位保持");
-    }
-
-    /// 刚经中继发过输入：必须等满静默窗口才切，否则 QUIC 帧会越过在飞的中继帧、
-    /// 让被控端 PTY 收到乱序字节（M6 §5 正是因此把输入方向钉死在中继上）。
-    #[test]
-    fn 输入直连闸门_刚发过中继输入须等满静默窗口() {
-        let ws = RemoteWs {
-            p2p_data_active: true,
-            ..Default::default()
-        };
-        ws.input_relay_last.set(Some(Instant::now()));
-        assert!(!ws.input_direct_open(), "静默未满不得开闸");
-        assert!(!ws.input_direct.get(), "未开闸不得置位");
-
-        // 静默窗口已过：中继上不可能还有在飞输入帧，此刻切换严格安全。
-        ws.input_relay_last
-            .set(Instant::now().checked_sub(INPUT_DIRECT_QUIET + Duration::from_millis(1)));
-        assert!(ws.input_direct_open(), "静默满足应开闸");
-    }
-
-    /// 开闸后必须保持：来回摆动本身就会制造闸门要防的那种乱序。
-    #[test]
-    fn 输入直连闸门_开后不因新输入摆回中继() {
-        let ws = RemoteWs {
-            p2p_data_active: true,
-            ..Default::default()
-        };
-        assert!(ws.input_direct_open(), "首次应开闸");
-        ws.input_relay_last.set(Some(Instant::now()));
-        assert!(ws.input_direct_open(), "开闸后即便刷新静默计时也必须保持");
-    }
-
-    /// 直连断开：关闸门（回到安全默认），但**保留**静默计时——直连若稍后重连，
-    /// 中继上可能正有在飞帧，清掉计时会让闸门立刻重开、直接撞上它本要防的乱序。
-    #[test]
-    fn 数据面回退中继_关闸门但保留静默计时() {
-        let mut ws = RemoteWs {
-            p2p_data_active: true,
-            ..Default::default()
-        };
-        assert!(ws.input_direct_open(), "前置：先开闸");
-        let stamp = Instant::now();
-        ws.input_relay_last.set(Some(stamp));
-        ws.apply_p2p_event(P2pEvent::DataPlaneDown);
-        assert!(!ws.input_direct.get(), "回退中继必须关闸门");
-        assert!(!ws.p2p_data_active, "回退后数据面非直连态");
-        assert_eq!(
-            ws.input_relay_last.get(),
-            Some(stamp),
-            "静默计时必须保留，否则重连时闸门会立刻重开撞上乱序"
-        );
-    }
-
-    /// 静默判据只认真正写进 PTY 的字节流；其余控制帧计入的话，控制端后台一有帧闸门就永远开不了。
-    #[test]
-    fn 保序输入帧判定_只认写进pty的字节流() {
-        assert!(is_ordered_input(&RemoteFrame::Input(vec![b'a'])));
-        assert!(is_ordered_input(&RemoteFrame::InputWithId {
-            tab_id: 1,
-            session_id: 2,
-            data: vec![b'a'],
-        }));
-        assert!(
-            !is_ordered_input(&RemoteFrame::HistoryReq { top: 0, count: 1 }),
-            "纯查询帧幂等，乱序无害"
-        );
-        assert!(
-            !is_ordered_input(&RemoteFrame::ViewportResize { rows: 24, cols: 80 }),
-            "尺寸帧有变更检测/重发自愈"
-        );
-        assert!(!is_ordered_input(&RemoteFrame::Echo("x".into())));
         // drop ws → P2pEngine Drop 停后台线程。
     }
 

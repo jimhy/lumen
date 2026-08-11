@@ -213,9 +213,13 @@ Rust 侧对 `llm.rs` 里**每一个带 `#[serde(other)]` 的类型**（共 9 个
 `#[serde(default, skip_serializing_if = "Option::is_none")] Option<T>` 之后——语料照常解析、
 序列化跳过该键、`frame == reserialized` 不变、`变体表!` 与 `覆盖::收帧` 的 `{ .. }` 模式压根不看
 字段。**Rust 全绿、覆盖断言全绿、Dart 实现者永远收不到信号。** 而这正是本协议扩展的主要方式
-（`llm.rs` 里已有 33 个 `Option + skip` 字段，每一个目前都至少被一条语料填了 `Some`）。
+（`llm.rs` 里已有 35 个 `Option + skip` 字段，每一个目前都至少被一条语料填了 `Some`）。
 
-唯一的机械兜底是 `协议源文件的可增长点数目未变` 里那个 `skip_serializing_if == 33`：
+> **它真的绊住过人**（2026-08-11，片 10）：给 `Send` 与 `TurnStarted` 各加一个 `client_msg_id`
+> 时全套 harness 照绿，只有这个数字红了，才回来补上 `frame_send.json` / `frame_turn_started.json`
+> 的两个 `Some`。**一次真实拦截 = 这条规矩不是纸面纪律。**
+
+唯一的机械兜底是 `协议源文件的可增长点数目未变` 里那个 `skip_serializing_if == 35`：
 它不会告诉你该改哪条语料，只会在你加字段时**绊你一下**，逼你回来读这一段。
 
 ## 6. 失败了怎么办

@@ -10,6 +10,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lumen_mobile/router.dart';
+import 'package:lumen_mobile/ui/lifecycle_bridge.dart';
 
 /// 顶层 App。
 ///
@@ -22,9 +23,15 @@ class LumenApp extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // ★ [LifecycleBridge] 包在 `builder` 里而不是包在 `MaterialApp.router` 外面：
+    // 它要 `ref.read(conversationSessionProvider)`，而那条 provider 链最终依赖路由
+    // 决定出来的状态。包在外面同样能编译，但它会在路由初始化之前就跑一次
+    // `didChangeAppLifecycleState`——那时 session 还是 null，第一次进后台不落盘。
     return MaterialApp.router(
       title: 'Lumen',
       debugShowCheckedModeBanner: false,
+      builder: (BuildContext context, Widget? child) =>
+          LifecycleBridge(child: child ?? const SizedBox.shrink()),
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3B6EA5)),
         useMaterial3: true,

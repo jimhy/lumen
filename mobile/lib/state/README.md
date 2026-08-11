@@ -1,6 +1,6 @@
 # `lib/state/` —— 状态层
 
-> 状态：**片 5 落了控制面状态机与设备列表**；对话归约在片 7。
+> 状态：片 5 落控制面状态机与设备列表，片 7 落流式归约与渲染，**片 10 落 outbox 与离线补齐**。
 
 ## 文件
 
@@ -8,9 +8,45 @@
 |---|---|---|
 | `link_controller.dart` | **显式 sealed** `LinkState` 控制面状态机（含 12 秒发起超时） | ✅ 片 5（`test/state/link_controller_test.dart`，25 项） |
 | `device_list_controller.dart` | 设备列表三态 + 并发刷新合并 | ✅ 片 5 |
-| `providers.dart` | 全部 provider 定义收口 | ✅ 片 5（页面级 provider 随片 6 加） |
-| `conversation_controller.dart` | 流式归约 + outbox + backfill | 片 7 |
-| `streaming_tail.dart` | 末块 `ValueNotifier`（隔离高频重绘） | 片 7 |
+| `providers.dart` | 全部 provider 定义收口 | ✅ 片 5 / 6 / 10 |
+| `conversation_controller.dart` | 流式归约 + 落库 + 恢复 + `Attach` 补齐 | ✅ 片 7 + 10 |
+| `streaming_tail.dart` | 末块 `ValueNotifier`（隔离高频重绘） | ✅ 片 7 |
+| `conversation_session.dart` | 两层拆包 / 装包 + **启动三步**（恢复 → 补齐 → 重发） | ✅ 片 7 + 10 |
+| `outbox.dart` | 乐观发送 + 幂等重发 + 销账 | ✅ 片 10（`test/state/outbox_test.dart`，23 项） |
+
+## 片 10 的四条不变量（写错了症状都是「消息凭空多一条或少一条」，且不报错）
+
+1. **先落库、再发帧。** 反过来的话，「发出去了但没落库」那一瞬间进程被杀，消息永远消失，
+   而用户明明看见气泡出现过。
+   （⚠ 只断言「submit 之后库里有」是**测不出顺序反了**的——两种顺序下都绿。
+   `outbox_test.dart` 里用一个记录副作用先后的 store 包装守着。）
+2. **重发一律带原来的 `clientMsgId`。** 被控端按它去重（`LLM_CLIENT_MSG_DEDUP_MAX = 32`）。
+   换新 id 重发 = 主动制造一条重复消息。
+   **例外是「用户手动重发」**：那是用户明确表示要再发一次，用新 id。
+3. **自动重发有上限**（`kOutboxMaxAttempts = 3`），到点转「送达状态未知」并**停手**。
+   被控端的去重表会淘汰，无限重发早晚会越过窗口而被真的执行第二遍。
+4. **水位线宁可偏低，不可偏高。** 偏低 ⇒ 重连时多补一段，归约器的幂等规则正好吸收；
+   偏高 ⇒ 那一段内容永远补不回来，两端都没有任何迹象。
+   所以水位线按秒节流写盘，且**只在内容真的落库之后**才推。
+
+## ★ 启动顺序是硬的（`ConversationSession.start()`）
+
+```text
+① restore()      从库恢复历史 + 水位线 + 未确认的消息
+② 订阅 + attach() 用①恢复出来的水位线请求补齐
+③ flushOutbox()   重发未确认的
+```
+
+- ①②换序 ⇒ `knownSeq` 从 0 开始补，被控端要么整段重发、要么回 `resync_required`
+  （用户看到历史被整个重建）；
+- ②③换序 ⇒ 每次重连都白发一遍（功能正确、纯属浪费，被控端日志刷一片「丢弃重复的 Send」）。
+
+## ★ 幂等键不能用 `req_id`（这条是被协议逼出来的）
+
+`req_id` 由**每个控制端各自**分配，而被控端的对话表是**全端共用**的（一台 PC 上可以同时
+挂着桌面镜像控制端与最多两部手机）。两个控制端的 `req_id` 空间完全重叠，拿它去重会把
+**另一个控制端的正常消息**误判成重复丢掉。所以片 10 给协议加了 `client_msg_id`
+（`Send` 带、`TurnStarted` 原样回带），那是 outbox 能做到「至多一次」的唯一手段。
 
 ## ★ 三条与蓝图不同、以**服务端代码**为准的事实（片 5 落地时核对出来的）
 

@@ -253,6 +253,29 @@ void main() {
       expect(f.record.outcome.apiErrorStatus, 403);
     });
 
+    test('★ client_msg_id 两端同一个键，且不与相邻的 req_id 接反', () {
+      // 片 10 新增。这条属于 §5.1 那类「往返断言完全测不出来」的字段：
+      // Send 与 TurnStarted 上它都是 `String?`，两侧同时接错键名或与别的可选串串位，
+      // 65 条语料照样全绿。
+      final LlmSend send =
+          LlmFrame.fromJson(caseNamed('frame_send.json').frame) as LlmSend;
+      expect(send.clientMsgId, '018f1d2c-7a3b-7c4d-8e5f-0123456789ab');
+      expect(send.reqId, 4, reason: '相邻同型字段，别串位');
+
+      final LlmTurnStarted started = LlmFrame.fromJson(
+        caseNamed('frame_turn_started.json').frame,
+      ) as LlmTurnStarted;
+      // ★ 与 Send 里的**同一个值**：回带链路一旦在某一端改了键名，这里就对不上。
+      expect(started.clientMsgId, send.clientMsgId);
+
+      // 老控制端不带这个键的路径：必须是 null，**不能**退化成空串——
+      // 空串会让 outbox 的「按 id 销账」把一条别人发的消息认领成自己的。
+      final LlmSend legacy = LlmFrame.fromJson(
+        caseNamed('redact_send_secrets.json').frame,
+      ) as LlmSend;
+      expect(legacy.clientMsgId, isNull);
+    });
+
     test('edge_int_boundary：i64 上界不退化成 double', () {
       final LlmTurnEnded f = LlmFrame.fromJson(
         caseNamed('edge_int_boundary.json').frame,

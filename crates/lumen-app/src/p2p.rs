@@ -844,27 +844,34 @@ pub async fn build_endpoint(bind: SocketAddr, stun_host: Option<&str>) -> anyhow
     let local_addr = std_sock.local_addr()?;
     // 经同一 socket 探 STUN（async）；探完转回 std socket 交给 quinn（保 NAT 映射端口一致）。
     let tokio_sock = tokio::net::UdpSocket::from_std(std_sock)?;
+    // 生产绑的是通配地址（`0.0.0.0:0`），loopback 测试绑具体地址（`127.0.0.1:0`）——
+    // 据此区分「该不该把 loopback 当候选」：生产下 loopback 对端永远连不通，测试下它就是全部。
+    let wildcard_bind = bind.ip().is_unspecified();
     let mut candidates = Vec::new();
-    // 通配绑定地址（生产的 `0.0.0.0:P`）**绝不能**当候选发给对端：对端 `connect` 到 `0.0.0.0`
-    // 在 Windows 上被内核当 localhost、打到它自己身上，在 Linux 上直接 EINVAL——两种都只是白白
-    // 占掉一个候选名额和一份 5 秒超时窗口内的 spawn，永远不可能连通。loopback 测试
-    // （`bind=127.0.0.1:0`）拿到的是具体地址，不受此过滤影响。
-    if local_addr.ip().is_unspecified() {
-        log::debug!("P2P 本端绑定地址 {local_addr} 为通配地址，不作候选（对端无法连通）");
-    } else {
-        candidates.push(local_addr);
-    }
+    push_candidate(&mut candidates, local_addr, wildcard_bind, "本端绑定地址");
     if let Some(ip) = local_lan_addr() {
-        let lan = SocketAddr::new(ip, local_addr.port());
-        if !candidates.contains(&lan) {
-            candidates.push(lan);
-        }
+        push_candidate(
+            &mut candidates,
+            SocketAddr::new(ip, local_addr.port()),
+            wildcard_bind,
+            "出口网卡地址",
+        );
     }
     if let Some(host) = stun_host {
         match stun_query(&tokio_sock, host, STUN_TIMEOUT).await {
+            // **STUN 反射结果同样要过滤**，不能因为「它来自服务端」就当然可信：自托管
+            // lumen-server 与被控端同机、server_origin 写成 `http://127.0.0.1:PORT` 时，
+            // STUN 走 loopback、反射回来的就是 `127.0.0.1:P`——无条件采信会把它当「公网候选」
+            // 广播给远端（对端 connect 打到它自己身上），而且日志显示「STUN 成功」，
+            // 给出一个假的健康信号，比没有候选更难排查。
             Some(public) => {
-                log::info!("P2P STUN 公网映射端点: {public}（经 {host}）");
-                candidates.push(public);
+                if push_candidate(&mut candidates, public, wildcard_bind, "STUN 反射端点") {
+                    log::info!("P2P STUN 公网映射端点: {public}（经 {host}）");
+                } else {
+                    log::warn!(
+                        "P2P STUN 反射回不可路由地址 {public}（经 {host}）：本端无公网候选，跨网打洞必失败、全程走中继"
+                    );
+                }
             }
             // 没有公网候选 = **对端永远打不到本端**（只剩 LAN 候选，跨网必然失败），本次会话
             // 注定全程走中继。这是「远程一直是中继」最常见的单点原因，必须 warn 级留证——
@@ -887,6 +894,41 @@ pub async fn build_endpoint(bind: SocketAddr, stun_host: Option<&str>) -> anyhow
         cert,
         candidates,
     })
+}
+
+/// 收一个候选端点：**对端连不通的地址一律不收**，重复的也不收。收下返回 `true`。
+///
+/// 三类必须挡掉的地址（每一类都只会白占一个候选名额和一份 [`PUNCH_TIMEOUT`] 内的 spawn，
+/// 永远不可能连通，还会让日志里出现「候选表非空」的假象）：
+/// - **通配地址**（生产绑定拿到的 `0.0.0.0:P`）：对端 `connect` 到它，Windows 上被内核当
+///   localhost 打到它自己身上，Linux 上直接 EINVAL。
+/// - **loopback**（仅 `wildcard_bind` 即生产部署时）：跨机永远不可达。loopback 单测绑的是
+///   `127.0.0.1:0`，那时它是唯一有效候选，故按绑定形态区分而非一刀切。
+/// - **端口 0**：不是一个可连接的端点。
+///
+/// 去重覆盖**所有**来源而不只是 LAN：公网 IP 直挂网卡（VPS 无 NAT）时，出口网卡地址与 STUN
+/// 反射端点会是同一个 `IP:端口`，重复候选会让对端对同一地址并发两条 QUIC 连接，而被控端的
+/// accept 循环首个成功即 `break`，第二条永远没人收、一直重传到超时——日志里于是对同一地址
+/// 同时出现「握手成功」和「未建立: timed out」，正好毁掉「公网候选也超时才是真失败」这条判据。
+fn push_candidate(
+    candidates: &mut Vec<SocketAddr>,
+    addr: SocketAddr,
+    wildcard_bind: bool,
+    what: &str,
+) -> bool {
+    let unroutable = addr.ip().is_unspecified()
+        || addr.port() == 0
+        || (wildcard_bind && addr.ip().is_loopback());
+    if unroutable {
+        log::debug!("P2P {what} {addr} 对端不可达，不作候选");
+        return false;
+    }
+    if candidates.contains(&addr) {
+        log::debug!("P2P {what} {addr} 与已有候选重复，跳过");
+        return false;
+    }
+    candidates.push(addr);
+    true
 }
 
 /// 经**已有** socket 发 STUN Binding（不 `connect`，留 socket 给 quinn 复用）：`send_to` 请求 →
@@ -949,10 +991,13 @@ pub async fn punch(
         "P2P 开始打洞：角色 {role:?}，对端候选 {peer_candidates:?}，超时 {timeout:?}"
     );
     let (tx, mut rx) = tokio::sync::mpsc::channel::<quinn::Connection>(4);
+    // 本次打洞期间 accept 侧被拒的连入次数（打洞结束时汇总成一行）。
+    let rejected = Arc::new(AtomicU64::new(0));
     // accept 任务：Controlled 取首个 accept 作结果；Controller 的 accept 是冗余方向，连上即弃。
     {
         let ep = endpoint.clone();
         let tx = tx.clone();
+        let rejected = Arc::clone(&rejected);
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
                 let from = incoming.remote_address();
@@ -966,11 +1011,22 @@ pub async fn punch(
                             }
                             // Controller：accept 到的是 B→A 冗余方向，弃（drop conn 即关）。
                         }
-                        // mTLS 失败会落在这里（对端证书与信令里 pinned 的那份对不上）——
-                        // 与「根本没有包进来」是完全不同的病因，故必须留证而非 debug 静默。
-                        Err(e) => log::warn!("P2P accept 来自 {from} 的握手失败: {e}"),
+                        // mTLS 失败落在这里（对端证书与信令里 pinned 的那份对不上）。
+                        //
+                        // **刻意留在 debug 级**：本端候选（含公网 IP:端口）经中继信令主动给了对端，
+                        // 而这个 UDP 端口对全锥型 NAT 外的任意主机可达——任何扫描器都能无限次
+                        // 触发这条日志。提到 warn 就等于把「日志写入速率」交给未鉴权的远端控制，
+                        // 足以在一次会话内把磁盘写满。诊断需要的是**有没有、有多少**，
+                        // 那由下面的汇总行给出。
+                        Err(e) => {
+                            rejected.fetch_add(1, Ordering::Relaxed);
+                            log::debug!("P2P accept 来自 {from} 的握手失败: {e}");
+                        }
                     },
-                    Err(e) => log::warn!("P2P accept 拒绝来自 {from} 的连入: {e}"),
+                    Err(e) => {
+                        rejected.fetch_add(1, Ordering::Relaxed);
+                        log::debug!("P2P accept 拒绝来自 {from} 的连入: {e}");
+                    }
                 }
             }
         });
@@ -1001,10 +1057,14 @@ pub async fn punch(
     }
     drop(tx); // 所有发送端 drop 后 recv 返回 None（全失败时不空等到超时）。
     let conn = tokio::time::timeout(timeout, rx.recv()).await.ok().flatten();
+    // 被拒连入数汇总成一行（逐条打会被未鉴权远端灌爆日志，见 accept 任务里的说明）。
+    // 非零且打洞失败时特别有意义：说明**包进来了但握手没过**（证书 pinning 对不上 / 有人扫端口），
+    // 与「一个包都没进来」（纯 NAT 打不穿）是完全不同的病因。
+    let rejected = rejected.load(Ordering::Relaxed);
     match &conn {
         Some(c) => log::info!("P2P 打洞成功 → {}（角色 {role:?}）", c.remote_address()),
         None => log::warn!(
-            "P2P 打洞失败：{timeout:?} 内 {} 个对端候选无一建立连接（角色 {role:?}）→ 回退中继",
+            "P2P 打洞失败：{timeout:?} 内 {} 个对端候选无一建立连接（角色 {role:?}，期间拒绝连入 {rejected} 次）→ 回退中继",
             peer_candidates.len()
         ),
     }
@@ -1236,6 +1296,44 @@ mod tests {
                 de.candidates
             );
         });
+    }
+
+    /// 候选闸门：对端连不通的地址一律不收。三类各自都会白占一个候选名额和一份打洞超时窗口，
+    /// 还会让候选表看起来「非空」而掩盖「本端其实没有可用候选」。
+    #[test]
+    fn 候选闸门_拒收对端不可达地址() {
+        let mut c = Vec::new();
+        // 通配地址：对端 connect 到它，Windows 打到它自己、Linux EINVAL。
+        assert!(!push_candidate(&mut c, "0.0.0.0:5000".parse().expect("解析"), true, "t"));
+        // 端口 0 不是可连接端点。
+        assert!(!push_candidate(&mut c, "203.0.113.7:0".parse().expect("解析"), true, "t"));
+        // 生产（通配绑定）下 loopback 跨机永远不可达——STUN 反射回 127.0.0.1 也要挡，
+        // 否则会广播给远端并伪造「STUN 成功」的健康信号。
+        assert!(!push_candidate(&mut c, "127.0.0.1:5000".parse().expect("解析"), true, "t"));
+        assert!(c.is_empty(), "不可达地址一个都不该进候选表: {c:?}");
+    }
+
+    /// loopback 单测绑的是 `127.0.0.1:0`，那时 loopback 就是唯一有效候选，不能一刀切拒掉。
+    #[test]
+    fn 候选闸门_loopback绑定下保留loopback() {
+        let mut c = Vec::new();
+        assert!(push_candidate(&mut c, "127.0.0.1:5000".parse().expect("解析"), false, "t"));
+        assert_eq!(c.len(), 1);
+    }
+
+    /// 去重覆盖所有来源：公网 IP 直挂网卡（VPS 无 NAT）时出口网卡地址与 STUN 反射端点
+    /// 完全相同，重复候选会让对端对同一地址并发两条 QUIC 连接，第二条永远没人 accept、
+    /// 一直重传到超时，日志里同一地址既「握手成功」又「未建立: timed out」。
+    #[test]
+    fn 候选闸门_跨来源去重() {
+        let mut c = Vec::new();
+        let addr = "203.0.113.7:5000".parse().expect("解析");
+        assert!(push_candidate(&mut c, addr, true, "出口网卡地址"));
+        assert!(
+            !push_candidate(&mut c, addr, true, "STUN 反射端点"),
+            "同一地址不同来源也必须去重"
+        );
+        assert_eq!(c.len(), 1, "重复候选必须只留一份: {c:?}");
     }
 
     #[test]

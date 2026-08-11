@@ -29,6 +29,8 @@ class MessageList extends StatefulWidget {
     required this.snapshot,
     required this.tail,
     this.onFillGap,
+    this.onResend,
+    this.onDiscard,
     super.key,
   });
 
@@ -39,6 +41,12 @@ class MessageList extends StatefulWidget {
 
   /// 点击「内容有缺口」时补齐（发 `TurnFetch`）。
   final void Function(ChatGap gap)? onFillGap;
+
+  /// 手动重发一条「送达状态未知」的消息（片 10）。
+  final void Function(ChatPending item)? onResend;
+
+  /// 放弃一条消息。
+  final void Function(ChatPending item)? onDiscard;
 
   @override
   State<MessageList> createState() => _MessageListState();
@@ -60,25 +68,36 @@ class _MessageListState extends State<MessageList> {
       valueListenable: widget.tail,
       builder: (BuildContext context, TailSnapshot tail, Widget? _) {
         final List<ChatItem> items = widget.snapshot.items;
+        final List<ChatPending> pending = widget.snapshot.pending;
         final bool hasTail = !tail.isEmpty;
         final bool thinking = widget.snapshot.thinking;
-        // 自下而上：末块 → 思考指示 → items 倒序。
+        // 自下而上：在途消息倒序 → 末块 → 思考指示 → items 倒序。
+        //
+        // ★ 在途消息在**最底部**，比正在流的末块还靠下。理由是聊天软件的普适直觉：
+        // 「我刚发的那句」永远在最下面。把它排在末块上方（即按 items 顺序拼接）在
+        // 「模型回复到一半、用户又发一条」时会让新消息插在回复中间，读起来像是它先发生的。
         final int extras = (hasTail ? 1 : 0) + (thinking ? 1 : 0);
+        final int below = pending.length;
 
         return ListView.builder(
           reverse: true,
           padding: const EdgeInsets.symmetric(vertical: 8),
-          itemCount: items.length + extras,
+          itemCount: below + items.length + extras,
           findChildIndexCallback: (Key key) {
             if (key is! ValueKey<String>) return null;
+            final int atPending =
+                pending.indexWhere((ChatPending i) => i.key == key.value);
+            if (atPending >= 0) return below - 1 - atPending;
             final int at = items.indexWhere((ChatItem i) => i.key == key.value);
             if (at < 0) return null;
-            // items 倒序排在 extras 之后。
-            return items.length - 1 - at + extras;
+            // items 倒序排在「在途 + extras」之后。
+            return items.length - 1 - at + extras + below;
           },
           itemBuilder: (BuildContext context, int index) {
-            if (hasTail && index == 0) return _tailBubble(tail);
-            final int afterTail = index - (hasTail ? 1 : 0);
+            if (index < below) return _bubble(pending[below - 1 - index]);
+            final int afterPending = index - below;
+            if (hasTail && afterPending == 0) return _tailBubble(tail);
+            final int afterTail = afterPending - (hasTail ? 1 : 0);
             if (thinking && afterTail == 0) return const ThinkingIndicator();
             final int at = items.length - 1 - (afterTail - (thinking ? 1 : 0));
             if (at < 0 || at >= items.length) return const SizedBox.shrink();
@@ -105,6 +124,11 @@ class _MessageListState extends State<MessageList> {
       ChatImage() => ImageTile(item: item),
       ChatError() => ErrorTile(item: item),
       ChatGap() => GapTile(item: item, onFill: widget.onFillGap),
+      ChatPending() => PendingTile(
+          item: item,
+          onResend: widget.onResend,
+          onDiscard: widget.onDiscard,
+        ),
       ChatUnknown() => const UnsupportedTile(),
     };
     return ChatBubble(

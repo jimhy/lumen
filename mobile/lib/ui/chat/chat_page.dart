@@ -9,6 +9,8 @@
 /// 合并成一个订阅的后果是：每 33 毫秒重建一次整页。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lumen_mobile/domain/chat_item.dart';
@@ -32,9 +34,6 @@ class ChatPage extends ConsumerStatefulWidget {
 
 class _ChatPageState extends ConsumerState<ChatPage> {
   final TextEditingController _input = TextEditingController();
-
-  /// 本端请求号。与服务端的 `seq` 是两个空间，只用来把回执与请求配对。
-  int _nextReqId = 1;
 
   @override
   void dispose() {
@@ -80,6 +79,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                   snapshot: state,
                   tail: session.controller.tail,
                   onFillGap: (ChatGap gap) => _fillGap(session, gap),
+                  onResend: (ChatPending item) => session.controller
+                      .resendByUser(item.clientMsgId, nowMs: _nowMs()),
+                  onDiscard: (ChatPending item) =>
+                      session.controller.discardPending(item.clientMsgId),
                 ),
               ),
               _composer(context, session, state),
@@ -141,19 +144,19 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     );
   }
 
+  /// 发消息。**走发件箱，不直接发帧**（片 10）。
+  ///
+  /// ## ★ 现在无论如何都清输入框，这是相对片 7 的行为变更
+  ///
+  /// 老写法是「`send` 返回 false 就不清空」——因为那时消息真的丢了，把用户的话留在
+  /// 输入框是唯一的补救。现在消息**先落库再发**：发不出去只是状态是「待发送」，
+  /// 气泡已经在列表里、重连会自动补发。此时还留在输入框反而制造了两份同样的内容，
+  /// 用户很可能再按一次发送。
   void _send(ConversationSession session, ConversationSnapshot state) {
     final String text = _input.text.trim();
     if (text.isEmpty) return;
-    final LlmConvMeta? meta = state.meta;
-    if (meta == null) return;
-    // 发不出去时不清输入框——让用户的话留在那儿，比清空之后什么都没发生好。
-    final bool ok = session.send(LlmSend(
-      convId: session.convId,
-      convGeneration: meta.convGeneration,
-      reqId: _nextReqId++,
-      text: LlmText(text),
-    ));
-    if (ok) _input.clear();
+    _input.clear();
+    unawaited(session.controller.submit(text, nowMs: _nowMs()));
   }
 
   void _interrupt(ConversationSession session, ConversationSnapshot state) {
@@ -162,7 +165,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     session.send(LlmInterrupt(
       convId: session.convId,
       convGeneration: meta.convGeneration,
-      reqId: _nextReqId++,
+      reqId: session.controller.nextReqId(),
     ));
   }
 
@@ -173,8 +176,10 @@ class _ChatPageState extends ConsumerState<ChatPage> {
     session.send(LlmTurnFetch(
       convId: session.convId,
       convGeneration: meta.convGeneration,
-      reqId: _nextReqId++,
+      reqId: session.controller.nextReqId(),
       turn: gap.turn,
     ));
   }
+
+  static int _nowMs() => DateTime.now().millisecondsSinceEpoch;
 }

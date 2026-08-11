@@ -2178,6 +2178,9 @@ mod tests {
                     turn: u32::try_from(*turn).unwrap_or(u32::MAX),
                     user: blocks.clone(),
                     started_ms: 0,
+                    // 本 fixture 走的是「上游事件 → 帧」这一段，与控制端的幂等键无关
+                    // （回带发生在 `remote_ws/llm.rs::begin_turn`）。
+                    client_msg_id: None,
                 }),
                 RunnerEvent::TurnEnded(info) => frames.push(LlmFrame::TurnEnded {
                     conv_id: 1,

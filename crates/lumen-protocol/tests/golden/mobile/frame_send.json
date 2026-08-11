@@ -1,5 +1,5 @@
 {
-  "note": "控→被：发一条用户消息。附件**字节不在本帧内**，只带被控端绝对路径 + 元数据；单张手机照片 base64 后就会顶穿服务端 4 MiB 单帧上限。",
+  "note": "控→被：发一条用户消息。附件**字节不在本帧内**，只带被控端绝对路径 + 元数据；单张手机照片 base64 后就会顶穿服务端 4 MiB 单帧上限。client_msg_id 是 outbox 的幂等键，被控端按它去重并随 TurnStarted 原样回带；**不带它的老控制端路径由 redact_send_secrets.json 覆盖**（那条刻意没有这个键）。",
   "expect_variant": "Send",
   "frame": {
     "op": "Send",
@@ -14,6 +14,7 @@
         "mime": "image/png",
         "len": 348219
       }
-    ]
+    ],
+    "client_msg_id": "018f1d2c-7a3b-7c4d-8e5f-0123456789ab"
   }
 }
