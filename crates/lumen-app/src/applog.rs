@@ -101,10 +101,7 @@ mod tests {
             b"existing",
             "未超阈值不应轮转"
         );
-        assert!(
-            !dir.join(LOG_OLD_NAME).exists(),
-            "未超阈值不应产生 .old"
-        );
+        assert!(!dir.join(LOG_OLD_NAME).exists(), "未超阈值不应产生 .old");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

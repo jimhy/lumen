@@ -1195,6 +1195,49 @@ impl rustls::server::danger::ClientCertVerifier for PinnedClientVerifier {
 mod tests {
     use super::*;
 
+    /// 生产绑定（`0.0.0.0:0`）的候选里**绝不能**出现通配地址。
+    ///
+    /// 通配候选发给对端后，对端 `connect` 到 `0.0.0.0` 在 Windows 上被内核当 localhost、打到它
+    /// 自己身上，在 Linux 上直接 EINVAL——两种都只是白占一个候选名额和一份 5 秒超时窗口内的
+    /// spawn，永远不可能连通。这条断言就是防它回来。
+    #[test]
+    fn 通配绑定不产出通配候选() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建 current-thread runtime");
+        rt.block_on(async {
+            // `stun_host = None`：只看本地候选生成，不依赖任何外网可达性（CI 亦可跑）。
+            let de = build_endpoint(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), None)
+                .await
+                .expect("构建直连端点");
+            assert!(
+                !de.candidates.iter().any(|c| c.ip().is_unspecified()),
+                "候选混入通配地址（对端永远连不通）: {:?}",
+                de.candidates
+            );
+        });
+    }
+
+    /// 具体地址绑定（loopback 测试路径）不受通配过滤影响——`127.0.0.1:P` 是真实可连端点。
+    #[test]
+    fn loopback绑定保留本地候选() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建 current-thread runtime");
+        rt.block_on(async {
+            let de = build_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), None)
+                .await
+                .expect("构建直连端点");
+            assert!(
+                de.candidates.iter().any(|c| c.ip() == Ipv4Addr::LOCALHOST),
+                "loopback 绑定应保留 127.0.0.1 候选: {:?}",
+                de.candidates
+            );
+        });
+    }
+
     #[test]
     fn stun_binding_request_格式正确() {
         let txn = [7u8; 12];
