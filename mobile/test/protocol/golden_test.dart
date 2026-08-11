@@ -14,117 +14,24 @@
 /// 互不相同的值，就是为了让这类断言写得出来。
 library;
 
-import 'dart:convert';
-import 'dart:io';
-
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lumen_mobile/protocol/codec.dart';
 import 'package:lumen_mobile/protocol/llm_enums.dart';
 import 'package:lumen_mobile/protocol/llm_frame.dart';
 import 'package:lumen_mobile/protocol/llm_model.dart';
 import 'package:lumen_mobile/protocol/remote_frame.dart';
-import 'package:path/path.dart' as p;
 
-const String _corpusRelative = '../crates/lumen-protocol/tests/golden/mobile';
-
-/// 一条语料。
-final class _Case {
-  _Case(this.name, this.env);
-
-  final String name;
-  final JsonMap env;
-
-  String get note => env['note']! as String;
-  String get expectKind => (env['expect'] as String?) ?? 'ok';
-  String? get expectVariant => env['expect_variant'] as String?;
-  Object? get frame => env['frame'];
-
-  /// 期望的重新序列化结果。缺省 = 与 `frame` 逐值相等。
-  Object? get expected => env.containsKey('reserialized') ? env['reserialized'] : env['frame'];
-
-  List<String> get debugForbidden =>
-      (env['debug_forbidden'] as List<Object?>? ?? const <Object?>[])
-          .cast<String>();
-
-  List<Object?> get envelopes =>
-      (env['envelopes'] as List<Object?>? ?? const <Object?>[]);
-}
-
-List<_Case> _loadCorpus() {
-  final Directory dir =
-      Directory(p.normalize(p.join(Directory.current.path, _corpusRelative)));
-  final List<File> files = dir
-      .listSync()
-      .whereType<File>()
-      .where((File f) => p.extension(f.path) == '.json')
-      .toList()
-    ..sort((File a, File b) => a.path.compareTo(b.path));
-  return files
-      .map((File f) => _Case(
-            p.basename(f.path),
-            jsonDecode(f.readAsStringSync()) as JsonMap,
-          ))
-      .toList();
-}
-
-/// 深度相等——**叶子连类型一起比**。
-///
-/// Dart 的 `num` 相等是跨 `int`/`double` 的（`240262 == 240262.0` 为真），不比类型
-/// 就等于放过「把整数存成 double」这类漂移：那样几乎全部语料都会绿灯通过，只有
-/// `edge_int_boundary.json` 里 `9223372036854775807` 那一个会因 double 表示不了而露馅。
-///
-/// 也**不能**用 `jsonEncode(a) == jsonEncode(b)` —— 那是在比键序，而键序不算差异
-/// （Rust 侧输出恒按键名排序，Dart 的 Map 保插入序）。
-bool deepJsonEquals(Object? a, Object? b) {
-  if (a is Map<String, Object?> && b is Map<String, Object?>) {
-    if (a.length != b.length) return false;
-    for (final String k in a.keys) {
-      if (!b.containsKey(k)) return false;
-      if (!deepJsonEquals(a[k], b[k])) return false;
-    }
-    return true;
-  }
-  if (a is List<Object?> && b is List<Object?>) {
-    if (a.length != b.length) return false;
-    for (int i = 0; i < a.length; i++) {
-      if (!deepJsonEquals(a[i], b[i])) return false;
-    }
-    return true;
-  }
-  // 一边是容器一边不是 ⇒ 直接不等（别落到下面的标量比较上）。
-  if (a is Map<Object?, Object?> ||
-      b is Map<Object?, Object?> ||
-      a is List<Object?> ||
-      b is List<Object?>) {
-    return false;
-  }
-  if (a is num && b is num) {
-    if ((a is int) != (b is int)) return false;
-    return a == b;
-  }
-  return a == b;
-}
-
-String _pretty(Object? json) =>
-    const JsonEncoder.withIndent('  ').convert(_sortKeys(json));
-
-/// 打印前按键名排序，让失败 diff 与 Rust 侧的输出对得上（那边是 BTreeMap）。
-Object? _sortKeys(Object? json) {
-  if (json is Map<String, Object?>) {
-    final List<String> keys = json.keys.toList()..sort();
-    return <String, Object?>{
-      for (final String k in keys) k: _sortKeys(json[k]),
-    };
-  }
-  if (json is List<Object?>) return json.map(_sortKeys).toList();
-  return json;
-}
+import 'corpus.dart';
 
 void main() {
-  final List<_Case> corpus = _loadCorpus();
+  // ★ 只遍历**内层帧**语料。片 5 起同一个目录里还有控制面（c2s_/s2c_）、REST（rest_）与
+  // 枚举（enums_）三类，它们各有自己的测试文件；不过滤的话这里会拿一条 c2s 语料去
+  // LlmFrame.fromJson(null)，报出一个与真正问题毫无关系的错。
+  final List<GoldenCase> corpus =
+      loadCorpus().where((GoldenCase c) => c.isFrame).toList();
 
   group('语料 ⇄ Dart 模型（契约 §3 第 1–4 条）', () {
-    for (final _Case c in corpus) {
+    for (final GoldenCase c in corpus) {
       test('${c.name}：${c.note.split('。').first}', () {
         if (c.expectKind == 'decode_error') {
           // C 型枚举的**形状**变了时整帧报废，LlmUnknown 也救不回来。
@@ -150,8 +57,8 @@ void main() {
           deepJsonEquals(actual, c.expected),
           isTrue,
           reason: '${c.name} 往返后与期望不等。\n'
-              '--- 实际 ---\n${_pretty(actual)}\n'
-              '--- 期望 ---\n${_pretty(c.expected)}',
+              '--- 实际 ---\n${pretty(actual)}\n'
+              '--- 期望 ---\n${pretty(c.expected)}',
         );
 
         // 不动点：挡的是手写错的 reserialized。没有这一条，一个瞎写的期望值会让
@@ -161,8 +68,8 @@ void main() {
           deepJsonEquals(refeed, c.expected),
           isTrue,
           reason: '${c.name} 的 reserialized 不是不动点。\n'
-              '--- 再编码 ---\n${_pretty(refeed)}\n'
-              '--- 期望 ---\n${_pretty(c.expected)}',
+              '--- 再编码 ---\n${pretty(refeed)}\n'
+              '--- 期望 ---\n${pretty(c.expected)}',
         );
 
         // D(期望) 与 D(frame) 必须是同一个值。两者都是模型，比它们的编码即可
@@ -189,7 +96,7 @@ void main() {
   group('覆盖矩阵（契约 §3 第 5 条）', () {
     test('语料申报的每个变体，Dart 侧都实现了', () {
       final Set<String> declared = <String>{
-        for (final _Case c in corpus)
+        for (final GoldenCase c in corpus)
           if (c.expectKind == 'ok') c.expectVariant!,
       };
       final Set<String> missing =
@@ -204,7 +111,7 @@ void main() {
 
     test('Dart 侧实现的每个变体，语料都覆盖到了', () {
       final Set<String> declared = <String>{
-        for (final _Case c in corpus)
+        for (final GoldenCase c in corpus)
           if (c.expectKind == 'ok') c.expectVariant!,
       };
       final Set<String> uncovered =
@@ -246,7 +153,7 @@ void main() {
   group('外层信封（契约 §3 第 6 条）', () {
     test('envelopes 数组里每一项都能解成 RemoteFrame 并原样往返', () {
       final List<Object?> samples = <Object?>[
-        for (final _Case c in corpus) ...c.envelopes,
+        for (final GoldenCase c in corpus) ...c.envelopes,
       ];
       expect(samples, isNotEmpty, reason: '一条 envelopes 样本都没有，语料被改过？');
       for (final Object? sample in samples) {
@@ -255,8 +162,8 @@ void main() {
           deepJsonEquals(frame.toJson(), sample),
           isTrue,
           reason: '外层信封往返不等。\n'
-              '--- 实际 ---\n${_pretty(frame.toJson())}\n'
-              '--- 期望 ---\n${_pretty(sample)}',
+              '--- 实际 ---\n${pretty(frame.toJson())}\n'
+              '--- 期望 ---\n${pretty(sample)}',
         );
       }
     });
@@ -281,8 +188,8 @@ void main() {
   });
 
   group('字段取值断言（契约 §3 第 7 条：往返测不出来的那一半）', () {
-    _Case caseNamed(String name) =>
-        corpus.firstWhere((_Case c) => c.name == name);
+    GoldenCase caseNamed(String name) =>
+        corpus.firstWhere((GoldenCase c) => c.name == name);
 
     test('frame_attach：三个同型字段没有接反', () {
       final LlmAttach f =

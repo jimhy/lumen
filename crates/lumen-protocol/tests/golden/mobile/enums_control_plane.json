@@ -1,0 +1,32 @@
+{
+  "note": "控制面四个 C 型枚举的**全集**。它们在线上是裸字符串，而且与 LLM 子协议那十个开放枚举**不同**：这四个**没有** Other 兜底，收到不认识的值就是整条消息报废——所以 Dart 侧必须把每一个值都实现出来，且这份清单是「Rust 加了新取值 ⇒ 覆盖断言红 ⇒ 补语料 ⇒ Dart 红」这条链的唯一载体。DenyReason 与 PairingFailReason 有两个**重名**取值（Expired / TooManyAttempts），共用一套解析就会静默串味，故分开列。",
+  "enums": {
+    "DenyReason": [
+      "Offline",
+      "AlreadyControlled",
+      "ControllerBusy",
+      "TargetPairing",
+      "CrossUser",
+      "SelfControl",
+      "RejectedByUser",
+      "ControllerLeft",
+      "Expired",
+      "TooManyAttempts"
+    ],
+    "PairingFailReason": [
+      "InvalidCode",
+      "Expired",
+      "NoPending",
+      "TooManyAttempts"
+    ],
+    "EndReason": [
+      "PeerLeft",
+      "PeerDisconnected",
+      "Replaced"
+    ],
+    "Role": [
+      "Controller",
+      "Controlled"
+    ]
+  }
+}

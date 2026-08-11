@@ -1,0 +1,13 @@
+{
+  "note": "首次登录：device_id 与 hw_id 都是 Option + skip_serializing_if，**键必须整个消失**，不能写成 \"device_id\": null。这是手写模型最常见的一处漂移，而在这里犯的后果比在 LLM 帧里重——服务端拿到一个显式的 null 与拿不到这个键走的是同一条分支，但 Dart 侧若把 hw_id 写成 null 再有人「顺手」改成空串，upsert_device 的 filter(|s| !s.is_empty()) 会把它当没有，账户里就多一台幽灵设备。",
+  "rest_type": "LoginRequest",
+  "rest": {
+    "email": "haifeng@example.com",
+    "password": "correct horse battery staple",
+    "device": {
+      "name": "海风的手机",
+      "os": "android",
+      "app_version": "0.1.0"
+    }
+  }
+}

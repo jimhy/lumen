@@ -1,0 +1,10 @@
+{
+  "note": "发起被拒的**唯一**回执。DenyReason 刻意零新增变体：它随本消息下行，加变体会让老客户端整条 from_str 失败、丢掉唯一的拒绝回执 ⇒ UI 永久转圈。AlreadyControlled 在隐藏桶里是「该电脑的手机会话已达上限（2）」，文案必须给出具体数字——只说「已被占用」会让用户去找一个并不存在的占用者。",
+  "expect_variant": "ControlDenied",
+  "s2c": {
+    "ControlDenied": {
+      "target_device_id": "pc-1",
+      "reason": "AlreadyControlled"
+    }
+  }
+}

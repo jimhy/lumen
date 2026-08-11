@@ -1,0 +1,9 @@
+{
+  "note": "**镜像**会话结束（双方各收一份），与隐藏会话的 HiddenSessionEnded 是两条独立的臂：那条带 session_id、这条不带。手机端解析后丢弃即可，但不能把两者的处理合并——合并之后一条镜像会话结束会把手机自己的隐藏会话一起清掉。",
+  "expect_variant": "SessionEnded",
+  "s2c": {
+    "SessionEnded": {
+      "reason": "Replaced"
+    }
+  }
+}

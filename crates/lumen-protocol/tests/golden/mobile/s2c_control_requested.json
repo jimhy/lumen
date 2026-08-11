@@ -1,0 +1,12 @@
+{
+  "note": "**镜像**会话的配对请求，发给被控端。手机端正常不会收到它（手机不做被控端），但 DeviceKind「手机不可被控」是 P1 的软策略、P0 服务端并不拦——所以手机端必须能把它解出来、记一条日志后丢弃，而不是整条消息解析失败。字段与 HiddenControlRequested 逐字相同，接反了往返也照绿，靠取值断言钉。",
+  "expect_variant": "ControlRequested",
+  "s2c": {
+    "ControlRequested": {
+      "controller_device_id": "desktop-9",
+      "controller_name": "书房台式机",
+      "pairing_code": "987654321",
+      "expires_in_secs": 120
+    }
+  }
+}

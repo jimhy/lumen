@@ -1,0 +1,8 @@
+{
+  "note": "续期响应：只有新 token 与新到期时刻，**不回传账户与设备信息**（客户端已有）。手机端的 401 → refresh → retry 拦截器就吃这个形状；refresh 自己再回 401 表示 token 已过期或设备行已被删，那时只能重新登录，不许再重试第二次（否则是一个无限重放循环）。",
+  "rest_type": "RefreshResponse",
+  "rest": {
+    "token": "eyJhbGciOiJIUzI1NiJ9.fake.renewed",
+    "expires_at": 1787548800
+  }
+}

@@ -65,8 +65,31 @@
 //!   `u64`，协议上确实塞得下；但 **Dart 的 `int` 是 64 位有符号**，`jsonDecode` 遇到超出的字面量会
 //!   退化成 `double` 并丢精度，两端从此静默不一致。故 [`语料自身的硬规矩`] 里有一条 lint 扫全部
 //!   语料执行这个上界——协议能表达 ≠ 语料可以用。
+//!
+//! # 四类语料（M7 片 5 起）
+//!
+//! 一个语料文件只放**一种**载荷，靠文件名前缀区分，四者互斥（[`语料自身的硬规矩`] 里有断言）：
+//!
+//! | 前缀 | 载荷键 | 守什么 | 谁在读 |
+//! |---|---|---|---|
+//! | `frame_` / `compat_` / `edge_` / `redact_` / `envelope_` | `frame` | 内层 [`LlmFrame`]（数据面） | 片 1 起 |
+//! | `c2s_` | `c2s` | [`RemoteC2S`]（控制面，手机 → 服务端） | 片 5 起 |
+//! | `s2c_` | `s2c` | [`RemoteS2C`]（控制面，服务端 → 手机） | 片 5 起 |
+//! | `rest_` | `rest` + `rest_type` | REST DTO（登录 / 设备列表 / 错误体） | 片 5 起 |
+//! | `enums_` | `enums` | 控制面四个 C 型枚举的**全集** | 片 5 起 |
+//!
+//! **控制面与数据面的前向兼容口径相反，这是四类分开的根本原因**：内层 `LlmFrame` 有
+//! `#[serde(other)]` 兜底（未知 `op` 降级成 `Unknown`），而外层 [`RemoteC2S`] / [`RemoteS2C`] 是
+//! serde 默认的**外部标签枚举**，它**不支持** `other` ——未知变体就是整条 `from_str` 失败。
+//! 所以两侧对 Dart 实现者的要求也相反：数据面「必须有 default 分支」，控制面「必须把每个变体都
+//! 实现出来」。后者没有任何运行时兜底，语料是唯一的强制手段。
+//!
+//! 同理，`enums_control_plane.json` 里那四个枚举（[`DenyReason`] / [`PairingFailReason`] /
+//! [`EndReason`] / [`Role`]）与 LLM 子协议那十个开放枚举**不是一回事**：开放枚举有 `Other(String)`
+//! 保底，这四个没有——收到不认识的取值就是整条消息报废，而 [`RemoteS2C::ControlDenied`] 恰恰是
+//! 「发起被拒」的**唯一**回执，丢了它 UI 就永久转圈。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -76,7 +99,12 @@ use lumen_protocol::llm::{
     LlmPermissionDecision, LlmPermissionResolvedBy, LlmThinking, LlmToolResultDetail,
     LlmToolStatus, LlmTurnRecord, LLM_ENUM_DEBUG_HEAD_BYTES,
 };
-use lumen_protocol::remote::RemoteFrame;
+use lumen_protocol::remote::{
+    DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C, Role,
+};
+use lumen_protocol::{
+    ApiError, AuthResponse, DeviceListResponse, LoginRequest, RefreshResponse, RegisterRequest,
+};
 
 // ── 语料信封 ──────────────────────────────────────────────────────────────────
 
@@ -96,12 +124,36 @@ struct 用例 {
     /// 期望的解析结果类别，缺省 [`期望::可解析`]。
     #[serde(default)]
     expect: 期望,
-    /// 期望解出的 [`LlmFrame`] 变体名。`expect = "ok"` 时必填，是覆盖矩阵的申报值
-    /// （测试会拿它与**实际**解出的变体名对账，防止申报与事实不符）。
+    /// 期望解出的变体名（[`LlmFrame`] / [`RemoteC2S`] / [`RemoteS2C`] 视载荷而定）。
+    /// `expect = "ok"` 时必填，是覆盖矩阵的申报值（测试会拿它与**实际**解出的变体名对账，
+    /// 防止申报与事实不符）。REST 与枚举语料没有变体概念，故不填。
     #[serde(default)]
     expect_variant: Option<String>,
     /// 线格式帧原文（内部标签 `op`，即 `RemoteFrame::Llm` 里那一层）。
-    frame: serde_json::Value,
+    ///
+    /// **片 5 起改成可选**：一个语料文件只放一种载荷，`frame` / `c2s` / `s2c` / `rest` / `enums`
+    /// 五者恰好有一个（[`语料自身的硬规矩`] 里有断言）。下面那批只针对内层帧的测试一律先过
+    /// [`帧语料`] 过滤，别的类别不会被它们误判成「缺 expect_variant」。
+    #[serde(default)]
+    frame: Option<serde_json::Value>,
+    /// 控制面 C2S 消息原文（外部标签，手机 → 服务端）。
+    #[serde(default)]
+    c2s: Option<serde_json::Value>,
+    /// 控制面 S2C 消息原文（外部标签，服务端 → 手机）。
+    #[serde(default)]
+    s2c: Option<serde_json::Value>,
+    /// REST DTO 原文（普通结构体，无标签），必须配 [`Self::rest_type`] 指明是哪个类型。
+    #[serde(default)]
+    rest: Option<serde_json::Value>,
+    /// [`Self::rest`] 的类型名，见 [`REST类型全集`]。
+    #[serde(default)]
+    rest_type: Option<String>,
+    /// 控制面 C 型枚举的取值全集：`{"DenyReason": ["Offline", …], …}`。
+    ///
+    /// 这四个枚举**没有** `Other` 兜底，Dart 侧必须把每个取值都实现出来；本字段是
+    /// 「Rust 加取值 ⇒ 覆盖断言红 ⇒ 补语料 ⇒ Dart 红」这条链的唯一载体。
+    #[serde(default)]
+    enums: BTreeMap<String, Vec<String>>,
     /// 重新序列化后的期望值；缺省 = 与 [`Self::frame`] 逐值相等。
     ///
     /// 只有**刻意考察缺省 / 降级**的用例才写它；`frame_*` 系列一律把字段写全，让它保持缺省。
@@ -165,6 +217,32 @@ fn 载入语料() -> Vec<(String, 用例)> {
             (名, 用例)
         })
         .collect()
+}
+
+/// 只保留**内层帧**语料。
+///
+/// 片 5 引入控制面与 REST 语料之后，「遍历全部语料」不再等于「遍历全部帧」——不过滤的话，
+/// 一条 `c2s_*.json` 会被 [`语料覆盖全部可增长变体`] 判成「缺 expect_variant 的帧语料」，
+/// 失败信息还会指向一个根本不存在的问题。
+fn 帧语料() -> Vec<(String, 用例)> {
+    载入语料()
+        .into_iter()
+        .filter(|(_, 用例)| 用例.frame.is_some())
+        .collect()
+}
+
+impl 用例 {
+    /// 帧原文。只在 [`帧语料`] 过滤之后调用。
+    fn 帧(&self) -> serde_json::Value {
+        self.frame.clone().expect("帧语料必须有 frame")
+    }
+
+    /// 申报的变体名（`expect = "ok"` 时必填）。
+    fn 申报变体<'a>(&'a self, 名: &str) -> &'a str {
+        self.expect_variant
+            .as_deref()
+            .unwrap_or_else(|| panic!("{名}.json 缺 expect_variant（Dart 侧靠它断言）"))
+    }
 }
 
 // ── 变体表：名字清单与穷尽 match **同源** ─────────────────────────────────────
@@ -278,6 +356,119 @@ macro_rules! 变体表 {
     对话态名,
     [Starting, Idle, Running, WaitingPermission, Exited, Unknown]
 );
+
+// ── 控制面（片 5）：外部标签枚举，**没有 `other` 兜底** ───────────────────────
+//
+// 同一个 `变体表!` 宏，但对账口径与数据面相反：数据面要的是「每个变体都有语料，好验降级」，
+// 控制面要的是「每个变体 Dart 都实现了，因为没有降级可言」。
+
+变体表!(
+    RemoteC2S,
+    C2S变体全集,
+    上行变体名,
+    [
+        RequestControl,
+        SubmitPairing,
+        DeclineControl,
+        EndSession,
+        Relay,
+        Ping,
+        ClientHello,
+        OpenHidden,
+        RelayTo,
+        EndHidden,
+    ]
+);
+变体表!(
+    RemoteS2C,
+    S2C变体全集,
+    下行变体名,
+    [
+        Welcome,
+        ControlRequested,
+        PairingNeeded,
+        PairingResult,
+        ControlDenied,
+        PairingCancelled,
+        SessionStarted,
+        SessionEnded,
+        Relay,
+        Pong,
+        HiddenControlRequested,
+        HiddenSessionStarted,
+        HiddenSessionEnded,
+        RelayTo,
+    ]
+);
+
+变体表!(
+    DenyReason,
+    拒因全集,
+    拒因名,
+    [
+        Offline,
+        AlreadyControlled,
+        ControllerBusy,
+        TargetPairing,
+        CrossUser,
+        SelfControl,
+        RejectedByUser,
+        ControllerLeft,
+        Expired,
+        TooManyAttempts,
+    ]
+);
+变体表!(
+    PairingFailReason,
+    配对失败全集,
+    配对失败名,
+    [InvalidCode, Expired, NoPending, TooManyAttempts]
+);
+变体表!(
+    EndReason,
+    结束原因全集,
+    结束原因名,
+    [PeerLeft, PeerDisconnected, Replaced]
+);
+变体表!(Role, 角色全集, 角色名, [Controller, Controlled]);
+
+/// 手机端**刻意不实现**的 C2S 变体，逐条写明理由——这份清单本身就是设计决策的存放处。
+///
+/// [`控制面语料覆盖移动端子集`] 断言「有语料的 ∪ 本清单 == 全集」且两者**不相交**：
+/// 协议加一个 C2S 变体时，穷尽 `match` 先让编译失败逼人补进 [`C2S变体全集`]，随后覆盖断言
+/// 逼人二选一——要么给手机端写语料并实现，要么写进这里并说明为什么不实现。**没有默认值**。
+const 手机不发的C2S: &[(&str, &str)] = &[
+    (
+        "RequestControl",
+        "镜像会话的发起消息。手机发它 = 占住那台 PC 的镜像独占位（且老服务端会照常执行成功、\
+         两端都察觉不到），手机要的是 OpenHidden。类型层不实现，比在文档里写一句「不要发」硬。",
+    ),
+    (
+        "DeclineControl",
+        "被控端拒绝未决配对用的。手机端在 P0 不做被控端。",
+    ),
+    (
+        "EndSession",
+        "拆的是本设备唯一的**镜像**会话；手机拆隐藏会话用带 id 的 EndHidden。\
+         两者都是 unit/结构体变体、名字又像，实现出来只会被误用。",
+    ),
+    (
+        "Relay",
+        "镜像会话的数据面盲转，按「发送者是谁」路由，在一台 PC 挂多条隐藏会话时结构性失效。\
+         手机走带 session_id 的 RelayTo。",
+    ),
+];
+
+/// 移动端会用到的 REST DTO 顶层类型（嵌套的 `DeviceInfo` / `UserInfo` / `DeviceRecord`
+/// 随顶层一起被覆盖）。[`rest语料双向往返`] 断言每一个都至少有一条语料。
+const REST类型全集: &[&str] = &[
+    "RegisterRequest",
+    "LoginRequest",
+    "AuthResponse",
+    "RefreshResponse",
+    "DeviceListResponse",
+    "ApiError",
+];
 
 // ── 覆盖账本 ──────────────────────────────────────────────────────────────────
 
@@ -451,28 +642,26 @@ fn 对账(类型名: &str, 实际: &BTreeSet<&'static str>, 全集: &[&str]) {
 #[test]
 fn 语料双向往返语义等价() {
     let mut 已见帧: BTreeSet<String> = BTreeSet::new();
-    for (名, 用例) in 载入语料() {
+    for (名, 用例) in 帧语料() {
         if 用例.expect == 期望::整帧报废 {
             continue;
         }
+        let 帧 = 用例.帧();
         // 语料不该有两条一模一样的帧（复制粘贴出来的语料只增加维护量、不增加覆盖）。
-        let 指纹 = serde_json::to_string(&用例.frame).expect("序列化 frame");
+        let 指纹 = serde_json::to_string(&帧).expect("序列化 frame");
         assert!(
             已见帧.insert(指纹),
             "{名}.json 的 frame 与另一条语料完全相同——语料要么加信息、要么别加"
         );
 
-        let 解出: LlmFrame = serde_json::from_value(用例.frame.clone())
+        let 解出: LlmFrame = serde_json::from_value(帧.clone())
             .unwrap_or_else(|e| panic!("{名}.json 必须能解析（未知内容应降级而不是报错）: {e}"));
         let 回写 = serde_json::to_value(&解出).expect("序列化");
-        let 期望值 = 用例
-            .reserialized
-            .clone()
-            .unwrap_or_else(|| 用例.frame.clone());
+        let 期望值 = 用例.reserialized.clone().unwrap_or_else(|| 帧.clone());
 
         if let Some(声明) = &用例.reserialized {
             assert_ne!(
-                声明, &用例.frame,
+                声明, &帧,
                 "{名}.json 的 reserialized 与 frame 逐值相同——它是给「缺省被补上 / 未知被降级」用的，\
                  没有差异就该删掉，留着会让 review 的人以为这里有玄机"
             );
@@ -523,7 +712,7 @@ fn 语料双向往返语义等价() {
 #[test]
 fn 语料覆盖全部可增长变体() {
     let mut 账 = 覆盖::default();
-    for (名, 用例) in 载入语料() {
+    for (名, 用例) in 帧语料() {
         if 用例.expect == 期望::整帧报废 {
             assert!(
                 用例.expect_variant.is_none(),
@@ -531,11 +720,8 @@ fn 语料覆盖全部可增长变体() {
             );
             continue;
         }
-        let 解出: LlmFrame = serde_json::from_value(用例.frame.clone()).expect("必须能解析");
-        let 申报 = 用例
-            .expect_variant
-            .as_deref()
-            .unwrap_or_else(|| panic!("{名}.json 缺 expect_variant（Dart 侧靠它断言）"));
+        let 解出: LlmFrame = serde_json::from_value(用例.帧()).expect("必须能解析");
+        let 申报 = 用例.申报变体(&名);
         assert_eq!(
             申报,
             帧变体名(&解出),
@@ -573,8 +759,8 @@ fn 语料覆盖全部可增长变体() {
 #[test]
 fn 未知内容降级而不是报错() {
     let mut 报废条数 = 0_u32;
-    for (名, 用例) in 载入语料() {
-        let 结果 = serde_json::from_value::<LlmFrame>(用例.frame.clone());
+    for (名, 用例) in 帧语料() {
+        let 结果 = serde_json::from_value::<LlmFrame>(用例.帧());
         match 用例.expect {
             期望::可解析 => {
                 assert!(
@@ -612,14 +798,15 @@ fn 未知内容降级而不是报错() {
 #[test]
 fn 敏感值不得进调试渲染() {
     let mut 守到的语料 = 0_u32;
-    for (名, 用例) in 载入语料() {
+    for (名, 用例) in 帧语料() {
         if 用例.debug_forbidden.is_empty() {
             continue;
         }
         守到的语料 += 1;
-        let 解出: LlmFrame = serde_json::from_value(用例.frame.clone()).expect("必须能解析");
+        let 帧 = 用例.帧();
+        let 解出: LlmFrame = serde_json::from_value(帧.clone()).expect("必须能解析");
         let 调试 = format!("{解出:?}");
-        let 线上 = serde_json::to_string(&用例.frame).expect("序列化");
+        let 线上 = serde_json::to_string(&帧).expect("序列化");
         for 敏感 in &用例.debug_forbidden {
             assert!(
                 线上.contains(敏感.as_str()),
@@ -752,34 +939,294 @@ fn 语料自身的硬规矩() {
         );
     }
 
+    /// 文件名前缀 → 该类语料必须带的载荷键。
+    const 前缀与载荷: &[(&str, &str)] = &[
+        ("frame_", "frame"),
+        ("compat_", "frame"),
+        ("edge_", "frame"),
+        ("redact_", "frame"),
+        ("envelope_", "frame"),
+        ("c2s_", "c2s"),
+        ("s2c_", "s2c"),
+        ("rest_", "rest"),
+        ("enums_", "enums"),
+    ];
+
     for (名, 用例) in 载入语料() {
         assert!(
             名.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
             "语料文件名 {名}.json 必须是 ASCII 小写 + 下划线（Flutter 资源路径 / 跨平台 CI 兼容）"
         );
-        assert!(
-            名.starts_with("frame_")
-                || 名.starts_with("compat_")
-                || 名.starts_with("edge_")
-                || 名.starts_with("redact_")
-                || 名.starts_with("envelope_"),
-            "语料文件名 {名}.json 必须带分类前缀 frame_ / compat_ / edge_ / redact_ / envelope_"
-        );
+        let 载荷键 = 前缀与载荷
+            .iter()
+            .find(|(前缀, _)| 名.starts_with(前缀))
+            .map(|(_, 键)| *键)
+            .unwrap_or_else(|| {
+                panic!(
+                    "语料文件名 {名}.json 必须带分类前缀 frame_ / compat_ / edge_ / redact_ / \
+                     envelope_ / c2s_ / s2c_ / rest_ / enums_"
+                )
+            });
         assert!(
             用例.note.chars().count() >= 20,
             "{名}.json 的 note 太短，写清它守的是什么（Dart 实现者只看这一行）"
         );
-        if let Some(大数) = 越界整数(&用例.frame) {
-            panic!(
-                "{名}.json 里有超过 i64::MAX 的整数 {大数}：Dart 的 int 是 64 位有符号，\
-                 jsonDecode 会把它退化成 double 并丢精度，两端从此静默不一致"
-            );
-        }
-        if let Some(期望值) = &用例.reserialized {
-            if let Some(大数) = 越界整数(期望值) {
-                panic!("{名}.json 的 reserialized 里有超过 i64::MAX 的整数 {大数}");
+
+        // 一个文件只放一种载荷：混着放会让「遍历某一类语料」变成一件要靠读注释才知道对不对的事，
+        // 而两端各遍历一次，漏判在哪一端都只是静默少测几条。
+        let 实有: Vec<&str> = [
+            ("frame", 用例.frame.is_some()),
+            ("c2s", 用例.c2s.is_some()),
+            ("s2c", 用例.s2c.is_some()),
+            ("rest", 用例.rest.is_some()),
+            ("enums", !用例.enums.is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(键, 有)| 有.then_some(键))
+        .collect();
+        assert_eq!(
+            实有,
+            vec![载荷键],
+            "{名}.json 的载荷与文件名前缀不符：前缀要求恰好一个 \"{载荷键}\"，实得 {实有:?}"
+        );
+
+        // rest_type 与 rest 必须同进同出：少了它测试不知道该往哪个类型解，多了它是复制粘贴残留。
+        assert_eq!(
+            用例.rest.is_some(),
+            用例.rest_type.is_some(),
+            "{名}.json 的 rest 与 rest_type 必须同时出现（rest_type 指明往哪个 DTO 解）"
+        );
+        // debug_forbidden 的断言只在内层帧那条通路上跑（脱敏包装都在 llm.rs 里），
+        // 挂到别的语料上会被静默忽略——那正是「测了个寂寞」的形状。
+        assert!(
+            用例.debug_forbidden.is_empty() || 用例.frame.is_some(),
+            "{名}.json 在非帧语料上写了 debug_forbidden，它不会被任何断言读到"
+        );
+
+        for (什么, 值) in [
+            ("frame", 用例.frame.as_ref()),
+            ("c2s", 用例.c2s.as_ref()),
+            ("s2c", 用例.s2c.as_ref()),
+            ("rest", 用例.rest.as_ref()),
+            ("reserialized", 用例.reserialized.as_ref()),
+        ] {
+            if let Some(大数) = 值.and_then(越界整数) {
+                panic!(
+                    "{名}.json 的 {什么} 里有超过 i64::MAX 的整数 {大数}：Dart 的 int 是 64 位\
+                     有符号，jsonDecode 会把它退化成 double 并丢精度，两端从此静默不一致"
+                );
             }
         }
     }
+}
+
+// ── 控制面（片 5）：外部标签枚举 + REST DTO ───────────────────────────────────
+
+/// **控制面双向断言**：语料 → [`RemoteC2S`] / [`RemoteS2C`] → 语料，逐值相等。
+///
+/// 与内层帧那条的三点不同，每一点都源自「外部标签枚举没有 `other` 兜底」：
+///
+/// 1. **没有 `reserialized`**：控制面结构体里一个 `#[serde(default)]` 都没有，输入即输出。
+///    哪天真加了一个，这里会当场红——那正是该停下来想想「老端收到缺字段的消息会怎样」的时刻。
+/// 2. **没有「未知降级」用例**：未知变体在这一层就是整条 `from_str` 失败，两端都必须报错。
+/// 3. **unit 变体是裸字符串**（`"Ping"` / `"Pong"`），不是 `{"Ping":{}}`。心跳走的正是这条，
+///    Dart 侧假设「消息一定是 object」会在每 25 秒一次的心跳上直接炸。
+#[test]
+fn 控制面语料双向往返() {
+    /// 一条控制面语料的往返断言（C2S / S2C 两侧逻辑逐字相同，只有类型不同）。
+    macro_rules! 往返 {
+        ($名:expr, $用例:expr, $原文:expr, $类型:ty, $取名:ident, $方向:expr) => {{
+            let 解出: $类型 = serde_json::from_value($原文.clone()).unwrap_or_else(|e| {
+                panic!(
+                    "{}.json 的 {} 必须能解析（控制面没有 other 兜底，解不出就是整条丢弃）: {e}",
+                    $名, $方向
+                )
+            });
+            assert_eq!(
+                $用例.申报变体($名),
+                $取名(&解出),
+                "{}.json 申报的变体与实际解出的不一致",
+                $名
+            );
+            assert_eq!(
+                &serde_json::to_value(&解出).expect("序列化"),
+                $原文,
+                "{}.json 的 {} 往返不等价（外部标签：结构体变体是 {{\"名\": {{…}}}}、\
+                 unit 变体是裸字符串）",
+                $名,
+                $方向
+            );
+        }};
+    }
+
+    let mut 条数 = 0_u32;
+    for (名, 用例) in 载入语料() {
+        if let Some(原文) = &用例.c2s {
+            条数 += 1;
+            往返!(&名, 用例, 原文, RemoteC2S, 上行变体名, "c2s");
+        }
+        if let Some(原文) = &用例.s2c {
+            条数 += 1;
+            往返!(&名, 用例, 原文, RemoteS2C, 下行变体名, "s2c");
+        }
+    }
+    assert!(
+        条数 >= 20,
+        "控制面语料只剩 {条数} 条——手机会发的 6 个 C2S 变体与全部 14 个 S2C 变体都该有语料"
+    );
+}
+
+/// **控制面覆盖矩阵**：S2C 全覆盖，C2S 按「会发的 ∪ 刻意不发的 == 全集」对账。
+///
+/// 两侧口径不同，因为两侧的失败形态不同：
+///
+/// - **S2C 必须全实现**。手机是接收方，收到一条没实现的变体就是整条解析失败。哪怕是
+///   「手机理论上收不到」的镜像消息（`SessionStarted` / `Relay` …）——「理论上收不到」是
+///   对服务端当前行为的假设，不是协议保证，而 `DeviceKind`「手机不可被控」到 P1 才做。
+///   解出来记一条日志丢掉，成本是几十行；假设它不会来，代价是一条静默失效的连接。
+/// - **C2S 刻意不全实现**。手机发得出 `RequestControl` 才是真危险（占住那台 PC 的镜像独占位，
+///   且老服务端会照常执行成功）。不实现 = 类型系统层面发不出去，比文档里写一句「不要发」硬。
+///   [`手机不发的C2S`] 里逐条写着理由。
+#[test]
+fn 控制面语料覆盖移动端子集() {
+    let mut c2s见: BTreeSet<&'static str> = BTreeSet::new();
+    let mut s2c见: BTreeSet<&'static str> = BTreeSet::new();
+    for (_, 用例) in 载入语料() {
+        if let Some(原文) = &用例.c2s {
+            let 解出: RemoteC2S = serde_json::from_value(原文.clone()).expect("必须能解析");
+            c2s见.insert(上行变体名(&解出));
+        }
+        if let Some(原文) = &用例.s2c {
+            let 解出: RemoteS2C = serde_json::from_value(原文.clone()).expect("必须能解析");
+            s2c见.insert(下行变体名(&解出));
+        }
+    }
+
+    对账("RemoteS2C", &s2c见, S2C变体全集);
+
+    let 不发: BTreeSet<&'static str> = 手机不发的C2S.iter().map(|(名, _)| *名).collect();
+    for (名, 理由) in 手机不发的C2S {
+        assert!(
+            !c2s见.contains(名),
+            "{名} 既有 c2s 语料又列在「手机不发」清单里——二选一：要么删语料，要么把它从清单里拿掉"
+        );
+        assert!(
+            理由.chars().count() >= 20,
+            "「手机不发 {名}」缺少像样的理由。这份清单是设计决策的存放处，写「不需要」等于没写"
+        );
+    }
+    let 合计: BTreeSet<&'static str> = c2s见.union(&不发).copied().collect();
+    对账("RemoteC2S（有语料的 ∪ 手机刻意不发的）", &合计, C2S变体全集);
+}
+
+/// **控制面 C 型枚举**：四个枚举的每一个取值都必须被语料点名，且**线格式恒等于变体名**。
+///
+/// 后半句是在钉一条容易被顺手破坏的事实：这四个枚举都没挂 `#[serde(rename)]`，所以线上的
+/// 字符串就是 Rust 的变体名。哪天有人加了 rename，Dart 侧那张手写的取值表会静默对不上——
+/// 而它们没有 `Other` 兜底，对不上就是整条 [`RemoteS2C::ControlDenied`] 报废，
+/// 丢掉的正是「发起被拒」的唯一回执。
+#[test]
+fn 控制面枚举语料覆盖全部取值() {
+    let mut 账: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    let mut 条数 = 0_u32;
+    for (名, 用例) in 载入语料() {
+        for (类型, 取值们) in &用例.enums {
+            assert!(!取值们.is_empty(), "{名}.json 的 {类型} 取值表是空的");
+            for 取值 in 取值们 {
+                条数 += 1;
+                let 原文 = serde_json::Value::String(取值.clone());
+                /// 解析一个取值并返回它的变体名；解不出说明语料里的字符串不是合法取值。
+                macro_rules! 解 {
+                    ($类型:ty, $取名:ident) => {{
+                        let 值: $类型 = serde_json::from_value(原文.clone()).unwrap_or_else(|e| {
+                            panic!("{名}.json 的 {类型} 取值「{取值}」不是合法线格式: {e}")
+                        });
+                        $取名(&值)
+                    }};
+                }
+                let 变体名 = match 类型.as_str() {
+                    "DenyReason" => 解!(DenyReason, 拒因名),
+                    "PairingFailReason" => 解!(PairingFailReason, 配对失败名),
+                    "EndReason" => 解!(EndReason, 结束原因名),
+                    "Role" => 解!(Role, 角色名),
+                    其它 => panic!(
+                        "{名}.json 里的枚举类型 \"{其它}\" 不认识：控制面 C 型枚举只有 \
+                         DenyReason / PairingFailReason / EndReason / Role 四个"
+                    ),
+                };
+                assert_eq!(
+                    变体名, 取值,
+                    "{名}.json：{类型} 的线格式与变体名不一致（多半是加了 serde rename）——\
+                     Dart 侧那张手写取值表会静默对不上，而这四个枚举没有 Other 兜底"
+                );
+                账.entry(类型.clone()).or_default().insert(变体名);
+            }
+        }
+    }
+    assert!(条数 > 0, "一条控制面枚举语料都没有（enums_control_plane.json 丢了？）");
+
+    对账("DenyReason", 账.get("DenyReason").unwrap_or(&BTreeSet::new()), 拒因全集);
+    对账(
+        "PairingFailReason",
+        账.get("PairingFailReason").unwrap_or(&BTreeSet::new()),
+        配对失败全集,
+    );
+    对账("EndReason", 账.get("EndReason").unwrap_or(&BTreeSet::new()), 结束原因全集);
+    对账("Role", 账.get("Role").unwrap_or(&BTreeSet::new()), 角色全集);
+}
+
+/// **REST DTO 往返**：登录 / 注册 / 续期 / 设备列表 / 错误体逐个过一遍线格式。
+///
+/// 这一层此前**两端都没有守卫**：REST DTO 不在 `RemoteFrame` 里，桌面端与服务端共用同一份
+/// Rust 类型所以永远不会漂，而手机端是第二份手写实现——改一个字段名，Rust 侧全绿，
+/// 手机端要等到有人真的点了登录才发现。
+///
+/// 最需要守的是 `DeviceInfo` 那两个 `Option + skip_serializing_if`：写成 `"hw_id": null`
+/// 与键缺席在**服务端**看是同一条分支（`filter(|s| !s.is_empty())`），所以线上看不出区别，
+/// 直到某次有人把 null 改成空串——账户里就开始长幽灵设备。
+#[test]
+fn rest语料双向往返() {
+    let mut 见过: BTreeSet<&'static str> = BTreeSet::new();
+    for (名, 用例) in 载入语料() {
+        let (Some(原文), Some(类型)) = (&用例.rest, &用例.rest_type) else {
+            continue;
+        };
+        /// 按 `rest_type` 分派到具体 DTO 做往返，返回（回写值, 类型名）。
+        macro_rules! 分派 {
+            ([$($t:ident),+ $(,)?]) => {
+                match 类型.as_str() {
+                    $(stringify!($t) => {
+                        let 解出: $t = serde_json::from_value(原文.clone()).unwrap_or_else(|e| {
+                            panic!("{名}.json 解成 {} 失败: {e}", stringify!($t))
+                        });
+                        (serde_json::to_value(&解出).expect("序列化"), stringify!($t))
+                    })+
+                    其它 => panic!(
+                        "{名}.json 的 rest_type \"{其它}\" 不在 REST类型全集里——\
+                         新增 DTO 要同时加进 REST类型全集与这个 match"
+                    ),
+                }
+            };
+        }
+        let (回写, 类型名) = 分派!([
+            RegisterRequest,
+            LoginRequest,
+            AuthResponse,
+            RefreshResponse,
+            DeviceListResponse,
+            ApiError,
+        ]);
+        assert_eq!(
+            &回写,
+            原文,
+            "{名}.json 的 REST 往返不等价。\n\
+             —— note: {}\n\
+             —— 实际输出（键按名排序；Option + skip 的字段应当整个消失，不是写成 null）：\n{}",
+            用例.note,
+            serde_json::to_string_pretty(&回写).expect("pretty")
+        );
+        见过.insert(类型名);
+    }
+    对账("REST DTO", &见过, REST类型全集);
 }

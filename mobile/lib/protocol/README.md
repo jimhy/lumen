@@ -1,6 +1,6 @@
 # `lib/protocol/` —— 线格式层（**零 Flutter 依赖**）
 
-> 状态：**LLM 子协议已落地**（M7 片 1-Dart）。REST 与控制面 DTO 留给片 5。
+> 状态：**全部落地**——LLM 子协议（片 1-Dart）+ 控制面与 REST（片 5）。
 
 ## 铁律（这一条不是风格偏好）
 
@@ -23,8 +23,32 @@
 | `llm_model.dart` | 块 / 用量 / 对话元信息 / 轮记录 / 增量项 / 审批，含三个脱敏包装 | ✅ |
 | `llm_frame.dart` | `LlmFrame` 30 个变体（**内部标签** `"op"`，未知 op 降级成 `LlmUnknown`） | ✅ |
 | `remote_frame.dart` | 外层 `RemoteFrame` 信封（**externally tagged**，只实现移动端用得到的子集） | ✅ 子集 |
-| `rest_dto.dart` | `LoginRequest` / `AuthResponse` / `DeviceRecord` … | 片 5 |
-| `remote_c2s.dart` / `remote_s2c.dart` | 控制面 sealed 类 | 片 5 |
+| `rest_dto.dart` | `LoginRequest` / `AuthResponse` / `DeviceRecord` … + `LumenRoutes` 路径常量 | ✅ 片 5 |
+| `remote_c2s.dart` | 控制面上行，**只实现手机会发的 6 个变体** | ✅ 片 5 |
+| `remote_s2c.dart` | 控制面下行，**全部 14 个变体** + 四个封闭式 C 型枚举 | ✅ 片 5 |
+
+## 控制面与数据面的口径**相反**（片 5 新增，读之前别动那两个文件）
+
+| | 内层 `LlmFrame`（数据面） | 外层 `RemoteC2S` / `RemoteS2C`（控制面） |
+|---|---|---|
+| 标签 | internally tagged（`"op"`） | externally tagged（变体名当唯一 key） |
+| 未知变体 | 降级成 `Unknown`，同帧其余内容照常 | **整条报废**（serde 的外部标签枚举不支持 `other`） |
+| 这一层要写 | 一条 `default:` 分支 | **每个变体都实现出来**，没有 default 可写 |
+
+两侧的覆盖要求也不对称，这是刻意的：
+
+- **S2C 全实现**（14 个）。手机是接收方，收到一条没实现的变体就是整条消息失败。哪怕是
+  「理论上收不到」的镜像消息——「理论上」是对服务端**当前行为**的假设，不是协议保证。
+- **C2S 只实现 6 个**。`RequestControl` / `DeclineControl` / `EndSession` / `Relay` 是桌面端与
+  被控端的；手机发得出 `RequestControl` 才是真危险（占住那台 PC 的镜像独占位，而且**老服务端
+  会照常执行成功**、两端都察觉不到）。不实现 = 类型层面发不出去。
+
+**unit 变体是裸字符串**（`"Ping"` / `"Pong"`），不是 `{"Ping":{}}`。心跳走的正是这条。
+
+四个封闭式 C 型枚举（`DenyReason` / `PairingFailReason` / `EndReason` / `RemoteRole`）
+**没有 `Other` 兜底**，与 LLM 那十个开放枚举不是一回事：收到不认识的取值就是整条消息报废，
+而 `ControlDenied` 是「发起被拒」的**唯一**回执。⚠ 前两个有重名取值（`Expired` /
+`TooManyAttempts`）但语义不同，共用一套解析会静默串味。
 
 ## 三条已经被测试钉死的规则
 

@@ -23,6 +23,22 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NOPROXY=(env -u http_proxy -u https_proxy -u all_proxy -u ftp_proxy -u no_proxy
          -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u FTP_PROXY -u NO_PROXY)
 
+# ★ 把 PUB_HOSTED_URL 钉回源站（片 5 踩到的坑，2026-08-10）。
+#
+# 作者本机把 PUB_HOSTED_URL=https://pub.flutter-io.cn 设成了**全局**环境变量，而
+# `flutter analyze` / `flutter test` 都会**隐式**跑一次 pub get。pub 把 hosted URL 当作
+# 依赖身份的一部分：环境里的 URL 与 lock 里的对不上时，它会**忽略 lock 重新解析整个依赖图**，
+# 顺手把依赖升到最新兼容版本，再把镜像 URL 写回 lock 的每一条 url。
+#
+# 后果是一次「只读」的 analyze 就悄悄改掉 146 行 pubspec.lock，而 CI 跑的
+# `flutter pub get --enforce-lockfile` 不设这个变量 ⇒ 第一步就红。
+# 老写法只在 --pub 分支归一化，analyze / test 这两条**更常跑**的路径完全不设防。
+#
+# 这里不摘掉变量而是显式设成源站：pub 需要一个 hosted URL，摘掉它会退回默认值 pub.dev
+# ——效果相同，但显式写出来才看得见「我们要求的是源站」。下载不会真的发生（包已在 pub cache 里，
+# 且 lock 与环境一致时 pub 不会重新解析）。
+PUB_SOURCE=(PUB_HOSTED_URL=https://pub.dev)
+
 MODE=test
 ARGS=()
 DO_PUB=0
@@ -55,11 +71,11 @@ if [ "$MODE" = analyze ]; then
   # --fatal-infos：analysis_options.yaml 里开的 strict-casts 等报的是 info 级，
   # 不加这个参数等于白开。与 mobile.yml 同参数。
   echo "[test.sh] flutter analyze --fatal-infos"
-  exec "${NOPROXY[@]}" flutter analyze --fatal-infos
+  exec "${NOPROXY[@]}" "${PUB_SOURCE[@]}" flutter analyze --fatal-infos
 fi
 
 echo "[test.sh] flutter test ${ARGS[*]:-（全部）}"
 # 展开写法必须是 ${ARGS[@]+"${ARGS[@]}"} 而不是 "${ARGS[@]:-}"：
 # 后者在数组为空时会展开成**一个空字符串参数**，`flutter test ''` 会报「找不到测试文件」；
 # 而 set -u 下又不能直接写 "${ARGS[@]}"（空数组在旧版 bash 上算未绑定变量）。
-exec "${NOPROXY[@]}" flutter test ${ARGS[@]+"${ARGS[@]}"}
+exec "${NOPROXY[@]}" "${PUB_SOURCE[@]}" flutter test ${ARGS[@]+"${ARGS[@]}"}

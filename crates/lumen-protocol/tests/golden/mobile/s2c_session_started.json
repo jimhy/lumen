@@ -1,0 +1,11 @@
+{
+  "note": "**镜像**会话建立，双方各收一份。手机端永远不该走到这条（它发的是 OpenHidden 不是 RequestControl）——真收到就说明有人把手机端的发起路径改错了，必须能解出来并**告警**，而不是解析失败后无声无息。与 HiddenSessionStarted 的差别只有一个 session_id 字段，这正是「两条臂绝不合并」那条铁律要挡的相似度。",
+  "expect_variant": "SessionStarted",
+  "s2c": {
+    "SessionStarted": {
+      "peer_device_id": "pc-1",
+      "peer_name": "海风的工作站",
+      "role": "Controller"
+    }
+  }
+}

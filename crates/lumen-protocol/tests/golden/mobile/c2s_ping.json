@@ -1,0 +1,5 @@
+{
+  "note": "应用层心跳。unit 变体在 externally tagged 下序列化成**裸 JSON 字符串** \"Ping\"，不是对象 {\"Ping\":{}}——假设「消息一定是 object」的 Dart 解析器会在心跳上直接炸，而心跳是唯一每 25 秒必发的消息，炸了就是全链路不通。",
+  "expect_variant": "Ping",
+  "c2s": "Ping"
+}

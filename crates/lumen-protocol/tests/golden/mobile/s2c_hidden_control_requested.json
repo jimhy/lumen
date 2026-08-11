@@ -1,0 +1,12 @@
+{
+  "note": "发给**被控端 PC**（手机收不到，但线格式必须两端一致，且这是「手机端解析器不许对陌生变体整条崩」的载体之一）。刻意不复用 ControlRequested：复用的话老 PC 会展示一个码、念完之后收不到它认识的 SessionStarted（服务端发的是 HiddenSessionStarted，老端整条丢弃）⇒ 横幅永久残留，用户点「拒绝」还会得到「我拒绝成功了」的错觉而会话早已建立——那是安全误导。",
+  "expect_variant": "HiddenControlRequested",
+  "s2c": {
+    "HiddenControlRequested": {
+      "controller_device_id": "phone-1",
+      "controller_name": "海风的手机",
+      "pairing_code": "012345678",
+      "expires_in_secs": 120
+    }
+  }
+}

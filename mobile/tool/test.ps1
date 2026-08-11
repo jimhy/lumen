@@ -98,6 +98,19 @@ try {
         Write-Host '[test.ps1] pubspec.lock 已归一化回 pub.dev（PUB_HOSTED_URL 只许影响下载源，不许留在 lock 里）' -ForegroundColor DarkGray
     }
 
+    # ── ★ 坑 4：把 PUB_HOSTED_URL 钉回源站（片 5 踩到的，2026-08-10）─────────────
+    # 作者本机把 PUB_HOSTED_URL=https://pub.flutter-io.cn 设成了**全局**环境变量，而
+    # `flutter analyze` / `flutter test` 都会**隐式**跑一次 pub get。pub 把 hosted URL 当作
+    # 依赖身份的一部分：环境里的 URL 与 lock 里的对不上时，它会**忽略 lock 重新解析整个依赖图**，
+    # 顺手把依赖升到最新兼容版本，再把镜像 URL 写回 lock 的每一条 url。
+    #
+    # 后果是一次「只读」的 analyze 就悄悄改掉 146 行 pubspec.lock，而 CI 跑的
+    # `flutter pub get --enforce-lockfile` 不设这个变量 ⇒ 第一步就红。
+    # 老写法只在 -Pub 分支归一化，analyze / test 这两条**更常跑**的路径完全不设防。
+    #
+    # 放在 -Pub 分支**之后**：那一支要的正是镜像，它自己会在 pub get 之后归一化 lock。
+    $env:PUB_HOSTED_URL = 'https://pub.dev'
+
     if ($Analyze) {
         # --fatal-infos：与 mobile.yml 同参数。analysis_options.yaml 里开的
         # strict-casts / strict-inference / strict-raw-types 报的是 info 级，

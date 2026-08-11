@@ -1,0 +1,9 @@
+{
+  "note": "**镜像**会话的数据面盲转，newtype 变体：线上是 {\"Relay\": <载荷>}，载荷直接就是外层 RemoteFrame 信封、**外面没有再套一层字段名**（RelayTo 才是 {session_id, payload} 的结构体变体）。手机端不镜像终端画面，收到只丢弃；但载荷必须原样往返，不许在解析时窥探或改写它。",
+  "expect_variant": "Relay",
+  "s2c": {
+    "Relay": {
+      "Echo": "hi"
+    }
+  }
+}

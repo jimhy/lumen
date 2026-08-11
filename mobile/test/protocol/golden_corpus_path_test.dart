@@ -17,6 +17,7 @@ library;
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:collection/collection.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
@@ -91,13 +92,18 @@ void main() {
       }
     });
 
-    test('expect == ok 的用例都申报了 expect_variant', () {
+    test('带变体的语料都申报了 expect_variant', () {
       // 这个申报值是覆盖矩阵的唯一载体：Dart 没有 Rust 的穷尽 match，
-      // 「Dart 少实现一个变体就红」全靠片 1 把这些申报值收成集合去对账。
+      // 「Dart 少实现一个变体就红」全靠把这些申报值收成集合去对账。
+      // REST 与枚举语料没有「变体」这回事，故不要求（片 5）。
       for (final File f in _corpusFiles()) {
         final Map<String, dynamic> env =
             jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
         if (((env['expect'] as String?) ?? 'ok') != 'ok') continue;
+        final bool hasVariant = env.containsKey('frame') ||
+            env.containsKey('c2s') ||
+            env.containsKey('s2c');
+        if (!hasVariant) continue;
 
         final Object? variant = env['expect_variant'];
         expect(variant, isA<String>(), reason: '${f.path} 缺 expect_variant');
@@ -105,11 +111,35 @@ void main() {
       }
     });
 
-    test('frame 键存在（这是可逐字节当样本用的那一层）', () {
+    test('五个载荷键恰好有一个，且与文件名前缀相符', () {
+      // 片 5 起语料分四类。一个文件混放两种载荷，会让「遍历某一类」变成要靠读注释才知道
+      // 对不对的事——而两端各遍历一次，漏判在哪一端都只是静默少测几条。
+      // Rust 侧 `语料自身的硬规矩` 有同款断言，两边一起守。
+      const Map<String, String> prefixToKey = <String, String>{
+        'frame_': 'frame',
+        'compat_': 'frame',
+        'edge_': 'frame',
+        'redact_': 'frame',
+        'envelope_': 'frame',
+        'c2s_': 'c2s',
+        's2c_': 's2c',
+        'rest_': 'rest',
+        'enums_': 'enums',
+      };
       for (final File f in _corpusFiles()) {
+        final String name = p.basename(f.path);
         final Map<String, dynamic> env =
             jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
-        expect(env.containsKey('frame'), isTrue, reason: '${f.path} 缺 frame');
+        final List<String> present = <String>[
+          for (final String k in <String>['frame', 'c2s', 's2c', 'rest', 'enums'])
+            if (env.containsKey(k)) k,
+        ];
+        final String? expected = prefixToKey.entries
+            .where((MapEntry<String, String> e) => name.startsWith(e.key))
+            .map((MapEntry<String, String> e) => e.value)
+            .firstOrNull;
+        expect(expected, isNotNull, reason: '$name 没有已知的分类前缀');
+        expect(present, <String>[expected!], reason: '$name 的载荷与前缀不符');
       }
     });
   });

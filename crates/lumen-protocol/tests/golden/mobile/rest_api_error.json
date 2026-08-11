@@ -1,0 +1,8 @@
+{
+  "note": "HTTP 4xx/5xx 的统一错误体。**按 code 本地化，不许拿 message 做字符串匹配**——message 是英文散文、随时可能改。手机端要认的几个：invalid_credentials（密码错）、user_not_found（账号不存在，登录页据此提示去注册）、email_taken（注册时邮箱已占用）。未知 code 一律展示为「服务器返回错误（<code>）」并把原文记日志，不要吞成一句「网络错误」。",
+  "rest_type": "ApiError",
+  "rest": {
+    "code": "invalid_credentials",
+    "message": "invalid email or password"
+  }
+}

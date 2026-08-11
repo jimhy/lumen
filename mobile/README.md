@@ -23,6 +23,22 @@
 不照抄这里的 `env -u`。两边都成立是刻意的：`env -u` 在没有代理的机器上是无操作，
 所以不存在「本地能过、CI 不能过」的分叉。
 
+### ★ 第四个坑（片 5 踩到，最隐蔽的一个）：`PUB_HOSTED_URL` 是**全局**设的
+
+上面第 2 条的解法（`PUB_HOSTED_URL=https://pub.flutter-io.cn`）在本机被设成了**全局环境变量**，
+而 `flutter analyze` / `flutter test` 都会**隐式**跑一次 pub get。pub 把 hosted URL 当作依赖
+身份的一部分：环境里的 URL 与 `pubspec.lock` 里的对不上时，它会**忽略 lock 重新解析整个依赖图**，
+顺手把依赖升到最新兼容版本，再把镜像 URL 写回 lock 的每一条 `url`。
+
+于是一次「只读」的 `flutter analyze` 会悄悄改掉 **146 行** `pubspec.lock`，而 CI 跑的
+`flutter pub get --enforce-lockfile` 不设这个变量 ⇒ **第一步就红**。本地看不出来：
+diff 里只是一堆 URL 与版本号，很容易当成「谁顺手升了个依赖」。
+
+`tool/test.sh` / `tool/test.ps1` 的**非 `--pub` 分支**现在会把 `PUB_HOSTED_URL` 显式钉回
+`https://pub.dev`（`--pub` 那一支要的正是镜像，它自己会在 pub get 之后归一化 lock）。
+
+⇒ **判据**：跑完任何 flutter 命令后 `git status pubspec.lock` 应当是干净的。
+
 ### 还有一个与代理无关、但同样只在本机出现的坑
 
 **PATH 里有两个 `dart`**：独立的 `D:\backup\flutterSdk\...\dart.exe` 是 **3.4.3**，

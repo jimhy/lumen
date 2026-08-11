@@ -1,0 +1,10 @@
+{
+  "note": "隐藏会话结束，只有**仍在线的那一端**收得到（主动发 EndHidden 的一端不回执，断线的一端已被移出 peers）。所以手机端不能把「收到这条」当作拆除会话的唯一入口——本端主动结束时要自己就地清状态。reason 复用镜像那套三值枚举。",
+  "expect_variant": "HiddenSessionEnded",
+  "s2c": {
+    "HiddenSessionEnded": {
+      "session_id": 7,
+      "reason": "PeerDisconnected"
+    }
+  }
+}

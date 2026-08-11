@@ -1,0 +1,16 @@
+{
+  "note": "隐藏会话数据面盲转：session_id 在**信封**上（一台 PC 可同时挂多条隐藏会话，光凭「发送者是谁」已无法定位对端，这正是 Relay 的路由方式在多会话下结构性失效之处），payload 是**外层 RemoteFrame 信封**那一层（{\"Llm\": {\"op\": …}}），服务端一个字节都不反序列化。",
+  "expect_variant": "RelayTo",
+  "c2s": {
+    "RelayTo": {
+      "session_id": 7,
+      "payload": {
+        "Llm": {
+          "op": "Detach",
+          "conv_id": 13,
+          "conv_generation": 2
+        }
+      }
+    }
+  }
+}

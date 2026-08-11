@@ -1,0 +1,11 @@
+{
+  "note": "发给**发起方**（手机）：请求已送达，请输入对方屏幕上展示的码。隐藏会话刻意**复用**这条而不是新增变体——它只说「请输入码」，与会话种类无关，且手机本就是新客户端、无老端兼容问题。expires_in_secs 是服务端 PAIRING_TTL_SECS，手机端倒计时用它、不要自己写死 120。",
+  "expect_variant": "PairingNeeded",
+  "s2c": {
+    "PairingNeeded": {
+      "target_device_id": "pc-1",
+      "target_name": "海风的工作站",
+      "expires_in_secs": 120
+    }
+  }
+}

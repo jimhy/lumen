@@ -285,6 +285,38 @@ final class OpenEnumCodec<K extends WireNamed> {
       m[key] == null ? null : decode(m[key]);
 }
 
+// ── 封闭式 C 型枚举（控制面专用，**没有 Other 兜底**）────────────────────────
+
+/// 读一个**封闭**的 C 型枚举：未知取值直接报错。
+///
+/// 与上面那套 [OpenEnum] 正好相反，而两者的差别是有依据的、不是随手定的：
+///
+/// | | 开放式（`LlmStopReason` 一类） | 封闭式（`DenyReason` 一类） |
+/// |---|---|---|
+/// | 在哪层 | LLM 子协议（数据面） | 远程控制协议（控制面） |
+/// | 上游 | CLI 随时会长新取值 | 只有本仓库自己会改 |
+/// | 未知取值 | 落 `Other(原文)`，正文照常显示 | **整条消息报废** |
+///
+/// 控制面选封闭，不是因为「不会加取值」，而是因为**加取值本身就被禁止了**：
+/// `DenyReason` 随 `ControlDenied` 下行，加一个变体会让老客户端整条解析失败，
+/// 丢掉的正是它**唯一**的拒绝回执 —— UI 从此永久转圈。所以这里宽容成 `Other` 没有意义：
+/// 真出现未知取值时，本端已经没有正确行为可做了，报错至少会被日志记下来。
+T readClosedEnum<T extends WireNamed>(
+  JsonMap m,
+  String key,
+  List<T> values,
+  String label,
+) {
+  final String wire = readString(m, key);
+  for (final T v in values) {
+    if (v.wire == wire) return v;
+  }
+  _fail(
+    '$label 收到未知取值 "$wire"（本枚举没有 Other 兜底：'
+    '要么对端版本比本端新，要么协议被改坏了）',
+  );
+}
+
 // ── 内部标签枚举（`{"kind": "...", ...}` / `{"op": "...", ...}`）──────────────
 
 /// 内部标签枚举的解码骨架。
