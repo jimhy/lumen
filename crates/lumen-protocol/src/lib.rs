@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod llm;
+pub mod pairing_qr;
 pub mod remote;
 pub mod ssh_sync;
 

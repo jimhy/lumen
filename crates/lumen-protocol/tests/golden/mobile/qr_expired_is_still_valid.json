@@ -1,0 +1,17 @@
+{
+  "note": "★ 过期时刻 e **只做软提示、永不硬拒**：这条载荷的 e 是 0（1970 年），校验仍必须通过。服务端的 TTL 判定才是权威，而 PC 与手机的时钟偏差不得造成可用性故障——「码明明还在屏幕上、手机却说过期了」是最难排查的一类投诉，用户没有任何办法自助。e 可以用来在 UI 上画倒计时，但**不能**进 validate。",
+  "qr": {
+    "m": "lumen.pair.v1",
+    "o": "https://lumen.example.com",
+    "u": "a3a9e1ed9732cab2",
+    "t": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "c": "012345678",
+    "e": 0
+  },
+  "qr_check": {
+    "origin": "https://lumen.example.com",
+    "user_fingerprint": "a3a9e1ed9732cab2",
+    "target": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "verdict": "Ok"
+  }
+}

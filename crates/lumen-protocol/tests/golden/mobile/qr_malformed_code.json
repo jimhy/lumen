@@ -1,0 +1,17 @@
+{
+  "note": "配对码必须是 **9 位纯数字**。这条给的是 9 位但含字母——只查长度不查字符类的实现会放它过去，然后把一串垃圾提交给服务端换来一次 InvalidCode，白白消耗掉用户 5 次尝试里的一次。注意 Dart 侧不能用 int.tryParse 判定：那会放过前导正负号与空白，也会在前导零上丢信息。",
+  "qr": {
+    "m": "lumen.pair.v1",
+    "o": "https://lumen.example.com",
+    "u": "a3a9e1ed9732cab2",
+    "t": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "c": "01234567x",
+    "e": 1786342908
+  },
+  "qr_check": {
+    "origin": "https://lumen.example.com",
+    "user_fingerprint": "a3a9e1ed9732cab2",
+    "target": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "verdict": "Malformed"
+  }
+}

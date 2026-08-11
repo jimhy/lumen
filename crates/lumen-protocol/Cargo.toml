@@ -16,3 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # 文件传输块 base64 编码（避免 Vec<u8> JSON 数字数组膨胀 ~4x）。
 base64 = { workspace = true }
+# M7 片 6 扫码配对：二维码载荷里的账户指纹 sha256(user_id)[..16]。
+# 放在协议 crate 而不是各端各算一遍——大小写、截取长度任何一处不同，都会让所有扫码
+# 都判成 ForeignAccount，而那看起来像「功能没做好」而不是「两端算法不一致」。
+sha2 = { workspace = true }

@@ -111,9 +111,9 @@ void main() {
       }
     });
 
-    test('五个载荷键恰好有一个，且与文件名前缀相符', () {
-      // 片 5 起语料分四类。一个文件混放两种载荷，会让「遍历某一类」变成要靠读注释才知道
-      // 对不对的事——而两端各遍历一次，漏判在哪一端都只是静默少测几条。
+    test('六个载荷键恰好有一个，且与文件名前缀相符', () {
+      // 片 5 起语料分类别（片 6 又加了 qr_）。一个文件混放两种载荷，会让「遍历某一类」
+      // 变成要靠读注释才知道对不对的事——而两端各遍历一次，漏判在哪一端都只是静默少测几条。
       // Rust 侧 `语料自身的硬规矩` 有同款断言，两边一起守。
       const Map<String, String> prefixToKey = <String, String>{
         'frame_': 'frame',
@@ -125,13 +125,21 @@ void main() {
         's2c_': 's2c',
         'rest_': 'rest',
         'enums_': 'enums',
+        'qr_': 'qr',
       };
       for (final File f in _corpusFiles()) {
         final String name = p.basename(f.path);
         final Map<String, dynamic> env =
             jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
         final List<String> present = <String>[
-          for (final String k in <String>['frame', 'c2s', 's2c', 'rest', 'enums'])
+          for (final String k in <String>[
+            'frame',
+            'c2s',
+            's2c',
+            'rest',
+            'enums',
+            'qr',
+          ])
             if (env.containsKey(k)) k,
         ];
         final String? expected = prefixToKey.entries

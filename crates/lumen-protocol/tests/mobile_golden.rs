@@ -99,6 +99,7 @@ use lumen_protocol::llm::{
     LlmPermissionDecision, LlmPermissionResolvedBy, LlmThinking, LlmToolResultDetail,
     LlmToolStatus, LlmTurnRecord, LLM_ENUM_DEBUG_HEAD_BYTES,
 };
+use lumen_protocol::pairing_qr::{PairingQrError, PairingQrPayload};
 use lumen_protocol::remote::{
     DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C, Role,
 };
@@ -154,6 +155,12 @@ struct 用例 {
     /// 「Rust 加取值 ⇒ 覆盖断言红 ⇒ 补语料 ⇒ Dart 红」这条链的唯一载体。
     #[serde(default)]
     enums: BTreeMap<String, Vec<String>>,
+    /// 扫码配对的二维码载荷（[`PairingQrPayload`]），必须配 [`Self::qr_check`]。
+    #[serde(default)]
+    qr: Option<serde_json::Value>,
+    /// [`Self::qr`] 的四重校验期望。
+    #[serde(default)]
+    qr_check: Option<Qr校验>,
     /// 重新序列化后的期望值；缺省 = 与 [`Self::frame`] 逐值相等。
     ///
     /// 只有**刻意考察缺省 / 降级**的用例才写它；`frame_*` 系列一律把字段写全，让它保持缺省。
@@ -172,6 +179,23 @@ struct 用例 {
     /// 断言（[`语料双向往返语义等价`] 末尾）过不到 Dart 手里。
     #[serde(default)]
     envelopes: Vec<serde_json::Value>,
+}
+
+/// 二维码语料的校验期望：拿这三个「本机已知值」去 `validate`，应当得到 `verdict`。
+///
+/// 把**期望值**写进语料而不是只放一个合法载荷，是因为这一层真正要守的不是往返，
+/// 而是**四重校验各自命中且顺序正确**——那才是扫码配对的全部安全性所在。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Qr校验 {
+    /// 本机登录的规范化 origin。
+    origin: String,
+    /// 本机账户指纹。
+    user_fingerprint: String,
+    /// 本次要连接的目标设备。
+    target: String,
+    /// 期望结果：`Ok` 或 [`PairingQrError::code`] 的四个取值之一。
+    verdict: String,
 }
 
 /// 语料对解析结果的期望。
@@ -950,6 +974,7 @@ fn 语料自身的硬规矩() {
         ("s2c_", "s2c"),
         ("rest_", "rest"),
         ("enums_", "enums"),
+        ("qr_", "qr"),
     ];
 
     for (名, 用例) in 载入语料() {
@@ -981,6 +1006,7 @@ fn 语料自身的硬规矩() {
             ("s2c", 用例.s2c.is_some()),
             ("rest", 用例.rest.is_some()),
             ("enums", !用例.enums.is_empty()),
+            ("qr", 用例.qr.is_some()),
         ]
         .into_iter()
         .filter_map(|(键, 有)| 有.then_some(键))
@@ -996,6 +1022,12 @@ fn 语料自身的硬规矩() {
             用例.rest.is_some(),
             用例.rest_type.is_some(),
             "{名}.json 的 rest 与 rest_type 必须同时出现（rest_type 指明往哪个 DTO 解）"
+        );
+        // 同理：只有载荷没有校验期望，等于只测了往返——而这一层要守的是四重校验。
+        assert_eq!(
+            用例.qr.is_some(),
+            用例.qr_check.is_some(),
+            "{名}.json 的 qr 与 qr_check 必须同时出现（光有载荷等于没测校验）"
         );
         // debug_forbidden 的断言只在内层帧那条通路上跑（脱敏包装都在 llm.rs 里），
         // 挂到别的语料上会被静默忽略——那正是「测了个寂寞」的形状。
@@ -1174,6 +1206,67 @@ fn 控制面枚举语料覆盖全部取值() {
     );
     对账("EndReason", 账.get("EndReason").unwrap_or(&BTreeSet::new()), 结束原因全集);
     对账("Role", 账.get("Role").unwrap_or(&BTreeSet::new()), 角色全集);
+}
+
+/// **扫码配对**：载荷往返 + **四重校验各自命中**。
+///
+/// 这一层的语料与别处不同——它守的重点不是往返（那只是顺手验的），而是
+/// `validate` 的**判定与顺序**：形状（魔数 / 码格式）先于身份（服务器 / 账户 / 设备），
+/// 且四种拒绝互不混淆。理由在 `pairing_qr.rs` 里：每一种拒绝对应一条不同的 UI 文案，
+/// 合并成一句「二维码无效」，用户就永远不知道自己是扫错了设备、扫了别人的码，
+/// 还是**遇到了钓鱼**。
+///
+/// 二维码载荷**不上线缆**（只经屏幕→摄像头），但两端各有一份实现，所以它同样需要语料。
+#[test]
+fn 二维码语料的四重校验() {
+    let mut 见过: BTreeSet<String> = BTreeSet::new();
+    for (名, 用例) in 载入语料() {
+        let (Some(原文), Some(检查)) = (&用例.qr, &用例.qr_check) else {
+            continue;
+        };
+        let 载荷: PairingQrPayload = serde_json::from_value(原文.clone())
+            .unwrap_or_else(|e| panic!("{名}.json 的 qr 必须能解成 PairingQrPayload: {e}"));
+
+        // 顺手验往返：字段是单字母短名，写错一个在这里就露馅。
+        assert_eq!(
+            &serde_json::to_value(&载荷).expect("序列化"),
+            原文,
+            "{名}.json 的二维码载荷往返不等价"
+        );
+
+        let 实际 = match 载荷.validate(&检查.origin, &检查.user_fingerprint, &检查.target) {
+            Ok(()) => "Ok".to_string(),
+            Err(e) => e.code().to_string(),
+        };
+        assert_eq!(
+            实际, 检查.verdict,
+            "{名}.json 的校验结果与语料声明不符\n—— note: {}",
+            用例.note
+        );
+        见过.insert(检查.verdict.clone());
+    }
+
+    // 五种结果都要有语料：少了任何一种，就有一条 UI 文案分支没人测过。
+    let 全集: BTreeSet<String> = ["Ok", "Malformed", "ForeignServer", "ForeignAccount", "WrongTarget"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        见过, 全集,
+        "二维码校验的五种结果必须各有语料（Ok 与四种拒绝），实得 {见过:?}"
+    );
+    // 与 PairingQrError 的变体数对账：加了新拒因而不加语料，这里会红。
+    assert_eq!(
+        [
+            PairingQrError::Malformed,
+            PairingQrError::ForeignServer,
+            PairingQrError::ForeignAccount,
+            PairingQrError::WrongTarget,
+        ]
+        .len() + 1,
+        全集.len(),
+        "PairingQrError 变体数变了：新拒因要补一条语料，并确认它有自己的 UI 文案"
+    );
 }
 
 /// **REST DTO 往返**：登录 / 注册 / 续期 / 设备列表 / 错误体逐个过一遍线格式。
