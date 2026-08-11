@@ -22,7 +22,7 @@
 //! 必须在那里补回锁屏判定**。
 
 use lumen_protocol::pairing_qr::PairingQrPayload;
-use qrcode::{EcLevel, QrCode};
+use qrcodegen::{QrCode, QrCodeEcc};
 
 /// 二维码在横幅里的边长（逻辑像素）。
 ///
@@ -59,11 +59,8 @@ impl PairingQrCache {
         if self.texture.is_none() || self.text != text {
             let image = encode_to_image(&text)?;
             // 名字里带载荷长度只是为了让 egui 的纹理调试面板可读，不参与任何逻辑。
-            self.texture = Some(ctx.load_texture(
-                "lumen_pairing_qr",
-                image,
-                egui::TextureOptions::NEAREST,
-            ));
+            self.texture =
+                Some(ctx.load_texture("lumen_pairing_qr", image, egui::TextureOptions::NEAREST));
             self.text = text;
         }
         self.texture.as_ref()
@@ -84,15 +81,19 @@ impl PairingQrCache {
 /// 纠错等级取 **Medium**：配对二维码显示在屏幕上、距离近、无污损，Low 就够用；
 /// 但 Medium 只多几个模块，换来对屏幕反光与拍摄角度的宽容度，这个交换是划算的。
 fn encode_to_image(text: &str) -> Option<egui::ColorImage> {
-    let qr = QrCode::with_error_correction_level(text.as_bytes(), EcLevel::M).ok()?;
-    let modules = qr.width();
+    let qr = QrCode::encode_text(text, QrCodeEcc::Medium).ok()?;
+    let modules = usize::try_from(qr.size()).ok()?;
     let side = modules + QUIET_MODULES * 2;
     // 深色 = 模块，浅色 = 静区与空白。**不跟随主题**：扫码器需要的是高对比的
     // 深/浅关系，而不是好看的配色；深色主题下用主题色画会显著降低识别率。
     let mut pixels = vec![egui::Color32::WHITE; side * side];
     for y in 0..modules {
         for x in 0..modules {
-            if qr[(x, y)] == qrcode::Color::Dark {
+            let dark = qr.get_module(
+                i32::try_from(x).unwrap_or(i32::MAX),
+                i32::try_from(y).unwrap_or(i32::MAX),
+            );
+            if dark {
                 pixels[(y + QUIET_MODULES) * side + (x + QUIET_MODULES)] = egui::Color32::BLACK;
             }
         }
@@ -134,7 +135,11 @@ mod tests {
                 egui::Color32::WHITE,
                 "下边静区被画黑了"
             );
-            assert_eq!(image.pixels[i * side], egui::Color32::WHITE, "左边静区被画黑了");
+            assert_eq!(
+                image.pixels[i * side],
+                egui::Color32::WHITE,
+                "左边静区被画黑了"
+            );
             assert_eq!(
                 image.pixels[i * side + side - 1],
                 egui::Color32::WHITE,
@@ -158,20 +163,30 @@ mod tests {
     }
 
     #[test]
-    fn 定位图形在三个角上() {
-        // 三个 7×7 的定位图形是扫码器找方向的依据。这条顺带证明我们没有把矩阵转置或镜像
-        // ——那种错误画出来仍然是个「像二维码的东西」，只有真去扫才会发现。
+    fn 三个定位图形的结构完整() {
+        // 定位图形是 7×7：最外一圈黑、里面一圈白、中心 3×3 黑。三个角各验这三点，
+        // 能抓住「x/y 读反」「静区偏移算错」「边界差一」这类错误——它们画出来仍然是个
+        // 「像二维码的东西」，只有真拿手机去扫才会发现不对。
+        //
+        // ⚠ **抓不住矩阵被转置或镜像**：那种情况下三个定位图形看起来仍然正确
+        //（转置不动主对角线，另两个互换但它们是同一个图形）。真要验只能去解码，
+        // 而那要引一个解码器——不值当，因为转置/镜像在这段代码里没有可能的来源
+        //（就一个 x/y 双层循环）。这条注释比一个测不到的断言诚实。
+        //
+        // 也**不能**断言「右下角是白的」：右下角没有定位图形，但那里是**数据区**，
+        // 黑白取决于载荷内容。第一版这么写过，换一份载荷就红了。
         let text = 样例载荷().to_qr_text().expect("序列化");
         let image = encode_to_image(&text).expect("编码");
         let side = image.size[0];
         let 黑 = |x: usize, y: usize| image.pixels[y * side + x] == egui::Color32::BLACK;
         let q = QUIET_MODULES;
-        let 末 = side - QUIET_MODULES - 1;
-        for (x, y) in [(q, q), (末, q), (q, 末)] {
-            assert!(黑(x, y), "({x}, {y}) 应当是定位图形的外框");
+        let 末 = side - QUIET_MODULES - 7; // 右/下那两个定位图形的左上角
+        for (ox, oy) in [(q, q), (末, q), (q, 末)] {
+            assert!(黑(ox, oy), "({ox}, {oy}) 定位图形外框应为黑");
+            assert!(黑(ox + 6, oy + 6), "({ox}, {oy}) 定位图形外框右下角应为黑");
+            assert!(!黑(ox + 1, oy + 1), "({ox}, {oy}) 定位图形第二圈应为白");
+            assert!(黑(ox + 3, oy + 3), "({ox}, {oy}) 定位图形中心应为黑");
         }
-        // 右下角**没有**定位图形，这是二维码的不对称性所在。
-        assert!(!黑(末, 末), "右下角不该有定位图形");
     }
 
     #[test]

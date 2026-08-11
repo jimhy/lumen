@@ -111,6 +111,8 @@ pub struct ShellState {
     pub toast: toast::ToastState,
     /// LLM CLI 右下角 HUD 的展开/关闭状态。
     pub hud: hud::HudState,
+    /// M7 片 6：配对二维码的纹理缓存（同一份载荷只编码与上传一次）。
+    pub pairing_qr: crate::remote_pairing_qr::PairingQrCache,
     /// 进行中的远程设备重命名（M5.2）：(设备 id, 编辑中文本)。编辑期间键盘归 egui。
     pub renaming_device: Option<(String, String)>,
     /// 设备重命名刚开始，下一帧把焦点交给编辑框。
@@ -504,6 +506,12 @@ pub struct ShellInput<'a> {
     pub remote_pairing: Option<&'a crate::remote_ws::PairingPrompt>,
     /// M5.3 远程控制：被控端来件控制请求态（Some = 渲染来件横幅 + 配对码）。
     pub remote_incoming: Option<&'a crate::remote_ws::IncomingControl>,
+    /// M7 片 6：来件配对码对应的二维码载荷（Some = 横幅里同时画二维码）。
+    ///
+    /// 由 `main.rs` 组装——它才拿得到 origin / user_id / 本机 device_id 三样东西，
+    /// 而 `shell` 只负责画。为 None 时横幅退化成只显示 9 位数字，功能不缺失
+    /// （扫码只是数字码的另一种呈现）。
+    pub pairing_qr: Option<&'a lumen_protocol::pairing_qr::PairingQrPayload>,
     /// M5.3 远程控制：活跃会话态（Some = 渲染「被控中 / 控制中」横幅）。
     pub remote_session: Option<&'a crate::remote_ws::ActiveSession>,
     /// M5.3 part3b：控制端远程镜像离屏纹理（Some = 控制中+远程视图 且 订阅**单窗格**会话，
@@ -2603,7 +2611,20 @@ pub fn show(
         st.remote_ui.reset();
     }
     {
-        let b_out = remote_ui::banner(root.ctx(), input.remote_incoming, input.remote_session, pal);
+        // 没有来件配对时丢掉纹理：配对码是一次性口令，留着只让一份含码的纹理在显存里多待一会儿。
+        if input.pairing_qr.is_none() {
+            st.pairing_qr.clear();
+        }
+        let qr = input
+            .pairing_qr
+            .and_then(|payload| st.pairing_qr.texture(root.ctx(), payload).cloned());
+        let b_out = remote_ui::banner(
+            root.ctx(),
+            input.remote_incoming,
+            input.remote_session,
+            qr.as_ref(),
+            pal,
+        );
         if let Some(code) = b_out.copy_code {
             out.copy_pairing_code = Some(code);
         }

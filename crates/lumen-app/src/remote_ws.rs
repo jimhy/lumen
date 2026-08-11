@@ -137,6 +137,11 @@ pub struct IncomingControl {
     pub controller_name: String,
     /// 本机展示给对方转述的 9 位配对码。
     pub pairing_code: String,
+    /// 预计过期时刻（Unix 秒），由服务端下发的 `expires_in_secs` 换算。
+    ///
+    /// M7 片 6 起进配对二维码的 `e` 字段。**只做软提示**：服务端的 TTL 判定才是权威，
+    /// 两端时钟偏差不得造成「码还在屏幕上、手机却说过期了」这种用户无法自助的故障。
+    pub expires_at: i64,
 }
 
 /// 活跃会话态（控制中 / 被控中）。
@@ -7620,11 +7625,15 @@ impl RemoteWs {
             RemoteS2C::ControlRequested {
                 controller_name,
                 pairing_code,
+                expires_in_secs,
                 ..
             } => {
                 self.incoming = Some(IncomingControl {
                     controller_name,
                     pairing_code,
+                    // 用服务端给的 TTL 换算，不在客户端写死 120——服务端改了 TTL 而这里
+                    // 没跟着改，二维码上的过期时刻就会与真实的错开。
+                    expires_at: crate::remote::now_secs().saturating_add(i64::from(expires_in_secs)),
                 });
             }
             RemoteS2C::PairingNeeded {
@@ -7763,12 +7772,15 @@ impl RemoteWs {
             RemoteS2C::HiddenControlRequested {
                 controller_name,
                 pairing_code,
+                expires_in_secs,
                 ..
             } => {
                 // 另开一个横幅槽，不碰 self.incoming（镜像配对横幅）。
                 self.hidden_incoming = Some(IncomingControl {
                     controller_name,
                     pairing_code,
+                    expires_at: crate::remote::now_secs()
+                        .saturating_add(i64::from(expires_in_secs)),
                 });
             }
             RemoteS2C::HiddenSessionStarted {
@@ -8718,6 +8730,7 @@ mod tests {
         ws2.hidden_incoming = Some(IncomingControl {
             controller_name: "手机二".into(),
             pairing_code: "123456789".into(),
+            expires_at: 0,
         });
         ws2.apply(WsEvent::Disconnected);
         assert_eq!(ws2.hidden_session_count(), 0, "隐藏会话未被清空");
@@ -8777,10 +8790,12 @@ mod tests {
                 incoming: Some(IncomingControl {
                     controller_name: "桌面".into(),
                     pairing_code: "111111111".into(),
+                    expires_at: 0,
                 }),
                 hidden_incoming: Some(IncomingControl {
                     controller_name: "手机".into(),
                     pairing_code: "222222222".into(),
+                    expires_at: 0,
                 }),
                 ..RemoteWs::default()
             };
@@ -8798,10 +8813,12 @@ mod tests {
             incoming: Some(IncomingControl {
                 controller_name: "桌面".into(),
                 pairing_code: "111111111".into(),
+                expires_at: 0,
             }),
             hidden_incoming: Some(IncomingControl {
                 controller_name: "手机".into(),
                 pairing_code: "222222222".into(),
+                expires_at: 0,
             }),
             ..RemoteWs::default()
         };

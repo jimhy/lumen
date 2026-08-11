@@ -17,6 +17,8 @@ mod virtual_files;
 // M5.2 远程设备状态（心跳 + 设备列表后台线程）。
 mod remote;
 mod remote_mirror;
+// M7 片 6：被控端把配对码同时渲染成二维码，手机扫码即完成配对。
+mod remote_pairing_qr;
 mod remote_ws;
 // M6 P2P 直连（QUIC 打洞 + 中继回退）：tokio 隔离后台线程 + STUN 端点发现 + QUIC/证书就位。
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
@@ -13230,6 +13232,23 @@ impl ApplicationHandler<PtyWake> for App {
                 let ssh_session_views = state.ssh_runtime.session_views();
                 let ssh_file_tree_view = state.ssh_runtime.active_file_tree_view();
                 let ssh_connection_test_view = state.ssh_runtime.connection_test_view();
+                // M7 片 6：被控端来件配对时，把配对码同时渲染成二维码。
+                // 三样东西只有这里拿得全：规范化 origin、账户 id、本机 device_id。
+                // 任何一样取不到就不出二维码——横幅退化成只显示 9 位数字，功能不缺失
+                // （扫码只是数字码的另一种呈现），所以这里静默 None、不报错。
+                let pairing_qr_payload = state.remote_ws.incoming.as_ref().and_then(|inc| {
+                    let profile = state.profile.as_ref()?;
+                    let origin =
+                        profile_server_origin(Some(profile), &cloud::server_url())?;
+                    Some(lumen_protocol::pairing_qr::PairingQrPayload::new(
+                        &origin,
+                        profile.user_id.as_deref()?,
+                        // 被控端 = 手机要连的目标，所以 t 填**本机** device_id。
+                        profile.device_id.as_deref()?,
+                        &inc.pairing_code,
+                        inc.expires_at,
+                    ))
+                });
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -13308,6 +13327,7 @@ impl ApplicationHandler<PtyWake> for App {
                     ssh_terminal_tex: state.ssh_texture,
                     active_device_id: state.remote.active_device_id.as_deref(),
                     remote_pairing: state.remote_ws.pairing.as_ref(),
+                    pairing_qr: pairing_qr_payload.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
                     remote_mirror_tex,

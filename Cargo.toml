@@ -54,6 +54,11 @@ objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
+# M7 片 6 扫码配对：只用它算出模块布尔矩阵，格子由 egui 自己画成纹理。
+# 选 qrcodegen（Nayuki）而不是 qrcode/fast_qr：**零传递依赖、无 unsafe**，
+# 而我们要的只有「文本 → bool 矩阵」这一件事——不引 image/svg，也不落盘任何图片文件
+# （配对码是一次性口令，落盘等于把它留在磁盘上）。
+qrcodegen = "1.8"
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"

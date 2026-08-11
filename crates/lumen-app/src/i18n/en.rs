@@ -506,6 +506,7 @@ pub static STRINGS: Strings = Strings {
     remote_pairing_invalid_fmt: "Wrong code, {} attempt(s) left",
     remote_incoming_fmt: "“{}” wants to remotely control this device",
     remote_incoming_code: "Pairing code",
+    remote_incoming_scan_hint: "Scan with Lumen mobile, or read out the digits below",
     remote_decline: "Decline",
     remote_being_controlled_fmt: "⚠ Being remotely controlled by “{}”",
     remote_controlling_fmt: "Controlling “{}”",

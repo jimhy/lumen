@@ -782,6 +782,8 @@ pub struct Strings {
     pub remote_incoming_fmt: &'static str,
     /// 配对码标签
     pub remote_incoming_code: &'static str,
+    /// M7 片 6：配对二维码下方的一行说明（扫码或念数字，两条路都通）。
+    pub remote_incoming_scan_hint: &'static str,
     /// 拒绝控制按钮
     pub remote_decline: &'static str,
     /// 正在被控横幅（{}=控制端设备名）

@@ -499,6 +499,7 @@ pub static STRINGS: Strings = Strings {
     remote_pairing_invalid_fmt: "配对码错误，还可尝试 {} 次",
     remote_incoming_fmt: "「{}」请求远程控制本机",
     remote_incoming_code: "配对码",
+    remote_incoming_scan_hint: "用手机端 Lumen 扫码，或念出下面这串数字",
     remote_decline: "拒绝",
     remote_being_controlled_fmt: "⚠ 正在被「{}」远程控制",
     remote_controlling_fmt: "正在远程控制「{}」",

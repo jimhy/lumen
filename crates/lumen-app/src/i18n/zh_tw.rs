@@ -506,6 +506,7 @@ pub static STRINGS: Strings = Strings {
     remote_pairing_invalid_fmt: "配對碼錯誤，還可嘗試 {} 次",
     remote_incoming_fmt: "「{}」請求遠端控制本機",
     remote_incoming_code: "配對碼",
+    remote_incoming_scan_hint: "用手機端 Lumen 掃碼，或念出下面這串數字",
     remote_decline: "拒絕",
     remote_being_controlled_fmt: "⚠ 正在被「{}」遠端控制",
     remote_controlling_fmt: "正在遠端控制「{}」",
