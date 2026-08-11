@@ -4143,4 +4143,192 @@ mod tests {
         );
         assert_eq!(title_of("   ").as_str(), "新对话");
     }
+
+    // ── 片 7 回放语料生成器 ─────────────────────────────────────────────────
+
+    /// 把两份 Claude CLI 的**原始 stream-json** 采样跑完整条 PC 侧链路，把真正会过网的
+    /// [`LlmFrame`] 逐帧写成 JSONL，供 M7 片 7 的手机端离线回放用。
+    ///
+    /// # 为什么必须生成，而不能直接拿样本当语料
+    /// 样本是**归一化的输入**，不是输出：它的每一行是 `{"type":"assistant",…}` 这种 CLI
+    /// 私有形状，而手机端 Dart 侧解的是内部标签为 `"op"` 的 [`LlmFrame`]。把样本直接喂给
+    /// Dart，每一行都会**静默**落到 `LlmUnknown` 兜底变体上——测试全绿、画面全空。
+    /// 交接文档里「回放语料直接用样本 B」那句话按字面做必然是这个下场。
+    ///
+    /// # 走的是哪条路径
+    /// 与线上「读线程 + 泵」**逐段同构**：
+    /// `event::classify`（白名单严入）→ `LlmAgentDecoder::decode_line`（片 3 归一化）
+    /// → [`LlmPlane::pump`]（片 4 的轮号 / seq / 合并窗口 / 白名单严出）→ 出站帧。
+    /// 前两段抄的是 `llm_runner::decode_chunk` 的处置（那是私有函数），第三段就是生产代码本身。
+    ///
+    /// # 私人内容为何不会进语料
+    /// hook 行（`system/hook_started` / `system/hook_response`）在**第一段**就被白名单挡下，
+    /// 只产出 `RunnerEvent::LineDropped { tag }`（只留标签、不留内容），而 `LineDropped`
+    /// 在片 4 里只累加一个计数器、不产帧。`system/init` 的 `cwd` / `plugins` / `skills` /
+    /// `slash_commands` 同理：`on_started` 只把 model / cli_session_id / permission_mode
+    /// 三项写进 `Conv::meta`，而 `meta` 只随 `ConvStarted` / `HelloAck` 过网，不进本文件。
+    /// [`回放泄漏自查`] 把这条不变量钉死——出了任何一个禁用键或私人内容标记就地失败，不写文件。
+    ///
+    /// 跑法：`cargo test -p lumen-app -- --ignored 生成片7回放语料 --nocapture`
+    #[test]
+    #[ignore = "手动运行：产出片 7 的回放语料"]
+    fn 生成片7回放语料() {
+        /// crate 内的那两份副本（与 `docs/调研/` 下的原件逐字节相同）。**不读 `docs/`**：
+        /// 让测试依赖文档目录会在有人整理文档时无声变红。
+        const 样本A: &str =
+            include_str!("../llm_runner/fixtures/claude-stream-json-sample-a-2026-08-08.jsonl");
+        const 样本B: &str = include_str!(
+            "../llm_runner/fixtures/claude-stream-json-sample-b-tooluse-2026-08-08.jsonl"
+        );
+
+        let 目录 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../lumen-protocol/tests/golden/mobile/replay");
+        std::fs::create_dir_all(&目录).expect("建回放语料目录");
+
+        for (样本, 文件名) in [
+            (样本B, "sample_b_llmframes.jsonl"),
+            (样本A, "sample_a_llmframes.jsonl"),
+        ] {
+            let frames = 回放一份样本(样本);
+            let jsonl: String = frames
+                .iter()
+                .map(|f| serde_json::to_string(f).expect("帧必可序列化") + "\n")
+                .collect();
+            回放泄漏自查(&jsonl);
+
+            let 路径 = 目录.join(文件名);
+            std::fs::write(&路径, &jsonl).expect("写回放语料");
+
+            let mut 直方图: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for f in &frames {
+                *直方图.entry(frame_op_name(f)).or_default() += 1;
+            }
+            println!("{文件名}：{} 帧 {直方图:?}", frames.len());
+        }
+    }
+
+    /// 一份样本 → 一串出站 [`LlmFrame`]。
+    ///
+    /// # 时钟为什么要一行推两拍
+    /// 每行**先泵一次带事件的**（进合并窗口），再泵一次**空的**（窗口到期、冲出去）。
+    /// [`LlmPlane::pump`] 的次序是「吃事件 → flush」，只泵一次的话下一行的事件会在同一次
+    /// flush 前被吃进去，于是相邻几行的增量并成一条巨大的 `Delta`——回放出来看不到任何
+    /// 流式过程，而片 7 要验的恰恰是流式渲染。33 ms 合并窗口本身是生产行为，这里只是把
+    /// 「上游两行间隔 > 33 ms」这个常见情形喂给它，没有绕开任何一行代码。
+    fn 回放一份样本(样本: &str) -> Vec<LlmFrame> {
+        use crate::llm_runner::event::{classify, LineVerdict};
+
+        let (mut encoder, mut decoder) = ClaudeAdapter::new().split();
+        // **用真编码器推轮号**：`ClaudeDecoder` 的轮号来自与编码器共享的那个 `AtomicU64`，
+        // 不发这一下，全部块都会挂在 turn 0 上（0 在协议里是「还没有轮」的形状）。
+        // 这一步与 `LlmRunner::submit` 里的调用完全一致，只是我们不把 stdin 行真写出去。
+        let _ = encoder
+            .encode_user_message("把这份文件读一下", &[])
+            .expect("编码用户消息");
+
+        let mut plane = LlmPlane::default();
+        seed_conv(&mut plane, 1, 1);
+        let runner = RunnerId(1);
+        let t0 = Instant::now();
+        let mut tseq = 0u64;
+        let mut frames: Vec<LlmFrame> = Vec::new();
+
+        for (i, line) in 样本.lines().enumerate() {
+            let mut events: Vec<RunnerEvent> = Vec::new();
+            match classify(line) {
+                LineVerdict::Blank => {}
+                LineVerdict::Parse(env) => {
+                    if let Err(err) = decoder.decode_line(&env, line, &mut events) {
+                        events.push(RunnerEvent::ProtocolError {
+                            kind: ProtocolErrorKind::DecodeFailed { at: err.at },
+                        });
+                    }
+                }
+                LineVerdict::DropSilently { tag } => {
+                    events.push(RunnerEvent::LineDropped { tag });
+                }
+                LineVerdict::UnknownSchema { tag } => {
+                    events.push(RunnerEvent::ProtocolError {
+                        kind: ProtocolErrorKind::UnknownSchema { tag },
+                    });
+                }
+                LineVerdict::Malformed { kind, bytes } => {
+                    events.push(RunnerEvent::ProtocolError {
+                        kind: ProtocolErrorKind::MalformedEnvelope { kind, bytes },
+                    });
+                }
+            }
+            let batch: Vec<(RunnerId, u64, RunnerEvent)> = events
+                .into_iter()
+                .map(|e| {
+                    tseq += 1;
+                    (runner, tseq, e)
+                })
+                .collect();
+            let 本行 = t0 + Duration::from_millis(100 * (i as u64 + 1));
+            frames.extend(pump_events(&mut plane, 本行, &batch));
+            frames.extend(pump_events(
+                &mut plane,
+                本行 + Duration::from_millis(LLM_DELTA_FLUSH_MS + 1),
+                &[],
+            ));
+        }
+        frames
+    }
+
+    /// 回放语料的**泄漏自查**：出了任何一条就地 panic，绝不落盘。
+    ///
+    /// 断言在**序列化后的文本**上而不是帧的 `Debug` 上：`LlmPath` / `LlmText` 的 `Debug` 恒为
+    /// `<redacted>`，脱敏包装保护的是日志、不是线格式（同 `claude.rs::started_json` 那段注释）。
+    /// 真正过网的、也是真正会被入库的，是这份 JSON。
+    ///
+    /// ⚠ 两份 fixture 都是**脱敏版**：私人内容已被替换成占位符，所以本函数的强度上限是
+    /// 「占位符没被透传」。它靠的是**占位符自带来源标记**这一点：hook 与 init 的占位符写作
+    /// `<<REDACTED stdout: 4797 chars of local hook output>>` / `<<REDACTED local env: …>>`，
+    /// 而合法转发的工具结果占位符是 `<<REDACTED 12272 chars>>`——前者的来源标记一旦出现在
+    /// 产物里，就说明白名单漏了一整个字段，而不只是漏了一个值。
+    fn 回放泄漏自查(jsonl: &str) {
+        // 一、只存在于 CLI 原始形状、绝不该出现在 `LlmFrame` 里的键。
+        for 禁用键 in [
+            "\"stdout\"",
+            "\"stderr\"",
+            "\"cwd\"",
+            "\"plugins\"",
+            "\"skills\"",
+            "\"tools\"",
+            "\"agents\"",
+            "\"slash_commands\"",
+            "\"memory_paths\"",
+            "\"mcp_servers\"",
+            "\"hook_id\"",
+            "\"hook_name\"",
+            "\"hook_event\"",
+            "\"apiKeySource\"",
+            "\"permissionMode\"",
+            "\"claude_code_version\"",
+            "\"session_id\"",
+            "\"request_id\"",
+            "\"parent_tool_use_id\"",
+            "\"signature\"",
+            "\"uuid\"",
+        ] {
+            assert!(
+                !jsonl.contains(禁用键),
+                "回放语料里出现了 {禁用键}——白名单漏了一整个字段，绝不能入库"
+            );
+        }
+        // 二、私人内容的来源标记（占位符里那半句话），以及 hook 行独有的标识。
+        for 私人标记 in [
+            "of local hook output",
+            "local env:",
+            "SessionStart",
+            "hook_response",
+            "hook_started",
+        ] {
+            assert!(
+                !jsonl.contains(私人标记),
+                "回放语料里出现了私人内容标记 {私人标记:?}——绝不能入库"
+            );
+        }
+    }
 }

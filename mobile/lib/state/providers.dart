@@ -17,6 +17,8 @@
 /// platform channel，也就不会出现「本地测试全绿、真机崩」。
 library;
 
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lumen_mobile/core/env.dart';
 import 'package:lumen_mobile/data/device_identity.dart';
@@ -25,6 +27,7 @@ import 'package:lumen_mobile/net/io_ws_socket.dart';
 import 'package:lumen_mobile/net/rest_client.dart';
 import 'package:lumen_mobile/net/ws_client.dart';
 import 'package:lumen_mobile/state/auth_controller.dart';
+import 'package:lumen_mobile/state/conversation_session.dart';
 import 'package:lumen_mobile/state/device_list_controller.dart';
 import 'package:lumen_mobile/state/link_controller.dart';
 
@@ -120,6 +123,44 @@ final Provider<LinkController?> linkControllerProvider =
       LinkController(ws: ws, origin: endpoint.origin);
   ref.onDispose(() => controller.dispose());
   return controller;
+});
+
+/// 当前隐藏会话上的对话。没有活跃会话时为 null。
+///
+/// **会话建立即创建、断开即销毁**：LinkActive 里的 sessionId 是 RelayTo 的路由键，
+/// 而断线重连后它会变——把 session 挂在 LinkState 上，代次一换旧的自动被 dispose，
+/// 不需要额外的失效逻辑。
+///
+/// convId 暂时写死 1：片 7 只做单对话，多对话列表与切换是 P1（蓝图 §10.2）。
+/// 真正的 convId 由被控端在 ConvStarted 里给出——接多对话时改这里为「按 convId 建一组」。
+final Provider<ConversationSession?> conversationSessionProvider =
+    Provider<ConversationSession?>((Ref ref) {
+  final LinkController? link = ref.watch(linkControllerProvider);
+  final WsClient? ws = ref.watch(wsClientProvider);
+  if (link == null || ws == null) return null;
+  final LinkState state = ref.watch(linkStateProvider).value ?? const LinkIdle();
+  if (state is! LinkActive) return null;
+  final ConversationSession session = ConversationSession(
+    link: link,
+    ws: ws,
+    convId: 1,
+    sessionId: state.sessionId,
+  );
+  ref.onDispose(() => session.dispose());
+  return session;
+});
+
+/// 控制面状态流。让依赖它的 provider 能随状态变化重建。
+final StreamProvider<LinkState> linkStateProvider =
+    StreamProvider<LinkState>((Ref ref) {
+  final LinkController? link = ref.watch(linkControllerProvider);
+  if (link == null) return const Stream<LinkState>.empty();
+  // 先补一个当前值：Stream 本身不带初值，不补的话页面要等下一次状态变化才画得出来。
+  return Stream<LinkState>.multi((StreamController<LinkState> out) {
+    out.add(link.state);
+    final StreamSubscription<LinkState> sub = link.states.listen(out.add);
+    out.onCancel = sub.cancel;
+  });
 });
 
 /// 设备列表。未选服务器时为 null。

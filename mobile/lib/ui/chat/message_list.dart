@@ -1,0 +1,116 @@
+/// 气泡流。**长对话不卡的三招全在这个文件里。**
+///
+/// 1. **流式末块渲染成纯 `Text`，块闭合才切成 Markdown**——既省解析，又避免半截
+///    code fence 造成的闪烁（```` ``` ```` 刚流出一半时 Markdown 会把后面全当代码块）。
+/// 2. **Markdown 按 `(itemKey, revision)` memo**（见 `ui/common/markdown_view.dart`），
+///    条目一旦定稿就再也不重复解析。
+/// 3. **`ListView.builder(reverse: true)` + `ValueKey` + `findChildIndexCallback`**，
+///    末块挂在独立的 `ValueListenableBuilder` 上——**全程不重建整表**。
+///
+/// `reverse: true` 还天然锚在底部：流式增长不会把用户滚跑，也**不需要**每次增量调
+/// `animateTo`（那是长对话卡顿的头号来源）。
+///
+/// ## 索引换算
+///
+/// `reverse: true` 下 index 0 是**视觉最底部**。自下而上依次是：
+/// 末块（若有）→「正在思考…」（若有）→ items 的倒序。
+library;
+
+import 'package:flutter/material.dart';
+import 'package:lumen_mobile/domain/chat_item.dart';
+import 'package:lumen_mobile/state/conversation_controller.dart';
+import 'package:lumen_mobile/state/streaming_tail.dart';
+import 'package:lumen_mobile/ui/chat/chat_bubbles.dart';
+import 'package:lumen_mobile/ui/common/markdown_view.dart';
+
+/// 气泡流列表。
+class MessageList extends StatefulWidget {
+  const MessageList({
+    required this.snapshot,
+    required this.tail,
+    this.onFillGap,
+    super.key,
+  });
+
+  final ConversationSnapshot snapshot;
+
+  /// 末块。**单独订阅**，不进 [snapshot]。
+  final StreamingTail tail;
+
+  /// 点击「内容有缺口」时补齐（发 `TurnFetch`）。
+  final void Function(ChatGap gap)? onFillGap;
+
+  @override
+  State<MessageList> createState() => _MessageListState();
+}
+
+class _MessageListState extends State<MessageList> {
+  /// 每个列表一份，页面销毁即随之释放——全局单例会在页面没了之后继续攥着一堆 Widget。
+  final MarkdownMemo _memo = MarkdownMemo();
+
+  @override
+  void dispose() {
+    _memo.clear();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<TailSnapshot>(
+      valueListenable: widget.tail,
+      builder: (BuildContext context, TailSnapshot tail, Widget? _) {
+        final List<ChatItem> items = widget.snapshot.items;
+        final bool hasTail = !tail.isEmpty;
+        final bool thinking = widget.snapshot.thinking;
+        // 自下而上：末块 → 思考指示 → items 倒序。
+        final int extras = (hasTail ? 1 : 0) + (thinking ? 1 : 0);
+
+        return ListView.builder(
+          reverse: true,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          itemCount: items.length + extras,
+          findChildIndexCallback: (Key key) {
+            if (key is! ValueKey<String>) return null;
+            final int at = items.indexWhere((ChatItem i) => i.key == key.value);
+            if (at < 0) return null;
+            // items 倒序排在 extras 之后。
+            return items.length - 1 - at + extras;
+          },
+          itemBuilder: (BuildContext context, int index) {
+            if (hasTail && index == 0) return _tailBubble(tail);
+            final int afterTail = index - (hasTail ? 1 : 0);
+            if (thinking && afterTail == 0) return const ThinkingIndicator();
+            final int at = items.length - 1 - (afterTail - (thinking ? 1 : 0));
+            if (at < 0 || at >= items.length) return const SizedBox.shrink();
+            return _bubble(items[at]);
+          },
+        );
+      },
+    );
+  }
+
+  /// 流式末块：**纯 Text**，不走 Markdown。
+  Widget _tailBubble(TailSnapshot tail) => ChatBubble(
+        role: ChatRole.assistant,
+        // 没有 ValueKey：它每几十毫秒变一次，给 key 反而妨碍复用。
+        child: Text(tail.text),
+      );
+
+  Widget _bubble(ChatItem item) {
+    final Widget body = switch (item) {
+      ChatText(:final String markdown) =>
+        _memo.of(item.key, item.revision, () => MarkdownView(data: markdown)),
+      ChatToolCall() => ToolCallTile(item: item),
+      ChatToolResult() => ToolResultTile(item: item),
+      ChatImage() => ImageTile(item: item),
+      ChatError() => ErrorTile(item: item),
+      ChatGap() => GapTile(item: item, onFill: widget.onFillGap),
+      ChatUnknown() => const UnsupportedTile(),
+    };
+    return ChatBubble(
+      key: ValueKey<String>(item.key),
+      role: item.role,
+      child: body,
+    );
+  }
+}

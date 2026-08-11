@@ -10,15 +10,23 @@
 /// 3. **先拼接、再交渲染层做字素簇切分**（在 `streaming_tail.dart` 里）：增量可能把一个
 ///    ZWJ emoji 拆两半，两半各自都是合法字符串，协议层无从阻止。
 ///
-/// ## seq 是**整条对话**一个序列，不是每种帧一个
+/// ## ★ seq 的严格性**只对 Delta 成立**（这条是被真实语料推翻一次之后才写对的）
 ///
-/// 依据：`LlmAttached` 的文档说「控制端丢弃 seq 不大于本值的迟到 Delta」，而 golden 语料里
-/// 同一对话的 `ConvStarted(100) → Delta(102) → TurnStarted(103) → TurnEnded(104) →
-/// TurnSnapshot(105)` 是连号的。所以所有带 seq 的帧走同一套水位线。
+/// 最初按 golden 语料的连号推断「所有带 seq 的帧共用一套严格水位线」。
+/// **真实回放语料把它证伪了**：`replay/sample_a_llmframes.jsonl` 里
+/// `Delta(seq=1)` 之后紧跟 `TurnEnded(seq=1)`——**同号**。
+/// 按严格幂等（`seq <= lastSeq` 丢）会把 TurnEnded 整条吃掉，症状是
+/// 「一轮永远结束不了」：中断按钮一直亮着、轮末的 usage 永远刷不上去。
 ///
-/// ⚠ 万一这个推断错了（TurnStarted/TurnEnded 走独立序列），症状是**偶尔多发一次 Attach**
-/// ——多一次补齐往返，数据不会错。反过来「不检查」的代价是丢帧永远不被发现。
-/// 两害相权，这里选前者。
+/// 现在的规则：
+///
+/// | 帧 | 判据 | 理由 |
+/// |---|---|---|
+/// | `Delta` | `seq <= lastSeq` 丢 + 空洞补齐 | 它的文档明写「严格递增且连续」，且重复应用会让文字翻倍 |
+/// | 其余带 seq 的帧 | 只丢 `seq < lastSeq` | 它们的 seq 是**参照点**（「本轮到这个水位为止」），不占独立号 |
+///
+/// 重复到达的 TurnEnded 会被重复应用一次（多发一次 TurnFetch），
+/// 那比丢掉整条 TurnEnded 轻得多。
 ///
 /// ## 「正在思考…」只做状态指示
 ///
@@ -48,11 +56,21 @@ const String _tag = 'conv';
 /// 把一帧发给被控端。返回 false = 没连上、这帧被丢弃。
 typedef LlmFrameSender = bool Function(LlmFrame frame);
 
+/// 「一帧都还没收到」的水位线哨兵。
+///
+/// ★ **不能用 0**：被控端的第一帧 seq 就是 **0**（实测回放语料里 `TurnStarted` 的
+/// seq 是 0），拿 0 当初值会让幂等规则 `seq <= lastSeq` 把整条对话的第一帧丢掉，
+/// 而后续帧又会因为「空洞」触发一次白跑的补齐。
+///
+/// 这个 bug 在手工构造的测试里看不见——那些用例的 seq 都从 100 起。
+/// 它是**真实语料回放**第一次跑就撞出来的。
+const int kNoSeqYet = -1;
+
 /// 对话的当前快照（不含高频变化的末块，那在 [ConversationController.tail]）。
 final class ConversationSnapshot {
   const ConversationSnapshot({
     this.items = const <ChatItem>[],
-    this.lastSeq = 0,
+    this.lastSeq = kNoSeqYet,
     this.meta,
     this.thinking = false,
     this.rateLimit,
@@ -63,7 +81,7 @@ final class ConversationSnapshot {
   /// 定稿条目，按 `(turn, blockId)` 升序。
   final List<ChatItem> items;
 
-  /// 已消费到的增量水位线。
+  /// 已消费到的增量水位线。[kNoSeqYet] = 一帧都还没收到。
   final int lastSeq;
 
   /// 对话元信息（模型 / 用量 / 运行态）。null = 还没收到基线帧。
@@ -161,7 +179,9 @@ final class ConversationController {
 
       // ── 增量流 ──────────────────────────────────────────────────────────
       case LlmDelta():
-        if (!_admit(frame.seq, frame.convGeneration)) return;
+        // 只有 Delta 走严格判据：它是唯一「严格递增且连续」的流，
+        // 也是唯一重复应用会造成可见错误（文字翻倍）的帧。
+        if (!_admit(frame.seq, frame.convGeneration, strict: true)) return;
         _applyDelta(frame);
       case LlmTurnStarted():
         if (!_admit(frame.seq, frame.convGeneration)) return;
@@ -201,7 +221,9 @@ final class ConversationController {
   // ── 不变量 ─────────────────────────────────────────────────────────────────
 
   /// 幂等 + 空洞补齐。返回 false = 这一帧不该被应用。
-  bool _admit(int seq, int generation) {
+  ///
+  /// [strict] 只对 `Delta` 为真，理由见库文档那张表。
+  bool _admit(int seq, int generation, {bool strict = false}) {
     if (generation != _generation) {
       // 代次变了说明被控端重建了对话（进程重启等）。**丢弃旧代次的迟到帧**，
       // 应用它们会把新对话污染成两条对话的混合体。
@@ -212,14 +234,17 @@ final class ConversationController {
       logWarn(_tag, '代次前进（$_generation → $generation），清空重建');
       _resetForGeneration(generation);
     }
-    if (seq <= _state.lastSeq) return false; // 不变量 1：幂等
-    if (seq > _state.lastSeq + 1) {
+    // 不变量 1：幂等。非 Delta 帧的 seq 是参照点、可与最后一条 Delta 同号，
+    // 用 <= 会把 TurnEnded 吃掉（真实语料实证，见库文档）。
+    if (strict ? seq <= _state.lastSeq : seq < _state.lastSeq) return false;
+    if (strict && seq > _state.lastSeq + 1) {
       // 不变量 2：**先补齐再说**，不能先应用。
       logWarn(_tag, '增量出现空洞（收到 $seq，本地 ${_state.lastSeq}），请求补齐');
       _send(LlmAttach(
         convId: convId,
         knownGeneration: _generation,
-        knownSeq: _state.lastSeq,
+        // 协议里 knownSeq 的 0 是「尚未同步」哨兵，负数不是合法线格式。
+        knownSeq: _state.lastSeq < 0 ? 0 : _state.lastSeq,
       ));
       return false;
     }
@@ -314,7 +339,8 @@ final class ConversationController {
     }
     final LlmConvMeta? meta = _state.meta;
     _emit(_state.copyWith(
-      lastSeq: frame.seq,
+      // 同号帧不该让水位线倒退。
+      lastSeq: frame.seq > _state.lastSeq ? frame.seq : _state.lastSeq,
       turnRunning: false,
       thinking: false,
       // 轮末的 usage 是**真值**（分母来自上游的 contextWindow，不是我们猜的）。

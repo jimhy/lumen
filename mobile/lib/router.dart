@@ -1,9 +1,15 @@
 /// go_router 路由表。
 ///
-/// 片 6 起有三条真路由：`/login`、`/devices`、`/pair`。`/chat/:conv` 是片 7 的活——
+/// 片 7 起有四条真路由：`/login`、`/devices`、`/pair`、`/chat`。
+///
 /// **刻意不先把空路由摆上**：空路由会让 `flutter analyze` 绿着、`go_router` 也绿着，
 /// 然后在真机上点进去是白屏，正是 §14-6「无声降级禁令」要挡的形态。
 /// 要么有页面，要么没这条路由。
+///
+/// ## `/chat` 不带 `:conv`
+///
+/// 与 `/pair` 同理：当前对话已经在 `conversationSessionProvider` 里，从 URL 再取一份
+/// 就有了两个事实来源。多对话列表与切换是 P1，那时再考虑要不要带参数。
 ///
 /// ## `/pair` 不带 `:id`
 ///
@@ -21,6 +27,7 @@ import 'package:go_router/go_router.dart';
 import 'package:lumen_mobile/state/auth_controller.dart';
 import 'package:lumen_mobile/state/link_controller.dart';
 import 'package:lumen_mobile/state/providers.dart';
+import 'package:lumen_mobile/ui/chat/chat_page.dart';
 import 'package:lumen_mobile/ui/devices/devices_page.dart';
 import 'package:lumen_mobile/ui/login/login_page.dart';
 import 'package:lumen_mobile/ui/pair/pair_page.dart';
@@ -44,7 +51,14 @@ final Provider<GoRouter> appRouterProvider = Provider<GoRouter>((Ref ref) {
       if (link is LinkPairing) {
         return state.matchedLocation == '/pair' ? null : '/pair';
       }
-      return state.matchedLocation == '/login' || state.matchedLocation == '/pair'
+      // 会话建立即进对话页——用户点设备的目的就是去说话，多一次点击没有意义。
+      if (link is LinkActive) {
+        return state.matchedLocation == '/chat' ? null : '/chat';
+      }
+      // 没有会话时 /chat 是空的，退回设备列表。
+      return state.matchedLocation == '/login' ||
+              state.matchedLocation == '/pair' ||
+              state.matchedLocation == '/chat'
           ? '/devices'
           : null;
     },
@@ -62,6 +76,10 @@ final Provider<GoRouter> appRouterProvider = Provider<GoRouter>((Ref ref) {
       GoRoute(
         path: '/pair',
         builder: (BuildContext context, GoRouterState state) => const PairPage(),
+      ),
+      GoRoute(
+        path: '/chat',
+        builder: (BuildContext context, GoRouterState state) => const ChatPage(),
       ),
     ],
   );

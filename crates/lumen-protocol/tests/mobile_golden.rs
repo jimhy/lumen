@@ -941,7 +941,11 @@ fn 协议源文件的可增长点数目未变() {
 /// 2. **整数不得超过 `i64::MAX`**：Dart 的 `int` 是 64 位**有符号**，`jsonDecode` 遇到更大的字面量
 ///    退化成 `double` 并丢精度。协议里 `seq` / `bytes` / `len` 是 `u64`，表达得了 ≠ 语料可以用。
 /// 3. **`note` 必须像句人话**：语料是给 Dart 实现者读的，一句「测试用」等于没写。
-/// 4. **目录里不许有闲杂文件**：除 `README.md` 外只准放 `.json`，免得半成品语料被两端各自忽略。
+/// 4. **目录里不许有闲杂文件**：除 `README.md` 与 `replay/` 子目录外只准放 `.json`，
+///    免得半成品语料被两端各自忽略。`replay/` 装的是**回放语料**（JSONL，一行一个
+///    `LlmFrame`），形状与本目录的「一文件一用例」信封完全不同，故独立成目录、
+///    不参与 `载入语料`；两端的枚举都只取本层的 `*.json`（Dart 侧 `whereType<File>()`
+///    天然跳过目录）。
 #[test]
 fn 语料自身的硬规矩() {
     /// 递归找出第一个超过 `i64::MAX` 的整数（`serde_json` 会把它存成 `u64`）。
@@ -957,9 +961,14 @@ fn 语料自身的硬规矩() {
     for 项 in std::fs::read_dir(语料目录()).expect("读语料目录") {
         let 路径 = 项.expect("目录项").path();
         let 文件名 = 路径.file_name().expect("文件名").to_string_lossy();
+        // `replay/` 是唯一获准的子目录（回放语料，见本函数文档第 4 条）；除它以外
+        // **任何**目录都要拦下来，否则「除 README.md 外只准放 .json」这条会被一个
+        // 随手建的目录悄悄架空。
         assert!(
-            文件名 == "README.md" || 路径.extension().is_some_and(|e| e == "json"),
-            "语料目录里混进了 {文件名}：除 README.md 外只准放 .json"
+            文件名 == "README.md"
+                || 文件名 == "replay"
+                || 路径.extension().is_some_and(|e| e == "json"),
+            "语料目录里混进了 {文件名}：除 README.md 与 replay/ 外只准放 .json"
         );
     }
 
