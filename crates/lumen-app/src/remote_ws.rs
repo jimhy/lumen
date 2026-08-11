@@ -7607,19 +7607,29 @@ impl RemoteWs {
                 // M6：会话建立 → 启动 P2P 打洞引擎（控制端发 Offer，被控端等 Offer 回 Answer）。
                 // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。传入主线程唤醒句柄——
                 // P2P 收到数据帧后须 nudge 主线程重绘（漏传则按需重绘 UI 回显延迟数秒）。
-                self.p2p = self
-                    .server_origin
-                    .as_deref()
-                    .and_then(|origin| stun_host_from_origin(origin).ok())
-                    .map(|stun_host| {
-                        P2pEngine::start(
+                // 不启动直连的两条路径**都必须留证**：`p2p == None` 时状态栏连「● 中继」指示
+                // 都不显示（见 p2p_link_state），用户只看到"就是慢"、日志里却一个字都没有——
+                // 排查「为什么远程一直走中继」时这正是最先要排除的一档。
+                self.p2p = match self.server_origin.as_deref().map(stun_host_from_origin) {
+                    Some(Ok(stun_host)) => {
+                        log::info!("P2P 引擎启动：角色 {role:?}，STUN {stun_host}");
+                        Some(P2pEngine::start(
                             role,
                             stun_host,
                             self.ctx.clone(),
                             self.proxy.clone(),
                             self.wake_pending.clone(),
-                        )
-                    });
+                        ))
+                    }
+                    Some(Err(e)) => {
+                        log::warn!("P2P 未启动：服务器地址推不出 STUN 主机({e:?})，全程走中继");
+                        None
+                    }
+                    None => {
+                        log::warn!("P2P 未启动：本端无 server_origin，全程走中继");
+                        None
+                    }
+                };
                 // M7 片 4 第 6 个清理点（会话建立：旧会话残留的 LLM 协议态必须先清）
                 // + 握手起点。控制端在这里立即发 `LlmFrame::Hello` 并起 5 秒计时（§5.4）；
                 // 被控端只清理、不主动发帧（握手是单向的，诉求方是控制端）。

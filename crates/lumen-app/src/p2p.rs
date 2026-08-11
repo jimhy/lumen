@@ -382,7 +382,7 @@ fn run(
                 return;
             }
         };
-        log::debug!("P2P 本端候选端点: {:?}", de.candidates);
+        log::info!("P2P 本端候选端点（将经中继信令发给对端）: {:?}", de.candidates);
         let my_payload = SignalPayload {
             candidates: de.candidates.clone(),
             cert_der: de.cert.cert_der.clone(),
@@ -844,17 +844,38 @@ pub async fn build_endpoint(bind: SocketAddr, stun_host: Option<&str>) -> anyhow
     let local_addr = std_sock.local_addr()?;
     // 经同一 socket 探 STUN（async）；探完转回 std socket 交给 quinn（保 NAT 映射端口一致）。
     let tokio_sock = tokio::net::UdpSocket::from_std(std_sock)?;
-    let mut candidates = vec![local_addr];
+    let mut candidates = Vec::new();
+    // 通配绑定地址（生产的 `0.0.0.0:P`）**绝不能**当候选发给对端：对端 `connect` 到 `0.0.0.0`
+    // 在 Windows 上被内核当 localhost、打到它自己身上，在 Linux 上直接 EINVAL——两种都只是白白
+    // 占掉一个候选名额和一份 5 秒超时窗口内的 spawn，永远不可能连通。loopback 测试
+    // （`bind=127.0.0.1:0`）拿到的是具体地址，不受此过滤影响。
+    if local_addr.ip().is_unspecified() {
+        log::debug!("P2P 本端绑定地址 {local_addr} 为通配地址，不作候选（对端无法连通）");
+    } else {
+        candidates.push(local_addr);
+    }
     if let Some(ip) = local_lan_addr() {
         let lan = SocketAddr::new(ip, local_addr.port());
-        if lan != local_addr {
+        if !candidates.contains(&lan) {
             candidates.push(lan);
         }
     }
     if let Some(host) = stun_host {
-        if let Some(public) = stun_query(&tokio_sock, host, STUN_TIMEOUT).await {
-            candidates.push(public);
+        match stun_query(&tokio_sock, host, STUN_TIMEOUT).await {
+            Some(public) => {
+                log::info!("P2P STUN 公网映射端点: {public}（经 {host}）");
+                candidates.push(public);
+            }
+            // 没有公网候选 = **对端永远打不到本端**（只剩 LAN 候选，跨网必然失败），本次会话
+            // 注定全程走中继。这是「远程一直是中继」最常见的单点原因，必须 warn 级留证——
+            // 埋在 debug 里等于没有，GUI 构建下更是彻底不可见。
+            None => log::warn!(
+                "P2P STUN 探测无应答（{host}，{STUN_TIMEOUT:?} 超时）：本端无公网候选，跨网打洞必失败、全程走中继"
+            ),
         }
+    }
+    if candidates.is_empty() {
+        log::warn!("P2P 本端无任何可用候选端点，直连不可能建立（全程中继）");
     }
     let std_back = tokio_sock.into_std()?;
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("无 tokio runtime"))?;
@@ -921,6 +942,12 @@ pub async fn punch(
     // 双向打洞开两端 NAT，但**按角色选定同一条连接**作数据面承载（否则两端各留各的连接、
     // open_bi/accept_bi 不在同一连接上）：Controller 取自己 connect 出去的（A→B），Controlled 取自己
     // accept 进来的（同为 A→B）。另一方向（B→A）仅用于开 NAT，连上即弃。
+    //
+    // 这条 info 是排查「为什么一直走中继」的起点：对端候选里**有没有公网地址**一眼可见
+    // （只有 LAN/loopback = 对端 STUN 挂了，跨网必然打不通，问题在对端而非本端）。
+    log::info!(
+        "P2P 开始打洞：角色 {role:?}，对端候选 {peer_candidates:?}，超时 {timeout:?}"
+    );
     let (tx, mut rx) = tokio::sync::mpsc::channel::<quinn::Connection>(4);
     // accept 任务：Controlled 取首个 accept 作结果；Controller 的 accept 是冗余方向，连上即弃。
     {
@@ -928,41 +955,60 @@ pub async fn punch(
         let tx = tx.clone();
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
+                let from = incoming.remote_address();
                 match incoming.accept() {
                     Ok(connecting) => match connecting.await {
                         Ok(conn) => {
+                            log::info!("P2P accept 来自 {from} 的连入握手成功");
                             if matches!(role, Role::Controlled) {
                                 let _ = tx.send(conn).await;
                                 break;
                             }
                             // Controller：accept 到的是 B→A 冗余方向，弃（drop conn 即关）。
                         }
-                        Err(e) => log::debug!("P2P accept 握手失败: {e}"),
+                        // mTLS 失败会落在这里（对端证书与信令里 pinned 的那份对不上）——
+                        // 与「根本没有包进来」是完全不同的病因，故必须留证而非 debug 静默。
+                        Err(e) => log::warn!("P2P accept 来自 {from} 的握手失败: {e}"),
                     },
-                    Err(e) => log::debug!("P2P accept 拒绝连入: {e}"),
+                    Err(e) => log::warn!("P2P accept 拒绝来自 {from} 的连入: {e}"),
                 }
             }
         });
     }
     // connect 任务：Controller 取首个 connect 作结果；Controlled 的 connect 仅开自身 NAT，连上即弃。
     for cand in peer_candidates {
-        match endpoint.connect_with(client_cfg.clone(), *cand, SERVER_NAME) {
+        let cand = *cand;
+        match endpoint.connect_with(client_cfg.clone(), cand, SERVER_NAME) {
             Ok(connecting) => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(conn) = connecting.await {
-                        if matches!(role, Role::Controller) {
-                            let _ = tx.send(conn).await;
+                    match connecting.await {
+                        Ok(conn) => {
+                            log::info!("P2P connect {cand} 握手成功");
+                            if matches!(role, Role::Controller) {
+                                let _ = tx.send(conn).await;
+                            }
+                            // Controlled：connect 仅为开 NAT，弃。
                         }
-                        // Controlled：connect 仅为开 NAT，弃。
+                        // 逐候选留证：LAN 候选超时属正常（跨网本就打不到），公网候选也超时
+                        // 才是「打洞真失败」；两者混在一起看不出区别，分开记才定位得了。
+                        Err(e) => log::info!("P2P connect {cand} 未建立: {e}"),
                     }
                 });
             }
-            Err(e) => log::debug!("P2P connect {cand} 发起失败: {e}"),
+            Err(e) => log::warn!("P2P connect {cand} 发起失败: {e}"),
         }
     }
     drop(tx); // 所有发送端 drop 后 recv 返回 None（全失败时不空等到超时）。
-    tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
+    let conn = tokio::time::timeout(timeout, rx.recv()).await.ok().flatten();
+    match &conn {
+        Some(c) => log::info!("P2P 打洞成功 → {}（角色 {role:?}）", c.remote_address()),
+        None => log::warn!(
+            "P2P 打洞失败：{timeout:?} 内 {} 个对端候选无一建立连接（角色 {role:?}）→ 回退中继",
+            peer_candidates.len()
+        ),
+    }
+    conn
 }
 
 /// ring CryptoProvider（与 quinn/rustls 后端一致）。

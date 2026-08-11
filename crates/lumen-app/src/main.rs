@@ -3,6 +3,8 @@
 
 mod action;
 mod app_lock;
+/// 日志落盘（stderr + `<数据目录>/lumen.log`）：GUI 构建无控制台，不落盘就没有任何现场证据。
+mod applog;
 mod background;
 // M5 远程控制：客户端与 lumen-server 的 REST 通道 + 设备 id 持久化。
 // cloud.rs 提供 M5.1–M5.4 的完整 REST API；设备列表/重命名/删除、设置/历史
@@ -363,7 +365,12 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     post_install::wait_for_installer_if_requested();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // stderr + 文件双写：release 是 windows_subsystem="windows"（无控制台），不落盘等于没日志。
+    let log_path = applog::init();
+    match &log_path {
+        Some(p) => log::info!("日志落盘 → {}", p.display()),
+        None => log::warn!("日志无法落盘（数据目录不可用），本次运行仅输出到 stderr"),
+    }
     // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
     // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；
     // 若日志里没有这行，就是拷了旧 exe，本次测试无效。
