@@ -24,6 +24,7 @@ import 'package:lumen_mobile/data/token_store.dart';
 import 'package:lumen_mobile/net/io_ws_socket.dart';
 import 'package:lumen_mobile/net/rest_client.dart';
 import 'package:lumen_mobile/net/ws_client.dart';
+import 'package:lumen_mobile/state/auth_controller.dart';
 import 'package:lumen_mobile/state/device_list_controller.dart';
 import 'package:lumen_mobile/state/link_controller.dart';
 
@@ -62,6 +63,27 @@ final Provider<DeviceIdentity> deviceIdentityProvider =
     Provider<DeviceIdentity>(
   (Ref ref) => DeviceIdentity(ref.watch(rawMachineIdProvider)),
 );
+
+/// 设备显示名。默认值是个通用名字，真机实现（`device_info_plus`）在 `main.dart` 覆盖。
+final Provider<DeviceNameSource> deviceNameProvider =
+    Provider<DeviceNameSource>((Ref ref) => const StaticDeviceName('我的手机'));
+
+/// 登录 / 注册。未选服务器时为 null。
+final Provider<AuthController?> authControllerProvider =
+    Provider<AuthController?>((Ref ref) {
+  final ServerEndpoint? endpoint = ref.watch(serverEndpointProvider);
+  final RestClient? rest = ref.watch(restClientProvider);
+  if (endpoint == null || rest == null) return null;
+  final AuthController controller = AuthController(
+    rest: rest,
+    tokens: ref.watch(tokenStoreProvider),
+    identity: ref.watch(deviceIdentityProvider),
+    deviceName: ref.watch(deviceNameProvider),
+    endpoint: endpoint,
+  );
+  ref.onDispose(() => controller.dispose());
+  return controller;
+});
 
 /// REST 客户端。未选服务器时为 null。
 final Provider<RestClient?> restClientProvider = Provider<RestClient?>((Ref ref) {
