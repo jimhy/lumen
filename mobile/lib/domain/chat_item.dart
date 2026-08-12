@@ -90,7 +90,8 @@ final class ChatText extends ChatItem {
 /// 一次工具调用。
 ///
 /// 入参**刻意不在这里展开**：`LlmToolInput` 是脱敏包装，它的 `value` 是 `Object?`
-/// （任意 JSON），展开成字符串就等于把可能含密钥的原文摊进列表内存。片 9 的卡片按需渲染。
+/// （任意 JSON），展开成字符串就等于把可能含密钥的原文摊进列表内存。
+/// 片 9 的卡片在**展开时**才按 `domain/tool_card.dart` 的规则取字段渲染。
 final class ChatToolCall extends ChatItem {
   const ChatToolCall({
     required super.turn,
@@ -108,7 +109,8 @@ final class ChatToolCall extends ChatItem {
   /// 与 [ChatToolResult.callId] 配对。
   final String callId;
 
-  /// 工具名（`Read` / `Bash` / …）。片 9 按它选卡片形态，未知名一律走通用兜底。
+  /// 工具名（`Read` / `Bash` / …）。`domain/tool_shape.dart` 按它选卡片形态，
+  /// **未知名一律走通用兜底**（CLI 的工具清单会持续新增）。
   final String name;
 
   /// PC 侧归一化出来的一行人话摘要。null 时 UI 自己按 [name] 兜底。

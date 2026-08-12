@@ -1,13 +1,14 @@
 /// 气泡与各类条目的呈现。
 ///
-/// 片 7 只做**能读**：文本气泡、工具调用/结果的一行摘要、缺口提示、思考指示。
-/// 工具卡片的展开、diff、复制是片 9 的活——这里刻意**不**预留展开箭头，
-/// 因为一个点开什么都没有的箭头比没有箭头更糟。
+/// 文本气泡、图片、错误块、缺口提示、思考指示、乐观发送中的消息都在这里。
+///
+/// **工具卡片不在这里**：它有折叠/展开、diff、复制、按需拉全文，且判断逻辑全在
+/// `domain/tool_card.dart`（纯函数、可测），故单独一个 `tool_card_tile.dart`。
+/// 片 7 时它在这里放过一个只有一行摘要的简版，片 9 起被取代并删除。
 library;
 
 import 'package:flutter/material.dart';
 import 'package:lumen_mobile/domain/chat_item.dart';
-import 'package:lumen_mobile/protocol/llm_model.dart';
 
 /// 一个气泡外壳。用户靠右、模型靠左。
 class ChatBubble extends StatelessWidget {
@@ -71,82 +72,6 @@ class ThinkingIndicator extends StatelessWidget {
       ),
     );
   }
-}
-
-/// 一次工具调用的摘要行。
-class ToolCallTile extends StatelessWidget {
-  const ToolCallTile({required this.item, super.key});
-
-  final ChatToolCall item;
-
-  @override
-  Widget build(BuildContext context) {
-    // title 是 PC 侧归一化出来的一行人话；没有就退回工具名。
-    final String label = item.title?.value ?? item.name;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: <Widget>[
-        const Icon(Icons.build_outlined, size: 14),
-        const SizedBox(width: 6),
-        Flexible(child: Text(label, style: const TextStyle(fontSize: 13))),
-      ],
-    );
-  }
-}
-
-/// 一次工具结果的摘要行。
-///
-/// ★ **摘要走 `detail`，不走 `output`**：一次 `Read` 的正文实测 12272 字符，
-/// 而 `detail` 四个小字段就够画出「读取 README.md 第 1–165 行（共 165 行）」。
-/// `detail == null`（非文件类工具，形态未实测）时才退回正文的**首行**。
-class ToolResultTile extends StatelessWidget {
-  const ToolResultTile({required this.item, super.key});
-
-  final ChatToolResult item;
-
-  @override
-  Widget build(BuildContext context) {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
-    final bool bad = item.status != LlmToolStatus.ok;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: <Widget>[
-        Icon(
-          bad ? Icons.error_outline : Icons.check_circle_outline,
-          size: 14,
-          color: bad ? scheme.error : scheme.primary,
-        ),
-        const SizedBox(width: 6),
-        Flexible(child: Text(summarize(item), style: const TextStyle(fontSize: 13))),
-      ],
-    );
-  }
-
-  /// 组一句摘要。**纯函数，好测。**
-  static String summarize(ChatToolResult item) {
-    final LlmToolResultDetail? detail = item.detail;
-    if (detail is LlmToolResultDetailFile) {
-      final int last = detail.startLine + detail.lineCount - 1;
-      final String range = '第 ${detail.startLine}–$last 行（共 ${detail.totalLines} 行）';
-      // 只读了一部分时要说出来，否则用户以为模型看了全文。
-      return '读取 ${detail.path.value} $range';
-    }
-    if (item.status != LlmToolStatus.ok) {
-      return '工具${_statusLabel(item.status)}';
-    }
-    // 未实测形态：退回正文首行，**不猜字段名**。
-    final String first = item.output.value.split('\n').first;
-    final String head = first.length > 60 ? '${first.substring(0, 60)}…' : first;
-    return head.isEmpty ? '工具已完成' : head;
-  }
-
-  static String _statusLabel(LlmToolStatus status) => switch (status) {
-        LlmToolStatus.ok => '完成',
-        LlmToolStatus.error => '出错',
-        LlmToolStatus.denied => '被拒绝',
-        LlmToolStatus.cancelled => '被取消',
-        LlmToolStatus.unknown => '状态未知',
-      };
 }
 
 /// 图片附件（片 7 只画一行说明，缩略图是 P1 的活）。

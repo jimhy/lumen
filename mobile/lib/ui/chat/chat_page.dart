@@ -83,6 +83,7 @@ class _ChatPageState extends ConsumerState<ChatPage> {
                       .resendByUser(item.clientMsgId, nowMs: _nowMs()),
                   onDiscard: (ChatPending item) =>
                       session.controller.discardPending(item.clientMsgId),
+                  onFetchTurn: (int turn) => _fetchTurn(session, turn),
                 ),
               ),
               _composer(context, session, state),
@@ -170,14 +171,21 @@ class _ChatPageState extends ConsumerState<ChatPage> {
   }
 
   /// 点「内容有缺口」：拉整轮快照覆盖重建。
-  void _fillGap(ConversationSession session, ChatGap gap) {
+  void _fillGap(ConversationSession session, ChatGap gap) =>
+      _fetchTurn(session, gap.turn);
+
+  /// 拉一整轮的定稿快照。
+  ///
+  /// 两个入口共用它：「内容有缺口」（片 7）与工具正文「还有 N 字节未同步」（片 9）。
+  /// 两者都是同一条自愈通路——被控端为省流量夹短过的内容，按需要时才拉。
+  void _fetchTurn(ConversationSession session, int turn) {
     final LlmConvMeta? meta = session.controller.state.meta;
     if (meta == null) return;
     session.send(LlmTurnFetch(
       convId: session.convId,
       convGeneration: meta.convGeneration,
       reqId: session.controller.nextReqId(),
-      turn: gap.turn,
+      turn: turn,
     ));
   }
 

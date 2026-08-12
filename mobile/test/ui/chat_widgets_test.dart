@@ -5,12 +5,10 @@
 library;
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:lumen_mobile/domain/chat_item.dart';
 import 'package:lumen_mobile/protocol/codec.dart';
 import 'package:lumen_mobile/protocol/llm_enums.dart';
 import 'package:lumen_mobile/protocol/llm_model.dart';
 import 'package:lumen_mobile/state/conversation_controller.dart';
-import 'package:lumen_mobile/ui/chat/chat_bubbles.dart';
 import 'package:lumen_mobile/ui/chat/chat_rate_limit_bar.dart';
 import 'package:lumen_mobile/ui/chat/chat_status_bar.dart';
 
@@ -185,48 +183,4 @@ void main() {
     });
   });
 
-  group('工具结果摘要', () {
-    ChatToolResult result({
-      LlmToolResultDetail? detail,
-      String output = '',
-      LlmToolStatus status = LlmToolStatus.ok,
-    }) =>
-        ChatToolResult(
-          turn: 1,
-          blockId: 0,
-          role: ChatRole.assistant,
-          callId: 'c1',
-          status: status,
-          output: LlmText(output),
-          detail: detail,
-        );
-
-    test('★ 有 detail ⇒ 走结构化摘要，不碰正文', () {
-      // 一次 Read 的正文实测 12272 字符；detail 四个小字段就够画出这句话。
-      final String s = ToolResultTile.summarize(result(
-        detail: const LlmToolResultDetailFile(
-          path: LlmPath('README.md'),
-          startLine: 1,
-          lineCount: 165,
-          totalLines: 165,
-        ),
-        output: '这段正文不该出现在摘要里' * 100,
-      ));
-      expect(s, '读取 README.md 第 1–165 行（共 165 行）');
-      expect(s.contains('不该出现'), isFalse);
-    });
-
-    test('没有 detail ⇒ 退回正文首行并截断', () {
-      final String s = ToolResultTile.summarize(
-          result(output: '第一行\n第二行\n第三行'));
-      expect(s, '第一行');
-    });
-
-    test('非 ok 状态说出来', () {
-      expect(ToolResultTile.summarize(result(status: LlmToolStatus.denied)),
-          '工具被拒绝');
-      expect(ToolResultTile.summarize(result(status: LlmToolStatus.error)),
-          '工具出错');
-    });
-  });
 }

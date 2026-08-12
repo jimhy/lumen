@@ -18,9 +18,11 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:lumen_mobile/domain/chat_item.dart';
+import 'package:lumen_mobile/domain/tool_card.dart';
 import 'package:lumen_mobile/state/conversation_controller.dart';
 import 'package:lumen_mobile/state/streaming_tail.dart';
 import 'package:lumen_mobile/ui/chat/chat_bubbles.dart';
+import 'package:lumen_mobile/ui/chat/tool_card_tile.dart';
 import 'package:lumen_mobile/ui/common/markdown_view.dart';
 
 /// 气泡流列表。
@@ -31,6 +33,7 @@ class MessageList extends StatefulWidget {
     this.onFillGap,
     this.onResend,
     this.onDiscard,
+    this.onFetchTurn,
     super.key,
   });
 
@@ -48,6 +51,12 @@ class MessageList extends StatefulWidget {
   /// 放弃一条消息。
   final void Function(ChatPending item)? onDiscard;
 
+  /// 拉取某一轮的完整内容（片 9：工具正文被 PC 侧夹紧时按需拉）。
+  ///
+  /// 与 [onFillGap] 走的是同一条自愈通路（`TurnFetch`），只是入口不同：
+  /// 那个是「这里有缺口」，这个是「这里被夹短了」。
+  final void Function(int turn)? onFetchTurn;
+
   @override
   State<MessageList> createState() => _MessageListState();
 }
@@ -55,6 +64,13 @@ class MessageList extends StatefulWidget {
 class _MessageListState extends State<MessageList> {
   /// 每个列表一份，页面销毁即随之释放——全局单例会在页面没了之后继续攥着一堆 Widget。
   final MarkdownMemo _memo = MarkdownMemo();
+
+  /// 已展开的工具卡片（按 [ChatItem.key]）。
+  ///
+  /// ★ **必须存在这里，不能存在卡片自己的 State 里**：气泡流是 `ListView.builder`，
+  /// 滚出屏幕的条目会被销毁重建。存在卡片里的话，用户展开一张、往下滚一屏再滚回来，
+  /// 它就自己折叠了——一个不报错、只让人觉得「这 App 有点怪」的 bug。
+  final Set<String> _expanded = <String>{};
 
   @override
   void dispose() {
@@ -119,8 +135,8 @@ class _MessageListState extends State<MessageList> {
     final Widget body = switch (item) {
       ChatText(:final String markdown) =>
         _memo.of(item.key, item.revision, () => MarkdownView(data: markdown)),
-      ChatToolCall() => ToolCallTile(item: item),
-      ChatToolResult() => ToolResultTile(item: item),
+      ChatToolCall() => _toolCard(item, toolCallCard(item)),
+      ChatToolResult() => _toolCard(item, toolResultCard(item)),
       ChatImage() => ImageTile(item: item),
       ChatError() => ErrorTile(item: item),
       ChatGap() => GapTile(item: item, onFill: widget.onFillGap),
@@ -137,4 +153,17 @@ class _MessageListState extends State<MessageList> {
       child: body,
     );
   }
+
+  /// 工具卡片。展开状态按条目 key 存在 [_expanded] 里，滚动不丢。
+  Widget _toolCard(ChatItem item, ToolCard card) => ToolCardTile(
+        card: card,
+        expanded: _expanded.contains(item.key),
+        onToggle: () => setState(() {
+          if (!_expanded.remove(item.key)) _expanded.add(item.key);
+        }),
+        // 夹紧过才给拉取入口；父级没接这个回调时按钮自然是禁用的。
+        onFetchFull: card.truncatedBytes == null || widget.onFetchTurn == null
+            ? null
+            : () => widget.onFetchTurn!(item.turn),
+      );
 }
