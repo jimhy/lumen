@@ -54,6 +54,11 @@ objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
+# M7 片 6 扫码配对：只用它算出模块布尔矩阵，格子由 egui 自己画成纹理。
+# 选 qrcodegen（Nayuki）而不是 qrcode/fast_qr：**零传递依赖、无 unsafe**，
+# 而我们要的只有「文本 → bool 矩阵」这一件事——不引 image/svg，也不落盘任何图片文件
+# （配对码是一次性口令，落盘等于把它留在磁盘上）。
+qrcodegen = "1.8"
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
@@ -95,6 +100,15 @@ windows-sys = { version = "0.61", features = [
     # P0 应用锁：DPAPI 保护本机密码校验值。
     "Win32_Security_Cryptography",
     "Win32_System_Threading",
+    # M7 片 2 headless LLM runner 进程树清理（llm_runner/proc.rs）：CreateJobObjectW /
+    # AssignProcessToJobObject / SetInformationJobObject / TerminateJobObject +
+    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE。claude 会 spawn bash/pwsh/node，只 kill 父进程
+    # 会留孤儿继续改用户文件；KILL_ON_JOB_CLOSE 还能兜住「Lumen 崩溃/被强杀」。
+    # 注：JOBOBJECT_EXTENDED_LIMIT_INFORMATION 内嵌 IO_COUNTERS，windows-sys 0.61 把它
+    # gated 在上面已启用的 Win32_System_Threading 上，无需再补 feature。
+    # windows-sys 在 lumen-app 是 [target.'cfg(windows)'.dependencies]，本改动只影响
+    # Windows 目标（会让缓存失效，但不是全平台依赖树改动）。
+    "Win32_System_JobObjects",
     # P0 应用锁：GetLastInputInfo + GetTickCount 读取系统级空闲时长。
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",

@@ -1,0 +1,24 @@
+{
+  "note": "显式 null 与键缺席**在输入侧等价、在输出侧不等价**：Option 字段收到 null → None → skip_serializing_if 让它在输出里**消失**。Dart 侧 toJson 若照着自己的字段写出 'model': null，线上就与 Rust 不同——这是手写模型最常见的一处漂移，本用例专门钉住它。",
+  "expect_variant": "Start",
+  "frame": {
+    "op": "Start",
+    "req_id": 11,
+    "agent": "Claude",
+    "cwd": "F:\\projects\\lumen",
+    "model": null,
+    "permission_mode": null,
+    "resume": null,
+    "fork_session": false,
+    "append_system_prompt": null,
+    "allowed_tools": null,
+    "origin": null
+  },
+  "reserialized": {
+    "op": "Start",
+    "req_id": 11,
+    "agent": "Claude",
+    "cwd": "F:\\projects\\lumen",
+    "fork_session": false
+  }
+}

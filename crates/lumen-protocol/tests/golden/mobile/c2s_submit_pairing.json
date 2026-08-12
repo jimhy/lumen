@@ -1,0 +1,10 @@
+{
+  "note": "手机提交 PC 屏幕上展示的 9 位配对码。**隐藏会话每次都要念码**：服务端 ws.rs 的 OpenHidden 臂恒传 paired=false、hub.rs 的 submit_pairing 在 Hidden 分支恒返回 None（不写 device_pairs），两处合起来堵住「镜像信任与隐藏信任串用」这条静默提权路径。code 刻意带前导零，Dart 侧当成数字处理就会掉一位。",
+  "expect_variant": "SubmitPairing",
+  "c2s": {
+    "SubmitPairing": {
+      "target": "pc-1",
+      "code": "012345678"
+    }
+  }
+}

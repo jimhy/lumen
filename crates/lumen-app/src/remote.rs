@@ -27,7 +27,10 @@ const TOKEN_REFRESH_AHEAD_SECS: i64 = 2 * 24 * 3600;
 const TOKEN_REFRESH_RETRY: Duration = Duration::from_secs(60);
 
 /// 当前 Unix 秒（系统时钟早于 1970 记 0；与服务端 `expires_at` 同基准比较）。
-fn now_secs() -> i64 {
+///
+/// `pub(crate)`：M7 片 6 的配对二维码要把「预计过期时刻」写进载荷，与 token 续期用的是
+/// 同一个基准，没有理由在 `remote_ws.rs` 里再写一份。
+pub(crate) fn now_secs() -> i64 {
     let s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

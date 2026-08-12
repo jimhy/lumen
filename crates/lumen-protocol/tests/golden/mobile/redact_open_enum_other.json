@@ -1,0 +1,31 @@
+{
+  "note": "开放枚举 Other(String) 的**最后一道**脱敏：收进来的 Other 长度不受本端夹紧约束（接收侧刻意不校验），所以调试渲染只许打前 LLM_ENUM_DEBUG_HEAD_BYTES=16 字节 + 总长，形如 Other(\"unknown_reason__…\", 38B)。本用例把假密钥藏在第 16 字节**之后**，两端只要 derive 一个朴素的 toString 就会红。",
+  "expect_variant": "TurnEnded",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 115,
+    "turn": 11,
+    "stop": "unknown_reason__hunter2-LUMEN-FAKE-KEY-0000-DO-NOT-USE",
+    "outcome": {
+      "is_error": true
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 0,
+      "context_used": 0,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": 1786211600000,
+    "truncated": false
+  },
+  "debug_forbidden": [
+    "hunter2",
+    "LUMEN-FAKE-KEY-0000-DO-NOT-USE"
+  ]
+}

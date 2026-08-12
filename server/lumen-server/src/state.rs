@@ -6,6 +6,7 @@ use deadpool_postgres::Pool;
 
 use crate::config::Config;
 use crate::hub::Hub;
+use crate::throttle::Throttle;
 
 /// axum handler 间共享的状态。克隆廉价：`Pool` 内部 `Arc`，`Config`/`Hub` 包 `Arc`。
 #[derive(Clone)]
@@ -16,4 +17,6 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// M5.3 远程控制中继枢纽（in-memory presence / 配对 / 会话状态机）。
     pub hub: Arc<Hub>,
+    /// 片 11：登录 / 注册节流（进程内滑动窗口）。
+    pub throttle: Arc<Throttle>,
 }

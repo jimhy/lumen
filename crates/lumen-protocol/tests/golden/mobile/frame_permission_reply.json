@@ -1,0 +1,14 @@
+{
+  "note": "控→被：用户的审批结果。Allow.remember=true ⇒ 本对话内后续同名工具自动放行。remember 带 #[serde(default)] 但没有 skip，永远序列化。",
+  "expect_variant": "PermissionReply",
+  "frame": {
+    "op": "PermissionReply",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 42,
+    "decision": {
+      "kind": "Allow",
+      "remember": true
+    }
+  }
+}

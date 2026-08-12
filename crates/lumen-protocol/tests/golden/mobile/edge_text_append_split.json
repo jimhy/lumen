@@ -1,0 +1,41 @@
+{
+  "note": "增量切分边界：一个 ZWJ 家庭 emoji 被两条 TextAppend 拆开传（前半 👨 ZWJ 👩 ZWJ，后半 👧 ZWJ 👦）。两半各自都是**合法**字符串（ZWJ 本身是合法字符），所以协议层无从阻止；归约器必须**先按字节/码元拼接、再交给渲染层做字素簇切分**，不能每收到一条就按字素簇渲染一次（那会先画出两个人再突然变成一家四口，且在 Flutter 上是可见闪烁）。",
+  "expect_variant": "Delta",
+  "frame": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 112,
+    "turn": 8,
+    "items": [
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 0,
+          "block": {
+            "kind": "Text",
+            "text": ""
+          }
+        }
+      },
+      {
+        "kind": "TextAppend",
+        "block_id": 0,
+        "text": "👨‍👩‍"
+      },
+      {
+        "kind": "TextAppend",
+        "block_id": 0,
+        "text": "👧‍👦"
+      },
+      {
+        "kind": "BlockEnd",
+        "block_id": 0,
+        "block": {
+          "kind": "Text",
+          "text": "👨‍👩‍👧‍👦"
+        }
+      }
+    ]
+  }
+}

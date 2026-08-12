@@ -1,0 +1,19 @@
+{
+  "note": "**外层 RemoteFrame 信封**——全套语料里唯一一条把它写成可执行样本的。外层是 serde 默认的 externally tagged（变体名当唯一 key，unit 变体是**裸字符串** \"P2pStreamHello\" 而不是对象 {\"P2pStreamHello\":{}}），内层 LlmFrame 才是 internally tagged（\"op\" 字段）。两层机制不同，别用同一个解析器。此前这一层只有 README 里的散文，而它恰恰是 Dart 侧最容易搞错的一层（把 op 直接摊到 Relay 载荷顶层）。envelopes 数组里的每一项都必须能解成 RemoteFrame 并原样往返。",
+  "expect_variant": "Detach",
+  "frame": {
+    "op": "Detach",
+    "conv_id": 12,
+    "conv_generation": 1
+  },
+  "envelopes": [
+    {
+      "Llm": {
+        "op": "Detach",
+        "conv_id": 12,
+        "conv_generation": 1
+      }
+    },
+    "P2pStreamHello"
+  ]
+}

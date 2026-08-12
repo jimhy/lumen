@@ -1,0 +1,35 @@
+{
+  "note": "设备列表。服务端按注册时间**升序**返回（老实现按 last_seen 降序，每次心跳都会让列表重排、设备跳位，海风哥反馈后改的）——手机端**不要**再按在线状态重排整表，那会把这条修复重新引入。online 由服务端按 last_seen 与在线窗口算好，客户端不自己判；is_self 标出手机自己（不能控制自己，SelfControl）。三个布尔与两个整数相邻，取值刻意各不相同。",
+  "rest_type": "DeviceListResponse",
+  "rest": {
+    "devices": [
+      {
+        "id": "pc-1",
+        "name": "海风的工作站",
+        "os": "windows",
+        "app_version": "1.0.30",
+        "online": true,
+        "last_seen": 1786342700,
+        "is_self": false
+      },
+      {
+        "id": "phone-1",
+        "name": "海风的手机",
+        "os": "android",
+        "app_version": "0.1.0",
+        "online": true,
+        "last_seen": 1786342788,
+        "is_self": true
+      },
+      {
+        "id": "laptop-2",
+        "name": "出差本",
+        "os": "macos",
+        "app_version": "1.0.28",
+        "online": false,
+        "last_seen": 1785000000,
+        "is_self": false
+      }
+    ]
+  }
+}

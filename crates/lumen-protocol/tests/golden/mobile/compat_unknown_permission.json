@@ -1,0 +1,29 @@
+{
+  "note": "审批决定与裁决方双双降级。**安全侧硬约束**：被控端收到 LlmPermissionDecision::Unknown 必须按**拒绝**处理——认不出的审批结果在安全上只能保守解释，绝不能当放行。",
+  "expect_variant": "PermissionResolved",
+  "frame": {
+    "op": "PermissionResolved",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 43,
+    "decision": {
+      "kind": "AllowOnce",
+      "ttl": 30
+    },
+    "by": {
+      "kind": "AdminOverride"
+    }
+  },
+  "reserialized": {
+    "op": "PermissionResolved",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 43,
+    "decision": {
+      "kind": "Unknown"
+    },
+    "by": {
+      "kind": "Unknown"
+    }
+  }
+}

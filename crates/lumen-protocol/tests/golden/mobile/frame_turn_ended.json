@@ -1,0 +1,29 @@
+{
+  "note": "被→控：一轮结束。**判成败只看 outcome.is_error**——stop 是展示用，上游 subtype 判据价值为零（两次采样同为 \"success\"、成败相反）。truncated=true ⇒ 本轮曾因积压丢过增量，控制端应发 TurnFetch 补齐。",
+  "expect_variant": "TurnEnded",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 104,
+    "turn": 5,
+    "stop": "Error",
+    "outcome": {
+      "is_error": true,
+      "terminal_reason": "ApiError",
+      "api_error_status": 403
+    },
+    "usage": {
+      "input_tokens": 3,
+      "output_tokens": 24,
+      "cache_read_tokens": 53883,
+      "cache_write_tokens": 18013,
+      "cost_micro_usd": 240262,
+      "context_used": 38342,
+      "context_limit": 1000000,
+      "max_output_tokens": 64000
+    },
+    "ended_ms": 1786211126000,
+    "truncated": true
+  }
+}

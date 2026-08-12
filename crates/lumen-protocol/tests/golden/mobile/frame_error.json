@@ -1,0 +1,11 @@
+{
+  "note": "被→控：与具体对话无关、或无法归入某条应答的错误。conv_id / req_id 尽力回带，两者都是 Option。",
+  "expect_variant": "Error",
+  "frame": {
+    "op": "Error",
+    "conv_id": 11,
+    "req_id": 9,
+    "code": "StaleSession",
+    "message": "conv_generation 不匹配：请求 2，当前 3"
+  }
+}

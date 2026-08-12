@@ -1,0 +1,19 @@
+{
+  "note": "多字节文本的总覆盖：中文、四字节 CJK 扩展字（𠮷，UTF-16 里是代理对）、ZWJ 家庭 emoji、带变体选择符的 ❤️、组合字符 é（e + U+0301）、零宽空格 U+200B。**Dart 陷阱**：Dart 的 String 按 UTF-16 码元计长，Rust 的 LlmText::len_bytes() 按 UTF-8 字节计长，两者对同一段文本给出完全不同的数——凡是按长度夹紧的地方（LLM_TOOL_OUTPUT_MAX_BYTES 等）Dart 侧必须先 utf8.encode 再数字节，直接用 s.length 会少算 2–3 倍。",
+  "expect_variant": "Send",
+  "frame": {
+    "op": "Send",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 12,
+    "text": "汉字 𠮷 家庭 👨‍👩‍👧‍👦 心 ❤️ 组合 é 零宽​结束",
+    "attachments": [
+      {
+        "path": "F:\\projects\\lumen\\.lumen\\llm-attach\\11\\截图-📸.png",
+        "name": "截图-📸-𠮷.png",
+        "mime": "image/png",
+        "len": 1024
+      }
+    ]
+  }
+}

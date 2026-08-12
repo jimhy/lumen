@@ -382,12 +382,6 @@ pub struct Session {
     alternate_scroll_tracker: AlternateScrollTracker,
     /// 当前前台 LLM CLI。仅表示程序类型，不表示忙闲状态。
     pub llm_cli: Option<LlmCliKind>,
-    /// 当前 LLM CLI 首次被识别的时刻。CLI 类型变化或退出时重置，
-    /// HUD 在 transcript 暂不可用时用它显示本窗格会话时长。
-    pub llm_started_at: Option<Instant>,
-    /// 当前 LLM CLI 前台进程 PID。与 CLI 类型同一次节流探测更新，
-    /// 避免 HUD 每帧重新遍历系统进程快照。
-    pub llm_foreground_pid: Option<u32>,
     /// `/prefix` 临时镜像到原生 CLI 后，从终端菜单提取到的候选。
     pub slash_probe: SlashProbeState,
     /// M4.1 批D1：焦点窗格的输入编辑器（`input-editor` feature 门控）。
@@ -498,8 +492,6 @@ impl Session {
             frame_activity,
             alternate_scroll_tracker: AlternateScrollTracker::default(),
             llm_cli: None,
-            llm_started_at: None,
-            llm_foreground_pid: None,
             slash_probe: SlashProbeState::default(),
             #[cfg(feature = "input-editor")]
             editor: Editor::default(),

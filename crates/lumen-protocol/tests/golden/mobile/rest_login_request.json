@@ -1,0 +1,15 @@
+{
+  "note": "登录请求（回访：device_id 与 hw_id 都带着）。hw_id 是**服务端幂等认领同一台物理机的键**——handlers.rs 的 upsert_device 优先按 (user_id, hw_id) 命中就复用同一行、绝不新建；不带它就退化成「带一个查不到的 device_id 就 INSERT 新行」，重装即产幽灵设备。它是 sha256(canonical_origin ‖ 0x00 ‖ 原始机器标识) 的 hex，**原始值永不上网**。",
+  "rest_type": "LoginRequest",
+  "rest": {
+    "email": "haifeng@example.com",
+    "password": "correct horse battery staple",
+    "device": {
+      "device_id": "phone-1",
+      "hw_id": "9f2c4e7a1b8d3f60a5c9e2d4b7f108a3c6e9d2b5f8a1c4e7092b5d8f1a4c7e0b",
+      "name": "海风的手机",
+      "os": "android",
+      "app_version": "0.1.0"
+    }
+  }
+}

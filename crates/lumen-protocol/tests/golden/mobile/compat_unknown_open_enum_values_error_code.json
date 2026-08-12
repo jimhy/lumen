@@ -1,0 +1,10 @@
+{
+  "note": "开放枚举 Other 的第 3 组：LlmErrorCode（ConvFailed.code / Error.code / LlmBlock::Error.code 三处共用）。这是全部开放枚举里风险最高的一个——新错误码恰恰是最先长出来的东西，而这一帧正是「出事时唯一告诉用户出了什么事」的那一帧。Dart 若写成 enum + values.byName，一个新 code 会让整帧抛异常，用户看到的是「什么都没发生」而不是错误提示。message 是给人看的兜底文案，code 认不出时必须原样显示它。",
+  "expect_variant": "ConvFailed",
+  "frame": {
+    "op": "ConvFailed",
+    "req_id": 22,
+    "code": "QuotaExhausted",
+    "message": "本月额度已用尽，请到账号页面充值后重试"
+  }
+}

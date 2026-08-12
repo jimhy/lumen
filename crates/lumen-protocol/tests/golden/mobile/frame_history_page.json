@@ -1,0 +1,98 @@
+{
+  "note": "被→控：一页历史（turns 按轮号**升序**）。控制端必须以 oldest_turn 推进游标、以 has_more 判断到底，绝不能假设「请求 N 轮就回 N 轮」。第二条记录**省略 stop 与 ended_ms** = 这一轮还没结束（拉取进行中的那一轮时会出现）；两条记录顺带覆盖 LlmToolStatus 的 Denied 与 Cancelled。",
+  "expect_variant": "HistoryPage",
+  "frame": {
+    "op": "HistoryPage",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 8,
+    "oldest_turn": 1,
+    "turns": [
+      {
+        "turn": 1,
+        "user": [
+          {
+            "block_id": 0,
+            "block": {
+              "kind": "Text",
+              "text": "删掉 build 目录"
+            }
+          }
+        ],
+        "assistant": [
+          {
+            "block_id": 1,
+            "block": {
+              "kind": "ToolResult",
+              "call_id": "toolu_FAKE0003",
+              "status": {
+                "kind": "Denied"
+              },
+              "output": "用户拒绝了这次 Bash 调用"
+            }
+          }
+        ],
+        "stop": "ToolUse",
+        "outcome": {
+          "is_error": false
+        },
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost_micro_usd": 0,
+          "context_used": 0,
+          "context_limit": 0,
+          "max_output_tokens": 0
+        },
+        "started_ms": 1786210100000,
+        "ended_ms": 1786210120000,
+        "complete": true,
+        "blocks_omitted": 0
+      },
+      {
+        "turn": 2,
+        "user": [
+          {
+            "block_id": 0,
+            "block": {
+              "kind": "Text",
+              "text": "算了，改跑测试"
+            }
+          }
+        ],
+        "assistant": [
+          {
+            "block_id": 1,
+            "block": {
+              "kind": "ToolResult",
+              "call_id": "toolu_FAKE0004",
+              "status": {
+                "kind": "Cancelled"
+              },
+              "output": ""
+            }
+          }
+        ],
+        "outcome": {
+          "is_error": false
+        },
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost_micro_usd": 0,
+          "context_used": 0,
+          "context_limit": 0,
+          "max_output_tokens": 0
+        },
+        "started_ms": 1786210200000,
+        "complete": false,
+        "blocks_omitted": 0
+      }
+    ],
+    "has_more": true
+  }
+}

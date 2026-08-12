@@ -1,0 +1,17 @@
+{
+  "note": "隐藏会话数据面来帧。**必须带回 session_id**：手机上可能同时挂着不止一条会话，没有 id 就无法路由。payload 是外层 RemoteFrame 信封那一层，手机端拿到后先 RemoteFrame.fromJson 再取内层 LlmFrame——两层机制不同（外层 externally tagged、内层 internally tagged），别用同一个解析器。",
+  "expect_variant": "RelayTo",
+  "s2c": {
+    "RelayTo": {
+      "session_id": 9,
+      "payload": {
+        "Llm": {
+          "op": "DeltaAck",
+          "conv_id": 11,
+          "conv_generation": 3,
+          "seq": 102
+        }
+      }
+    }
+  }
+}

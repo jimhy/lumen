@@ -1,0 +1,15 @@
+{
+  "note": "登录成功响应。device_id 是服务端分配的，**客户端必须持久化**并在下次登录带回去。expires_at 是 Unix **秒**（不是毫秒），默认 TTL 7 天；手机端据它提前续期，别等 401。protocol_version 与 expires_at 都是整数、取值刻意区分度大，接反了往返照绿。",
+  "rest_type": "AuthResponse",
+  "rest": {
+    "protocol_version": 4,
+    "token": "eyJhbGciOiJIUzI1NiJ9.fake.payload",
+    "expires_at": 1786944000,
+    "user": {
+      "id": "user-1",
+      "email": "haifeng@example.com",
+      "display_name": "haifeng"
+    },
+    "device_id": "phone-1"
+  }
+}

@@ -11,6 +11,9 @@
 # agent 验证日志（纪律：不入库，放 target/ 下）
 *-log.txt
 F*ClaudeWorkspacesLumen*
+# agent 会话摘要。上面那条只兜「以工作区路径命名」的那种，兜不住这类前缀，
+# 而它们会静静躺在仓库根上等着下一次 `git add -A`（2026-08-11 差点被扫进来一个）。
+_digest*
 # 终端调试/验证日志（pty dump、截图、复现脚本）
 /ptylog/
 
@@ -19,6 +22,11 @@ F*ClaudeWorkspacesLumen*
 
 # 敏感：证书/私钥，绝不入库（公开仓库）。
 /证书/
+# 敏感：环境变量文件。仓库里目前没有，但 /证书/ 与签名密钥都设了防线，
+# 唯独这条常见入口一直敞着——补上，例子文件照常入库。
+.env
+.env.*
+!.env.example
 # 文档媒体素材（截图等），默认本地保留、不随源码入库；README 引用的展示
 # 截图白名单入库。目录规则必须写 /* 而非以 / 结尾：整目录被 ignore 时
 # git 不进入该目录，! 例外不生效。
@@ -31,3 +39,40 @@ F*ClaudeWorkspacesLumen*
 !/docs/media/lumen-customize.png
 # Docker 交叉编译 Linux 版服务端的产物目录（本地临时）。
 /target-linux/
+
+# ── 移动端 Flutter 子项目（mobile/，M7 片 0b）───────────────────────────────
+# 目录规则一律带 /mobile/ 前缀锚定。理由不是洁癖：Flutter 官方 .gitignore 模板里
+# 的 build/ 、.dart_tool/ 都是**无锚点**规则，一旦照抄进仓库根，它们会把仓库任意
+# 位置的同名目录一并吞掉（本文件上面的 *.pdb 与 *-log.txt 就是既有的无锚点规则，
+# 已知会顺带吞掉 Flutter Windows 产物与任何 xxx-log.txt——新增规则不要再繁殖这个坑）。
+# 另注：目录规则若要配 ! 例外，必须写成 /xxx/* 而非 /xxx/（见上面 /docs/media/* 的记录）；
+# 本节全是纯排除、无例外，所以写 / 结尾即可。
+/mobile/build/
+/mobile/.dart_tool/
+/mobile/.flutter-plugins
+/mobile/.flutter-plugins-dependencies
+/mobile/.packages
+/mobile/android/.gradle/
+/mobile/android/local.properties
+/mobile/android/app/build/
+/mobile/android/captures/
+/mobile/ios/Pods/
+# Xcode 若配成 per-project build location 就会在这里堆产物（默认走 DerivedData，
+# 不落在仓库内）。mobile/ios/.gitignore 里只有 **/DerivedData/，兜不住这条。
+/mobile/ios/build/
+/mobile/ios/.symlinks/
+/mobile/ios/Flutter/Generated.xcconfig
+/mobile/ios/Flutter/flutter_export_environment.sh
+/mobile/ios/Runner.xcworkspace/xcuserdata/
+/mobile/ios/Runner.xcodeproj/xcuserdata/
+/mobile/**/*.iml
+/mobile/.idea/
+/mobile/coverage/
+# 敏感：Android 签名密钥，绝不入库（公开仓库，同 /证书/）。
+/mobile/android/key.properties
+# 下面两条**刻意不加锚点**——与本节其余规则相反，这是有意的例外：
+# 密钥文件无论被谁放到仓库哪个角落都不许入库，这里宁可误伤也不能漏。
+*.jks
+*.keystore
+# 注：mobile/pubspec.lock **要入库**（App 而非 library，锁定可复现构建），
+# 故此处刻意没有它的规则。拍板与理由见 mobile/README.md「pubspec.lock 入库」一节。

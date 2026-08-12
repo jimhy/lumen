@@ -1,0 +1,18 @@
+{
+  "note": "开放枚举 Other 的第 5 组：额度播报里那四个各自独立的开放枚举（status / window / overage_status / overage_disabled_reason）。四个都只声明了实测到的一两个值，其余全靠 Other 原样保留。**控制端对未知 status 必须按「状态不明」展示，绝不能默认当成放行**——把认不出的额度状态渲染成绿色，用户会在真的被限流时毫无察觉。using_overage 保持 Option：None（键缺席）与 false 是两件事。",
+  "expect_variant": "RateLimit",
+  "frame": {
+    "op": "RateLimit",
+    "conv_id": 12,
+    "conv_generation": 1,
+    "observed_ms": 1786212000000,
+    "info": {
+      "status": "throttled",
+      "window": "seven_day",
+      "resets_at_secs": 1786298400,
+      "overage_status": "pending_review",
+      "overage_disabled_reason": "org_policy",
+      "using_overage": true
+    }
+  }
+}

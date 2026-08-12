@@ -1,0 +1,48 @@
+{
+  "note": "将来 CLI 真给出 summarized 思考时，老控制端只降级**这一块的 content**（→ LlmThinking::Unknown），块本身还在、同帧其余照常。反过来说：手机端只要看到 Thinking 块就该显示「思考中/思考了 N 秒」的状态，不要指望里面一定有正文（Claude 实测恒为 Omitted）。",
+  "expect_variant": "Delta",
+  "frame": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 107,
+    "turn": 4,
+    "items": [
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 3,
+          "block": {
+            "kind": "Thinking",
+            "content": {
+              "kind": "Summarized",
+              "text": "…",
+              "tokens": 42
+            }
+          }
+        }
+      }
+    ]
+  },
+  "reserialized": {
+    "op": "Delta",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 107,
+    "turn": 4,
+    "items": [
+      {
+        "kind": "BlockStart",
+        "entry": {
+          "block_id": 3,
+          "block": {
+            "kind": "Thinking",
+            "content": {
+              "kind": "Unknown"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

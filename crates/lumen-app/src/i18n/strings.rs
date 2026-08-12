@@ -782,6 +782,22 @@ pub struct Strings {
     pub remote_incoming_fmt: &'static str,
     /// 配对码标签
     pub remote_incoming_code: &'static str,
+    /// M7 片 6：配对二维码下方的一行说明（扫码或念数字，两条路都通）。
+    pub remote_incoming_scan_hint: &'static str,
+    /// M7 片 8：远程 LLM 会话图标的 hover 提示。
+    pub agent_icon_tooltip: &'static str,
+    /// 断开一条隐藏会话。**本片的安全底线**（§6.8.3）。
+    pub agent_disconnect: &'static str,
+    /// 断开全部隐藏会话。
+    pub agent_disconnect_all: &'static str,
+    /// 打开审计日志目录。
+    pub agent_open_audit: &'static str,
+    /// 「本会话出现 {0} 种未识别事件」。
+    pub agent_unknown_events_fmt: &'static str,
+    /// 弹层里一条会话的状态：空闲。
+    pub agent_status_idle: &'static str,
+    /// 弹层里一条会话的状态：执行中。**刻意不带工具名**——见 main.rs 那处注释。
+    pub agent_status_busy: &'static str,
     /// 拒绝控制按钮
     pub remote_decline: &'static str,
     /// 正在被控横幅（{}=控制端设备名）
@@ -806,6 +822,11 @@ pub struct Strings {
     pub remote_toast_reconnecting: &'static str,
     /// toast：断线宽限重挂成功（会话已自动恢复）
     pub remote_toast_restored: &'static str,
+    /// toast：M7 对端 Lumen 不支持 LLM 远程控制面（`LlmFrame::Hello` 5 秒无 `HelloAck`）
+    ///
+    /// **文案必须点明「终端功能不受影响」**：LLM 是纯增量能力（`MIN_SUPPORTED_VERSION`
+    /// 因此保持 3），只说「版本过低」会让用户以为整条远程链路坏了、去做无谓的排查。
+    pub remote_toast_llm_peer_too_old: &'static str,
     /// 状态栏链路指示：P2P 直连（短标签）
     pub statusbar_link_direct: &'static str,
     /// 状态栏链路指示：中继转发（短标签）
@@ -867,44 +888,6 @@ pub struct Strings {
     /// 状态栏：经典模式切换按钮 hover tooltip
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub statusbar_classic_tip: &'static str,
-    /// LLM HUD：关闭按钮 tooltip
-    pub hud_close_tip: &'static str,
-    /// LLM HUD：收起按钮 tooltip
-    pub hud_open_tip: &'static str,
-    /// LLM HUD：左上角调整大小 tooltip
-    pub hud_resize_tip: &'static str,
-    /// LLM HUD：项目字段
-    pub hud_project: &'static str,
-    /// LLM HUD：上下文字段
-    pub hud_context: &'static str,
-    /// LLM HUD：CLI 未在终端公开该字段时的占位
-    pub hud_waiting_cli: &'static str,
-    /// LLM HUD：已用上下文百分比，单参 `{}`
-    pub hud_context_used_fmt: &'static str,
-    /// LLM HUD：剩余上下文百分比，单参 `{}`
-    pub hud_context_remaining_fmt: &'static str,
-    /// LLM HUD：运行状态
-    pub hud_status_working: &'static str,
-    /// LLM HUD：等待输入状态
-    pub hud_status_ready: &'static str,
-    /// LLM HUD：会话时长
-    pub hud_session: &'static str,
-    /// LLM HUD：token 统计
-    pub hud_tokens: &'static str,
-    /// LLM HUD：订阅/API 用量窗口
-    pub hud_usage: &'static str,
-    /// LLM HUD：工具活动
-    pub hud_tools: &'static str,
-    /// LLM HUD：子代理活动
-    pub hud_agents: &'static str,
-    /// LLM HUD：任务进度
-    pub hud_tasks: &'static str,
-    /// LLM HUD：配置计数
-    pub hud_config: &'static str,
-    /// LLM HUD：上下文压缩次数
-    pub hud_compactions: &'static str,
-    /// LLM HUD：后台数据加载中
-    pub hud_loading: &'static str,
     /// Compose 态输入框占位提示文字（缓冲为空时 footer 显示）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub composer_placeholder: &'static str,

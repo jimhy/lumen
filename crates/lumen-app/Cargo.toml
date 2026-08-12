@@ -50,6 +50,11 @@ lumen-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# M7 片 6：配对二维码的模块矩阵（见 remote_pairing_qr.rs）。
+qrcodegen.workspace = true
+# M7 片 2 headless LLM runner：RunnerError 用 thiserror 派生（workspace 早有此依赖，
+# 但 lumen-app 的 [dependencies] 里此前只有 anyhow —— 设计稿 §6.9 缺陷修正 ① 记的就是这条）。
+thiserror.workspace = true
 md5 = "0.8.1"
 chrono = "0.4"
 url.workspace = true

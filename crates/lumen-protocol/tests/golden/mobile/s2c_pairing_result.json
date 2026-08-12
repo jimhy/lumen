@@ -1,0 +1,10 @@
+{
+  "note": "配对码校验结果，**只在失败时下发**（成功走 HiddenSessionStarted）。attempts_left 为 0 表示这次配对已作废、要重新发起 OpenHidden，不是「还能再试 0 次」那么轻。四种 reason 的全集见 enums_control_plane.json。",
+  "expect_variant": "PairingResult",
+  "s2c": {
+    "PairingResult": {
+      "reason": "InvalidCode",
+      "attempts_left": 4
+    }
+  }
+}

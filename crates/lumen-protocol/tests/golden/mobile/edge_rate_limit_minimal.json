@@ -1,0 +1,21 @@
+{
+  "note": "额度播报的最小形态：info 里只有必填的 status，其余键**全缺**。缺省一律解释成「上游没说」，**不得**解释成「否」——尤其 using_overage 是 Option<bool>，None（没给键）与 false（明确没在超额）是两件事，手机端对 None 应当**不显示任何超额文案**。顺带：conv_generation 缺 → 补 0。",
+  "expect_variant": "RateLimit",
+  "frame": {
+    "op": "RateLimit",
+    "conv_id": 11,
+    "observed_ms": 1786211000000,
+    "info": {
+      "status": "Allowed"
+    }
+  },
+  "reserialized": {
+    "op": "RateLimit",
+    "conv_id": 11,
+    "conv_generation": 0,
+    "observed_ms": 1786211000000,
+    "info": {
+      "status": "Allowed"
+    }
+  }
+}

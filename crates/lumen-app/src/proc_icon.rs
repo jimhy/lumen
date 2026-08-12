@@ -31,14 +31,6 @@ pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
     imp::foreground_exe(shell_pid)
 }
 
-/// 会话前台运行程序 PID；无子进程时回落到 shell 自身 PID。
-///
-/// HUD 用它关联 Claude Code 的 `.claude/sessions/<pid>.json`，从而精确
-/// 找到当前窗格而不是“同目录最近一次”的 transcript。
-pub fn foreground_pid(shell_pid: u32) -> u32 {
-    imp::foreground_pid(shell_pid).unwrap_or(shell_pid)
-}
-
 /// 抽取 `exe` 关联图标为 RGBA8。失败返回 `None`（上层回退自绘字形）。
 pub fn load_icon_rgba(exe: &Path) -> Option<IconRgba> {
     imp::load_icon_rgba(exe)

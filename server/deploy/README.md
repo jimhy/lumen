@@ -56,6 +56,29 @@ sudo chmod 600 /etc/lumen-server/lumen-server.env
 sudo nano /etc/lumen-server/lumen-server.env
 ```
 
+> ### ⚠ 破坏性变更（M7 片 11 起）：不设 `LUMEN_JWT_SECRET` 会**拒绝启动**
+>
+> 旧版本只打一条启动 warn 就继续跑。现在改成直接退出，因为默认密钥是**写在源码里的
+> 公开字符串**，而本服务的 JWT 无 `jti`、无版本号、改密码不失效、TTL 7 天——
+> 用默认密钥等于任何人都能给任意账户签一张 7 天有效的通行证。
+>
+> **从旧版本升级时**：先确认 `/etc/lumen-server/lumen-server.env` 里有这一行，
+> 再重启服务。没有就会起不来（`journalctl -u lumen-server` 里有完整提示与命令）。
+>
+> ```bash
+> grep -q '^LUMEN_JWT_SECRET=' /etc/lumen-server/lumen-server.env \
+>   || echo "LUMEN_JWT_SECRET=$(openssl rand -hex 32)" | sudo tee -a /etc/lumen-server/lumen-server.env
+> ```
+>
+> ⚠ **如果你此前一直在用默认密钥**，那么这次设置新密钥会让**所有已签发的 token 立刻失效**
+> ——每台客户端都要重新登录一次。这是预期行为：那些 token 本来就是任何人都能伪造的。
+>
+> 本地开发 / CI 确实要用默认密钥时，显式放行（**切勿用于公网**）：
+>
+> ```bash
+> LUMEN_ALLOW_INSECURE_SECRET=1
+> ```
+>
 > ⚠ **`LUMEN_JWT_SECRET` 只在首次部署生成一次，之后务必固定不变。**
 > 升级 / 重部署时**不要重跑 `openssl rand`** 覆盖它——密钥一变，所有客户端的
 > 现有 token 立刻验签失败（全端 401），而客户端此前不提示、只默默显示「未连接」，
@@ -128,8 +151,26 @@ curl -sS http://127.0.0.1:8787/health || true    # 若有 health 路由
 
   删除会经外键级联清掉该设备相关的配对信任（`device_pairs`），下次配对需重输一次配对码。
 
+  **M7 片 11 起有了细粒度的撤销**，不必再靠删设备：
+
+  | 想做的事 | 接口 |
+  |---|---|
+  | 看这台设备信任了哪些对端 | `GET /api/v1/pairs` |
+  | 撤销与某台设备的信任 | `DELETE /api/v1/pairs/{peer_device_id}` |
+  | 清空本设备的**全部**信任 | `DELETE /api/v1/pairs/*` |
+
+  ⚠ 撤销只影响**下一次**建会话（届时要重新念配对码），**不会拆掉正在进行中的会话**。
+  手机丢失的正确处置是「撤销 + 删设备」两步：前者断掉免码权，后者让那台设备的 token 失效。
+
 ## 注意
 
-- `LUMEN_JWT_SECRET` **必须**改强随机，否则 token 可被伪造；且**一经设定不要再变**（见 §4）。
+- `LUMEN_JWT_SECRET` **必须**改强随机，否则**服务端拒绝启动**（M7 片 11 起，见 §4）；
+  且**一经设定不要再变**。
+- **反代部署建议设 `LUMEN_TRUST_PROXY_HEADER=1`**（M7 片 11）：登录 / 注册的**按 IP 节流**
+  靠它才能拿到真实客户端地址。不设的话，Caddy 后面的 socket 对端恒为 `127.0.0.1`，
+  服务端会**主动放弃 IP 维度**（拿它当 key 就是全服务共用一个桶 = 每 5 分钟只允许 5 次登录）。
+  此时按邮箱的那一维仍然生效，但「换邮箱遍历」与「批量注册」就没有防护了。
+  ⚠ **只有在确认 8787 端口不对外暴露时才设它**——否则任何人都能伪造 `X-Forwarded-For`
+  绕过节流（服务端取的是该头的**最后一跳**，绕过需要能直连 8787）。
 - server ↔ Postgres 当前 `NoTls`；若跨主机需加密，接 tokio-postgres 的 rustls connector。
 - 8788/udp 若被云安全组/NAT 挡住，P2P 打洞失败会自动回退 WebSocket 中继（功能不受影响、仅非直连）。

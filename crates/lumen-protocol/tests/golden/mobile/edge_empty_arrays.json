@@ -1,0 +1,11 @@
+{
+  "note": "空数组与缺省 Option 同时出现：caps / agents / convs 都是空数组（**不是键缺席**，因为它们没有 skip_serializing_if），而 rate_limit 与 rate_limit_observed_ms 是**键缺席**（Option + skip）。两类「空」在线上长得完全不一样，Dart 侧 toJson 必须分别照做。",
+  "expect_variant": "HelloAck",
+  "frame": {
+    "op": "HelloAck",
+    "llm_proto": 1,
+    "caps": [],
+    "agents": [],
+    "convs": []
+  }
+}

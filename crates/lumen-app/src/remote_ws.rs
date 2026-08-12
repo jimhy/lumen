@@ -17,6 +17,13 @@
 //! 事件并推进 UI 态，登出 [`RemoteWs::stop`]。本模块（part2a）只做**引擎 + 状态
 //! 机**；配对弹窗 / 被控横幅 / 设备「连接」入口等 UI 在 part2b 消费这里暴露的态。
 //!
+/// M7 片 4：LLM 数据面状态机（`RemoteFrame::Llm` ↔ [`crate::llm_runner`]）。
+///
+/// 独立成子模块而不是继续往本文件里堆：本文件已 9576 行，而 LLM 面自带一整套与终端镜像
+/// **正交**的状态（握手、对话注册表、seq 水位、ACK 窗口、合并窗口）。混进来只会让
+/// 「哪些字段属于哪条通路」再也说不清——`RemoteWs` 的 60 多个字段就是这么来的。
+mod llm;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -24,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,9 +39,9 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use lumen_protocol::remote::{
     DenyReason, DirEntry, EditChunk, EditFileError, EditPath, EndReason, FileRevision, FsErr,
-    PairingFailReason, PaneOpKind, PaneSnapshot, PaneViewport, PutConflict, PutOverwrite, PutStatus,
-    RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr, RemoteS2C, Role, SessionId, TabId,
-    TabState, EDIT_MAX_LEN, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
+    HiddenSessionId, PairingFailReason, PaneOpKind, PaneSnapshot, PaneViewport, PutConflict,
+    PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr, RemoteS2C,
+    Role, SessionId, TabId, TabState, EDIT_MAX_LEN, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
     LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
@@ -76,6 +83,9 @@ const DIR_SERVICE_WORKERS: usize = 4;
 /// 读目录任务有界队列容量：满即拒绝并回 `FsErr::Io`（控制端不空挂）。正常负载下控制端
 /// `has_listing`/`is_pending` 闸使每目录至多一次在途，远不及此；上限仅防慢盘大量展开堆积。
 const DIR_SERVICE_QUEUE_CAP: usize = 64;
+/// M7 片 4：「数据面帧解析失败」这条 warn 的节流间隔。见 [`RemoteWs::warn_undecodable_frame`]。
+const UNDECODABLE_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 应用层 Ping 周期（保活 + 刷新服务端 `last_seen`）。
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
@@ -120,6 +130,11 @@ pub struct IncomingControl {
     pub controller_name: String,
     /// 本机展示给对方转述的 9 位配对码。
     pub pairing_code: String,
+    /// 预计过期时刻（Unix 秒），由服务端下发的 `expires_in_secs` 换算。
+    ///
+    /// M7 片 6 起进配对二维码的 `e` 字段。**只做软提示**：服务端的 TTL 判定才是权威，
+    /// 两端时钟偏差不得造成「码还在屏幕上、手机却说过期了」这种用户无法自助的故障。
+    pub expires_at: i64,
 }
 
 /// 活跃会话态（控制中 / 被控中）。
@@ -130,6 +145,39 @@ pub struct ActiveSession {
     /// 对端设备显示名。
     pub peer_name: String,
     /// 本端角色（[`Role::Controller`] = 控制中；[`Role::Controlled`] = 被控中）。
+    pub role: Role,
+}
+
+/// M7 片 4b：一条**隐藏会话**（手机端接入本机时建立）。
+///
+/// # 「隐藏会话」四个字在代码里的落点就是这里
+/// 它**不是** Tab、**不是** Session（不是终端窗格）、**不进**侧栏、**不进**窗格树、
+/// **不进** [`RemoteWs::session`]。桌面端对它的全部可见性 = 一个带计数的图标。
+/// 之所以要在类型上把它和 [`ActiveSession`] 分开，而不是给 `session` 加一个
+/// `kind` 字段：`session` 是 `Option<_>`（单会话结构），而隐藏会话可以有多条；
+/// 更要紧的是 [`RemoteS2C::SessionStarted`] 那条臂会无条件重置镜像态，任何让隐藏
+/// 会话流经它的写法都等于「手机一连上，桌面镜像立刻黑屏」。
+///
+/// # P0 边界：隐藏会话**恒走中继**，不走 P2P
+/// `p2p` 引擎是绑在镜像会话上的单例，`send_frame` 的 QUIC 判据读的也是
+/// `self.session`。隐藏会话走 [`Self::send_hidden_frame`]，恒发
+/// `RemoteC2S::RelayTo`。这省掉了一整类乱序问题，也不必把 `P2pEngine` 扩成多会话。
+///
+/// # 为什么带 `#[allow(dead_code)]`
+/// 这三个字段的**唯一**消费者是桌面端那个「有几部手机在跑」的图标与它的弹层，
+/// 而图标要挂进 `main.rs` 的窗口绘制路径——本片刻意不动 `main.rs`（协议 + 服务端
+/// 仲裁与 UI 是两件事，混在一起会让回归面失控）。字段现在就写全，是为了让
+/// `HiddenSessionStarted` 那条臂**一次把服务端给的信息都接住**：漏接的话，等 UI 片
+/// 要用时才发现协议帧里的东西已经被丢在地上了，那时改的是分发逻辑而不是渲染。
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct HiddenSession {
+    /// 对端（手机）设备 id。
+    pub peer_device_id: String,
+    /// 对端设备显示名（图标弹层展示）。
+    pub peer_name: String,
+    /// 本端在这条隐藏会话里的角色。桌面 PC 恒为 [`Role::Controlled`]；
+    /// 保留字段是为了让日后「桌面也能当发起方」时不必改结构。
     pub role: Role,
 }
 
@@ -261,6 +309,18 @@ pub enum Notice {
     SessionReconnecting,
     /// 断线宽限重挂：会话已自动恢复（免码重建 + 镜像重订阅完成）。
     SessionRestored,
+    /// M7 片 4：**对端 Lumen 不支持 LLM 远程控制面**（发出 `LlmFrame::Hello` 后
+    /// [`LLM_HELLO_TIMEOUT_SECS`](lumen_protocol::llm::LLM_HELLO_TIMEOUT_SECS) 秒没收到 `HelloAck`）。
+    ///
+    /// # 为什么这条通知非有不可
+    /// 老被控端的 `RemoteFrame` 里根本没有 `Llm` 变体 ⇒ `from_value` **整帧失败** ⇒
+    /// `apply_relay` 丢弃且**不回任何东西**。没有这条通知时，控制端的表现是「转圈、没反应、
+    /// 没有任何错误」——设计蓝图 §5.4 把「唯一可执行的版本门」四个字给了这条超时判定，
+    /// 而版本门只有在**用户看得见**的时候才算门。
+    ///
+    /// **终端镜像与文件传输完全不受影响**（LLM 是纯增量能力，`MIN_SUPPORTED_VERSION`
+    /// 因此保持 3），文案必须把这一点说清楚，否则用户会以为整条远程链路坏了。
+    LlmPeerTooOld,
 }
 
 /// 后台线程 → 主线程事件。
@@ -280,8 +340,21 @@ pub struct RemoteWs {
     pub pairing: Option<PairingPrompt>,
     /// 被控端：来件配对态（part2b 渲染横幅 + 配对码）。
     pub incoming: Option<IncomingControl>,
-    /// 活跃会话态（part2b 渲染「控制中 / 正在被远程控制」横幅）。
+    /// 活跃**镜像**会话态（part2b 渲染「控制中 / 正在被远程控制」横幅）。
     pub session: Option<ActiveSession>,
+    /// M7 片 4b：活跃**隐藏**会话表（手机端接入本机时建立，见 [`HiddenSession`]）。
+    ///
+    /// 与 [`Self::session`] 是两个**互不相交**的桶——这就是「桌面镜像开着时手机可以
+    /// 同时接入」在客户端的落点。表由三个**本来就存在**的事件维护：
+    /// `HiddenSessionStarted` 插入、`HiddenSessionEnded` 删除、
+    /// [`WsEvent::Disconnected`] 整表清空。
+    hidden: HashMap<HiddenSessionId, HiddenSession>,
+    /// M7 片 4b：被控端来件**隐藏会话**配对态（展示配对码）。
+    ///
+    /// **刻意与 [`Self::incoming`] 分开**：镜像配对与隐藏配对可能先后到达（服务端的
+    /// `pending` 是单槽，但本端两条横幅的生命周期彼此独立），共用一个字段会互相覆盖
+    /// ——用户念的码和屏幕上显示的码就对不上了。
+    pub hidden_incoming: Option<IncomingControl>,
     /// M5.3 part3a 控制端镜像：被控端整屏状态在本地用无 PTY 的 `Terminal` 复现
     /// （`advance` 喂入被控端转发的 PTY 字节）。仅 `role==Controller` 会话期间存在。
     mirror: Option<Terminal>,
@@ -445,6 +518,17 @@ pub struct RemoteWs {
     /// 任一端：数据面是否已处于直连态（去重 `DataPlaneUp`/`Down` 事件，避免重复 toast / 重订阅风暴）。
     /// 控制端据此重订阅重建镜像、被控端据此把输出切到 QUIC；两端各自维护。
     p2p_data_active: bool,
+    /// M7 片 4：LLM 数据面状态机（握手 / 对话注册表 / seq 水位 / ACK 窗口 / 合并窗口）。
+    ///
+    /// **只有协议侧状态在这里**：headless 子进程本体挂在 `AppState.llm_runners` 上，与
+    /// `RemoteWs` 平级——runner 的生命周期与远程会话**刻意解耦**（§6.7 硬契约：手机断线
+    /// runner 照跑）。把管理器搬进来就会让 `stop()` / `teardown_session_state` 顺手把
+    /// 子进程一起清掉，正是那条契约禁止的事。
+    llm: llm::LlmPlane,
+    /// 上次打「数据面帧解析失败」的时刻（[`UNDECODABLE_WARN_INTERVAL`] 节流）。
+    undecodable_warn_at: Option<Instant>,
+    /// 自上次打日志以来被压掉的条数（补进下一条，避免「只发生过一次」的错觉）。
+    undecodable_suppressed: u64,
     /// 控制端断线自动重挂态（见 [`Reattach`]）；`None`=无待重挂会话。
     reattach: Option<Reattach>,
     /// WS 链路当前是否在线（[`WsEvent::Connected`]/[`WsEvent::Disconnected`] 翻转）。
@@ -463,6 +547,9 @@ pub struct RemoteWs {
     ctx: Option<egui::Context>,
     proxy: Option<EventLoopProxy<PtyWake>>,
     wake_pending: Option<Arc<AtomicBool>>,
+    /// M7 片 4：LLM 面纯计时事件（33 ms 合并窗口 / 5 秒握手超时）的唤醒器。
+    /// 为什么不能只靠 `ctx.request_repaint_after` 见 [`LlmWaker`] 的类型文档。
+    llm_waker: Option<LlmWaker>,
 }
 
 /// M5.3 part3c-2 控制端 Option B 远程树：**按需浏览被控端文件系统**的状态机。
@@ -1853,6 +1940,8 @@ impl RemoteWs {
         self.ctx = Some(ctx.clone());
         self.proxy = Some(proxy.clone());
         self.wake_pending = Some(wake_pending.clone());
+        // M7 片 4：LLM 面的定时唤醒器。起不来只降级（增量退回靠外部事件推进），不阻断启动。
+        self.llm_waker = LlmWaker::start(ctx.clone(), proxy.clone(), wake_pending.clone());
         // 读目录服务常驻 worker 池 + 有界队列（review MED-1）：替代旧「每请求起一线程、无上限」。
         // 多 worker 共享 Arc<Mutex<Receiver>>；主线程 drop dir_job_tx（stop）即关队列、worker 退出。
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<DirJob>(DIR_SERVICE_QUEUE_CAP);
@@ -1920,6 +2009,11 @@ impl RemoteWs {
         // 先 clear（其内排空 svc_rx 丢弃在途回包）再断 svc 通道——否则 svc_rx 已 None
         // 时排空成死代码（与 end_session/Disconnected 路径行为不一致）。
         self.clear_remote_filetree();
+        // M7 片 4 第 6 个清理点（登出/停引擎变体）：连对话注册表一起清。
+        // **仍不杀 headless 子进程**——登出不等于用户想终止正在跑的 agent（§6.7）。
+        self.llm.on_stop();
+        // drop 即置停止位 + notify，线程自行退出（见 `impl Drop for LlmWaker`）。
+        self.llm_waker = None;
         // 先 drop 读目录队列入口：关 sync_channel → worker 的 recv 返回 Err 即退出（无需 join）。
         self.dir_job_tx = None;
         self.svc_tx = None;
@@ -2174,7 +2268,9 @@ impl RemoteWs {
         }
         // 断线宽限重挂：退避重试 / 超窗放弃（事件驱动节拍，见 tick_reattach 文档）。
         let reattach_changed = self.tick_reattach();
-        changed || p2p_changed || reattach_changed
+        // M7 片 4：LLM 能力握手的 5 秒超时判定（§5.4-4：判据只能是「没收到 HelloAck」）。
+        let llm_changed = self.tick_llm(Instant::now());
+        changed || p2p_changed || reattach_changed || llm_changed
     }
 
     /// 处理一条 P2P 引擎事件：发信令（转 `send_frame`→中继盲转）/ 连接建立 / 数据面切换 / 入站数据帧。
@@ -2214,6 +2310,16 @@ impl RemoteWs {
     /// 同会话 cwd 未变，被控端重推的 RootChanged 经 `set_root` 去重为 no-op，文件树保持不动。镜像由
     /// 被控端重发的 `SubscriptionStarted` 重建。被控端 `subscribed_tab` 恒为 `None`，此处自然 no-op。
     fn resubscribe_after_switch(&mut self) {
+        // M7 片 4（§5.4-5 / §5.8 末条）：上面那条重订阅**只重发终端快照，对 LLM 流毫无作用**。
+        // LLM 面必须自己重走一次握手并把已订阅对话标记为待重同步——否则一次翻转或一次偶发
+        // 超时会让 LLM 面在整个会话生命周期内假死。放在 `subscribed_tab` 判空**之外**：
+        // LLM 对话与「订阅了哪个终端 tab」完全正交，没订阅 tab 也可能有 LLM 对话在跑。
+        if let Some(role) = self.session.as_ref().map(|s| s.role) {
+            self.llm.on_link_switched(role, Instant::now());
+            for llm::LlmOut::Frame(frame) in self.llm.take_out() {
+                self.send_frame(&RemoteFrame::Llm(frame));
+            }
+        }
         if let Some(tab) = self.subscribed_tab {
             self.reset_history(); // 换源/重建：回看绝对行号体系复位（同 subscribe_tab）。
             self.send_frame(&RemoteFrame::SubscribeSession { tab_id: tab });
@@ -2313,6 +2419,8 @@ impl RemoteWs {
         self.reset_history();
         self.reset_multi_session();
         self.clear_remote_filetree();
+        // M7 片 4 第 6 个清理点（用户主动结束会话）。
+        self.llm.on_session_ended();
     }
 
     // part3d（K2）：无 id 的 `send_output`/`send_resize`（旧单焦点镜像）已移除，被控端改用
@@ -2576,11 +2684,10 @@ impl RemoteWs {
 
     /// 控制端：分配下一个请求号（单调递增，跳 0 哨兵；ListDir/Fetch/Put 全局共用）。
     fn next_req_id(&mut self) -> u64 {
-        self.req_seq = self.req_seq.wrapping_add(1);
-        if self.req_seq == 0 {
-            self.req_seq = 1;
-        }
-        self.req_seq
+        // 实现下沉到 `llm::next_req_id`：M7 片 4 的 LLM 面也要分配 `req_id`，而设计蓝图 §5.5
+        // 把「单调、跳 0 哨兵、进程内永不重置」列为陈旧应答去重的基础——**两个计数器各自
+        // 单调不等于合起来单调**，故两边共用同一份实现与同一个 `req_seq` 本体。
+        llm::next_req_id(&mut self.req_seq)
     }
 
     /// 被控端：焦点窗格 cwd 变化即推 [`RemoteFrame::RootChanged`]（去重：同 cwd 不重发）。
@@ -5567,6 +5674,59 @@ impl RemoteWs {
         }
     }
 
+    /// M7 片 8：主动断开一条隐藏会话（图标弹层里那个红色按钮）。
+    ///
+    /// # 这是 ⑫ 之后剩下的唯一「掐断」手段
+    ///
+    /// 一部手机能远程驱动本机跑任意 Bash（Tier 0 无逐次授权）。在此之前桌面端
+    /// **没有任何终止入口**——`remote_ws.rs` 里那段长注释明写着「也没有 `EndHidden`
+    /// 的入口」。没有它，「一部手机能在我的电脑上跑任意命令而我无法阻止」就是设计的一部分
+    /// （蓝图 §6.8.1 把这条列为不可省的底线）。
+    ///
+    /// **本地表也立刻删**：`teardown_hidden_one` 对主动方 `except`，发起端收不到
+    /// `HiddenSessionEnded` 回执（与 `close()` 同款语义，见移动端 `state/README.md` 第 3 条）。
+    /// 等回执是等不到的。
+    pub fn end_hidden(&mut self, session_id: HiddenSessionId) {
+        self.send(RemoteC2S::EndHidden { session_id });
+        // 审计：用户主动掐断也是一条要留痕的安全动作 —— 事后要能回答
+        // 「那次是它自己结束的，还是我掐的」。
+        let peer = self
+            .hidden
+            .get(&session_id)
+            .map(|h| h.peer_name.clone())
+            .unwrap_or_default();
+        crate::llm_audit::record(
+            &crate::llm_audit::AuditEvent {
+                ev: "SessionClosed",
+                sid: session_id,
+                peer,
+                note: "reason=LocalUser".to_string(),
+                ..crate::llm_audit::AuditEvent::new("SessionClosed")
+            },
+            None,
+        );
+        // 分号不可省：`HashMap::remove` 返回 `Option<HiddenSession>`，作为尾表达式
+        // 会让本函数意外变成「返回被删掉的那条会话」，而调用方并不关心它。
+        let _ = self.hidden.remove(&session_id);
+    }
+
+    /// 断开全部隐藏会话。
+    pub fn end_all_hidden(&mut self) {
+        for id in self.hidden.keys().copied().collect::<Vec<_>>() {
+            self.end_hidden(id);
+        }
+    }
+
+    /// M7 片 8：当前隐藏会话的只读视图（图标计数 + 弹层每行一条）。
+    ///
+    /// **图标的 📱 计数只能取自这里**，不能用 `LlmRunnerManager` 的 runner 数：
+    /// §6.7 的硬契约是「手机断线不杀 runner」⇒ runner 数 ≠ 手机会话数。
+    /// 用 runner 数会在「手机已断线但 turn 还在跑」时显示 0 —— 而那恰恰是最需要
+    /// 可见的状态（蓝图 §6.8.2 的三选一表）。
+    pub fn hidden_sessions(&self) -> impl Iterator<Item = (HiddenSessionId, &HiddenSession)> {
+        self.hidden.iter().map(|(id, h)| (*id, h))
+    }
+
     /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
     #[must_use]
     pub fn is_controlling(&self) -> bool {
@@ -6233,6 +6393,20 @@ impl RemoteWs {
     /// 输入若走 QUIC，切换瞬间 QUIC 帧可越过在飞的中继输入帧、致被控端 PTY 收到乱序字节且无快照可自愈
     /// （审查发现，见 docs/M6 §5）。`P2pSignal` 信令亦必走中继（直连断时才能协商回退）。直连未就绪 /
     /// 通道断则回退中继。序列化失败仅记日志、不断连。
+    ///
+    /// # 为什么「输入方向也走直连」不能靠本端计时器放开（2026-08-11 实现过一版又回退）
+    /// 试过用「距最后一帧输入经中继发出已静默 300ms」当切换屏障，被对抗性审查按住三条独立的证伪：
+    /// ① 计时器打的是**入队时刻**——`send()` 只是塞进无界 mpsc，真正写 socket 在 WS 线程，
+    ///    而同一条队列上 `put_send_worker` 会绕过本函数直投 8×256 KiB 的 `PutChunk`，
+    ///    上传时输入帧要在队列里排 1–4 秒才上线，300ms 窗口被整体架空；
+    /// ② 中继是**两跳 TCP**，任一腿一次丢包重传（RTOmin 200ms，退避 400/800ms）就超窗；
+    /// ③ 更根本的：直连本身是**有损**路径——`try_send_frame` 只是投进 unbounded channel，
+    ///    返回 true 不代表送达，而 QUIC 路径黑洞要 `P2P_MAX_IDLE`=30 秒才被判死，
+    ///    这 30 秒里每一次按键都进虚空，且输入方向**没有快照、没有 ACK、没有重传**可以补救。
+    ///
+    /// 结论：本端任何计时器都无法推断「一条自己看不见、无确认、无序号的远端队列已排空」。
+    /// 要放开必须有**带内屏障 + 输入侧可靠投递**（往中继发标记帧、等被控端回执后再切；
+    /// 并给输入帧加 seq/ACK 让丢帧可检测可重传）。那是一个需要正经设计的特性，不是一个开关。
     fn send_frame(&self, frame: &RemoteFrame) {
         let v = match frame.to_value() {
             Ok(v) => v,
@@ -6259,11 +6433,85 @@ impl RemoteWs {
         }
     }
 
+    /// 解析不出的数据面帧：**`warn` 级 + 节流**，并尽力说清是哪一类。
+    ///
+    /// # 为什么要节流
+    /// 高版本对端的 LLM 增量流是 30 fps，不节流就是每秒 30 条 warn 把日志刷爆——而刷爆的
+    /// 日志和没有日志一样没用。[`UNDECODABLE_WARN_INTERVAL`] 内只打一条，并把压掉的条数
+    /// 补在下一条里（不补就会造成「只发生过一次」的错觉）。
+    ///
+    /// # 为什么能说出「是 LLM 帧」
+    /// `RemoteFrame` 是**外部标签**表示：变体名就是 JSON 对象唯一的 key。整帧反序列化失败了，
+    /// 但那个 key 仍然读得出来——`{"Llm":{…}}` 里的 `"Llm"` 就是「对端有 LLM 面而本端没有」
+    /// 的确凿证据。只打 **key 名**，不打任何 value（那里面是对话正文）。
+    fn warn_undecodable_frame(&mut self, value: &serde_json::Value) {
+        let tag = value
+            .as_object()
+            .and_then(|o| o.keys().next())
+            .map_or("<非对象>", String::as_str);
+        let now = Instant::now();
+        let due = self
+            .undecodable_warn_at
+            .is_none_or(|t| now.duration_since(t) >= UNDECODABLE_WARN_INTERVAL);
+        if !due {
+            self.undecodable_suppressed = self.undecodable_suppressed.saturating_add(1);
+            return;
+        }
+        let suppressed = std::mem::take(&mut self.undecodable_suppressed);
+        self.undecodable_warn_at = Some(now);
+        let hint = if tag == "Llm" {
+            "对端支持 LLM 远程控制面而本端不支持，请升级本机 Lumen"
+        } else {
+            "可能来自更高版本的对端"
+        };
+        if suppressed == 0 {
+            log::warn!("数据面帧解析失败并丢弃（变体 {tag}，{hint}）");
+        } else {
+            log::warn!("数据面帧解析失败并丢弃（变体 {tag}，{hint}；已压制 {suppressed} 条）");
+        }
+    }
+
+    /// 隐藏会话的数据面载荷被丢弃：**已知与未知 sid 都要留证据**，按
+    /// [`UNDECODABLE_WARN_INTERVAL`] 与 [`Self::warn_undecodable_frame`] 共用同一套节流。
+    ///
+    /// 两种情形的诊断含义完全不同，故文案分开：
+    /// - `known = true`：会话是真的，只是**本端还没接数据面**（后续片的活）。这是当前的常态。
+    /// - `known = false`：会话已被对端拆掉、或帧来自一条本端不认识的会话。
+    ///
+    /// **只打 sid，不打 payload**：那里面是对话正文。
+    fn warn_hidden_payload_dropped(&mut self, session_id: HiddenSessionId, known: bool) {
+        let now = Instant::now();
+        let due = self
+            .undecodable_warn_at
+            .is_none_or(|t| now.duration_since(t) >= UNDECODABLE_WARN_INTERVAL);
+        if !due {
+            self.undecodable_suppressed = self.undecodable_suppressed.saturating_add(1);
+            return;
+        }
+        let suppressed = std::mem::take(&mut self.undecodable_suppressed);
+        self.undecodable_warn_at = Some(now);
+        let what = if known {
+            "本端尚未接入隐藏会话数据面（手机→PC 的 LLM 通路在后续片打通）"
+        } else {
+            "未知隐藏会话（可能已被对端拆掉）"
+        };
+        if suppressed == 0 {
+            log::debug!("隐藏会话数据帧已丢弃（sid={session_id}，{what}）");
+        } else {
+            log::debug!("隐藏会话数据帧已丢弃（sid={session_id}，{what}；已压制 {suppressed} 条）");
+        }
+    }
+
     /// 作用一帧数据面：控制端的 `Output`/`Resize` → 镜像 Terminal；被控端的
     /// `Input` → 待执行输入队列（main 仲裁后写 PTY）。按本端角色路由。
     fn apply_relay(&mut self, value: &serde_json::Value) {
         let Ok(frame) = RemoteFrame::from_value(value) else {
-            log::debug!("数据面帧解析失败（可能是更高版本对端的未知变体），丢弃");
+            // M7 片 4：**这里原本是 `log::debug!`**，即默认日志级别下**零证据**。
+            // `RemoteFrame` 是外部标签枚举，serde 不支持在它上面加 `#[serde(other)]`，
+            // 所以对端任何新变体都是整帧解析失败 + 静默丢弃——现场排障时
+            // 「对端太老」与「帧压根没发出去」完全无法区分。`remote.rs` 的
+            // `RemoteFrame::from_value` 文档本来就写着「调用方应 warn 后丢弃」。
+            self.warn_undecodable_frame(value);
             return;
         };
         match frame {
@@ -7092,7 +7340,104 @@ impl RemoteWs {
             }
             // P2P 直连数据面首帧（仅解除对端 accept_bi 阻塞 + 标记流就绪）：收端 no-op。
             RemoteFrame::P2pStreamHello => {}
+            // M7 片 4：LLM 子协议帧 → [`Self::apply_llm_frame`]。
+            // **仍不用通配臂**——通配会让今后新增 `RemoteFrame` 变体不再触发 E0004 编译提醒，
+            // 而这条穷尽 match 正是「新增数据面变体必须显式决定怎么处理」的唯一强制点。
+            RemoteFrame::Llm(frame) => self.apply_llm_frame(*frame),
         }
+    }
+
+    /// M7 片 4：作用一帧 LLM 子协议。
+    ///
+    /// **只入队，不在这里执行**。执行发生在 [`Self::pump_llm`]，因为那是全进程唯一持有
+    /// `&mut LlmRunnerManager` 的地方（管理器挂在 `AppState.llm_runners`，与本结构平级；
+    /// 理由与被否决的三个替代方案见 `remote_ws/llm.rs` 的模块文档一）。
+    ///
+    /// 延迟代价是**一次事件循环迭代**：`main.rs` 里 `pump_remote()`（本方法的上游）与
+    /// `pump_llm_runners()`（`pump_llm` 的上游）是相邻两行，同一次 `PtyWake` 内跑完。
+    fn apply_llm_frame(&mut self, frame: lumen_protocol::llm::LlmFrame) {
+        self.llm.enqueue(frame, Instant::now());
+    }
+
+    /// M7 片 4：LLM 数据面的每帧推进——**入站指令 → runner 操作、runner 事件 → 上行帧**。
+    ///
+    /// 由 `main.rs` 的 `AppState::pump_llm_runners` 调用（那是本轮在 `main.rs` 上加的
+    /// 唯一一处接线）。`runners` 与 `self` 是 `AppState` 的两个**不相交字段**，
+    /// 借用检查器允许同时可变借出。
+    ///
+    /// 返回是否产出了帧（调用方据此请求重绘）。
+    pub fn pump_llm(
+        &mut self,
+        runners: &mut crate::llm_runner::LlmRunnerManager,
+        events: &[(
+            crate::llm_runner::RunnerId,
+            u64,
+            crate::llm_runner::event::RunnerEvent,
+        )],
+    ) -> bool {
+        let mut req_seq = self.req_seq;
+        let mut ctx = llm::PumpCtx {
+            now: Instant::now(),
+            role: self.session.as_ref().map(|s| s.role),
+            runners,
+            events,
+            req_seq: &mut req_seq,
+        };
+        let produced = self.llm.pump(&mut ctx);
+        // 计数器写回：`PumpCtx` 只能借到 `&mut u64`，而 `self.req_seq` 与 `self.llm` 同属
+        // `self`，直接借 `&mut self.req_seq` 进去会与 `&mut self.llm` 冲突（借用检查器
+        // 不能跨方法调用做字段级拆分）。拷进拷出是最小的解法，且**单调性不受影响**——
+        // 中间没有第二个写者（`next_req_id` 只在主线程调用）。
+        self.req_seq = req_seq;
+        for llm::LlmOut::Frame(frame) in self.llm.take_out() {
+            self.send_frame(&RemoteFrame::Llm(frame));
+        }
+        if self.llm.take_peer_too_old() {
+            self.notices.push(Notice::LlmPeerTooOld);
+        }
+        produced
+    }
+
+    /// M7 片 4：LLM 握手超时判定 + **纯计时事件的定时唤醒**。挂在 [`Self::poll`] 上
+    /// （与 [`Self::tick_reattach`] 同一处），返回是否有状态变化。
+    ///
+    /// 为什么非排这一次唤醒不可（`ControlFlow::Wait` 下握手判定与 33 ms 合并窗口都是纯计时
+    /// 驱动的），见 [`llm::LlmPlane::next_wake`] 的长注释。
+    ///
+    /// # 两条唤醒通路都要走，缺一条就不成立
+    /// - [`LlmWaker`]（`PtyWake`）是**真正把泵跑起来**的那条：`main.rs` 里 `pump_remote()` /
+    ///   `pump_llm_runners()` 只挂在 `user_event(PtyWake)` 上。
+    /// - `request_repaint_after` 只让 egui 侧的重绘跟上。**它单独不管用**——那条链的终点是
+    ///   `RedrawRequested`，只渲染、不跑泵（这正是本轮修掉的那个「增量最长压 25 秒」）。
+    ///
+    /// `now` **由调用方传入**而不是内部取 `Instant::now()`：5 秒判定要在单测里跑得动，
+    /// 唯一的替代是让测试真睡 5 秒——那种测试迟早会被人加 `#[ignore]`。
+    fn tick_llm(&mut self, now: Instant) -> bool {
+        let next_wake = self.llm.next_wake();
+        if let Some(waker) = self.llm_waker.as_ref() {
+            // `None` 也要传：本平面已无待办时要把上一次排程撤掉，否则会白唤醒一次。
+            //
+            // **过去时刻要抬到 now+1ms**：`tick_llm` 跑在 `pump_remote` 里、而真正 flush 的
+            // `pump_llm_runners` 在它**之后**，所以定时器刚到点这一帧读到的 `next_wake` 必然
+            // 还是那个已过去的时刻。原样排回去会让唤醒线程立刻再 nudge 一次（同一时刻自激）。
+            // 抬 1 ms 之后最多多跑一次事件循环，且下一帧 flush 完就变成 `None`。
+            // 这与下面 `request_repaint_after` 的 `+1ms` 是同一个理由。
+            waker.schedule(
+                next_wake.map(|at| at.max(now.checked_add(Duration::from_millis(1)).unwrap_or(at))),
+            );
+        }
+        if let (Some(at), Some(ctx)) = (next_wake, self.ctx.as_ref()) {
+            // `+1ms` 是为了让重绘落在**判定点之后**：正好等于 deadline 时
+            // `Instant::now() < deadline` 仍可能成立（单调时钟的粒度），会白跑一次。
+            ctx.request_repaint_after(at.saturating_duration_since(now) + Duration::from_millis(1));
+        }
+        if !self.llm.tick(now) {
+            return false;
+        }
+        if self.llm.take_peer_too_old() {
+            self.notices.push(Notice::LlmPeerTooOld);
+        }
+        true
     }
 
     /// 处理一条后台事件。
@@ -7102,6 +7447,32 @@ impl RemoteWs {
             //（`last_try` 为 `None` 时 [`Self::tick_reattach`] 不等退避）。
             WsEvent::Connected => {
                 self.ws_up = true;
+                // M7 片 4b：连上后**第一件事**——上报控制面能力位，服务端据此判断
+                // 本机能否承载手机端的隐藏会话。不发这条，服务端会把本机当老版本，
+                // 在生成配对码之前就把手机的请求按 Offline 拒掉。
+                //
+                // 发老服务端是安全的：未知**变体**在外部标签枚举下整条解析失败，
+                // 老服务端记一条 debug 后继续读，不断连、无副作用。
+                //
+                // # 当前隐藏会话是**建不起来**的，这是刻意的中间状态
+                // 三个 UI 落点都还空着：`hidden_incoming`（配对码横幅）无渲染方、
+                // `hidden_session_count` / `hidden_peers`（图标计数与弹层）无调用方、
+                // 也没有 `EndHidden` 的入口。而服务端侧现在**恒要求念配对码**
+                //（`ws.rs` 的 `OpenHidden` 臂传 `paired = false`，见那里的长注释）。
+                // 两者相乘 = 用户看不到码 ⇒ 配对完不成 ⇒ 隐藏会话开不出来。
+                //
+                // 这个组合是有意的：在此之前唯一能走通的是「凭历史镜像配对免码直连」那条
+                // **静默**路径——用户既看不到会话存在、也没有结束入口。宁可暂时开不出来，
+                // 也不留一条零指示的通道。
+                //
+                // ⇒ **UI 片是 `OpenHidden` 在任何已发布移动端启用之前的硬前置**。
+                // 那一片落地时顺带要决定：`HIDDEN_CAP` 是否改成读一个默认关闭的本地设置项
+                //（不勾选就不进 `caps`，服务端的 caps 门天然把请求挡在生成配对码之前），
+                // 让「本机可被手机接入」成为一次显式的用户决定。
+                self.send(RemoteC2S::ClientHello {
+                    protocol_version: lumen_protocol::PROTOCOL_VERSION,
+                    caps: vec![lumen_protocol::remote::HIDDEN_CAP.to_string()],
+                });
                 self.tick_reattach();
             }
             WsEvent::Disconnected => {
@@ -7109,6 +7480,16 @@ impl RemoteWs {
                 // 配对流程态直接丢弃（服务端侧已拆，配对需人工重走）。
                 self.pairing = None;
                 self.incoming = None;
+                // M7 片 4b：第 6 个清理点，也是**唯一一个「隐藏会话必须清、而镜像
+                // 会话刻意不清」**的地方。
+                //
+                // 这个不对称是有原因的，不要「顺手统一」：镜像会话走下面的
+                // `begin_reattach` 宽限重挂（本端是发起方，凭配对信任免码重建）；
+                // 隐藏会话的发起方是**手机**，本端只是被动承载方，重挂由手机侧发起，
+                // PC 侧唯一正确的动作就是忘掉——留着就是一批永远等不到帧的幽灵条目，
+                // 图标上还会显示一个假的计数。
+                self.hidden.clear();
+                self.hidden_incoming = None;
                 // 控制端有活跃会话：进入宽限重挂而非拆除——保留会话/镜像/订阅意图
                 //（画面冻结 + 状态栏「重连中」），WS 重连后凭服务端持久化的配对信任
                 // 免码自动重建（海风哥 2026-07-06 拍板：瞬断不再要求手动重连）。
@@ -7140,6 +7521,9 @@ impl RemoteWs {
         self.p2p = None;
         self.p2p_data_active = false;
         self.advance_edit_generation(true);
+        // M7 片 4 第 6 个清理点（断线进入宽限重挂）：订阅态与握手态一起清。
+        // 重挂成功后 `SessionStarted` 那一臂会重发 `Hello` 并让手机重新 `Attach`。
+        self.llm.on_session_ended();
         self.reattach = Some(Reattach {
             target,
             last_try: None,
@@ -7161,6 +7545,8 @@ impl RemoteWs {
         self.reset_history();
         self.reset_multi_session();
         self.clear_remote_filetree();
+        // M7 片 4 第 6 个清理点（对端结束 / 断线不可重挂 / 重挂放弃共用）。
+        self.llm.on_session_ended();
         if self.session.take().is_some() {
             self.notices.push(Notice::SessionEnded(reason));
         }
@@ -7214,11 +7600,15 @@ impl RemoteWs {
             RemoteS2C::ControlRequested {
                 controller_name,
                 pairing_code,
+                expires_in_secs,
                 ..
             } => {
                 self.incoming = Some(IncomingControl {
                     controller_name,
                     pairing_code,
+                    // 用服务端给的 TTL 换算，不在客户端写死 120——服务端改了 TTL 而这里
+                    // 没跟着改，二维码上的过期时刻就会与真实的错开。
+                    expires_at: crate::remote::now_secs().saturating_add(i64::from(expires_in_secs)),
                 });
             }
             RemoteS2C::PairingNeeded {
@@ -7261,7 +7651,7 @@ impl RemoteWs {
                 self.notices.push(Notice::ControlDenied(reason));
             }
             RemoteS2C::PairingCancelled { reason } => {
-                self.incoming = None;
+                self.clear_incoming_banners();
                 self.notices.push(Notice::PairingCancelled(reason));
             }
             RemoteS2C::SessionStarted {
@@ -7270,7 +7660,7 @@ impl RemoteWs {
                 role,
             } => {
                 self.pairing = None;
-                self.incoming = None;
+                self.clear_incoming_banners();
                 // 断线重挂成功到达的 SessionStarted：走恢复语义（重订阅 + 「已恢复」toast）。
                 // 须校验对端一致：重挂等待期间用户手动连了**另一台**设备时，新会话按
                 // 全新会话走（旧重挂意图作废；重订阅旧 tab 打到新设备上会串会话）。
@@ -7293,19 +7683,33 @@ impl RemoteWs {
                 // M6：会话建立 → 启动 P2P 打洞引擎（控制端发 Offer，被控端等 Offer 回 Answer）。
                 // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。传入主线程唤醒句柄——
                 // P2P 收到数据帧后须 nudge 主线程重绘（漏传则按需重绘 UI 回显延迟数秒）。
-                self.p2p = self
-                    .server_origin
-                    .as_deref()
-                    .and_then(|origin| stun_host_from_origin(origin).ok())
-                    .map(|stun_host| {
-                        P2pEngine::start(
+                // 不启动直连的两条路径**都必须留证**：`p2p == None` 时状态栏连「● 中继」指示
+                // 都不显示（见 p2p_link_state），用户只看到"就是慢"、日志里却一个字都没有——
+                // 排查「为什么远程一直走中继」时这正是最先要排除的一档。
+                self.p2p = match self.server_origin.as_deref().map(stun_host_from_origin) {
+                    Some(Ok(stun_host)) => {
+                        log::info!("P2P 引擎启动：角色 {role:?}，STUN {stun_host}");
+                        Some(P2pEngine::start(
                             role,
                             stun_host,
                             self.ctx.clone(),
                             self.proxy.clone(),
                             self.wake_pending.clone(),
-                        )
-                    });
+                        ))
+                    }
+                    Some(Err(e)) => {
+                        log::warn!("P2P 未启动：服务器地址推不出 STUN 主机({e:?})，全程走中继");
+                        None
+                    }
+                    None => {
+                        log::warn!("P2P 未启动：本端无 server_origin，全程走中继");
+                        None
+                    }
+                };
+                // M7 片 4 第 6 个清理点（会话建立：旧会话残留的 LLM 协议态必须先清）
+                // + 握手起点。控制端在这里立即发 `LlmFrame::Hello` 并起 5 秒计时（§5.4）；
+                // 被控端只清理、不主动发帧（握手是单向的，诉求方是控制端）。
+                self.llm.on_session_started(role, Instant::now());
                 if was_reattach {
                     // 重挂成功：重订阅断线前的 tab（subscribed_tab 在重挂期间特意保留），
                     // 被控端强制重发 SubscriptionStarted → 快照重建镜像，与直连↔中继切换
@@ -7327,7 +7731,300 @@ impl RemoteWs {
             }
             // 数据面：part3a 镜像字节流 / part4 远程输入，按角色路由。
             RemoteS2C::Relay(value) => self.apply_relay(&value),
+
+            // ── M7 片 4b：隐藏会话（手机端接入）─────────────────────────────
+            //
+            // ★★ 实施铁律：以下四条臂**绝不允许**与上面的 SessionStarted /
+            // SessionEnded / Relay 合并处理。★★
+            //
+            // `SessionStarted` 那条臂无条件执行「清配对态 + reset_history +
+            // advance_edit_generation + clear_remote_filetree + 重建 mirror +
+            // 重启 P2pEngine」。隐藏会话若流经它，表现就是**手机一连上、桌面镜像
+            // 立刻黑屏、文件树清空、P2P 重协商**。走独立变体是靠**类型系统**保证
+            // 这件事不可能发生，而不是靠某个运行时的 `if kind == …` 判断——这正是
+            // 协议侧选择「新增变体」而非「给 SessionStarted 加字段」的全部意义。
+            // 后人若来「顺手合并重复代码」，这段注释就是拦他的那道门。
+            RemoteS2C::HiddenControlRequested {
+                controller_name,
+                pairing_code,
+                expires_in_secs,
+                ..
+            } => {
+                // 另开一个横幅槽，不碰 self.incoming（镜像配对横幅）。
+                self.hidden_incoming = Some(IncomingControl {
+                    controller_name,
+                    pairing_code,
+                    expires_at: crate::remote::now_secs()
+                        .saturating_add(i64::from(expires_in_secs)),
+                });
+            }
+            RemoteS2C::HiddenSessionStarted {
+                session_id,
+                peer_device_id,
+                peer_name,
+                role,
+            } => {
+                self.hidden_incoming = None;
+                // ★ 片 8：审计。一条隐藏会话 = 一部手机拿到了在这台机器上跑命令的权限，
+                // 而它在桌面上**没有横幅、没有指示器**（那正是「隐藏」的含义）。
+                // 谁、什么时候接进来的，只有这一行能事后回答。
+                crate::llm_audit::record(
+                    &crate::llm_audit::AuditEvent {
+                        ev: "SessionOpened",
+                        sid: session_id,
+                        peer: peer_name.clone(),
+                        peer_dev: peer_device_id.clone(),
+                        note: format!("role={role:?}"),
+                        ..crate::llm_audit::AuditEvent::new("SessionOpened")
+                    },
+                    None,
+                );
+                self.hidden.insert(
+                    session_id,
+                    HiddenSession {
+                        peer_device_id,
+                        peer_name,
+                        role,
+                    },
+                );
+            }
+            RemoteS2C::HiddenSessionEnded { session_id, reason } => {
+                // 结束也要记：一段区间的两端都在，事后才能算出「它连了多久」。
+                let peer = self
+                    .hidden
+                    .get(&session_id)
+                    .map(|h| h.peer_name.clone())
+                    .unwrap_or_default();
+                crate::llm_audit::record(
+                    &crate::llm_audit::AuditEvent {
+                        ev: "SessionClosed",
+                        sid: session_id,
+                        peer,
+                        note: format!("reason={reason:?}"),
+                        ..crate::llm_audit::AuditEvent::new("SessionClosed")
+                    },
+                    None,
+                );
+                self.hidden.remove(&session_id);
+            }
+            RemoteS2C::RelayTo { session_id, .. } => {
+                // ★ **隐藏会话的数据面尚未打通**：payload 在这里被整个丢弃，后续片才接到
+                // `LlmPlane::enqueue` 上。也就是说「手机 → PC 的 LLM 数据面」端到端**不通**，
+                // 当前通的只有镜像会话（桌面↔桌面）那条 `Relay`。这行不是小注脚，
+                // 是复核片 4 交付范围时最容易被标题误导的一点。
+                //
+                // 已知 sid 也要留证据（老写法只在**未知** sid 时打日志，已知 sid 彻底静默，
+                // 于是「收到了但没人处理」这件事在默认日志级别下零痕迹）。
+                // 走 `warn_undecodable_frame` 同款节流：对端每 33 ms 一帧增量，不节流会刷爆。
+                // **只打 sid，绝不打 payload**——那里面是对话正文。
+                let known = self.hidden.contains_key(&session_id);
+                self.warn_hidden_payload_dropped(session_id, known);
+            }
         }
+    }
+
+    /// 清掉被控端侧**两个**待应答配对横幅（镜像 `incoming` + 隐藏 `hidden_incoming`）。
+    ///
+    /// # 为什么两个必须一起清，而不是「哪条路来的清哪个」
+    /// 服务端发 `PairingCancelled` 的四条路径（`purge_expired` / `cancel_pending_as_controller`
+    /// / `TooManyAttempts` / 提交时已过期）**全部与会话种类无关**——那条消息里根本没有种类
+    /// 信息，光凭它无从判断该清哪个。而 `HubState::pending` 是**按 target 单槽**的
+    /// （`open_hidden` 里那道 `TargetPairing` 门就是为了保证这一点：同一时刻 PC 屏幕上只该
+    /// 出现一个码），所以任一时刻至多一条配对是活的，另一个字段只可能是陈旧值。
+    ///
+    /// 少清一个的后果不是「多留一条无用状态」，而是 `remote.rs` 与本文件两处铁律注释自己
+    /// 宣布「不可接受」的那个形态：**横幅永久残留、屏幕上挂着一个已失效的 9 位码**，
+    /// 直到 WS 断开才清。作者当初为了躲开这个坑拒绝复用 `ControlRequested`，
+    /// 却在复用 `PairingCancelled` 时把它原样复刻了回来。
+    fn clear_incoming_banners(&mut self) {
+        self.incoming = None;
+        self.hidden_incoming = None;
+    }
+
+    /// M7 片 4b：把一个数据面帧投给某条**隐藏会话**的对端。
+    ///
+    /// 与 [`Self::send_frame`] 的两处区别，都是刻意的：
+    /// 1. **恒走中继**（`RemoteC2S::RelayTo`），不看 `self.p2p`——P2P 引擎绑在镜像
+    ///    会话上，`send_frame` 的 QUIC 判据读的也是 `self.session`。隐藏会话接 P2P
+    ///    要把 `P2pEngine` 扩成多会话，P0 不做。
+    /// 2. 信封上带 `session_id`——一台设备可能同时挂着多条隐藏会话，光凭「发送者是
+    ///    谁」在服务端已无法定位唯一对端（这正是 `Relay` 在多会话下结构性失效之处）。
+    ///
+    /// 未知 sid 直接丢弃：会话可能刚被对端拆掉，此时投递没有意义。
+    #[allow(dead_code)] // 载荷分发在后续片接上；先把出站口和不变量钉在这里。
+    fn send_hidden_frame(&self, session_id: HiddenSessionId, frame: &RemoteFrame) {
+        if !self.hidden.contains_key(&session_id) {
+            log::debug!("隐藏会话已不存在，丢弃出站帧（sid={session_id}）");
+            return;
+        }
+        let payload = match frame.to_value() {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("隐藏会话数据面帧序列化失败: {e}");
+                return;
+            }
+        };
+        self.send(RemoteC2S::RelayTo {
+            session_id,
+            payload,
+        });
+    }
+
+    /// M7 片 4b：当前活跃隐藏会话数（桌面端图标上的那个计数）。
+    ///
+    /// `allow(dead_code)`：调用点在 `main.rs` 的窗口绘制路径，本片刻意不动那个文件
+    /// （见 [`HiddenSession`] 的同款说明）。
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn hidden_session_count(&self) -> usize {
+        self.hidden.len()
+    }
+
+    /// M7 片 4b：当前活跃隐藏会话的 `(会话 id, 对端设备名)` 列表（图标弹层用）。
+    ///
+    /// 按 `session_id` 升序：`HashMap` 的迭代序**不稳定**，不排序的话弹层里的手机
+    /// 名字会每帧乱跳。
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn hidden_peers(&self) -> Vec<(HiddenSessionId, &str)> {
+        let mut out: Vec<(HiddenSessionId, &str)> = self
+            .hidden
+            .iter()
+            .map(|(sid, h)| (*sid, h.peer_name.as_str()))
+            .collect();
+        out.sort_unstable_by_key(|(sid, _)| *sid);
+        out
+    }
+}
+
+// ═══════════════════ M7 片 4：LLM 面的定时唤醒（纯计时事件的推进者）═══════════════════
+
+/// LLM 数据面的**一次性定时唤醒器**：到点 [`nudge`] 一次（重绘标记 + `PtyWake`）。
+///
+/// # 为什么非要一条线程不可（`request_repaint_after` 救不了场）
+/// `llm::LlmPlane` 有两件事是**纯计时驱动**的：33 ms 增量合并窗口的到期、5 秒能力握手超时。
+/// 直觉写法是把 `LlmPlane::next_wake()` 交给 `egui::Context::request_repaint_after`，
+/// 但那条链的终点是 `ControlFlow::WaitUntil` → `about_to_wait` 的 `request_redraw`
+/// → `WindowEvent::RedrawRequested`，而 **`RedrawRequested` 只渲染、不跑泵**：
+/// `AppState::pump_remote()` 与 `pump_llm_runners()` 在全仓只有 `main.rs` 的
+/// `user_event(PtyWake)` 两个调用点。
+///
+/// 少了这条线程，实际推进者会退化成 WS 后台线程 25 秒一次 Ping 的 Pong 回包：CLI 跑一个长
+/// 工具、期间零 runner 事件时，攒在 33 ms 窗口里的那批增量最长压 25 秒才发出（手机上表现为
+/// 「说到一半停住了」而 PC 侧一切正常），5 秒的「对端版本过低」提示同样最晚 ~25 秒才弹。
+///
+/// 仓库既有的一切定时/后台路径都走 `proxy.send_event(PtyWake)`（`llm_runner` 模块文档已把
+/// 「`ControlFlow::Wait` 下 `ctx.request_repaint()` 叫不醒空闲事件循环」这条坑写死过一次），
+/// 本类型只是把那条通路补给 LLM 面。**这样就不必为定时唤醒去改 `main.rs`。**
+///
+/// # 为什么是一条常驻线程而不是「每次排一个 `thread::spawn` + sleep」
+/// 合并窗口 33 ms 到期一次，一秒最多 30 次排程。每次起一条线程就是 30 次/秒的线程创建，
+/// 且旧线程无法取消——会在 `stop()` 之后继续 nudge。常驻线程 + `Condvar` 只有一次创建，
+/// 重排是一次 `notify_one`，停止是置位 + `notify_one`。
+struct LlmWaker {
+    shared: Arc<LlmWakerShared>,
+}
+
+/// [`LlmWaker`] 与其线程之间的共享格。
+struct LlmWakerShared {
+    inner: Mutex<LlmWakeInner>,
+    cv: Condvar,
+}
+
+/// 受 [`LlmWakerShared::inner`] 保护的可变部分。
+struct LlmWakeInner {
+    /// 下一次该 nudge 的时刻；`None` = 当前无待办，线程无限等。
+    at: Option<Instant>,
+    /// 置位后线程退出（`stop()` / `Drop`）。
+    stop: bool,
+}
+
+impl LlmWaker {
+    /// 起线程。失败（系统起不了线程）时回 `None`——调用方降级回「靠外部事件推进」，
+    /// **不为一次线程创建失败让整个远程会话起不来**。
+    fn start(
+        ctx: egui::Context,
+        proxy: EventLoopProxy<PtyWake>,
+        wake_pending: Arc<AtomicBool>,
+    ) -> Option<Self> {
+        let shared = Arc::new(LlmWakerShared {
+            inner: Mutex::new(LlmWakeInner {
+                at: None,
+                stop: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("lumen-llm-waker".into())
+            .spawn(move || llm_waker_loop(&worker_shared, &ctx, &proxy, &wake_pending))
+            .map_err(|e| log::error!("启动 LLM 定时唤醒线程失败（增量将退化为靠外部事件推进）: {e}"))
+            .ok()?;
+        Some(Self { shared })
+    }
+
+    /// 排一次唤醒。`None` = 撤销当前排程（本平面已无待办）。
+    ///
+    /// 幂等且可重排：同一时刻反复 `schedule` 不会积累多次 nudge。
+    fn schedule(&self, at: Option<Instant>) {
+        let Ok(mut inner) = self.shared.inner.lock() else {
+            return; // 锁中毒：唤醒是尽力而为的优化，不为它 panic 掉主线程。
+        };
+        if inner.at == at {
+            return; // 未变化，连 notify 都省掉（合并窗口每帧都会重排同一个时刻）。
+        }
+        inner.at = at;
+        drop(inner);
+        self.shared.cv.notify_one();
+    }
+}
+
+impl Drop for LlmWaker {
+    /// 置停止位并唤醒线程。**不 join**：线程醒来只做一次判断就退出，join 会让
+    /// `RemoteWs::stop()`（UI 线程）在最坏情况下等一个锁。
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.shared.inner.lock() {
+            inner.stop = true;
+        }
+        self.shared.cv.notify_one();
+    }
+}
+
+/// [`LlmWaker`] 的线程主体：等到点 → nudge 一次 → 回去等下一次排程。
+fn llm_waker_loop(
+    shared: &Arc<LlmWakerShared>,
+    ctx: &egui::Context,
+    proxy: &EventLoopProxy<PtyWake>,
+    wake_pending: &Arc<AtomicBool>,
+) {
+    loop {
+        let Ok(mut inner) = shared.inner.lock() else {
+            return; // 锁中毒（主线程在持锁时 panic 了）：本线程无事可做，退出。
+        };
+        loop {
+            if inner.stop {
+                return;
+            }
+            let Some(at) = inner.at else {
+                let Ok(next) = shared.cv.wait(inner) else {
+                    return;
+                };
+                inner = next;
+                continue;
+            };
+            let now = Instant::now();
+            if now >= at {
+                // 到点：清掉排程再放锁，避免同一时刻被连 nudge 两次。
+                inner.at = None;
+                break;
+            }
+            let Ok((next, _)) = shared.cv.wait_timeout(inner, at - now) else {
+                return;
+            };
+            inner = next;
+        }
+        drop(inner);
+        nudge(ctx, proxy, wake_pending);
     }
 }
 
@@ -7798,6 +8495,26 @@ mod tests {
         (ws, rx)
     }
 
+    /// M7 片 4b：断言「`ClientHello` 是连上后发出的**第一条**消息」并吃掉它。
+    ///
+    /// 服务端要在收到手机的 `OpenHidden` 之前就知道本机支持隐藏会话；晚一条消息，
+    /// 那个跨 socket 竞态窗口就宽一条消息。把这个顺序钉成断言，比写在注释里管用。
+    fn expect_client_hello(rx: &std::sync::mpsc::Receiver<RemoteC2S>) {
+        match rx.try_recv() {
+            Ok(RemoteC2S::ClientHello {
+                protocol_version,
+                caps,
+            }) => {
+                assert_eq!(protocol_version, lumen_protocol::PROTOCOL_VERSION);
+                assert!(
+                    caps.iter().any(|c| c == lumen_protocol::remote::HIDDEN_CAP),
+                    "必须上报 hidden 能力位，否则服务端会把本机判成老端"
+                );
+            }
+            other => panic!("连上后第一条必须是 ClientHello，实际 {other:?}"),
+        }
+    }
+
     #[test]
     fn 断线_控制端进入重挂_会话保留() {
         let (mut ws, _rx) = reattaching_ws();
@@ -7834,11 +8551,226 @@ mod tests {
     fn 重连后自动免码重发请求() {
         let (mut ws, rx) = reattaching_ws();
         ws.apply(WsEvent::Connected);
+        expect_client_hello(&rx);
         let sent = rx.try_recv().expect("重连后应立即发 RequestControl");
         assert!(
             matches!(sent, RemoteC2S::RequestControl { ref target } if target == "dev-peer"),
             "目标应为断线前对端设备，实际 {sent:?}"
         );
+    }
+
+    // —— M7 片 4b：隐藏会话（手机端接入）——
+
+    #[test]
+    fn 片4b_隐藏会话建立绝不冲毁镜像会话() {
+        // ★ 本片最容易翻车的那一处：HiddenSessionStarted 若被并进 SessionStarted 那条
+        // 臂，表现就是「手机一连上，桌面镜像立刻黑屏」。这条测试守着它。
+        let mut ws = controlling_ws();
+        ws.mirror = Some(Terminal::new(24, 80, 100));
+        ws.hist_bounds = Some((10, 20));
+        ws.subscribed_tab = Some(7);
+        ws.take_notices();
+
+        ws.apply_server(RemoteS2C::HiddenSessionStarted {
+            session_id: 1,
+            peer_device_id: "phone".into(),
+            peer_name: "海风的手机".into(),
+            role: Role::Controlled,
+        });
+
+        // 镜像侧的一切必须原封不动。
+        assert!(ws.mirror.is_some(), "镜像 Terminal 被冲毁 → 桌面黑屏");
+        assert_eq!(ws.hist_bounds, Some((10, 20)), "历史边界被重置");
+        assert_eq!(ws.subscribed_tab, Some(7), "订阅意图被清掉");
+        assert_eq!(
+            ws.session.as_ref().map(|s| s.peer_device_id.as_str()),
+            Some("dev-peer"),
+            "镜像会话对端被顶替"
+        );
+        assert!(ws.take_notices().is_empty(), "隐藏会话不应产生用户可见通知");
+        // 而隐藏会话确实记上了。
+        assert_eq!(ws.hidden_session_count(), 1);
+        assert_eq!(ws.hidden_peers(), vec![(1, "海风的手机")]);
+    }
+
+    #[test]
+    fn 片4b_多条隐藏会话按sid稳定排序且可逐条拆() {
+        let mut ws = RemoteWs::default();
+        for (sid, name) in [(3, "手机三"), (1, "手机一"), (2, "手机二")] {
+            ws.apply_server(RemoteS2C::HiddenSessionStarted {
+                session_id: sid,
+                peer_device_id: format!("phone-{sid}"),
+                peer_name: name.into(),
+                role: Role::Controlled,
+            });
+        }
+        // HashMap 迭代序不稳定：不排序的话图标弹层每帧乱跳。
+        assert_eq!(
+            ws.hidden_peers(),
+            vec![(1, "手机一"), (2, "手机二"), (3, "手机三")]
+        );
+        ws.apply_server(RemoteS2C::HiddenSessionEnded {
+            session_id: 2,
+            reason: EndReason::PeerLeft,
+        });
+        assert_eq!(ws.hidden_peers(), vec![(1, "手机一"), (3, "手机三")]);
+        // 未知 sid 的结束消息不得误伤别的会话。
+        ws.apply_server(RemoteS2C::HiddenSessionEnded {
+            session_id: 99,
+            reason: EndReason::PeerLeft,
+        });
+        assert_eq!(ws.hidden_session_count(), 2);
+    }
+
+    #[test]
+    fn 片4b_断线清空隐藏会话而镜像会话走宽限重挂() {
+        // 第 6 个清理点的**不对称**：隐藏会话必须清，镜像会话刻意不清。
+        // 隐藏会话的重挂由手机侧发起，PC 侧留着就是一批永远等不到帧的幽灵条目
+        //（图标上还会显示一个假计数）。
+        let (ws, _rx) = reattaching_ws();
+        let mut ws2 = controlling_ws();
+        ws2.hidden.insert(
+            5,
+            HiddenSession {
+                peer_device_id: "phone".into(),
+                peer_name: "手机".into(),
+                role: Role::Controlled,
+            },
+        );
+        ws2.hidden_incoming = Some(IncomingControl {
+            controller_name: "手机二".into(),
+            pairing_code: "123456789".into(),
+            expires_at: 0,
+        });
+        ws2.apply(WsEvent::Disconnected);
+        assert_eq!(ws2.hidden_session_count(), 0, "隐藏会话未被清空");
+        assert!(ws2.hidden_incoming.is_none(), "隐藏配对横幅未被清掉");
+        assert!(ws2.session.is_some(), "镜像会话不该被清（走宽限重挂）");
+        assert!(ws.reattach.is_some(), "镜像会话应进入重挂态");
+    }
+
+    #[test]
+    fn 片4b_隐藏配对横幅与镜像配对横幅互不覆盖() {
+        // 两个横幅共用一个字段的话，用户念的码和屏幕上的码会对不上。
+        let mut ws = RemoteWs::default();
+        ws.apply_server(RemoteS2C::ControlRequested {
+            controller_device_id: "desktop".into(),
+            controller_name: "桌面".into(),
+            pairing_code: "111111111".into(),
+            expires_in_secs: 120,
+        });
+        ws.apply_server(RemoteS2C::HiddenControlRequested {
+            controller_device_id: "phone".into(),
+            controller_name: "手机".into(),
+            pairing_code: "222222222".into(),
+            expires_in_secs: 120,
+        });
+        assert_eq!(
+            ws.incoming.as_ref().map(|i| i.pairing_code.as_str()),
+            Some("111111111"),
+            "镜像配对横幅被隐藏配对覆盖"
+        );
+        assert_eq!(
+            ws.hidden_incoming.as_ref().map(|i| i.pairing_code.as_str()),
+            Some("222222222")
+        );
+        // 隐藏会话建立后只关掉自己那个横幅。
+        ws.apply_server(RemoteS2C::HiddenSessionStarted {
+            session_id: 1,
+            peer_device_id: "phone".into(),
+            peer_name: "手机".into(),
+            role: Role::Controlled,
+        });
+        assert!(ws.hidden_incoming.is_none());
+        assert!(ws.incoming.is_some(), "隐藏会话建立不该关掉镜像配对横幅");
+    }
+
+    #[test]
+    fn 片4b_配对取消与会话建立必须同时清掉两个配对横幅() {
+        // 服务端发 PairingCancelled 的四条路径（purge_expired / cancel_pending_as_controller
+        // / TooManyAttempts / 提交时已过期）**全部与会话种类无关**，那条消息里根本没有种类
+        // 信息。只清 `incoming` 的话，隐藏配对横幅会永久残留 —— 屏幕上挂着一个已失效的
+        // 9 位码，直到 WS 断开。这正是 remote.rs 与本文件两处铁律注释宣布「不可接受」的形态。
+        for reason in [
+            DenyReason::Expired,
+            DenyReason::ControllerLeft,
+            DenyReason::TooManyAttempts,
+        ] {
+            let mut ws = RemoteWs {
+                incoming: Some(IncomingControl {
+                    controller_name: "桌面".into(),
+                    pairing_code: "111111111".into(),
+                    expires_at: 0,
+                }),
+                hidden_incoming: Some(IncomingControl {
+                    controller_name: "手机".into(),
+                    pairing_code: "222222222".into(),
+                    expires_at: 0,
+                }),
+                ..RemoteWs::default()
+            };
+            ws.apply_server(RemoteS2C::PairingCancelled { reason });
+            assert!(ws.incoming.is_none(), "{reason:?}：镜像横幅未清");
+            assert!(
+                ws.hidden_incoming.is_none(),
+                "{reason:?}：隐藏横幅未清 —— 屏幕上会永久挂着一个失效的配对码"
+            );
+        }
+
+        // SessionStarted 同理（HubState::pending 按 target 单槽，任一时刻至多一条配对是活的，
+        // 另一个字段只可能是陈旧值，故「两个一起清」在这里是正确而非偷懒）。
+        let mut ws = RemoteWs {
+            incoming: Some(IncomingControl {
+                controller_name: "桌面".into(),
+                pairing_code: "111111111".into(),
+                expires_at: 0,
+            }),
+            hidden_incoming: Some(IncomingControl {
+                controller_name: "手机".into(),
+                pairing_code: "222222222".into(),
+                expires_at: 0,
+            }),
+            ..RemoteWs::default()
+        };
+        ws.apply_server(RemoteS2C::SessionStarted {
+            peer_device_id: "desk".into(),
+            peer_name: "桌面".into(),
+            role: Role::Controlled,
+        });
+        assert!(ws.incoming.is_none());
+        assert!(ws.hidden_incoming.is_none(), "隐藏横幅未清");
+    }
+
+    #[test]
+    fn 片4b_隐藏会话出站帧恒走中继且未知sid被丢弃() {
+        let mut ws = controlling_ws();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ws.cmd_tx = Some(tx);
+        ws.hidden.insert(
+            9,
+            HiddenSession {
+                peer_device_id: "phone".into(),
+                peer_name: "手机".into(),
+                role: Role::Controlled,
+            },
+        );
+        ws.send_hidden_frame(9, &RemoteFrame::Echo("x".into()));
+        match rx.try_recv().expect("应发出 RelayTo") {
+            RemoteC2S::RelayTo {
+                session_id,
+                payload,
+            } => {
+                assert_eq!(session_id, 9, "信封必须带 sid，否则对端无法路由");
+                assert_eq!(
+                    RemoteFrame::from_value(&payload).expect("还原"),
+                    RemoteFrame::Echo("x".into())
+                );
+            }
+            other => panic!("隐藏会话必须恒走中继 RelayTo，实际 {other:?}"),
+        }
+        // 未知 sid：静默丢弃，不发任何东西（会话可能刚被对端拆掉）。
+        ws.send_hidden_frame(404, &RemoteFrame::Echo("y".into()));
+        assert!(rx.try_recv().is_err(), "未知 sid 不该产生出站帧");
     }
 
     #[test]
@@ -7945,6 +8877,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "WS 尚未上线时不应发送控制请求");
 
         ws.apply(WsEvent::Connected);
+        expect_client_hello(&rx);
         assert!(matches!(
             rx.try_recv(),
             Ok(RemoteC2S::RequestControl { target }) if target == "dev-peer"
@@ -8640,6 +9573,158 @@ mod tests {
             role,
         });
         let _ = ws.take_notices();
+    }
+
+    // ── M7 片 4：LLM 数据面接线（状态机本体的单测在 `remote_ws/llm.rs`）────────
+
+    /// 起一个装了出站通道的 `RemoteWs`（`send_frame` 要有 `cmd_tx` 才发得出去）。
+    fn llm_ws(role: Role) -> (RemoteWs, std::sync::mpsc::Receiver<RemoteC2S>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ws = RemoteWs {
+            cmd_tx: Some(tx),
+            ..RemoteWs::default()
+        };
+        起会话(&mut ws, role);
+        (ws, rx)
+    }
+
+    /// 从出站通道取一帧 LLM 子协议帧。
+    fn recv_llm(rx: &std::sync::mpsc::Receiver<RemoteC2S>) -> lumen_protocol::llm::LlmFrame {
+        match recv_relay(rx) {
+            RemoteFrame::Llm(frame) => *frame,
+            other => panic!("预期 RemoteFrame::Llm，实际 {other:?}"),
+        }
+    }
+
+    /// 跑一次 `pump_llm`（不起任何子进程）。
+    fn pump_llm(ws: &mut RemoteWs) -> bool {
+        let mut runners =
+            crate::llm_runner::LlmRunnerManager::new(crate::llm_runner::Waker::noop());
+        ws.pump_llm(&mut runners, &[])
+    }
+
+    #[test]
+    fn 片4_控制端会话建立后经数据面发出llm_hello() {
+        let (mut ws, rx) = llm_ws(Role::Controller);
+        // `SessionStarted` 那一臂已经把 Hello 塞进平面出站队列，`pump_llm` 把它投出去。
+        assert!(pump_llm(&mut ws), "首次 pump 应投出 Hello");
+        assert!(
+            matches!(recv_llm(&rx), lumen_protocol::llm::LlmFrame::Hello { .. }),
+            "控制端必须在会话建立后立即发 Hello（§5.4）"
+        );
+    }
+
+    #[test]
+    fn 片4_五秒无helloack弹对端太老toast() {
+        let (mut ws, _rx) = llm_ws(Role::Controller);
+        let t0 = Instant::now();
+        assert!(!ws.tick_llm(t0), "刚建立不该判超时");
+        assert!(ws.take_notices().is_empty());
+
+        let deadline = t0 + Duration::from_secs(lumen_protocol::llm::LLM_HELLO_TIMEOUT_SECS + 1);
+        assert!(ws.tick_llm(deadline), "超时必须判定");
+        assert!(
+            matches!(ws.take_notices().as_slice(), [Notice::LlmPeerTooOld]),
+            "老 PC 端整帧丢弃且不回任何东西 ⇒ 只能靠超时给用户一句人话"
+        );
+        // 不重复刷屏。
+        assert!(!ws.tick_llm(deadline + Duration::from_secs(60)));
+        assert!(ws.take_notices().is_empty());
+    }
+
+    #[test]
+    fn 片4_被控端收llm_hello经relay接上并回helloack() {
+        let (mut ws, rx) = llm_ws(Role::Controlled);
+        relay(
+            &mut ws,
+            &RemoteFrame::Llm(Box::new(lumen_protocol::llm::LlmFrame::Hello {
+                llm_proto: lumen_protocol::llm::LLM_PROTO_VERSION,
+                caps: Vec::new(),
+            })),
+        );
+        // `apply_relay` 只入队（那条路径拿不到 `LlmRunnerManager`），执行在 `pump_llm`。
+        assert!(pump_llm(&mut ws), "pump 应把 HelloAck 投出去");
+        let frame = recv_llm(&rx);
+        assert!(
+            matches!(frame, lumen_protocol::llm::LlmFrame::HelloAck { ref agents, .. } if agents.len() == 1),
+            "被控端必须回 HelloAck 并捎上 agent 清单，实际 {frame:?}"
+        );
+    }
+
+    #[test]
+    fn 片4_第6清理点_会话结束清握手态() {
+        let (mut ws, _rx) = llm_ws(Role::Controller);
+        assert!(ws.llm.hello_deadline().is_some(), "会话建立即进入等待握手");
+        ws.end_session();
+        assert!(
+            ws.llm.hello_deadline().is_none(),
+            "第 6 个清理点：会话结束必须清握手态，否则重连后一次偶发超时会让 LLM 面永久假死"
+        );
+        // 拆会话路径（对端结束 / 断线不可重挂）同理。
+        起会话(&mut ws, Role::Controller);
+        assert!(ws.llm.hello_deadline().is_some());
+        ws.teardown_session_state(EndReason::PeerLeft);
+        assert!(ws.llm.hello_deadline().is_none());
+    }
+
+    #[test]
+    fn 片4_链路翻转经resubscribe重发hello() {
+        let (mut ws, rx) = llm_ws(Role::Controller);
+        assert!(pump_llm(&mut ws));
+        assert!(matches!(
+            recv_llm(&rx),
+            lumen_protocol::llm::LlmFrame::Hello { .. }
+        ));
+        // QUIC↔中继翻转：`resubscribe_after_switch` 只重发终端订阅，LLM 面要自己重握手。
+        ws.resubscribe_after_switch();
+        assert!(
+            matches!(recv_llm(&rx), lumen_protocol::llm::LlmFrame::Hello { .. }),
+            "翻转后必须重发 Hello（§5.4-5）"
+        );
+    }
+
+    #[test]
+    fn 片4_解析不出的数据面帧打warn并节流() {
+        let mut ws = RemoteWs::default();
+        // 老端收到 `{"Llm":{…}}` 的场景：整帧 from_value 失败 → 走这条路。
+        let unknown = serde_json::json!({"Llm": {"op": "Hello", "llm_proto": 1}});
+        let 未来帧 = serde_json::json!({"VoiceInput": {"pcm": "AA"}});
+        ws.warn_undecodable_frame(&unknown);
+        assert_eq!(ws.undecodable_suppressed, 0, "首条立刻打出");
+        ws.warn_undecodable_frame(&未来帧);
+        ws.warn_undecodable_frame(&未来帧);
+        assert_eq!(
+            ws.undecodable_suppressed, 2,
+            "节流窗口内的后续条数必须被计数，否则日志会造成「只发生过一次」的错觉"
+        );
+    }
+
+    #[test]
+    fn 片4_llm帧不经会话不产出任何东西() {
+        // 无会话（`role == None`）时收到 LLM 帧：入队后在 pump 里被丢弃，不回帧。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ws = RemoteWs {
+            cmd_tx: Some(tx),
+            ..RemoteWs::default()
+        };
+        relay(
+            &mut ws,
+            &RemoteFrame::Llm(Box::new(lumen_protocol::llm::LlmFrame::ListAgents {
+                req_id: 1,
+            })),
+        );
+        assert!(!pump_llm(&mut ws));
+        assert!(rx.try_recv().is_err(), "无会话不得回帧");
+    }
+
+    #[test]
+    fn 片4_req_id分配器与llm面共用同一个计数器() {
+        // §5.5：陈旧应答去重建立在「全局单调」上，两个计数器各自单调 ≠ 合起来单调。
+        let mut ws = RemoteWs::default();
+        let a = ws.next_req_id();
+        let b = llm::next_req_id(&mut ws.req_seq);
+        let c = ws.next_req_id();
+        assert_eq!((a, b, c), (1, 2, 3));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "note": "控→被：拉单轮定稿快照（seq 断裂 / truncated / 直连切换后的**唯一**自愈通道）。",
+  "expect_variant": "TurnFetch",
+  "frame": {
+    "op": "TurnFetch",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 7,
+    "turn": 4
+  }
+}

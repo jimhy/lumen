@@ -1,0 +1,27 @@
+{
+  "note": "**已知的兜底边界，故意留成红线**：C 型枚举的**形状**变了（stop 从字符串变成数字）时，untagged 反序列化失败会让**整帧报废**，LlmFrame::Unknown 也救不回来。所以协议规定 C 型枚举字段的线格式一旦定为裸字符串就不得再改形状，要加信息只能另开兄弟字段（TurnEnded 的 terminal_reason / api_error_status 就是这么加的）。两端都必须在这里**报错**——Dart 侧若把它宽容成 Other(\"42\") 反而与 Rust 不一致。",
+  "expect": "decode_error",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 110,
+    "turn": 6,
+    "stop": 42,
+    "outcome": {
+      "is_error": false
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 0,
+      "context_used": 0,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": 1786211300000,
+    "truncated": false
+  }
+}

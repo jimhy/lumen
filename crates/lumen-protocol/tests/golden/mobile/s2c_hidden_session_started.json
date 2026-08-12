@@ -1,0 +1,12 @@
+{
+  "note": "隐藏会话已建立，双方各收一份。**绝不允许与 SessionStarted 合并处理**：被控端处理 SessionStarted 时会无条件重置镜像态（清配对、清历史缓存、推进编辑代次、清远程文件树、重建 mirror、重启 P2P），若隐藏会话复用那条消息下发给一台正被桌面镜像的 PC，表现就是「手机一连上、桌面镜像立刻黑屏」。手机端在这条里拿到的 session_id 是后续 RelayTo / EndHidden 的路由键，role 恒为 Controller。",
+  "expect_variant": "HiddenSessionStarted",
+  "s2c": {
+    "HiddenSessionStarted": {
+      "session_id": 7,
+      "peer_device_id": "pc-1",
+      "peer_name": "海风的工作站",
+      "role": "Controller"
+    }
+  }
+}

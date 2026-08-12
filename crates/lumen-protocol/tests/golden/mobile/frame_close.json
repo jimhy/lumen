@@ -1,0 +1,10 @@
+{
+  "note": "控→被：结束对话并回收子进程（与 Interrupt 的区别：Interrupt 只停当前这一轮、对话还在，Close 是把整个 headless 子进程连同进程树一起收掉，终态由 ConvExited 回报）。",
+  "expect_variant": "Close",
+  "frame": {
+    "op": "Close",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "req_id": 6
+  }
+}

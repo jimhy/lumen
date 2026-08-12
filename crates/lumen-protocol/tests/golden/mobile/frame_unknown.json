@@ -1,0 +1,7 @@
+{
+  "note": "LlmFrame::Unknown 的**发送形态**。协议规定它只用于反序列化兜底、永不发送，但它不能是「一序列化就炸」的半成品——本条守的是它自己也能恒等往返。Dart 侧的 LlmUnknown.toJson() 若直接 throw，本用例会红；契约是：可以 throw，但那样就必须在 Dart 侧把本用例标成「只解码不编码」，不能两边各写各的。",
+  "expect_variant": "Unknown",
+  "frame": {
+    "op": "Unknown"
+  }
+}

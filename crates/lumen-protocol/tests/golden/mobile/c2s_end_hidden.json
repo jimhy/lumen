@@ -1,0 +1,9 @@
+{
+  "note": "手机主动结束一条隐藏会话。与 unit 变体 EndSession 的区别是**必须带 id**：EndSession 拆的是本设备唯一的镜像会话，而一台 PC 上可能挂着多条隐藏会话。发起拆除的一端不收回执（服务端只通知另一端）。",
+  "expect_variant": "EndHidden",
+  "c2s": {
+    "EndHidden": {
+      "session_id": 7
+    }
+  }
+}

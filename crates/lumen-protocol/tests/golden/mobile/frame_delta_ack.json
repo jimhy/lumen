@@ -1,0 +1,10 @@
+{
+  "note": "控→被：确认已消费到 seq，维持 LLM_DELTA_WINDOW=16 的滑动窗口背压。窗口满时被控端**不能停读**子进程 stdout（会填满管道卡死 CLI），只能转本地积压。",
+  "expect_variant": "DeltaAck",
+  "frame": {
+    "op": "DeltaAck",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 102
+  }
+}

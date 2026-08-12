@@ -1,0 +1,68 @@
+# flutter create 生成的模板忽略表，**刻意保留**。
+#
+# 与仓库根 .gitignore 的关系（两份都要，不是重复；**本文件不是可删的冗余**）：
+# - 根 .gitignore 里那一节规则全部带 /mobile/ 前缀锚定，兜的是**产物目录**（build/、
+#   .dart_tool/、android/.gradle/、ios/Pods/ …）、**密钥**（*.jks / *.keystore /
+#   key.properties）与 ios/Flutter/Generated.xcconfig 这几类。
+# - ⚠ 它**兜不住本文件管的全部东西**（实测：删掉嵌套 .gitignore 后有 8 个文件会变成待提交）：
+#     gradlew / gradlew.bat / gradle/wrapper/gradle-wrapper.jar
+#     android/.../GeneratedPluginRegistrant.java
+#     ios/Flutter/ephemeral/flutter_lldb_helper.py 与 flutter_lldbinit
+#     ios/Runner/GeneratedPluginRegistrant.h 与 .m
+#   根那一节另外还缺 .cxx/、*.log、app.*.symbols、migrate_working_dir/、
+#   /android/app/{debug,profile,release}。
+#   **所以别把这个文件当「删了也没事的副本」**——早先这里写的是「有人删了本文件，
+#   那一节仍然兜得住」，那句话只对一半，是会误导后来人的过度承诺，已改成实话。
+# - 本文件里的规则是**无锚点**的（build/ 、.dart_tool/ 、*.iml …），但因为嵌套
+#   .gitignore 只作用于自己所在目录及以下，它们的作用域天然被限制在 mobile/ 内，
+#   不会像根目录里的无锚点规则那样误伤全仓库。**不要把本文件的内容原样搬到仓库根**。
+# - 嵌套的 .gitignore 优先级更高，所以 `git check-ignore -v` 报出来的命中行通常是这里。
+#
+# 结论：本文件由 flutter 工具链维护（`flutter create` 会重新生成/修复），随它去；
+# 新增移动端专用规则请写到**仓库根**的那一节，带上 /mobile/ 锚点。
+
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release

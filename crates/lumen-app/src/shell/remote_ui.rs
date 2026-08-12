@@ -165,6 +165,7 @@ pub fn banner(
     ctx: &egui::Context,
     incoming: Option<&IncomingControl>,
     session: Option<&ActiveSession>,
+    pairing_qr: Option<&egui::TextureHandle>,
     pal: &Palette,
 ) -> RemoteUiOutput {
     let mut out = RemoteUiOutput::default();
@@ -191,6 +192,29 @@ pub fn banner(
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
+                    // 二维码画在数字码**上方**、竖排：手机扫的是码，人念的是数字，
+                    // 两条路都要在同一个横幅里看得见。没有二维码时这一段整个不占位。
+                    if let (Some(_), Some(texture)) = (incoming, pairing_qr) {
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_exact_size(egui::vec2(
+                                        crate::remote_pairing_qr::QR_SIDE,
+                                        crate::remote_pairing_qr::QR_SIDE,
+                                    ))
+                                    // 二维码必须按原样绘制：染色会毁掉黑白对比，
+                                    // 而扫码器要的正是那个对比。
+                                    .tint(egui::Color32::WHITE),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(i18n::strings().remote_incoming_scan_hint)
+                                    .size(11.0)
+                                    .color(pal.fg_dim),
+                            );
+                            ui.add_space(6.0);
+                        });
+                    }
                     ui.horizontal(|ui| {
                         if let Some(inc) = incoming {
                             ui.label(

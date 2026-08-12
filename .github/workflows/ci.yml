@@ -15,10 +15,31 @@
 
 name: ci
 
+# paths-ignore：纯 mobile/ 或纯 docs/ 的改动不触发 Rust 全量编译（M7 片 0b）。
+# lumen-app 是超大 crate，三平台各编一遍的代价与「改了一个 Dart 文件」完全不成比例；
+# 移动端有自己的 workflow（mobile.yml）。
+#
+# ⚠ 加这个过滤的已知翻车点（设计蓝图 R15，**改分支保护前先读**）：
+# workflow 级 paths-ignore 命中时，**整个 workflow 不会运行**，三个 Rust job 在 PR 上
+# 既不是成功也不是失败，而是「压根没有这个 check」。若它们被设成 required checks，
+# 只改 mobile/ 的 PR 将**永远无法合并**（GitHub 会一直等一个不会到来的 check）。
+#   现状（2026-08-09 实测）：`gh api repos/:owner/:repo/branches/main/protection` 返回
+#   404 Branch not protected ⇒ 本仓库当前**没有**分支保护，这条不咬人。
+#   将来若要开分支保护，二选一：
+#     (a) 不把 test-windows/linux/macos 设成 required；
+#     (b) 去掉这里的 paths-ignore，改成「dorny/paths-filter 条件 job + 一个恒绿的 gate job」，
+#         把 gate job 设成 required。
+# 不要在没读这段的情况下顺手打开分支保护。
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'mobile/**'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - 'mobile/**'
+      - 'docs/**'
 
 # 同一分支新推送取消尚在跑的旧 run，省 CI 额度。
 concurrency:

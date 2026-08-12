@@ -15,19 +15,22 @@ mod ssh_sync;
 mod state;
 // M6 P2P：极简 STUN 反射端（独立 UDP，客户端探公网映射端点做 QUIC 打洞）。
 mod stun;
+// 片 11：登录 / 注册节流（进程内滑动窗口）。
+mod throttle;
 mod ws;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use lumen_protocol::routes as r;
 
 use crate::config::Config;
 use crate::hub::Hub;
 use crate::state::AppState;
+use crate::throttle::Throttle;
 
 /// 后台清理周期：扫一遍未决配对，移除过期项（与配对码有效期对齐）。
 const HUB_GC_INTERVAL: Duration = Duration::from_secs(30);
@@ -36,11 +39,23 @@ const HUB_GC_INTERVAL: Duration = Duration::from_secs(30);
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let config = Config::from_env();
-    // 安全告警：默认 JWT 密钥不安全（任何人可伪造 token）。局域网测试可容忍，
-    // 公网部署务必经 LUMEN_JWT_SECRET 设强随机值。
+    // 片 11：默认 JWT 密钥从「只 warn」升级为**拒绝启动**。
+    //
+    // 它是源码里公开的字符串，而本服务的 JWT 无 jti、无版本号、改密码不失效、TTL 7 天
+    // ——用默认密钥等于任何人都能给任意账户签一张 7 天有效的通行证。
+    // 理由与迁移步骤见 `Config::insecure_secret_refusal` 与 server/deploy/README.md。
+    if let Some(reason) = config.insecure_secret_refusal() {
+        // 用 error! 之后**再往 stderr 打一遍**：这条信息的读者是正在敲部署命令的人，
+        // 而 LUMEN_LOG 可能把 error 也过滤掉，那样他只会看到进程一声不吭地退出。
+        tracing::error!("{reason}");
+        eprintln!("{reason}");
+        anyhow::bail!("默认 JWT 密钥");
+    }
     if config.uses_default_jwt_secret() {
+        // 走到这里 = 显式设了逃生口。仍然每次启动都喊一嗓子。
         tracing::warn!(
-            "⚠ 正在使用默认 JWT 密钥（不安全，仅限本地/局域网测试）；监听 {}。公网部署务必设置 LUMEN_JWT_SECRET！",
+            "⚠ 已显式放行默认 JWT 密钥（{}=1），任何人都能伪造本服务的凭据；监听 {}。切勿用于公网。",
+            crate::config::ALLOW_INSECURE_SECRET_ENV,
             config.bind_addr
         );
     }
@@ -52,17 +67,28 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = config.bind_addr.clone();
     let stun_bind = config.stun_bind_addr.clone();
     let hub = Arc::new(Hub::new());
+    let throttle = Arc::new(Throttle::new());
     let state = AppState {
         pool,
         config: Arc::new(config),
         hub: hub.clone(),
+        throttle: throttle.clone(),
     };
-    // 后台 GC：周期清理过期未决配对（防内存泄漏 + 释放被占目标）。
+    // 后台 GC：周期清理过期未决配对（防内存泄漏 + 释放被占目标），
+    // 并顺带清掉节流表里不活跃的键——那张表的键来自**未鉴权可达**的登录接口，
+    // 不清就是一条随请求量无界增长的内存路径。
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HUB_GC_INTERVAL);
         loop {
             ticker.tick().await;
             hub.gc();
+            throttle.gc(auth::now_secs());
+            // 把节流表的规模变成可观测的：它是一条随**未鉴权**请求量增长的内存路径，
+            // 真被刷爆时这行日志是唯一的现场（GC 之后仍然很大 = 正在被持续攻击）。
+            let tracked = throttle.tracked_keys();
+            if tracked > 0 {
+                tracing::debug!("节流表 GC 后仍跟踪 {tracked} 个键");
+            }
         }
     });
     // M6 P2P STUN 反射端（独立 UDP，与中继 WS 解耦）：客户端探公网映射端点做 QUIC 打洞。
@@ -76,7 +102,14 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("lumen-server 已就绪 → http://{bind_addr}");
-    axum::serve(listener, app).await?;
+    // ★ `into_make_service_with_connect_info` 是片 11 的节流拿到 socket 对端地址的
+    // 唯一途径（`ConnectInfo<SocketAddr>` 提取器）。换回裸 `app` 会让 IP 维度**静默
+    // 失效**：`Option<ConnectInfo<..>>` 恒为 None ⇒ 每次都走「拿不到 IP」分支。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -92,6 +125,11 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/devices/{id}",
             patch(handlers::rename_device).delete(handlers::delete_device),
         )
+        // 片 11：配对信任的列举与撤销。
+        // ⚠ `{peer}` 通配段要能匹配 `*`（清空全部）——axum 的 `{name}` 捕获单段，
+        // `*` 是普通字符、不需要特殊处理。
+        .route(r::PAIRS, get(handlers::list_pairs))
+        .route("/api/v1/pairs/{peer}", delete(handlers::revoke_pair))
         .route(
             r::SYNC_SETTINGS,
             get(handlers::get_settings).put(handlers::put_settings),

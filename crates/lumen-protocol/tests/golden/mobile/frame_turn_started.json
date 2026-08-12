@@ -1,0 +1,34 @@
+{
+  "note": "被→控：新一轮开始，回显归一化后的用户块。user 与 assistant 在同一轮内**共用一个 block_id 空间**，这里从 0 起编，助手块必须接着往下编（分别从 0 编会让 TextAppend 静默覆盖用户气泡）。client_msg_id 原样回带触发本轮的那条 Send 的幂等键——这是控制端唯一能确知「我那条消息已送达」的信号；**本轮由别端/PC 本地发起时它缺席**，那条路径由 replay/*.jsonl 里的真实 TurnStarted 覆盖。",
+  "expect_variant": "TurnStarted",
+  "frame": {
+    "op": "TurnStarted",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 103,
+    "turn": 5,
+    "user": [
+      {
+        "block_id": 0,
+        "block": {
+          "kind": "Text",
+          "text": "跑一下测试"
+        }
+      },
+      {
+        "block_id": 1,
+        "block": {
+          "kind": "Image",
+          "attachment": {
+            "path": "F:\\projects\\lumen\\.lumen\\llm-attach\\11\\shot-1.png",
+            "name": "报错截图.png",
+            "mime": "image/png",
+            "len": 348219
+          }
+        }
+      }
+    ],
+    "started_ms": 1786211100000,
+    "client_msg_id": "018f1d2c-7a3b-7c4d-8e5f-0123456789ab"
+  }
+}

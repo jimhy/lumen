@@ -1,0 +1,28 @@
+{
+  "note": "长度上限附近。stop 是 63 个 A + 「中」+ 「尾」（69 字节）——**Dart 侧实现 fromWireClamped 时按 64 字节截必须退到 63 落在 UTF-8 字符边界**，裸切第 64 字节会切出半个「中」；terminal_reason 恰好 64 字节（= LLM_ENUM_WIRE_MAX_BYTES 边界值本身）。注意本用例**期望原样往返、不截断**：夹紧只在**发送侧**生效，接收侧刻意不校验长度（在 untagged 里校验长度会把「对端发了超长值」升级成整帧报废，比留着原文更糟）。",
+  "expect_variant": "TurnEnded",
+  "frame": {
+    "op": "TurnEnded",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "seq": 113,
+    "turn": 9,
+    "stop": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA中尾",
+    "outcome": {
+      "is_error": true,
+      "terminal_reason": "未知停止原因-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "cost_micro_usd": 0,
+      "context_used": 0,
+      "context_limit": 0,
+      "max_output_tokens": 0
+    },
+    "ended_ms": 1786211500000,
+    "truncated": false
+  }
+}

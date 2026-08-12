@@ -1,0 +1,8 @@
+{
+  "note": "注册请求：只有邮箱与明文密码，**不带设备信息**（与 LoginRequest 的差别就在这里，服务端 register 不登记设备，所以注册完必须再走一次登录才拿得到 token 和 device_id）。密码只在传输中出现，服务端 argon2 哈希后落库。",
+  "rest_type": "RegisterRequest",
+  "rest": {
+    "email": "haifeng@example.com",
+    "password": "correct horse battery staple"
+  }
+}

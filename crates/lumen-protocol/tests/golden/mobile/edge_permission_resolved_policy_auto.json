@@ -1,0 +1,17 @@
+{
+  "note": "被 permission_mode 策略自动放行、**从未询问过用户**。by=PolicyAuto ⇒ 手机端不该弹过审批框，只在时间轴上留一条记录。remember=false 与「策略放行」是两件事，别合并。",
+  "expect_variant": "PermissionResolved",
+  "frame": {
+    "op": "PermissionResolved",
+    "conv_id": 11,
+    "conv_generation": 3,
+    "request_id": 45,
+    "decision": {
+      "kind": "Allow",
+      "remember": false
+    },
+    "by": {
+      "kind": "PolicyAuto"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "note": "手机连上后发出的**第一条**控制面握手：上报协议版本，caps 是**空数组**——`hidden` 那个能力位表示「本端可承载隐藏会话」，是 PC 才有的，手机是发起方，报了反而是谎报。注意这是**控制面**握手（服务端消费），数据面另有一个 LlmFrame::Hello（对端 PC 消费），两层别搅在一起。",
+  "expect_variant": "ClientHello",
+  "c2s": {
+    "ClientHello": {
+      "protocol_version": 4,
+      "caps": []
+    }
+  }
+}

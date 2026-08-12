@@ -1,0 +1,11 @@
+{
+  "note": "控→被：订阅一个对话并声明本端已知进度。首次订阅填 known_generation=0（哨兵，必不匹配 → 被控端回全量基线）。",
+  "expect_variant": "Attach",
+  "frame": {
+    "op": "Attach",
+    "conv_id": 11,
+    "known_generation": 3,
+    "known_seq": 102,
+    "known_turn": 4
+  }
+}

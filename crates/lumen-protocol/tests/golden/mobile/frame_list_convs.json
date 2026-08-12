@@ -1,0 +1,8 @@
+{
+  "note": "控→被：列出现存对话。对话清单的所有权在被控端（子进程、transcript、附件目录都在 PC），手机端重挂后必须以这份清单为准，不得拿本地缓存当真。",
+  "expect_variant": "ListConvs",
+  "frame": {
+    "op": "ListConvs",
+    "req_id": 2
+  }
+}

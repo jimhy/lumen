@@ -8,10 +8,11 @@
 //! 菜单）与登录覆盖层（mock）。UI 只产出动作（[`ShellOutput`]），
 //! 会话增删切换/PTY 写入/设置即时生效/登录写盘由 main.rs 执行。
 
+// M7 片 8：远程 LLM 会话的图标标识 + 4 行弹层（含「断开」——本片的安全底线）。
+pub mod agent_icon;
 pub mod completion_ui;
 pub mod filetree;
 pub mod history_search_ui;
-pub mod hud;
 pub mod layout;
 pub mod lock_ui;
 pub mod login_ui;
@@ -81,6 +82,8 @@ pub struct TabItem {
 /// 跨帧保留的外壳 UI 状态。
 #[derive(Default)]
 pub struct ShellState {
+    /// M7 片 8：远程 LLM 会话弹层是否展开。**跨帧保持**，由图标点击翻转。
+    pub agent_popup_open: bool,
     /// 进行中的重命名：(会话 id, 编辑中文本)。编辑期间键盘归 egui。
     pub renaming: Option<(u64, String)>,
     /// 重命名刚开始，下一帧把焦点交给编辑框。
@@ -109,8 +112,8 @@ pub struct ShellState {
     pub completion: completion_ui::CompletionUiState,
     /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
     pub toast: toast::ToastState,
-    /// LLM CLI 右下角 HUD 的展开/关闭状态。
-    pub hud: hud::HudState,
+    /// M7 片 6：配对二维码的纹理缓存（同一份载荷只编码与上传一次）。
+    pub pairing_qr: crate::remote_pairing_qr::PairingQrCache,
     /// 进行中的远程设备重命名（M5.2）：(设备 id, 编辑中文本)。编辑期间键盘归 egui。
     pub renaming_device: Option<(String, String)>,
     /// 设备重命名刚开始，下一帧把焦点交给编辑框。
@@ -482,8 +485,8 @@ pub struct ShellInput<'a> {
     /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
     /// 候选列表由 main 在 render 前计算好。
     pub completion_view: Option<completion_ui::CompletionView<'a>>,
-    /// 焦点窗格运行受支持 LLM CLI 时的 HUD 数据。
-    pub llm_hud: Option<hud::HudView>,
+    /// M7 片 8：远程 LLM 会话的图标 / 弹层数据（两个计数 + 每条会话一行）。
+    pub agent_icon: agent_icon::AgentIconState,
     /// 远程设备列表（M5.2；仅远程 tab 渲染，服务端已按 last_seen 倒序）。
     pub remote_devices: &'a [lumen_protocol::DeviceRecord],
     /// 当前账号（或未登录作用域）的 SSH 服务器与分组库存。
@@ -504,6 +507,12 @@ pub struct ShellInput<'a> {
     pub remote_pairing: Option<&'a crate::remote_ws::PairingPrompt>,
     /// M5.3 远程控制：被控端来件控制请求态（Some = 渲染来件横幅 + 配对码）。
     pub remote_incoming: Option<&'a crate::remote_ws::IncomingControl>,
+    /// M7 片 6：来件配对码对应的二维码载荷（Some = 横幅里同时画二维码）。
+    ///
+    /// 由 `main.rs` 组装——它才拿得到 origin / user_id / 本机 device_id 三样东西，
+    /// 而 `shell` 只负责画。为 None 时横幅退化成只显示 9 位数字，功能不缺失
+    /// （扫码只是数字码的另一种呈现）。
+    pub pairing_qr: Option<&'a lumen_protocol::pairing_qr::PairingQrPayload>,
     /// M5.3 远程控制：活跃会话态（Some = 渲染「被控中 / 控制中」横幅）。
     pub remote_session: Option<&'a crate::remote_ws::ActiveSession>,
     /// M5.3 part3b：控制端远程镜像离屏纹理（Some = 控制中+远程视图 且 订阅**单窗格**会话，
@@ -537,6 +546,11 @@ pub enum OverwriteChoice {
 
 /// 一帧外壳 UI 的产出。
 pub struct ShellOutput {
+    /// M7 片 8：用户在远程 LLM 弹层里点了什么（断开 / 全部断开 / 打开审计日志）。
+    ///
+    /// ★ 「断开」是本片的安全底线：没有它，「一部手机能在我的电脑上跑任意命令而我
+    /// 无法阻止」就被写进了设计（蓝图 §6.8.1）。
+    pub agent_action: Option<agent_icon::AgentIconAction>,
     /// 终端工作区整体矩形（egui 逻辑点坐标；拖放落点判定等用）。
     pub term_rect: egui::Rect,
     /// SSH 中央区实际终端内容矩形（扣除状态栏与监控栏）。
@@ -835,6 +849,7 @@ pub fn show(
             .remote_session
             .is_some_and(|sess| matches!(sess.role, lumen_protocol::remote::Role::Controller));
     let mut out = ShellOutput {
+        agent_action: None,
         term_rect: egui::Rect::NOTHING,
         ssh_terminal_rect: None,
         pane_rects: Vec::new(),
@@ -2603,7 +2618,20 @@ pub fn show(
         st.remote_ui.reset();
     }
     {
-        let b_out = remote_ui::banner(root.ctx(), input.remote_incoming, input.remote_session, pal);
+        // 没有来件配对时丢掉纹理：配对码是一次性口令，留着只让一份含码的纹理在显存里多待一会儿。
+        if input.pairing_qr.is_none() {
+            st.pairing_qr.clear();
+        }
+        let qr = input
+            .pairing_qr
+            .and_then(|payload| st.pairing_qr.texture(root.ctx(), payload).cloned());
+        let b_out = remote_ui::banner(
+            root.ctx(),
+            input.remote_incoming,
+            input.remote_session,
+            qr.as_ref(),
+            pal,
+        );
         if let Some(code) = b_out.copy_code {
             out.copy_pairing_code = Some(code);
         }
@@ -2615,32 +2643,34 @@ pub fn show(
         }
     }
 
-    // —— LLM CLI HUD（右下角；设置/登录等覆盖层打开时暂时隐藏）——
-    // HUD 先于补全弹层绘制：斜杠菜单与 HUD 可以同时存在，重叠时菜单
-    // 位于 HUD 上方，且菜单的鼠标/滚轮命中不会被 HUD 截获。
-    let hud_pane_rect = input
-        .panes
-        .iter()
-        .position(|pane| pane.focused)
-        .and_then(|index| out.pane_rects.get(index))
-        .copied()
-        .unwrap_or(egui::Rect::NOTHING);
-    let hud_blocked = st.settings.open
-        || st.login.open
-        || st.history_search.open
-        || st.text_editor.is_visible()
-        || is_remote_view
-        || is_ssh_view;
-    hud::show(
-        root.ctx(),
-        &mut st.hud,
-        input.llm_hud.as_ref(),
-        hud_pane_rect,
-        pal,
-        hud_blocked,
-    );
+    // —— M7 片 8：远程 LLM 会话图标 + 弹层 ——
+    //
+    // 画在横幅**之后**：⑪ 拍板后「正在被镜像」与「手机 AI 会话」两种远程态会同时出现，
+    // 两者必须并存且可区分（§6.8.2 约束 2）。横幅在顶部居中，图标在右上角。
+    {
+        // 锁屏时图标仍显示计数（存在性信息无害），但弹层不可展开 —— 判定在
+        // `AgentIconState::expandable` 里，这里只负责把「锁没锁」如实传进去。
+        if input.agent_icon.visible() {
+            egui::Area::new(egui::Id::new("lumen_agent_icon"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .order(egui::Order::Foreground)
+                .show(root.ctx(), |ui| {
+                    if agent_icon::icon(ui, &input.agent_icon, pal) {
+                        st.agent_popup_open = !st.agent_popup_open;
+                    }
+                });
+        } else {
+            // 会话全没了就把弹层一起收起来，否则它会挂在一个空列表上。
+            st.agent_popup_open = false;
+        }
+        if st.agent_popup_open {
+            let a_out = agent_icon::popup(root.ctx(), &input.agent_icon, pal);
+            st.agent_popup_open = a_out.open;
+            out.agent_action = a_out.action;
+        }
+    }
 
-    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录/HUD 之上，toast 之下）——
+    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录之上，toast 之下）——
     // completion_view 由 main 每帧传入；Some = 显示弹窗，None = 不显示。
     if let Some(cv) = &input.completion_view {
         let c_out = completion_ui::show(root.ctx(), &mut st.completion, cv, pal);

@@ -1,0 +1,11 @@
+{
+  "note": "连接建立后服务端**立即**下发的第一条消息，手机据 device_id 确认自己是谁。注意 min_supported_version 与 protocol_version 自 v4 起**不再相等**（LLM 是纯增量能力，不该把 v3 桌面端挡在配对前），两个数字取值刻意不同，Dart 侧接反了只有取值断言抓得住。",
+  "expect_variant": "Welcome",
+  "s2c": {
+    "Welcome": {
+      "protocol_version": 4,
+      "min_supported_version": 3,
+      "device_id": "phone-1"
+    }
+  }
+}

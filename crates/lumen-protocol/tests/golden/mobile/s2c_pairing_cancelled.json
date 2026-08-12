@@ -1,0 +1,9 @@
+{
+  "note": "发给**被控端**：未决配对被取消（发起方撤销 / 超时 / 输错次数超限），dismiss 那个码。手机端同样只是解析后丢弃。注意它带的是 DenyReason 而不是 PairingFailReason——两个枚举取值有重名（Expired / TooManyAttempts），Dart 侧共用一套解析就会在别处静默串味。",
+  "expect_variant": "PairingCancelled",
+  "s2c": {
+    "PairingCancelled": {
+      "reason": "Expired"
+    }
+  }
+}

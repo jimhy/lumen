@@ -1,0 +1,32 @@
+{
+  "note": "开放枚举 Other 的第 2 组：LlmAgentKind 与 LlmPermissionMode。Rust 侧 10 个 open_enum! 是同一个宏生成的十份同样的代码，覆盖 2 个等于覆盖 10 个；**Dart 侧不是**——那边要手写 10 个 sealed class，语料覆盖了几个就只证明了几个。本条把未知值塞进 agent（被控端装了一家我们还不认识的 CLI）与 permission_modes（Vec 能一条覆盖多值）。Dart 若把它们写成 enum + values.byName，这一帧会整帧抛异常，而手机端从此列不出任何 agent。",
+  "expect_variant": "AgentList",
+  "frame": {
+    "op": "AgentList",
+    "req_id": 21,
+    "agents": [
+      {
+        "agent": "Qwen",
+        "available": true,
+        "version": "0.4.2",
+        "models": [
+          "qwen-max"
+        ],
+        "permission_modes": [
+          "Manual",
+          "SupervisedEdits",
+          "ask_every_time"
+        ],
+        "features": {
+          "streaming": true,
+          "thinking": false,
+          "thinking_text": false,
+          "interactive_permission": false,
+          "resume": false,
+          "attachments": false,
+          "interrupt": false
+        }
+      }
+    ]
+  }
+}

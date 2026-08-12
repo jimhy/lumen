@@ -1,0 +1,13 @@
+{
+  "note": "控→被握手首帧。llm_proto 是 LLM 子协议版本（不是 PROTOCOL_VERSION）；caps 带 #[serde(default)] 但没有 skip_serializing_if，空数组也必须序列化出来——Dart 侧 toJson 漏掉 caps 键会让本用例红。",
+  "expect_variant": "Hello",
+  "frame": {
+    "op": "Hello",
+    "llm_proto": 1,
+    "caps": [
+      "perm",
+      "attach",
+      "thinking"
+    ]
+  }
+}

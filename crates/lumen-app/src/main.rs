@@ -3,6 +3,8 @@
 
 mod action;
 mod app_lock;
+/// 日志落盘（stderr + `<数据目录>/lumen.log`）：GUI 构建无控制台，不落盘就没有任何现场证据。
+mod applog;
 mod background;
 // M5 远程控制：客户端与 lumen-server 的 REST 通道 + 设备 id 持久化。
 // cloud.rs 提供 M5.1–M5.4 的完整 REST API；设备列表/重命名/删除、设置/历史
@@ -15,6 +17,8 @@ mod virtual_files;
 // M5.2 远程设备状态（心跳 + 设备列表后台线程）。
 mod remote;
 mod remote_mirror;
+// M7 片 6：被控端把配对码同时渲染成二维码，手机扫码即完成配对。
+mod remote_pairing_qr;
 mod remote_ws;
 // M6 P2P 直连（QUIC 打洞 + 中继回退）：tokio 隔离后台线程 + STUN 端点发现 + QUIC/证书就位。
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
@@ -39,8 +43,21 @@ mod keymap;
 mod links;
 #[cfg(feature = "input-editor")]
 mod llm_attachments;
+// M7 片 8：远程 LLM 会话的结构化审计日志（⑫ 砍掉会话 UI 之后唯一能事后回溯的东西）。
+mod llm_audit;
 mod llm_cli;
-mod llm_hud;
+// M7 片 2：PC 端 headless LLM runner（进程 + 行解析 + 白名单 + 适配接口）。
+// 片 2/片 3 只落地底座与 Claude 适配器，与远程帧的分发接线在片 4，故此刻大量公开项
+// 尚无调用点——与 `mod cloud` 同样的脚手架处置（非真死代码）。
+//
+// **`cfg_attr(not(test), …)` 是刻意的**：allow 只在**非测试**构建里生效。
+// 于是 `cargo clippy -p lumen-app --all-targets`（带 `cfg(test)`）里，
+// 「既没被生产代码调用、也没被任何测试碰过」的项**仍然会报死代码**——那正是片 3/片 4
+// 开发期唯一能发现「写错了、没接上」的信号。整块无条件 allow 会把这个信号一起关掉
+// （3000 行的 claude.rs 全在它的覆盖范围内）。
+// **片 4 接完线后请把这一行整个去掉。**
+#[cfg_attr(not(test), allow(dead_code))]
+mod llm_runner;
 mod mode;
 /// unix：从系统读 shell 进程实时 cwd（bash/zsh 无 OSC 9;9 cwd 上报时文件树的兜底）。
 #[cfg(unix)]
@@ -351,13 +368,8 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     post_install::wait_for_installer_if_requested();
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
-    // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；
-    // 若日志里没有这行，就是拷了旧 exe，本次测试无效。
-    log::info!(
-        "[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16"
-    );
+    // 先只装 logger（纯 stderr），**不碰日志文件**——文件落盘要等单实例判定之后，见下。
+    applog::init();
     // F8 单实例限制（事件循环创建前检测）：release 默认单开——已有
     // 实例在跑时通知其前台化、本实例静默退出；debug 构建与
     // --multi-instance / LUMEN_MULTI_INSTANCE=1 放行多开。
@@ -365,9 +377,24 @@ fn main() -> Result<()> {
     // 整个运行期）。
     let instance = single_instance::acquire();
     if matches!(instance, single_instance::InstanceCheck::AlreadyRunning) {
+        // **在接文件之前就返回**：第二实例（用户双击图标想前台化，是正常路径）一旦碰日志文件，
+        // 就会把主实例正在写的 lumen.log 轮转成 .old——rename 对已打开句柄照样成功，主实例
+        // 毫不知情地继续往 .old 里追加，下次轮转再覆盖掉它，攒了几天的现场就此消失。
         info!("已有 Lumen 实例在运行，已通知其前台化，本实例退出");
         return Ok(());
     }
+    // 本实例会继续运行 → 现在才接上文件双写。release 是 windows_subsystem="windows"
+    //（无控制台），不落盘等于没日志。
+    match applog::attach_file() {
+        Some(p) => log::info!("日志落盘 → {}", p.display()),
+        None => log::warn!("日志无法落盘（数据目录不可用），本次运行仅输出到 stderr"),
+    }
+    // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
+    // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；
+    // 若日志里没有这行，就是拷了旧 exe，本次测试无效。
+    log::info!(
+        "[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16"
+    );
     let event_loop = EventLoop::<PtyWake>::with_user_event()
         .build()
         .context("创建事件循环失败")?;
@@ -1016,6 +1043,10 @@ struct AppState {
     next_session_id: SessionId,
     /// tab id 自增分配器（同上，关闭不回收）。
     next_tab_id: TabId,
+    /// M7：headless LLM runner 容器。**与 `tabs` 平行的独立容器**，对齐
+    /// [`ssh_runtime::SshRuntime`] 的既有范式；**绝不塞进 `Tab.panes`**（七条硬伤逐条写在
+    /// [`llm_runner`] 的模块文档里）。每帧由 [`AppState::pump_llm_runners`] 推进。
+    llm_runners: llm_runner::LlmRunnerManager,
     /// 与转发线程共享的「wake 已挂起」标志，用于事件去重（全局一个，
     /// 任一会话的转发线程都可触发，唤醒协议与单会话时代零变化）。
     wake_pending: Arc<AtomicBool>,
@@ -1886,6 +1917,39 @@ impl AppState {
         self.tabs[self.active_tab].focused_pane_mut()
     }
 
+    /// M7：推进全部 headless LLM runner（排空读线程事件 → 非阻塞收尸 → 停止宽限 /
+    /// 空闲回收 → 回收已退出且读完的 runner）。
+    ///
+    /// **调用点约束（两条，都踩过）**：
+    /// 1. 必须在 `wake_pending.store(false, SeqCst)` **之后**——否则读线程在清标志前 swap 到
+    ///    `true` 而事件还没被 drain，就是一次丢唤醒。
+    /// 2. 必须在 `if let Some(sub_id) = self.remote_ws.sub_target()` 那层嵌套**之外**——
+    ///    headless 会话与手机订阅哪个 tab 完全无关，塞进去会让「手机切走 tab 后 LLM 事件停摆」。
+    ///
+    /// 片 2 把泵接上：事件在这里被排空、状态机与环形缓冲被推进（这是 §6.7「手机断线不杀
+    /// 进程、事件进带 seq 的缓冲」硬契约成立的前提）。**片 4 接上了上行分发**：
+    /// `remote_ws.rs` 那个显式 no-op 臂已换成 `apply_llm_frame`，两个方向都收在
+    /// `RemoteWs::pump_llm` 里（见下）。返回是否有动作，供调用方决定要不要请求重绘。
+    ///
+    /// **本方法刻意插在 `pump_remote` 的那段长注释之前**：那段以「唯一状态变更入口」开头、
+    /// 含一节「返回值」的注释是仓库既有的、挂在 `pump_remote` 头上的历史遗留块，
+    /// 从它中间插一个函数会把它劈成两半、改掉既有函数的文档归属。
+    fn pump_llm_runners(&mut self) -> bool {
+        let events = self.llm_runners.pump();
+        for (id, seq, ev) in &events {
+            // `RunnerEvent` 的 `Debug` 已按 `lumen_protocol::llm` 的脱敏包装
+            //（`LlmText` 只打字符数、`LlmPath` 打 `<redacted>`、`LlmToolInput` 只打字段数与
+            // 字节数）产出，不会把对话正文写进日志。
+            log::trace!("{id} seq={seq} {ev:?}");
+        }
+        // ★ M7 片 4 在 main.rs 上的**唯一一处接线**：入站 LLM 指令 → runner 操作、
+        // runner 事件 → LlmFrame 上行。`remote_ws` 与 `llm_runners` 是本结构的两个
+        // **不相交字段**，借用检查器允许同时可变借出。逻辑全在
+        // `remote_ws/llm.rs`（见其模块文档一：为什么执行点必须在这里而不在 `apply_relay`）。
+        let piped = self.remote_ws.pump_llm(&mut self.llm_runners, &events);
+        piped || !events.is_empty()
+    }
+
     /// 唯一状态变更入口（M4.1 批B）——设计稿 §6。
     ///
     /// **凡绕过此方法直接改状态的代码，code review 一律打回。**
@@ -2512,6 +2576,64 @@ impl AppState {
             self.shell_state
                 .text_editor
                 .apply_saved(token, Err(SaveFailure::Message(error)));
+        }
+    }
+
+    /// M7 片 8：组装远程 LLM 会话图标 / 弹层要画的东西。
+    ///
+    /// 两个计数**刻意取自不同来源**，这是蓝图 §6.8.2 反复强调的一点：
+    ///
+    /// - 📱 手机数 ← `RemoteWs.hidden`（服务端零额外下发，三个既有事件维护）
+    /// - ⚙ 任务数 ← `LlmRunnerManager::working_count()`
+    ///
+    /// 用同一个来源会让「手机断线但 runner 还在跑」这个**最需要可见**的状态显示成 0
+    /// ——那正是 §6.7「断线不杀 runner」契约在 UI 上的唯一体现。
+    fn agent_icon_state(&self) -> shell::agent_icon::AgentIconState {
+        let rows: Vec<shell::agent_icon::AgentRow> = self
+            .remote_ws
+            .hidden_sessions()
+            .map(|(session_id, h)| {
+                // 一条隐藏会话对应哪个 runner 是片 8 之后才有的映射（目前一台手机
+                // 可开多个对话）；先按「本机唯一在跑的那个」给状态，取不到就说空闲。
+                // **绝不显示对话正文**，只到工具名为止。
+                let status = self
+                    .llm_runners
+                    .iter()
+                    .find(|r| r.state().is_working())
+                    .map_or_else(
+                        || i18n::strings().agent_status_idle.to_string(),
+                        // 只报「有活在跑」，不报具体工具名 —— runner 当前没有暴露
+                        // 「正在跑哪个工具」的访问器，而为了弹层去加一个会把工具名
+                        // 引进一条新的传播路径。状态本身足够满足「看见 + 掐断」。
+                        |_| i18n::strings().agent_status_busy.to_string(),
+                    );
+                let what = self
+                    .llm_runners
+                    .iter()
+                    .next()
+                    .map_or_else(String::new, |r| {
+                        format!("{} · {}", r.agent().as_wire(), r.workspace().display())
+                    });
+                shell::agent_icon::AgentRow {
+                    session_id,
+                    peer_name: h.peer_name.clone(),
+                    what,
+                    status,
+                }
+            })
+            .collect();
+        shell::agent_icon::AgentIconState {
+            phones: rows.len(),
+            tasks: self.llm_runners.working_count(),
+            rows,
+            // ★ 锁屏时仍显示计数（存在性信息无害），但弹层不可展开。
+            locked: self.app_lock.is_locked(),
+            unknown_kinds: self
+                .llm_runners
+                .iter()
+                .map(|r| r.tally().distinct())
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -5571,36 +5693,6 @@ impl AppState {
         })
     }
 
-    /// 鼠标是否命中焦点 LLM 会话的 HUD（展开卡片或收起按钮）。
-    ///
-    /// HUD 属于终端内工具：点击关闭/展开不应把键盘焦点交给 egui，
-    /// 否则后续普通字符落入无文本控件的 UI 层，Windows 会播放默认
-    /// 提示音。Area 的 LayerId 与创建时的 Id 同源，可精确区分 HUD
-    /// 和设置页、登录框等真正需要接管输入的前景层。
-    fn mouse_on_llm_hud(&self) -> bool {
-        if self.shell_state.hud.captures_pointer() {
-            return true;
-        }
-        if self.settings.layout.view_mode.is_remote() || self.settings.layout.view_mode.is_ssh() {
-            return false;
-        }
-        let session_id = self.focused_pane().id;
-        let ppp = self.egui_ctx.pixels_per_point();
-        let pos = egui::pos2(self.mouse_pos.0 as f32 / ppp, self.mouse_pos.1 as f32 / ppp);
-        self.egui_ctx.layer_id_at(pos).is_some_and(|layer| {
-            layer
-                == egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new(("lumen_llm_hud", session_id)),
-                )
-                || layer
-                    == egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new(("lumen_llm_hud_collapsed", session_id)),
-                    )
-        })
-    }
-
     /// 焦点窗格 footer 区域的物理像素矩形 (x, y, w, h)。
     ///
     /// 与 `sel_point_at_mouse` 使用相同几何源（同函数计算 footer_px），
@@ -8158,14 +8250,10 @@ impl AppState {
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
                 let shell_pid = pane.pty.shell_pid();
-                let foreground_pid = shell_pid.map(proc_icon::foreground_pid);
                 let exe = shell_pid.and_then(proc_icon::foreground_exe);
-                let detected = llm_cli::detect(exe.as_deref(), &pane.term);
-                if detected != pane.llm_cli {
-                    pane.llm_started_at = detected.map(|_| now);
-                }
-                pane.llm_cli = detected;
-                pane.llm_foreground_pid = detected.and(foreground_pid);
+                // HUD 删除后这里不再需要前台 PID（那是它专用的），顺带省掉每次探测
+                // 一遍系统进程快照的开销 —— `foreground_exe` 才是识别 CLI 必需的。
+                pane.llm_cli = llm_cli::detect(exe.as_deref(), &pane.term);
                 if pane.llm_cli.is_none() && !pane.slash_probe.shadow.is_empty() {
                     // CLI 已退出时清掉尚未提交的探测输入，避免候选串到 shell。
                     let _ = pane.write_user_input(b"\x15");
@@ -9259,6 +9347,12 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
         // 断线宽限重挂：中断提示（黄）+ 自动恢复成功（蓝）。
         Notice::SessionReconnecting => (ToastKind::Warn, s.remote_toast_reconnecting.to_string()),
         Notice::SessionRestored => (ToastKind::Info, s.remote_toast_restored.to_string()),
+        // M7 片 4：对端不支持 LLM 面（Hello 5 秒无 HelloAck）。**Warn 而非 Info**——
+        // 它是一次功能不可用，不是状态播报；但终端镜像与文件传输照常，文案里点明了。
+        Notice::LlmPeerTooOld => (
+            ToastKind::Warn,
+            s.remote_toast_llm_peer_too_old.to_string(),
+        ),
     }
 }
 
@@ -9383,6 +9477,8 @@ impl App {
         }
         // F6 多语言：启动后立即将全局语言设为设置中存储的语言。
         i18n::set_language(app_settings.language);
+        // M7 片 8：审计日志的参数脱敏长度（0 = 只记哈希，见该设置项的文档）。
+        llm_audit::set_arg_head_len(app_settings.audit_arg_head_len);
         // 系统深浅模式（P12 Sync with OS）：winit 报不出来（None）按
         // 深色处理——默认主题即深色；后续变化经 ThemeChanged 事件维护。
         let os_dark = !matches!(window.theme(), Some(winit::window::Theme::Light));
@@ -9729,6 +9825,14 @@ impl App {
             active_tab: active_idx,
             next_session_id,
             next_tab_id,
+            // M7：**必须写在 `wake_pending` 之前** —— 结构体字面量按书写顺序求值，
+            // 写在后面就会用到已经被 move 进字段的 `wake_pending`。
+            // 传的是 `AppState` 那个**全局**唤醒标志（不能另起一个，否则会丢唤醒，
+            // 理由见 `llm_runner::LlmRunnerManager::new`）。
+            llm_runners: llm_runner::LlmRunnerManager::new(llm_runner::Waker::new(
+                self.proxy.clone(),
+                wake_pending.clone(),
+            )),
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
@@ -10061,6 +10165,14 @@ impl ApplicationHandler<PtyWake> for App {
         // M5.3：先处理远程控制 WS（失焦也经此路径，bug2）——收帧 + 应用远程输入 +
         // 整屏快照转发。置于 PTY drain 之前，保证「快照先于实时增量」。
         state.pump_remote();
+
+        // M7：headless LLM runner 泵。紧跟 pump_remote，且**在 `remote_ws.sub_target()` 的
+        // 任何嵌套之外**——headless 会话与手机订阅哪个 tab 无关（见 `pump_llm_runners` 文档）。
+        // 有事件即重绘：桌面图标的两个计数（在线手机数 · 运行中任务数）挂在这上面，
+        // ControlFlow::Wait 下不重绘就永远停在旧数字。
+        if state.pump_llm_runners() {
+            state.window.request_redraw();
+        }
 
         // M5.2 设备列表：后台 worker 拉到新列表后经 PtyWake 唤醒到此（ControlFlow::Wait 下
         // request_repaint 单独叫不醒空闲循环）。**必须在此排空 + 重绘**——否则该 PtyWake 不带 PTY
@@ -11547,12 +11659,6 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.settings.layout.view_mode.is_ssh() {
                     return;
                 }
-                // HUD resize 必须独占整段拖动；否则 CursorMoved 会同时进入终端
-                // 鼠标上报或文本拖选，表现为尺寸跳动、CLI 被意外操作。
-                if state.mouse_on_llm_hud() {
-                    return;
-                }
-
                 // 镜像态（远程视图）：拖选进行中则更新选区终点并 return；其余
                 // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
                 // 只更新 hover，不会误触本地鼠标上报）。
@@ -11772,14 +11878,6 @@ impl ApplicationHandler<PtyWake> for App {
                         } else if !state.filetree_hovered {
                             state.filetree_focused = false;
                         }
-                    }
-                    return;
-                }
-                // HUD 是终端内工具：所有鼠标键都由 egui Area 自己处理，
-                // 不穿透到终端选区/鼠标上报，也不夺走终端键盘焦点。
-                if state.mouse_on_llm_hud() {
-                    if button == MouseButton::Left && btn_state == ElementState::Pressed {
-                        state.terminal_focused = state.terminal_focus_allowed();
                     }
                     return;
                 }
@@ -12823,40 +12921,6 @@ impl ApplicationHandler<PtyWake> for App {
                 });
                 #[cfg(not(unix))]
                 let active_cwd = osc_cwd;
-                // LLM HUD 只读取焦点 CLI 已画在终端中的模型/上下文状态；
-                // 不注入探测命令，也不从账号配置估算 token。
-                let llm_hud = if !state.settings.layout.view_mode.is_remote()
-                    && !state.settings.layout.view_mode.is_ssh()
-                {
-                    let pane = tab.focused_pane();
-                    pane.llm_cli
-                        .or_else(|| llm_cli::detect(None, &pane.term))
-                        .map(|kind| {
-                            let metrics = llm_cli::hud_metrics(&pane.term, kind);
-                            #[cfg(feature = "input-editor")]
-                            let bottom_inset =
-                                pane.footer_committed_h / state.egui_ctx.pixels_per_point();
-                            #[cfg(not(feature = "input-editor"))]
-                            let bottom_inset = 0.0;
-                            shell::hud::HudView {
-                                session_id: pane.id,
-                                kind,
-                                model: metrics.model,
-                                context: metrics.context,
-                                project_path: active_cwd
-                                    .as_ref()
-                                    .map(|path| path.display().to_string()),
-                                foreground_pid: pane.llm_foreground_pid,
-                                busy: pane.is_busy(),
-                                session_elapsed: pane
-                                    .llm_started_at
-                                    .map_or(Duration::ZERO, |started| started.elapsed()),
-                                bottom_inset,
-                            }
-                        })
-                } else {
-                    None
-                };
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 let remote_shell_idle = state.remote_ws.focused_mirror_shell_idle();
                 let ssh_shell_idle = state.ssh_runtime.active_shell_idle();
@@ -13151,7 +13215,26 @@ impl ApplicationHandler<PtyWake> for App {
                 let ssh_session_views = state.ssh_runtime.session_views();
                 let ssh_file_tree_view = state.ssh_runtime.active_file_tree_view();
                 let ssh_connection_test_view = state.ssh_runtime.connection_test_view();
+                // M7 片 6：被控端来件配对时，把配对码同时渲染成二维码。
+                // 三样东西只有这里拿得全：规范化 origin、账户 id、本机 device_id。
+                // 任何一样取不到就不出二维码——横幅退化成只显示 9 位数字，功能不缺失
+                // （扫码只是数字码的另一种呈现），所以这里静默 None、不报错。
+                let pairing_qr_payload = state.remote_ws.incoming.as_ref().and_then(|inc| {
+                    let profile = state.profile.as_ref()?;
+                    let origin =
+                        profile_server_origin(Some(profile), &cloud::server_url())?;
+                    Some(lumen_protocol::pairing_qr::PairingQrPayload::new(
+                        &origin,
+                        profile.user_id.as_deref()?,
+                        // 被控端 = 手机要连的目标，所以 t 填**本机** device_id。
+                        profile.device_id.as_deref()?,
+                        &inc.pairing_code,
+                        inc.expires_at,
+                    ))
+                });
                 let shell_input = shell::ShellInput {
+                    // M7 片 8：远程 LLM 会话的两个计数 + 每条会话一行。
+                    agent_icon: state.agent_icon_state(),
                     panes: &panes_view,
                     layout: tab.layout.clone(),
                     maximized: tab.maximized,
@@ -13216,7 +13299,6 @@ impl ApplicationHandler<PtyWake> for App {
                     completion_view: completion_view_owned,
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
-                    llm_hud,
                     remote_devices: &state.remote.devices,
                     ssh_inventory: state
                         .ssh_store
@@ -13229,6 +13311,7 @@ impl ApplicationHandler<PtyWake> for App {
                     ssh_terminal_tex: state.ssh_texture,
                     active_device_id: state.remote.active_device_id.as_deref(),
                     remote_pairing: state.remote_ws.pairing.as_ref(),
+                    pairing_qr: pairing_qr_payload.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
                     remote_mirror_tex,
@@ -13368,7 +13451,7 @@ impl ApplicationHandler<PtyWake> for App {
                             painter.rect_stroke(
                                 strip_rect,
                                 0.0,
-                                egui::Stroke::new(1.0, modal_pal.panel_outline),
+                                egui::Stroke::new(1.0_f32, modal_pal.panel_outline),
                                 egui::StrokeKind::Inside,
                             );
 
@@ -14109,6 +14192,29 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.end_remote_session {
                     state.clear_remote_restore_target();
                     state.remote_ws.end_session();
+                }
+                // M7 片 8：远程 LLM 会话弹层的动作。
+                if let Some(action) = shell_out.agent_action {
+                    match action {
+                        shell::agent_icon::AgentIconAction::Disconnect(sid) => {
+                            state.remote_ws.end_hidden(sid);
+                        }
+                        shell::agent_icon::AgentIconAction::DisconnectAll => {
+                            state.remote_ws.end_all_hidden();
+                        }
+                        shell::agent_icon::AgentIconAction::OpenAuditDir => {
+                            // 目录可能还不存在（一次远程会话都没有过），先建再开，
+                            // 否则用户点了只会看到一个「找不到路径」的系统弹窗。
+                            if let Some(dir) = llm_audit::audit_dir() {
+                                let _ = std::fs::create_dir_all(&dir);
+                                links::open(&links::LinkTarget::File {
+                                    path: dir,
+                                    line: None,
+                                    col: None,
+                                });
+                            }
+                        }
+                    }
                 }
                 // M5.3 part3d：记录镜像区物理像素矩形（鼠标命中→镜像选区换算，part4b）+ Phase 3
                 // 尺寸同步（控制端把订阅多窗格会话各格目标网格尺寸发给被控端，被控端 resize 后 1:1）。
