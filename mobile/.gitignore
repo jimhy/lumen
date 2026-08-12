@@ -66,3 +66,12 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Kotlin 2.x 的构建会话与错误记录（片 12 第一次出 APK 时冒出来的）。
+# 纯本地产物，`flutter build` 一跑就有，进 git 只会污染下一个人读到的 gitStatus。
+/android/.kotlin/
+
+# JVM 崩溃转储。gradle daemon 挂掉时会往 android/ 下扔 hs_err_pidNNN.log 与
+# replay_pidNNN.log，动辄几百 KB，且里面带本机路径与线程栈——**不入库**（铁律 8）。
+/android/hs_err_pid*.log
+/android/replay_pid*.log

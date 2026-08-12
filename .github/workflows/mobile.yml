@@ -1,6 +1,7 @@
 # Lumen 移动端（Flutter）持续集成 —— M7 片 0b 建立。
 #
-# 守住两件事：`flutter analyze` 零告警、`flutter test` 全绿。它与 ci.yml 是**互补**关系：
+# 守住三件事：`flutter analyze` 零告警、`flutter test` 全绿、**APK 出得来**（片 12 补的
+# 第三件，理由见下面 build-apk job 的注释）。它与 ci.yml 是**互补**关系：
 # ci.yml 加了 `paths-ignore: [mobile/**, docs/**]`，纯移动端改动不再触发 Rust 全量编译；
 # 反过来本 workflow 只在移动端相关路径变更时跑。
 #
@@ -76,3 +77,54 @@ jobs:
 
       - name: 测试
         run: flutter test --reporter expanded
+
+  # ── 出得了包吗（片 12 新增）────────────────────────────────────────────────
+  #
+  # 为什么值得单开一个 job：**「测试全绿」对「能不能出包」零信息量**。
+  # `flutter analyze` / `flutter test` 跑在 Dart VM 上，完全不碰 Android 工具链
+  # ——插件的 compileSdk 要求、AndroidManifest 合并、Kotlin 编译、gradle 脚本，
+  # 一样都验不到。
+  #
+  # 这不是假想的风险：片 12 第一次真正构建 APK 时，一次就撞出两个**从片 5 起就潜伏着**
+  # 的问题（flutter_secure_storage 11.x 要 compileSdk 37；见交接文档 §5.11）。
+  # 期间 CI 一直是绿的。
+  #
+  # 只跑 **debug**：它已经覆盖了上面那一整类问题（依赖解析 → Kotlin 编译 → manifest 合并
+  # → 打包），而 release 还要多跑 AOT 与 R8，时间翻倍、且不出包也用不着签名。
+  # 真要出正式包走 `mobile/tool/build.*`（密钥不入库，CI 上也签不了正式名）。
+  #
+  # 与 analyze-and-test **并行**，不设 needs：两者互不依赖，串起来只是让反馈更慢。
+  build-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          # 与 Android Gradle Plugin 8.11 的要求一致（app/build.gradle.kts 里
+          # sourceCompatibility / jvmTarget 都钉在 17）。
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # 与上面那个 job 同版本，理由见那里的注释。改要一起改。
+          flutter-version: '3.38.3'
+          channel: stable
+          cache: true
+
+      - name: 装依赖（按 pubspec.lock 精确复现）
+        run: flutter pub get --enforce-lockfile
+
+      - name: 出 debug APK
+        run: flutter build apk --debug
+
+      - name: 核对 pubspec.lock 没被构建改掉
+        # `flutter build` 会隐式跑一次 pub get。CI 上没有 PUB_HOSTED_URL，正常不会变——
+        # 但这条检查的成本是零，而它守的那个坑（本地出包把镜像 URL 写回 lock，
+        # 交接文档 §5.10）恰恰是「diff 看上去像没变化」的那一种。
+        run: git diff --exit-code pubspec.lock

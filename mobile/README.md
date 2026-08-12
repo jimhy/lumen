@@ -63,9 +63,13 @@ diff 里只是一堆 URL 与版本号，很容易当成「谁顺手升了个依�
 
 # 协议对齐守卫：先跑 Rust 侧 golden，再跑 Dart 侧
 .\tool\gen_golden_check.ps1
+
+# 出包（详见下面「出包（Android）」一节）
+.\tool\build.ps1                 # debug APK
+.\tool\build.ps1 -Release        # release APK
 ```
 
-bash / WSL 用 `./tool/test.sh`（`--pub` / `--analyze` 同义）。
+bash / WSL 用 `./tool/test.sh` / `./tool/build.sh`（`--pub` / `--analyze` / `--release` 同义）。
 
 原始命令（不想用脚本时照抄，**三段前缀缺一不可**）：
 
@@ -208,6 +212,7 @@ debug 签名，**后果要说清楚：签出来的 APK 不能上架、也不能�
 | 偏好 | `shared_preferences` | `^2.5.5` |
 | 凭据 | `flutter_secure_storage` | `^11.0.0` |
 | 设备身份 | `device_info_plus` / `crypto` / `uuid` | `^13.2.0` / `^3.0.7` / `^4.6.0` |
+| 扫码 | `mobile_scanner` | `^7.1.4` |
 | 工具 | `collection` | `^1.19.1` |
 | **Markdown** | `flutter_markdown_plus` | **`1.0.12`（精确锁版，无 caret）** |
 | dev | `flutter_lints` / `sqflite_common_ffi` | `^6.0.0` / `^2.4.0+3` |
@@ -215,6 +220,79 @@ debug 签名，**后果要说清楚：签出来的 APK 不能上架、也不能�
 Markdown 那条为什么单独锁死：官方 `flutter_markdown` 已归档，社区 fork 生态不稳（R14），
 一个 patch 版就可能改渲染行为。全 App 只有 `lib/ui/common/markdown_view.dart` 一个文件
 import 它，换实现只改那一处。
+
+`mobile_scanner` 同款隔离：只有 `lib/ui/pair/mobile_scanner_qr.dart` 一个文件 import 它，
+它实现的 `QrScanner` 接口就是换包时唯一要动的边界。它也是**唯一**要相机权限的依赖
+（`AndroidManifest` 那条由插件合并进来、`ios/Runner/Info.plist` 的
+`NSCameraUsageDescription` 由我们写），去掉这个包记得一起清。
+
+---
+
+## 平台实现的注入点（**改这里之前先读**）
+
+`lib/state/providers.dart` 里所有平台相关的 provider，默认值都是**能在 `flutter test` 里
+跑的**（内存 / 固定值 / 「没有相机」），真机实现一律在 `lib/main.dart` 的 `deviceScope()`
+里用 `ProviderScope(overrides:)` 换上去。
+
+**不要把平台实现设成 provider 的默认值**——那样 `flutter test` 从此都要起 platform channel，
+而纯 Dart 测试是这个工程能快速跑起来的全部原因。`test/main_overrides_test.dart` 两头都钉着：
+既断言真机 scope 覆盖齐了，也断言默认值仍是纯 Dart 的。
+
+| provider | 真机实现 | 漏了的症状（**都不会让测试变红**） |
+|---|---|---|
+| `chatStoreProvider` | `SqfliteChatStore` | 杀进程重开历史全空 |
+| `tokenStoreProvider` | `SecureTokenStore` | 每次冷启动都要重新登录 |
+| `rawMachineIdProvider` | `PlatformMachineId` | 所有设备算出同一个 `hw_id`（后果最重） |
+| `deviceNameProvider` | `PlatformDeviceName` | 设备列表里每台手机都叫「我的手机」 |
+| `qrScannerProvider` | `MobileScannerQrScanner` | 配对页没有扫码入口，只能手输 9 位码 |
+
+⚠ **Android 的机器标识走自定义 MethodChannel，不是 `device_info_plus`**：那个包从 4.0.0
+起移除了 `androidId`，剩下的 `AndroidDeviceInfo.id` 是 `Build.ID`（构建标签），同型号同 ROM
+的机器完全相同——拿它当 `hw_id` 会让同账户下两台手机认领到**同一行设备**。
+Kotlin 侧十几行在 `android/app/src/main/kotlin/.../MainActivity.kt`，
+常量必须与 `lib/data/platform_device.dart` 逐字对齐（对不上的表现是 `hw_id` 恒 null，
+而两侧测试都是绿的）。
+
+---
+
+## 出包（Android）
+
+⚠ **走 `tool/build.*`，别裸敲 `flutter build`**——理由与测试那两个脚本完全一样：
+`flutter build` 会**隐式**跑一次 pub get，而本机全局的 `PUB_HOSTED_URL` 会让它忽略 lock
+重新解析整个依赖图，再把镜像地址写回 `pubspec.lock` 的每一条 `url`，CI 的
+`--enforce-lockfile` 第一步就红。2026-08-12 第一次出 APK 时就这么踩了一次，
+118 处 URL 被改掉，靠 `test/pubspec_lock_test.dart` 才发现。
+
+```bash
+./tool/build.sh              # debug APK（debug 签名，装了就能用）
+./tool/build.sh --release    # release APK，适合 GitHub Release / 侧载
+./tool/build.sh --bundle     # release AAB，Google Play 用
+```
+
+```powershell
+.\tool\build.ps1
+.\tool\build.ps1 -Release
+.\tool\build.ps1 -Bundle
+```
+
+**签名密钥绝不入库**（根 `.gitignore` 第 72 / 75 / 76 行挡着 `key.properties` / `*.jks` /
+`*.keystore`）。出正式包的机器上按 `android/key.properties.example` 的说明放一份
+`android/key.properties`，`android/app/build.gradle.kts` 会自动读它。
+
+⚠ **没有那份文件时构建不会失败**：release 会回退成 debug 签名。用 debug key 签的包能装能跑，
+但**不能上架、也不能覆盖安装正式版**。`tool/build.*` 会在构建**前后各喊一遍**：
+
+```
+  ⚠⚠ 提醒：刚出的这个 release 包是用 debug 密钥签的，不能上架、不能覆盖安装正式版。
+```
+
+⚠ **这句话只有走脚本才看得到**。`build.gradle.kts` 里也有一条同样意思的 `logger.warn`，
+但 `flutter build` 会过滤 gradle 的输出，实测**看不见**——裸敲 `flutter build apk --release`
+的话，一个用 debug key 签的包和一个正式包在日志上长得一模一样。这也是「出包走脚本」的
+第二个理由。
+
+⚠ **密钥丢了就无法再更新这个 App**（应用市场按签名认身份）。生成之后立刻离线备份
+`.jks` 与两个口令。
 
 ---
 

@@ -18,6 +18,7 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:lumen_mobile/data/token_store.dart';
 import 'package:lumen_mobile/protocol/remote_s2c.dart';
 import 'package:lumen_mobile/protocol/rest_dto.dart';
 import 'package:lumen_mobile/state/device_list_controller.dart';
@@ -65,10 +66,42 @@ class _DevicesPageState extends ConsumerState<DevicesPage> {
       ),
       body: Column(
         children: <Widget>[
+          _tokenDegradedBanner(context),
           _linkBanner(context, link),
           Expanded(child: _list(context, devices, link)),
         ],
       ),
+    );
+  }
+
+  /// 凭据没能写进 Keychain / Keystore 时的横幅（片 12）。
+  ///
+  /// 这条降级**不会让任何东西看起来坏掉**：本次会话照常能用，直到用户杀掉进程、
+  /// 重开时发现自己被登出了。协作铁律 6 要的就是把这种「下次才发作」的降级现在就说出来。
+  ///
+  /// 放在设备页而不是登录页：写失败发生在登录**成功**的那一刻，那时页面已经切走了。
+  Widget _tokenDegradedBanner(BuildContext context) {
+    final TokenStore store = ref.watch(tokenStoreProvider);
+    return StreamBuilder<bool>(
+      stream: store.degradedChanges,
+      initialData: store.degraded,
+      builder: (BuildContext context, AsyncSnapshot<bool> snapshot) {
+        if (snapshot.data != true) return const SizedBox.shrink();
+        final ColorScheme scheme = Theme.of(context).colorScheme;
+        return MaterialBanner(
+          backgroundColor: scheme.errorContainer,
+          content: Text(
+            // 说清楚**后果**而不是原因：「Keystore 写入失败」对用户没有任何可操作性，
+            // 「下次打开要重新登录」才是他需要知道的那一件事。
+            '这台手机的安全存储不可用，登录状态没能保存下来。现在可以正常使用，'
+            '但下次打开 App 需要重新登录。',
+            style: TextStyle(color: scheme.onErrorContainer),
+          ),
+          // 刻意**没有**「知道了」按钮：它不是一次性事件，而是一个持续存在的状态，
+          // 关掉之后用户再也想不起来为什么自己被登出了。
+          actions: const <Widget>[SizedBox.shrink()],
+        );
+      },
     );
   }
 

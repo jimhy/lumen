@@ -15,7 +15,23 @@
 /// > 片 5 只落地存储抽象与内存实现；平台实现（`flutter_secure_storage` + 生物识别包裹）
 /// > 与上面那条规则的执行点在片 6 的登录/设置页。**接口先立在这里**，是为了让 rest_client
 /// > 的 401 → refresh → retry 现在就能写完并被测到。
+///
+/// > 片 12 补上平台实现（`SecureTokenStore`，见 `secure_token_store.dart`）。
+/// > **生物识别包裹仍然没做，而且这不是遗漏**：§9.3 那条规则的前提是「免码直连」，
+/// > 而片 4b 的止血让隐藏会话**每次都要念码**（`ws.rs` 的 `OpenHidden` 臂恒传
+/// > `paired = false`）。前提不成立时加生物锁只是给每次冷启动加一道指纹，
+/// > 换不来任何安全增量。等 `device_pairs` 有了会话种类列、免码真的活过来，
+/// > 那条规则连同生物锁一起补——**到时候要连着看这两处，别只加锁不加规则**。
 library;
+
+import 'package:lumen_mobile/protocol/codec.dart';
+
+/// 本机存储格式的版本号。
+///
+/// 存储格式与**线格式无关**：它只有本机自己读写，没有对端要对账。留版本号是为了
+/// 让将来的字段变更有一条明确的「读不懂就当没登录」的退路——见
+/// [SessionTokens.fromStorageJson] 的注释。
+const int kSessionTokensStorageVersion = 1;
 
 /// 一次登录得到的凭据。
 final class SessionTokens {
@@ -59,6 +75,44 @@ final class SessionTokens {
   bool needsRefresh(DateTime now, {Duration within = const Duration(days: 1)}) =>
       now.add(within).millisecondsSinceEpoch ~/ 1000 >= expiresAt;
 
+  /// 落盘用的形状。**不是线格式**，故意不叫 `toJson`。
+  ///
+  /// 名字里带 `Storage` 是一道防线：这个仓库里凡是 `toJson`/`fromJson` 都有 Rust 侧的
+  /// 对端与 golden 语料钉着，而这一份只有本机自己读——两者混用会让后人以为改字段名
+  /// 要去同步 Rust，或者反过来以为这份能随便改。
+  JsonMap toStorageJson() => <String, Object?>{
+        'v': kSessionTokensStorageVersion,
+        'token': token,
+        'exp': expiresAt,
+        'device_id': deviceId,
+        'origin': origin,
+        'user_id': userId,
+      };
+
+  /// 从落盘形状还原。
+  ///
+  /// 版本不认识、字段缺失、类型不对，一律抛 [WireFormatException]——**调用方必须把它
+  /// 当成「本机没有凭据」**（退回登录页），不能让它冒泡到启动路径。理由：这份数据在
+  /// 安全存储里，损坏的现实原因是 Keystore 出过问题或跨版本升级，此时唯一能让用户
+  /// 自助的动作就是重新登录；抛到 UI 只会变成一个打不开的 App。
+  factory SessionTokens.fromStorageJson(JsonMap m) {
+    final int version = readInt(m, 'v');
+    if (version != kSessionTokensStorageVersion) {
+      // **向前不兼容是刻意的**：老版本 App 读到新格式，只应退回登录页，
+      // 绝不能猜字段——猜错的表现是「拿着半份凭据去打服务端」，比重登难查得多。
+      throw WireFormatException(
+        '凭据存储格式版本 $version 不是本端认识的 $kSessionTokensStorageVersion',
+      );
+    }
+    return SessionTokens(
+      token: readString(m, 'token'),
+      expiresAt: readInt(m, 'exp'),
+      deviceId: readString(m, 'device_id'),
+      origin: readString(m, 'origin'),
+      userId: readString(m, 'user_id'),
+    );
+  }
+
   @override
   String toString() =>
       'SessionTokens(token=<已隐藏>, exp=$expiresAt, $deviceId @ $origin)';
@@ -72,6 +126,22 @@ abstract interface class TokenStore {
 
   /// 退出登录 / 收到 [`Unauthorized`] 时清空。
   Future<void> clear();
+
+  /// 凭据是否**只活在内存里**。
+  ///
+  /// ## 为什么这条属于接口，而不是平台实现的内部细节
+  ///
+  /// 协作铁律 6（无声降级禁令）：凡是降级路径，必须 `log` **且 UI 可见**。
+  /// 安全存储写失败之后 App 完全能继续用——直到用户杀掉进程，然后发现自己被登出了。
+  /// 那正是「功能看起来在、其实没生效」的形态。放进接口，UI 就能无条件地问一句
+  /// 「这份凭据存住了吗」，不必对具体实现做类型判断。
+  bool get degraded;
+
+  /// [degraded] 的变化。**只在真的变化时发**（false → true）。
+  ///
+  /// 与 `LinkController` 同款「当前值 + 变化流」两件套：横幅要在页面**建起来之后**
+  /// 也能显示，只有流会漏掉建页之前发生的那次降级。
+  Stream<bool> get degradedChanges;
 }
 
 /// 内存实现。单测用，**也用于「未登录」时的空实现**。
@@ -88,4 +158,14 @@ final class InMemoryTokenStore implements TokenStore {
 
   @override
   Future<void> clear() async => _tokens = null;
+
+  /// 恒 `false`：它**不是降级**，是刻意选择的测试替身。
+  ///
+  /// 报 `true` 会让每个用内存实现跑的 widget 测试都顶着一条降级横幅，
+  /// 那条横幅就此变成噪音，真出降级时没人看得见。
+  @override
+  bool get degraded => false;
+
+  @override
+  Stream<bool> get degradedChanges => const Stream<bool>.empty();
 }

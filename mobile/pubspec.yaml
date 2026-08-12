@@ -71,7 +71,18 @@ dependencies:
   shared_preferences: ^2.5.5
   # JWT 必须进 Keychain / Keystore，**不是** SharedPreferences：服务端 JWT 无 jti、无版本号、
   # 改密码不失效，默认 TTL 7 天，唯一撤销手段是删设备行，泄漏代价高（§7.7）。
-  flutter_secure_storage: ^11.0.0
+  #
+  # ⚠ **刻意停在 10.x，不升 11.x**（片 12，2026-08-12 实测）：11.0.0（2026-08-06 发布）把
+  # compileSdk 提到 **37**，而 Flutter 3.41.6 给的是 36。它是插件模块自己的 compileSdk，
+  # 改主 app 的那个没用 —— `:flutter_secure_storage:generateDebugRFile` 会直接失败。
+  # 更麻烦的是 API 37 用了 Android 新的「minor SDK version」编号：sdkmanager 装出来的目录叫
+  # `android-37.0`，而 AGP 8.11.1 找的是 `android-37`，于是即使装了也报
+  # 「Failed to find target with hash string 'android-37'」。要升它得连 AGP 一起升，
+  # 那是另一个量级的变更面。10.3.1 的 API 与我们用到的部分完全一致（`AndroidOptions()` /
+  # `IOSOptions(accessibility:, synchronizable:)`），没有功能损失。
+  # ⇒ **caret 上界是 11.0.0，正好挡住这件事**；将来要升，先确认 AGP 认得 `android-37.0`。
+  # 这个坑一直潜伏到片 12 第一次真正构建 APK 才暴露 —— `flutter test` 不碰 Android 工具链。
+  flutter_secure_storage: ^10.3.1
 
   # ── 设备身份 ─────────────────────────────────────────────────────────────
   # hw_id = sha256(origin || 0x00 || vendorId)（§7.2 device_identity.dart）。
@@ -80,6 +91,16 @@ dependencies:
   crypto: ^3.0.7
   # outbox 的 client_msg_id（乐观发送 + PC 侧幂等去重，§7.6）。
   uuid: ^4.6.0
+
+  # ── 扫码（片 12）────────────────────────────────────────────────────────
+  # 配对二维码的取景与识别。选 mobile_scanner 是因为它直接包 MLKit（Android）/
+  # AVFoundation（iOS）的原生扫码，不像 qr_code_scanner 那样依赖已停更的
+  # zxing + PlatformView 组合（那条路在 Android 14 上有已知的黑屏报告）。
+  # ⚠ 它是**唯一**需要相机权限的依赖：AndroidManifest 的 `android.permission.CAMERA`
+  # 与 iOS 的 `NSCameraUsageDescription` 都是为它加的，去掉这个包记得一起清。
+  # 用法收口在 lib/ui/pair/mobile_scanner_qr.dart 一个文件里（QrScanner 接口的实现），
+  # 换包只改那一处——与 flutter_markdown_plus 同款隔离。
+  mobile_scanner: ^7.1.4
 
   # ── 工具 ─────────────────────────────────────────────────────────────────
   collection: ^1.19.1

@@ -1,0 +1,30 @@
+# Android 上架签名配置的模板（片 12）。
+#
+# 用法：把本文件复制成同目录下的 `key.properties`、填上真实值。
+# **`key.properties` 与 `.jks` 都绝不入库**——根 .gitignore 第 72 / 75 / 76 行挡着，
+# 别用 `git add -f` 绕过去。
+#
+# 生成一把新密钥（有效期给足，Google Play 要求 2033 年之后过期）：
+#
+#   keytool -genkey -v -keystore lumen-release.jks -storetype JKS \
+#           -keyalg RSA -keysize 2048 -validity 10000 -alias lumen
+#
+# ⚠ **这把密钥丢了就无法再更新这个 App**（应用市场按签名认身份，包名相同但签名不同的
+# 包会被拒）。生成之后立刻离线备份 .jks 与两个口令，别只放在出包的那台机器上。
+#
+# ⚠ 缺这份文件时构建**不会失败**：release 会回退成 debug 签名，并在构建日志里打一行
+# 「⚠ 找不到 android/key.properties…」。用 debug key 签的包能装能跑，但不能上架、
+# 也不能覆盖安装正式版——出正式包前先在日志里确认没有那行警告。
+
+# 密钥别名（keytool 的 -alias）。
+keyAlias=lumen
+
+# 密钥自身的口令。
+keyPassword=在这里填密钥口令
+
+# .jks 文件路径。相对路径以 `mobile/android/` 为基准（如 `lumen-release.jks` 表示
+# 放在 android/ 目录下）；也可以写绝对路径，把密钥放在仓库之外更稳妥。
+storeFile=lumen-release.jks
+
+# 密钥库口令。keytool 生成时问的第一个口令。
+storePassword=在这里填密钥库口令

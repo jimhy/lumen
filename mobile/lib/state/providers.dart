@@ -12,7 +12,7 @@
 /// ## 依赖注入点
 ///
 /// [`tokenStoreProvider`] 与 [`rawMachineIdProvider`] 的默认实现都是**能在测试里跑的**
-/// （内存 / 固定值）。真机实现（Keychain / Keystore、`device_info_plus`）在片 6 由
+/// （内存 / 固定值）。真机实现（Keychain / Keystore、`device_info_plus`）在片 12 由
 /// `main.dart` 用 `ProviderScope(overrides: …)` 覆盖——这样 `flutter test` 不需要
 /// platform channel，也就不会出现「本地测试全绿、真机崩」。
 library;
@@ -34,6 +34,7 @@ import 'package:lumen_mobile/state/conversation_session.dart';
 import 'package:lumen_mobile/state/device_list_controller.dart';
 import 'package:lumen_mobile/state/link_controller.dart';
 import 'package:lumen_mobile/state/outbox.dart';
+import 'package:lumen_mobile/ui/pair/qr_scanner.dart';
 import 'package:uuid/uuid.dart';
 
 /// 当前服务器（规范化后的 origin）。未选定为 null。
@@ -55,11 +56,11 @@ final class ServerEndpointNotifier extends Notifier<ServerEndpoint?> {
   void clear() => state = null;
 }
 
-/// 凭据存放。默认内存实现，真机实现在片 6 覆盖。
+/// 凭据存放。默认内存实现，真机实现（`SecureTokenStore`）在片 12 覆盖。
 final Provider<TokenStore> tokenStoreProvider =
     Provider<TokenStore>((Ref ref) => InMemoryTokenStore());
 
-/// 原始机器标识来源。默认「取不到」，真机实现在片 6 覆盖。
+/// 原始机器标识来源。默认「取不到」，真机实现（`PlatformMachineId`）在片 12 覆盖。
 ///
 /// 默认值刻意是 `null` 而不是一个假 id：假 id 会让 `hw_id` 看起来在工作，
 /// 而它算出来的是全体测试机共用的同一个值——那比没有更糟。
@@ -75,6 +76,13 @@ final Provider<DeviceIdentity> deviceIdentityProvider =
 /// 设备显示名。默认值是个通用名字，真机实现（`device_info_plus`）在 `main.dart` 覆盖。
 final Provider<DeviceNameSource> deviceNameProvider =
     Provider<DeviceNameSource>((Ref ref) => const StaticDeviceName('我的手机'));
+
+/// 扫码取景。默认「没有相机」，真机实现（`mobile_scanner`）在 `main.dart` 覆盖。
+///
+/// 默认值报 `available = false`，于是配对页**根本不画**扫码入口——手输 9 位码
+/// 这条路本来就完整可用，画一个点了没反应的按钮才是坏掉的功能（铁律 6）。
+final Provider<QrScanner> qrScannerProvider =
+    Provider<QrScanner>((Ref ref) => const UnavailableQrScanner());
 
 /// 登录 / 注册。未选服务器时为 null。
 final Provider<AuthController?> authControllerProvider =
@@ -138,7 +146,8 @@ final Provider<LinkController?> linkControllerProvider =
 ///
 /// ⚠ **它的默认实现是「能跑但不持久」**：内存版一关 App 就没了。真机忘了覆盖的症状
 /// 不是崩溃、而是「杀进程重开历史空了」——所以 `main.dart` 那处覆盖有一条测试钉着
-/// （`test/app_boot_test.dart`）。
+/// （`test/main_overrides_test.dart`；片 12 之前这条注释指的是 `app_boot_test.dart`，
+/// 但那个文件里从来没有这条断言，覆盖清单当时其实是没人守的）。
 final Provider<ChatStore> chatStoreProvider =
     Provider<ChatStore>((Ref ref) => MemoryChatStore());
 

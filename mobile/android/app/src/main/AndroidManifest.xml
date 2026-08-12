@@ -1,4 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 相机权限（扫配对码）**刻意不在这里声明**：mobile_scanner 自己的
+         AndroidManifest 已经带了 android.permission.CAMERA 与
+         <uses-feature android:name="android.hardware.camera" android:required="false" />，
+         manifest merger 会合并进来。在这里再写一遍就有了两处声明，将来换扫码包时
+         必定漏改一处——留下的那条会让应用市场把「相机」列进权限清单，而 App 已经
+         不用相机了。要确认合并结果，看 build/app/outputs/logs/manifest-merger-*.txt。
+
+         ⚠ required="false" 很重要：真为 true 的话，没有摄像头的设备在应用市场里
+         会直接看不到这个 App，而手输 9 位码那条路本来完全可用。 -->
     <application
         android:label="Lumen"
         android:name="${applicationName}"

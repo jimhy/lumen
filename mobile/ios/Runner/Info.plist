@@ -41,6 +41,12 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<!-- 相机权限说明（片 12，为 mobile_scanner 加的）。
+	     ⚠ iOS 上**缺这一条不是报错，是直接崩**：AVFoundation 一请求相机就杀进程。
+	     文案要讲清楚「用来做什么」，App Store 审核按这一条驳回过无数应用；
+	     这里刻意说明扫的是配对码，不是泛泛的「需要相机权限」。 -->
+	<key>NSCameraUsageDescription</key>
+	<string>扫描电脑屏幕上的配对二维码，用来建立与这台电脑的连接。</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
