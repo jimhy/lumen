@@ -1408,6 +1408,7 @@ mod tests {
                 pool,
                 config,
                 hub: Arc::new(Hub::new()),
+                throttle: Arc::new(crate::throttle::Throttle::new()),
             },
             AuthUser { user_id, device_id },
         )

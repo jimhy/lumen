@@ -1193,8 +1193,8 @@ pub const HIDDEN_CAP: &str = "hidden";
 /// 等量数据传输量降到约 1/3、接近原始二进制。app / server 对此无感知（字段仍是 `Vec<u8>`，
 /// 服务端继续盲转 [`serde_json::Value`]）。
 mod b64 {
-    use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
     use serde::{Deserialize, Deserializer, Serializer};
 
     /// `Vec<u8>` → base64 字符串。
@@ -1527,7 +1527,11 @@ mod tests {
             assert_eq!(back, *msg);
         }
         // 信封/载荷分层：取出 payload 仍能还原成强类型帧，且不需要服务端认识它。
-        let RemoteS2C::RelayTo { session_id, payload } = &s2c[3] else {
+        let RemoteS2C::RelayTo {
+            session_id,
+            payload,
+        } = &s2c[3]
+        else {
             panic!("应为 RelayTo");
         };
         assert_eq!(*session_id, 7);
@@ -1669,7 +1673,8 @@ mod tests {
         // 新服务端必须原样解析成功。这里用**手写字面量**而不是 to_string(&构造出来的值)
         // —— 后者会跟着代码一起变，钉不住线格式。
         let old_request: RemoteC2S =
-            serde_json::from_str(r#"{"RequestControl":{"target":"pc-1"}}"#).expect("老 RequestControl");
+            serde_json::from_str(r#"{"RequestControl":{"target":"pc-1"}}"#)
+                .expect("老 RequestControl");
         assert_eq!(
             old_request,
             RemoteC2S::RequestControl {
@@ -1782,8 +1787,16 @@ mod tests {
             RemoteFrame::SubViewport {
                 tab_id: 7,
                 panes: vec![
-                    PaneViewport { session_id: 3, rows: 40, cols: 100 },
-                    PaneViewport { session_id: 5, rows: 40, cols: 60 },
+                    PaneViewport {
+                        session_id: 3,
+                        rows: 40,
+                        cols: 100,
+                    },
+                    PaneViewport {
+                        session_id: 5,
+                        rows: 40,
+                        cols: 60,
+                    },
                 ],
             },
             RemoteFrame::SubLayout {
@@ -1903,7 +1916,10 @@ mod tests {
     fn 镜像帧经value往返() {
         for frame in [
             RemoteFrame::Output(vec![0x1b, b'[', b'2', b'J']),
-            RemoteFrame::Resize { rows: 40, cols: 120 },
+            RemoteFrame::Resize {
+                rows: 40,
+                cols: 120,
+            },
         ] {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
@@ -2272,14 +2288,20 @@ mod tests {
     #[test]
     fn 历史分页帧经value往返() {
         for frame in [
-            RemoteFrame::HistoryReq { top: 1000, count: 40 },
+            RemoteFrame::HistoryReq {
+                top: 1000,
+                count: 40,
+            },
             RemoteFrame::HistoryRows {
                 top: 1000,
                 base: 0,
                 screen_top: 1234,
                 lines: vec![vec![b'h', b'i'], Vec::new(), vec![0x1b, b'[', b'0', b'm']],
             },
-            RemoteFrame::HistoryBounds { base: 0, screen_top: 1234 },
+            RemoteFrame::HistoryBounds {
+                base: 0,
+                screen_top: 1234,
+            },
         ] {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
@@ -2422,7 +2444,10 @@ mod tests {
                 tab_id: None,
                 err: Some(RemoteOpErr::LimitReached),
             },
-            RemoteFrame::CloseTab { req_id: 3, tab_id: 7 },
+            RemoteFrame::CloseTab {
+                req_id: 3,
+                tab_id: 7,
+            },
             RemoteFrame::CloseTabResult {
                 req_id: 3,
                 tab_id: 7,

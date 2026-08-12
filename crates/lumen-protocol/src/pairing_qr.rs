@@ -200,10 +200,18 @@ mod tests {
     fn 账户指纹是小写hex且长度固定() {
         let fp = account_fingerprint("550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(fp.len(), ACCOUNT_FINGERPRINT_LEN);
-        assert!(fp.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(fp
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         // 同一输入恒等；不同输入不同。
-        assert_eq!(fp, account_fingerprint("550e8400-e29b-41d4-a716-446655440000"));
-        assert_ne!(fp, account_fingerprint("550e8400-e29b-41d4-a716-446655440001"));
+        assert_eq!(
+            fp,
+            account_fingerprint("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_ne!(
+            fp,
+            account_fingerprint("550e8400-e29b-41d4-a716-446655440001")
+        );
     }
 
     #[test]
@@ -226,7 +234,10 @@ mod tests {
         let fp = account_fingerprint("550e8400-e29b-41d4-a716-446655440000");
         let target = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
         let ok = 样例();
-        assert_eq!(ok.validate("https://lumen.example.com", &fp, target), Ok(()));
+        assert_eq!(
+            ok.validate("https://lumen.example.com", &fp, target),
+            Ok(())
+        );
 
         let mut 坏魔数 = 样例();
         坏魔数.m = "lumen.pair.v2".into();

@@ -6,7 +6,7 @@
 //! （[`HubState`]）。早期设计的三把独立锁需规定全局加锁顺序、稍有不慎即 ABBA
 //! 死锁；单锁让每个操作在一次加锁内原子完成「检查 + 改状态 + 投递出站消息」，
 //! 从根上杜绝死锁与 TOCTOU 竞态。临界区内**绝不 `.await`**（投递走
-//! [`tokio::sync::mpsc::UnboundedSender::send`]，同步非阻塞），故同步锁安全。
+//! [`tokio::sync::mpsc::Sender::try_send`]，同步非阻塞），故同步锁安全。
 //!
 //! # 为何零 DB 依赖
 //! 设备名、`last_seen` 等 DB 交互全在 `ws.rs`（连接握手阶段，锁外 `await`）完成；
@@ -63,14 +63,16 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lumen_protocol::remote::{
     DenyReason, EndReason, HiddenSessionId, PairingFailReason, RemoteC2S, RemoteS2C, Role,
     MAX_HIDDEN_SESSIONS_PER_TARGET,
 };
 use lumen_protocol::{MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::Notify;
 
 use crate::auth;
 
@@ -115,7 +117,14 @@ struct PeerHandle {
     /// 连接代次（驱逐 / 迟到消息守卫）。
     conn_id: u64,
     /// 出站通道发送端（接收端在该连接的 socket 写循环里）。
-    tx: UnboundedSender<ToClient>,
+    ///
+    /// 片 11：**有界**（`ws::OUTBOUND_QUEUE`）。满了就说明这条 socket 写不动了。
+    tx: Sender<ToClient>,
+    /// 片 11：强制断开这条连接的旁路信号。
+    ///
+    /// ★ **必须是通道之外的一条路**：队列满时 `tx` 里塞不进任何东西——包括
+    /// [`ToClient::Close`]。想靠同一个通道通知「你被踢了」，恰恰在最需要它的时候失效。
+    kill: Arc<Notify>,
     /// M7 片 4b：该连接是否上报了 [`HIDDEN_CAP`]（由 [`RemoteC2S::ClientHello`] 填入）。
     /// **登记时为 false**——老客户端不发 `ClientHello`，新客户端也要等第一条消息到达才
     /// 填得上，所以 false 既表示「老端」也表示「新端但还没说话」，两者在 [`open_hidden`]
@@ -239,7 +248,9 @@ impl Hub {
 
     /// 取一次性递增的连接代次。
     fn next_conn_id(&self) -> u64 {
-        self.conn_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        self.conn_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
     }
 
     /// 加锁（poison 时取回内部值而非 panic / `unwrap`——临界区内无 panic 代码）。
@@ -259,7 +270,8 @@ impl Hub {
         device_id: &str,
         user_id: String,
         name: String,
-        tx: UnboundedSender<ToClient>,
+        tx: Sender<ToClient>,
+        kill: Arc<Notify>,
     ) -> u64 {
         let conn_id = self.next_conn_id();
         let mut st = self.lock();
@@ -270,7 +282,10 @@ impl Hub {
             teardown_hidden_for_device(&mut st, device_id, EndReason::Replaced);
             cancel_pending_as_controller(&mut st, device_id);
             cancel_pending_as_target(&mut st, device_id, DenyReason::Offline);
-            let _ = old.tx.send(ToClient::Close);
+            // 先礼后兵：Close 能塞进去就优雅关，塞不进去（队列已满）就走 kill 旁路。
+            if old.tx.try_send(ToClient::Close).is_err() {
+                old.kill.notify_one();
+            }
         }
         st.peers.insert(
             device_id.to_string(),
@@ -279,6 +294,7 @@ impl Hub {
                 name,
                 conn_id,
                 tx,
+                kill,
                 // 能力位等 ClientHello 到达后由 set_caps 填入（见
                 // PeerHandle::supports_hidden 的残余竞态说明）。
                 supports_hidden: false,
@@ -406,13 +422,33 @@ impl Hub {
 
 /// `device_id` 当前在线连接的代次是否等于 `conn_id`。
 fn is_current(st: &HubState, device_id: &str, conn_id: u64) -> bool {
-    st.peers.get(device_id).is_some_and(|p| p.conn_id == conn_id)
+    st.peers
+        .get(device_id)
+        .is_some_and(|p| p.conn_id == conn_id)
 }
 
 /// 向某设备投递一条消息（设备不在线则静默丢弃；通道已关亦忽略）。
 fn send_msg(peers: &HashMap<String, PeerHandle>, device_id: &str, msg: RemoteS2C) {
-    if let Some(peer) = peers.get(device_id) {
-        let _ = peer.tx.send(ToClient::Msg(Box::new(msg)));
+    let Some(peer) = peers.get(device_id) else {
+        return;
+    };
+    match peer.tx.try_send(ToClient::Msg(Box::new(msg))) {
+        Ok(()) => {}
+        // 片 11：队列满 = 这条 socket 已经写不动了（客户端网络卡死 / 不读）。
+        //
+        // **断开而不是丢帧**：中继上的消息是有序流（终端输出、镜像帧、LLM 增量），
+        // 悄悄丢一条会让对端的状态永久错位且无从察觉；而断开是客户端**已经会处理**
+        // 的情况——重连后走既有的重新握手与补齐路径。
+        //
+        // 这里只发信号、不动 `peers`：本函数在 Hub 锁的临界区内被 24 处调用，
+        // 就地拆会话会引出重入与借用两重麻烦。连接收到 kill 后自行退出循环，
+        // 再由它自己的 `disconnect` 走完整清理。
+        Err(TrySendError::Full(_)) => {
+            tracing::warn!("WS 出站队列已满，断开设备 {device_id} 的连接");
+            peer.kill.notify_one();
+        }
+        // 接收端没了（socket 循环已退出），清理马上会跑到，无需额外动作。
+        Err(TrySendError::Closed(_)) => {}
     }
 }
 
@@ -927,7 +963,9 @@ fn open_hidden(
     // 线」与「PC 版本过低」指向的用户动作完全相同（去看那台 PC），合并成一句话
     // 不是偷懒。
     if !target_supports_hidden(st, target) {
-        tracing::debug!("open_hidden 目标未上报 {HIDDEN_CAP} 能力，按 Offline 拒（target={target}）");
+        tracing::debug!(
+            "open_hidden 目标未上报 {HIDDEN_CAP} 能力，按 Offline 拒（target={target}）"
+        );
         deny(st, DenyReason::Offline);
         return;
     }
@@ -1185,17 +1223,42 @@ fn teardown_hidden_for_device(st: &mut HubState, device_id: &str, reason: EndRea
 mod tests {
     use super::*;
     use lumen_protocol::remote::RemoteFrame;
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+    use tokio::sync::mpsc::Receiver;
+
+    /// 测试用的出站队列容量。
+    ///
+    /// 与生产的 `ws::OUTBOUND_QUEUE` 不同值是刻意的：这里要大到「任何一个既有用例都
+    /// 撞不到上限」，否则背压会把一堆与它无关的断言变成随机失败。
+    /// 想测背压本身的用例自己开小队列（见 `片11_出站队列满时踢掉该连接`）。
+    const TEST_QUEUE: usize = 1024;
 
     /// 注册一台设备，返回 (conn_id, 该连接的接收端)。
-    fn join(hub: &Hub, device_id: &str, user_id: &str, name: &str) -> (u64, UnboundedReceiver<ToClient>) {
-        let (tx, rx) = unbounded_channel();
-        let cid = hub.register(device_id, user_id.to_string(), name.to_string(), tx);
-        (cid, rx)
+    fn join(hub: &Hub, device_id: &str, user_id: &str, name: &str) -> (u64, Receiver<ToClient>) {
+        join_with_queue(hub, device_id, user_id, name, TEST_QUEUE).0
+    }
+
+    /// 同上，但可指定队列容量，并把 kill 信号一并返回（背压用例要用）。
+    fn join_with_queue(
+        hub: &Hub,
+        device_id: &str,
+        user_id: &str,
+        name: &str,
+        cap: usize,
+    ) -> ((u64, Receiver<ToClient>), Arc<Notify>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let kill = Arc::new(Notify::new());
+        let cid = hub.register(
+            device_id,
+            user_id.to_string(),
+            name.to_string(),
+            tx,
+            kill.clone(),
+        );
+        ((cid, rx), kill)
     }
 
     /// 取下一条协议消息（非 Close）；无则 panic（测试断言）。
-    fn next_msg(rx: &mut UnboundedReceiver<ToClient>) -> RemoteS2C {
+    fn next_msg(rx: &mut Receiver<ToClient>) -> RemoteS2C {
         match rx.try_recv() {
             Ok(ToClient::Msg(m)) => *m,
             Ok(ToClient::Close) => panic!("收到 Close，期望消息"),
@@ -1204,7 +1267,7 @@ mod tests {
     }
 
     /// 排空并返回全部已到协议消息。
-    fn drain(rx: &mut UnboundedReceiver<ToClient>) -> Vec<RemoteS2C> {
+    fn drain(rx: &mut Receiver<ToClient>) -> Vec<RemoteS2C> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let ToClient::Msg(m) = ev {
@@ -1220,8 +1283,8 @@ mod tests {
         c_id: &str,
         c_cid: u64,
         t_id: &str,
-        c_rx: &mut UnboundedReceiver<ToClient>,
-        t_rx: &mut UnboundedReceiver<ToClient>,
+        c_rx: &mut Receiver<ToClient>,
+        t_rx: &mut Receiver<ToClient>,
     ) {
         hub.request_control(c_id, c_cid, t_id, false);
         // 被控端收到 ControlRequested（含配对码）。
@@ -1235,11 +1298,17 @@ mod tests {
         // 双方收到 SessionStarted。
         assert!(matches!(
             next_msg(c_rx),
-            RemoteS2C::SessionStarted { role: Role::Controller, .. }
+            RemoteS2C::SessionStarted {
+                role: Role::Controller,
+                ..
+            }
         ));
         assert!(matches!(
             next_msg(t_rx),
-            RemoteS2C::SessionStarted { role: Role::Controlled, .. }
+            RemoteS2C::SessionStarted {
+                role: Role::Controlled,
+                ..
+            }
         ));
     }
 
@@ -1251,7 +1320,9 @@ mod tests {
         pair_ok(&hub, "ctrl", c_cid, "tgt", &mut c_rx, &mut t_rx);
         // SessionStarted 对端信息正确。
         // （pair_ok 已断言角色；此处补一条 relay 验证通路。）
-        let frame = RemoteFrame::Echo("ping".into()).to_value().expect("to_value");
+        let frame = RemoteFrame::Echo("ping".into())
+            .to_value()
+            .expect("to_value");
         hub.handle("ctrl", c_cid, RemoteC2S::Relay(frame.clone()));
         match next_msg(&mut t_rx) {
             RemoteS2C::Relay(v) => assert_eq!(
@@ -1275,7 +1346,10 @@ mod tests {
         let _ = next_msg(&mut c_rx); // PairingNeeded
         let _ = hub.submit_pairing("ctrl", c_cid, "tgt", "000000000");
         match next_msg(&mut c_rx) {
-            RemoteS2C::PairingResult { reason: PairingFailReason::InvalidCode, attempts_left } => {
+            RemoteS2C::PairingResult {
+                reason: PairingFailReason::InvalidCode,
+                attempts_left,
+            } => {
                 assert_eq!(attempts_left, PAIRING_MAX_ATTEMPTS - 1);
             }
             o => panic!("期望 InvalidCode，得 {o:?}"),
@@ -1294,19 +1368,28 @@ mod tests {
         };
         let _ = drain(&mut c_rx);
         // 用一个保证错误的码（与真码不同）。
-        let wrong = if real == "111111111" { "222222222" } else { "111111111" };
+        let wrong = if real == "111111111" {
+            "222222222"
+        } else {
+            "111111111"
+        };
         for _ in 0..PAIRING_MAX_ATTEMPTS {
             let _ = hub.submit_pairing("ctrl", c_cid, "tgt", wrong);
         }
         let msgs = drain(&mut c_rx);
         assert!(msgs.iter().any(|m| matches!(
             m,
-            RemoteS2C::PairingResult { reason: PairingFailReason::TooManyAttempts, .. }
+            RemoteS2C::PairingResult {
+                reason: PairingFailReason::TooManyAttempts,
+                ..
+            }
         )));
         // 被控端收到取消。
         assert!(drain(&mut t_rx).iter().any(|m| matches!(
             m,
-            RemoteS2C::PairingCancelled { reason: DenyReason::TooManyAttempts }
+            RemoteS2C::PairingCancelled {
+                reason: DenyReason::TooManyAttempts
+            }
         )));
     }
 
@@ -1319,11 +1402,17 @@ mod tests {
         hub.request_control("ctrl", c, "tgt", true);
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::SessionStarted { role: Role::Controller, .. }
+            RemoteS2C::SessionStarted {
+                role: Role::Controller,
+                ..
+            }
         ));
         assert!(matches!(
             next_msg(&mut trx),
-            RemoteS2C::SessionStarted { role: Role::Controlled, .. }
+            RemoteS2C::SessionStarted {
+                role: Role::Controlled,
+                ..
+            }
         ));
         // 不应有配对码相关消息。
         assert!(drain(&mut trx).is_empty());
@@ -1337,7 +1426,10 @@ mod tests {
         hub.request_control("ctrl", c_cid, "tgt", false);
         assert!(matches!(
             next_msg(&mut c_rx),
-            RemoteS2C::ControlDenied { reason: DenyReason::CrossUser, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::CrossUser,
+                ..
+            }
         ));
     }
 
@@ -1348,7 +1440,10 @@ mod tests {
         hub.request_control("ctrl", c_cid, "ctrl", false);
         assert!(matches!(
             next_msg(&mut c_rx),
-            RemoteS2C::ControlDenied { reason: DenyReason::SelfControl, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::SelfControl,
+                ..
+            }
         ));
     }
 
@@ -1359,7 +1454,10 @@ mod tests {
         hub.request_control("ctrl", c_cid, "ghost", false);
         assert!(matches!(
             next_msg(&mut c_rx),
-            RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::Offline,
+                ..
+            }
         ));
     }
 
@@ -1373,7 +1471,10 @@ mod tests {
         hub.request_control("ctrl2", c2, "tgt", false);
         assert!(matches!(
             next_msg(&mut c2rx),
-            RemoteS2C::ControlDenied { reason: DenyReason::AlreadyControlled, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::AlreadyControlled,
+                ..
+            }
         ));
     }
 
@@ -1393,7 +1494,10 @@ mod tests {
         let _ = hub.submit_pairing("ctrl2", c2, "tgt", &code);
         assert!(matches!(
             next_msg(&mut c2rx),
-            RemoteS2C::PairingResult { reason: PairingFailReason::NoPending, .. }
+            RemoteS2C::PairingResult {
+                reason: PairingFailReason::NoPending,
+                ..
+            }
         ));
         // 原配对仍在：ctrl1 用真码仍可成功。
         // （此处不再重复，覆盖点是抢答被挡。）
@@ -1410,7 +1514,10 @@ mod tests {
         hub.handle("tgt", t, RemoteC2S::DeclineControl);
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::ControlDenied { reason: DenyReason::RejectedByUser, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::RejectedByUser,
+                ..
+            }
         ));
     }
 
@@ -1423,7 +1530,9 @@ mod tests {
         hub.disconnect("tgt", t);
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::SessionEnded { reason: EndReason::PeerDisconnected }
+            RemoteS2C::SessionEnded {
+                reason: EndReason::PeerDisconnected
+            }
         ));
         // 会话已拆：控制端再 relay 应被丢弃（对端收不到）。
         let frame = RemoteFrame::Echo("x".into()).to_value().expect("to_value");
@@ -1470,7 +1579,10 @@ mod tests {
         hub.request_control("ctrl", c, "t2", false);
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::ControlDenied { reason: DenyReason::ControllerBusy, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::ControllerBusy,
+                ..
+            }
         ));
     }
 
@@ -1494,8 +1606,8 @@ mod tests {
         c_id: &str,
         c_cid: u64,
         t_id: &str,
-        c_rx: &mut UnboundedReceiver<ToClient>,
-        t_rx: &mut UnboundedReceiver<ToClient>,
+        c_rx: &mut Receiver<ToClient>,
+        t_rx: &mut Receiver<ToClient>,
     ) -> HiddenSessionId {
         hub.open_hidden(c_id, c_cid, t_id, false);
         // 被控端收到的是**独立变体** HiddenControlRequested（不是 ControlRequested）。
@@ -1540,7 +1652,10 @@ mod tests {
             RemoteS2C::HiddenControlRequested { pairing_code, .. } => pairing_code,
             other => panic!("期望 HiddenControlRequested，得 {other:?}"),
         };
-        assert!(matches!(next_msg(&mut prx), RemoteS2C::PairingNeeded { .. }));
+        assert!(matches!(
+            next_msg(&mut prx),
+            RemoteS2C::PairingNeeded { .. }
+        ));
 
         let persisted = hub.submit_pairing("phone", p, "pc", &code);
         assert!(
@@ -1551,11 +1666,17 @@ mod tests {
         // 会话本身仍然建起来了（只是不留信任）。
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::HiddenSessionStarted { role: Role::Controller, .. }
+            RemoteS2C::HiddenSessionStarted {
+                role: Role::Controller,
+                ..
+            }
         ));
         assert!(matches!(
             next_msg(&mut trx),
-            RemoteS2C::HiddenSessionStarted { role: Role::Controlled, .. }
+            RemoteS2C::HiddenSessionStarted {
+                role: Role::Controlled,
+                ..
+            }
         ));
 
         // 对照组：镜像配对**仍然**要返回设备对，否则免码重连就没了。
@@ -1566,7 +1687,10 @@ mod tests {
             RemoteS2C::ControlRequested { pairing_code, .. } => pairing_code,
             other => panic!("期望 ControlRequested，得 {other:?}"),
         };
-        assert!(matches!(next_msg(&mut crx), RemoteS2C::PairingNeeded { .. }));
+        assert!(matches!(
+            next_msg(&mut crx),
+            RemoteS2C::PairingNeeded { .. }
+        ));
         assert_eq!(
             hub.submit_pairing("desk", c, "pc2", &code2),
             Some(("desk".to_string(), "pc2".to_string())),
@@ -1596,7 +1720,10 @@ mod tests {
         hub.open_hidden("phone", p, "pc", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::Offline,
+                ..
+            }
         ));
         assert!(drain(&mut trx).is_empty(), "被拒时 PC 上不该出现配对横幅");
 
@@ -1612,7 +1739,10 @@ mod tests {
         hub.open_hidden("phone", p, "pc", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::Offline,
+                ..
+            }
         ));
 
         // 合规的 caps 照常生效。
@@ -1639,11 +1769,15 @@ mod tests {
         let (p, mut prx) = join(&hub, "phone", "u", "手机");
         let sid = open_hidden_ok(&hub, "phone", p, "pc", &mut prx, &mut trx);
         // 3) 镜像会话仍在：桌面 → PC 的 Relay 照常送达。
-        let frame = RemoteFrame::Echo("mirror".into()).to_value().expect("to_value");
+        let frame = RemoteFrame::Echo("mirror".into())
+            .to_value()
+            .expect("to_value");
         hub.handle("desktop", c, RemoteC2S::Relay(frame));
         assert!(matches!(next_msg(&mut trx), RemoteS2C::Relay(_)));
         // 4) 隐藏会话数据面走 RelayTo{sid}，PC 收得到且带回 sid。
-        let llm = RemoteFrame::Echo("hidden".into()).to_value().expect("to_value");
+        let llm = RemoteFrame::Echo("hidden".into())
+            .to_value()
+            .expect("to_value");
         hub.handle(
             "phone",
             p,
@@ -1653,7 +1787,10 @@ mod tests {
             },
         );
         match next_msg(&mut trx) {
-            RemoteS2C::RelayTo { session_id, payload } => {
+            RemoteS2C::RelayTo {
+                session_id,
+                payload,
+            } => {
                 assert_eq!(session_id, sid);
                 assert_eq!(
                     RemoteFrame::from_value(&payload).expect("还原"),
@@ -1663,10 +1800,7 @@ mod tests {
             other => panic!("期望 RelayTo，得 {other:?}"),
         }
         // 5) 隐藏会话的帧**绝不**串到镜像会话去：桌面控制端一条都不该收到。
-        assert!(
-            drain(&mut crx).is_empty(),
-            "隐藏会话的数据面串进了镜像会话"
-        );
+        assert!(drain(&mut crx).is_empty(), "隐藏会话的数据面串进了镜像会话");
         // 6) 反向同理：PC 经 sid 回帧只到手机，不到桌面。
         hub.handle(
             "pc",
@@ -1677,7 +1811,10 @@ mod tests {
             },
         );
         assert!(matches!(next_msg(&mut prx), RemoteS2C::RelayTo { .. }));
-        assert!(drain(&mut crx).is_empty(), "PC 的隐藏会话回帧串进了镜像会话");
+        assert!(
+            drain(&mut crx).is_empty(),
+            "PC 的隐藏会话回帧串进了镜像会话"
+        );
     }
 
     #[test]
@@ -1696,7 +1833,10 @@ mod tests {
         hub.open_hidden("phone-extra", p, "pc", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::AlreadyControlled, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::AlreadyControlled,
+                ..
+            }
         ));
         // 被拒发生在**生成配对码之前**：PC 上不该多出一个横幅。
         assert!(drain(&mut trx).is_empty(), "超限请求不得在被控端弹出配对码");
@@ -1718,14 +1858,20 @@ mod tests {
         hub.open_hidden("phone", p, "pc2", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::ControllerBusy, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::ControllerBusy,
+                ..
+            }
         ));
         assert!(drain(&mut t2rx).is_empty());
         // 对同一台 PC 再开一条也是 ControllerBusy。
         hub.open_hidden("phone", p, "pc1", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::ControllerBusy, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::ControllerBusy,
+                ..
+            }
         ));
     }
 
@@ -1740,7 +1886,9 @@ mod tests {
         let sid = open_hidden_ok(&hub, "phone", p, "pc", &mut prx, &mut trx);
         // 同账户的第三台设备猜中了 sid。
         let (e, mut erx) = join(&hub, "evil", "u", "同账户另一台");
-        let frame = RemoteFrame::Echo("注入".into()).to_value().expect("to_value");
+        let frame = RemoteFrame::Echo("注入".into())
+            .to_value()
+            .expect("to_value");
         hub.handle(
             "evil",
             e,
@@ -1779,7 +1927,10 @@ mod tests {
         hub.open_hidden("phone", p, "old-pc", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::Offline,
+                ..
+            }
         ));
         // 老 PC 上不能出现一个念了也没用的配对码横幅。
         assert!(drain(&mut trx).is_empty(), "老端不得收到配对码");
@@ -1809,7 +1960,9 @@ mod tests {
                 if session_id == sid1
         ));
         assert!(drain(&mut crx).is_empty(), "手机断线波及了镜像会话");
-        let frame = RemoteFrame::Echo("still-alive".into()).to_value().expect("to_value");
+        let frame = RemoteFrame::Echo("still-alive".into())
+            .to_value()
+            .expect("to_value");
         hub.handle(
             "phone-2",
             p2,
@@ -1834,7 +1987,9 @@ mod tests {
         );
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::SessionEnded { reason: EndReason::PeerDisconnected }
+            RemoteS2C::SessionEnded {
+                reason: EndReason::PeerDisconnected
+            }
         ));
         // 3) 会话已拆：再发 RelayTo 转不出去（幽灵条目会在这里暴露）。
         hub.handle(
@@ -1885,7 +2040,10 @@ mod tests {
         hub.request_control("desktop", c, "pc", false);
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::ControlDenied { reason: DenyReason::TargetPairing, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::TargetPairing,
+                ..
+            }
         ));
         // 反向：镜像配对进行中，手机也拿 TargetPairing。
         let hub2 = Hub::new();
@@ -1893,13 +2051,19 @@ mod tests {
         say_hello(&hub2, "pc", t2);
         let (c2, mut c2rx) = join(&hub2, "desktop", "u", "桌面");
         hub2.request_control("desktop", c2, "pc", false);
-        assert!(matches!(next_msg(&mut t2rx), RemoteS2C::ControlRequested { .. }));
+        assert!(matches!(
+            next_msg(&mut t2rx),
+            RemoteS2C::ControlRequested { .. }
+        ));
         let _ = next_msg(&mut c2rx); // PairingNeeded
         let (p2, mut p2rx) = join(&hub2, "phone", "u", "手机");
         hub2.open_hidden("phone", p2, "pc", false);
         assert!(matches!(
             next_msg(&mut p2rx),
-            RemoteS2C::ControlDenied { reason: DenyReason::TargetPairing, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::TargetPairing,
+                ..
+            }
         ));
     }
 
@@ -1912,7 +2076,11 @@ mod tests {
         let (p, mut prx) = join(&hub, "phone", "u", "手机");
         hub.open_hidden("phone", p, "pc", true);
         let sid = match next_msg(&mut prx) {
-            RemoteS2C::HiddenSessionStarted { session_id, role: Role::Controller, .. } => session_id,
+            RemoteS2C::HiddenSessionStarted {
+                session_id,
+                role: Role::Controller,
+                ..
+            } => session_id,
             other => panic!("期望 HiddenSessionStarted，得 {other:?}"),
         };
         assert!(matches!(
@@ -1928,7 +2096,10 @@ mod tests {
         hub.open_hidden("phone-2", p2, "old-pc", true);
         assert!(matches!(
             next_msg(&mut p2rx),
-            RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::Offline,
+                ..
+            }
         ));
         assert!(drain(&mut oldrx).is_empty());
     }
@@ -1943,17 +2114,26 @@ mod tests {
         hub.open_hidden("phone", p, "pc", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::CrossUser, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::CrossUser,
+                ..
+            }
         ));
         hub.open_hidden("phone", p, "phone", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::SelfControl, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::SelfControl,
+                ..
+            }
         ));
         hub.open_hidden("phone", p, "ghost", false);
         assert!(matches!(
             next_msg(&mut prx),
-            RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
+            RemoteS2C::ControlDenied {
+                reason: DenyReason::Offline,
+                ..
+            }
         ));
     }
 
@@ -1985,6 +2165,95 @@ mod tests {
         }
     }
 
+    // ── 片 11：背压 ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn 片11_出站队列满时踢掉该连接而不是静默丢帧() {
+        // 中继上跑的是**有序流**（终端输出 / 镜像帧 / LLM 增量）。悄悄丢一条会让对端
+        // 的状态永久错位且无从察觉；断开则是客户端已经会处理的情况——重连后走既有的
+        // 重新握手与补齐路径。
+        let hub = Hub::new();
+        // 队列开到 1，第二条就满。
+        let ((c, mut crx), _ckill) = join_with_queue(&hub, "ctrl", "u", "控制端", 1);
+        let ((_t, mut trx), tkill) = join_with_queue(&hub, "tgt", "u", "被控端", 1);
+        // 两边各自的 Welcome 由 ws.rs 发，这里没有；先把配对跑通。
+        pair_ok(&hub, "ctrl", c, "tgt", &mut crx, &mut trx);
+
+        // 现在 trx 空着。塞满它（容量 1），再塞一条就该触发 kill。
+        let frame = RemoteFrame::Echo("x".into()).to_value().expect("to_value");
+        hub.handle("ctrl", c, RemoteC2S::Relay(frame.clone()));
+        // 队列已满且**没人消费**（模拟客户端卡死不读）。
+        hub.handle("ctrl", c, RemoteC2S::Relay(frame));
+
+        // kill 已被触发 —— `notified()` 在 notify_one 之后立刻就绪。
+        let killed = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt")
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(50), tkill.notified())
+                    .await
+                    .is_ok()
+            });
+        assert!(
+            killed,
+            "队列满必须触发 kill 旁路，否则一个卡死的客户端能撑爆服务端内存"
+        );
+    }
+
+    #[test]
+    fn 片11_队列没满时一切照旧() {
+        // 背压不该改变正常路径的任何行为。
+        let hub = Hub::new();
+        let ((c, mut crx), _ck) = join_with_queue(&hub, "ctrl", "u", "控制端", 8);
+        let ((_t, mut trx), tkill) = join_with_queue(&hub, "tgt", "u", "被控端", 8);
+        pair_ok(&hub, "ctrl", c, "tgt", &mut crx, &mut trx);
+
+        let frame = RemoteFrame::Echo("x".into()).to_value().expect("to_value");
+        hub.handle("ctrl", c, RemoteC2S::Relay(frame));
+        assert!(matches!(next_msg(&mut trx), RemoteS2C::Relay(_)));
+
+        let killed = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt")
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(20), tkill.notified())
+                    .await
+                    .is_ok()
+            });
+        assert!(!killed, "没满就不该踢人");
+    }
+
+    #[test]
+    fn 片11_驱逐旧连接时队列已满也踢得掉() {
+        // 老写法 `let _ = old.tx.send(Close)` 在有界通道上会**静默失败**：
+        // 队列满的那条连接正是最需要被踢掉的（它已经卡死了），却恰好踢不动。
+        let hub = Hub::new();
+        let ((_c, _crx), kill1) = join_with_queue(&hub, "dev", "u", "第一次连接", 1);
+        // 填满它的队列（这条 Welcome 由测试自己塞，模拟「已经积压」）。
+        {
+            let st = hub.lock();
+            let peer = st.peers.get("dev").expect("peer");
+            peer.tx
+                .try_send(ToClient::Msg(Box::new(RemoteS2C::Pong)))
+                .expect("填满");
+        }
+        // 同 device 再连一次 ⇒ 驱逐旧连接。
+        let ((_c2, _crx2), _kill2) = join_with_queue(&hub, "dev", "u", "第二次连接", 1);
+
+        let killed = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("rt")
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(50), kill1.notified())
+                    .await
+                    .is_ok()
+            });
+        assert!(killed, "队列满的旧连接必须走 kill 旁路踢掉");
+    }
+
     #[test]
     fn 老客户端不发_clienthello_不影响镜像会话() {
         // 兼容矩阵「新服务端 × 老客户端」：老端从不发 ClientHello，caps 恒为空，
@@ -1993,13 +2262,17 @@ mod tests {
         let (c, mut crx) = join(&hub, "old-ctrl", "u", "老控制端");
         let (t, mut trx) = join(&hub, "old-tgt", "u", "老被控端");
         pair_ok(&hub, "old-ctrl", c, "old-tgt", &mut crx, &mut trx);
-        let frame = RemoteFrame::Echo("ping".into()).to_value().expect("to_value");
+        let frame = RemoteFrame::Echo("ping".into())
+            .to_value()
+            .expect("to_value");
         hub.handle("old-ctrl", c, RemoteC2S::Relay(frame));
         assert!(matches!(next_msg(&mut trx), RemoteS2C::Relay(_)));
         hub.handle("old-tgt", t, RemoteC2S::EndSession);
         assert!(matches!(
             next_msg(&mut crx),
-            RemoteS2C::SessionEnded { reason: EndReason::PeerLeft }
+            RemoteS2C::SessionEnded {
+                reason: EndReason::PeerLeft
+            }
         ));
     }
 }

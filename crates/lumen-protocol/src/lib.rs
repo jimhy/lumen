@@ -75,12 +75,33 @@ pub mod routes {
     pub const HEARTBEAT: &str = "/api/v1/heartbeat";
     /// 远程控制 WebSocket 长连接 `GET`（升级；M5.3 终端远程，需 `Authorization` 头）。
     pub const WS: &str = "/api/v1/ws";
+    /// 本设备的配对信任对：`GET` 列举（M7 片 11）。
+    ///
+    /// **为什么需要它**：一次配对 = 对那台 PC 的**长期免码控制权**，而在此之前唯一的
+    /// 撤销手段是删掉整台设备（靠外键级联顺带清 `device_pairs`）——粒度粗到没法用。
+    /// 丢手机的用户需要的是「把这台手机的信任撤掉」，不是「把我的 PC 从账户里删了」。
+    pub const PAIRS: &str = "/api/v1/pairs";
 
     /// 单设备路径（重命名 `PATCH` / 删除 `DELETE`）。
     #[must_use]
     pub fn device(id: &str) -> String {
         format!("/api/v1/devices/{id}")
     }
+
+    /// 撤销与某台设备的配对信任 `DELETE`（M7 片 11）。
+    ///
+    /// `peer` 传 [`PAIRS_ALL`] 即**清空本设备的全部信任对**——那是「关掉生物锁」
+    /// （蓝图 §9.3）与「手机丢了」两个场景真正需要的动作。
+    #[must_use]
+    pub fn pair(peer: &str) -> String {
+        format!("/api/v1/pairs/{peer}")
+    }
+
+    /// [`pair`] 的通配 peer：清空本设备的全部信任对。
+    ///
+    /// 用 `*` 而不是「对 `PAIRS` 发 `DELETE`」：后者在路由上与「删除某一对」是两个
+    /// 不同的形状，客户端要写两条路径；而 `*` 让「撤一个」与「全撤」共用一条。
+    pub const PAIRS_ALL: &str = "*";
 }
 
 /// 统一错误响应体（HTTP 4xx/5xx 时返回）。
@@ -203,6 +224,40 @@ pub struct DeviceRecord {
 pub struct DeviceListResponse {
     /// 同账户下全部设备（在线优先由客户端排序）。
     pub devices: Vec<DeviceRecord>,
+}
+
+/// 一条配对信任（`GET /pairs`，M7 片 11）。
+///
+/// **一条 = 一台对端设备**，不是一行 `device_pairs`：那张表存的是无序对
+/// `(dev_lo, dev_hi)`，而用户想看的是「我这台手机信任了哪些电脑」。服务端负责把
+/// 无序对翻译成「对端是谁」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairRecord {
+    /// 对端设备 id。
+    pub peer_device_id: String,
+    /// 对端设备显示名。**可能为空**——对端行已被删但信任对还在时（外键级联之外的
+    /// 竞态窗口）取不到名字，此时客户端应显示 id 而不是显示一个空白项。
+    pub peer_name: String,
+    /// 建立信任的 Unix 秒。
+    pub created_at: i64,
+}
+
+/// 配对信任列表响应（`GET /pairs`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairListResponse {
+    /// 本设备当前信任的全部对端，按建立时间升序。
+    pub pairs: Vec<PairRecord>,
+}
+
+/// 撤销配对信任的响应（`DELETE /pairs/{peer}`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRevokeResponse {
+    /// 实际撤掉了几条。
+    ///
+    /// **要回具体条数而不是 `{"ok":true}`**：用户点「清空全部信任」之后，
+    /// 「已撤销 3 台」与「已撤销 0 台」是完全不同的两件事——后者说明他以为撤掉的
+    /// 东西其实不在这台设备上，而一句笼统的成功会让他就此安心。
+    pub revoked: u64,
 }
 
 /// 重命名设备请求（`PATCH /devices/{id}`）。
