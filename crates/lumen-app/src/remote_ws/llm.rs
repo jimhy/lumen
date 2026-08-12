@@ -339,6 +339,31 @@ impl Conv {
     }
 }
 
+/// 片 8：把一次工具调用写进审计日志。
+///
+/// # 为什么参数取 `input` 的 JSON 而不是某个具体字段
+///
+/// `LlmToolInput` 是**任意 JSON**（每个工具的入参形状都不同，且会随 CLI 版本长）。
+/// 审计要回答的是「它到底跑了什么」，那就得看原样的入参；挑字段等于预设了工具清单，
+/// 而清单一变审计就悄悄记漏——**审计漏记比记多危险得多**。
+///
+/// 脱敏由 `llm_audit::record` 统一做（首 N 字符 + 全量 sha256 + 字节数）。
+fn audit_tool_use(conv: &Conv, name: &str, input: &lumen_protocol::llm::LlmToolInput) {
+    // `to_value` 失败（几乎不可能）时退化成空参数：审计要记下「调用发生过」这件事，
+    // 那比因为参数序列化不出来就整条不记要好。
+    let arg = serde_json::to_string(input.get()).unwrap_or_default();
+    crate::llm_audit::record(
+        &crate::llm_audit::AuditEvent {
+            ev: "ToolUse",
+            conv: conv.meta.conv_id,
+            tool: name.to_string(),
+            cwd: conv.meta.cwd.as_str().to_string(),
+            ..crate::llm_audit::AuditEvent::new("ToolUse")
+        },
+        Some(&arg),
+    );
+}
+
 /// 往有界队列里压一条，满则丢最老的。
 fn push_bounded(q: &mut VecDeque<String>, v: String) {
     if q.len() >= LLM_CLIENT_MSG_DEDUP_MAX {
@@ -1686,6 +1711,16 @@ impl LlmPlane {
         let Some(conv) = self.convs.get_mut(&conv_id) else {
             return;
         };
+        // ★ 片 8：工具调用进审计日志。
+        //
+        // ⑫ 砍掉桌面会话 UI 之后，「手机远程让这台 PC 跑了什么」在界面上只剩一个计数图标，
+        // 关掉 Lumen 就没了。这一行是唯一能事后回答那个问题的东西（蓝图 §6.8.4）。
+        //
+        // **只记工具名 / cwd / 参数（按 `audit_arg_head_len` 脱敏）**，不记对话正文 ——
+        // 与弹层「绝不出现对话正文」是同一条纪律。
+        if let LlmBlock::ToolUse { name, input, .. } = &entry.block {
+            audit_tool_use(conv, name, input);
+        }
         if let Some(build) = conv.cur.as_mut() {
             build.assistant.push(entry.clone());
         }

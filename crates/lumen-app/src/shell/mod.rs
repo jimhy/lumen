@@ -8,6 +8,8 @@
 //! 菜单）与登录覆盖层（mock）。UI 只产出动作（[`ShellOutput`]），
 //! 会话增删切换/PTY 写入/设置即时生效/登录写盘由 main.rs 执行。
 
+// M7 片 8：远程 LLM 会话的图标标识 + 4 行弹层（含「断开」——本片的安全底线）。
+pub mod agent_icon;
 pub mod completion_ui;
 pub mod filetree;
 pub mod history_search_ui;
@@ -81,6 +83,8 @@ pub struct TabItem {
 /// 跨帧保留的外壳 UI 状态。
 #[derive(Default)]
 pub struct ShellState {
+    /// M7 片 8：远程 LLM 会话弹层是否展开。**跨帧保持**，由图标点击翻转。
+    pub agent_popup_open: bool,
     /// 进行中的重命名：(会话 id, 编辑中文本)。编辑期间键盘归 egui。
     pub renaming: Option<(u64, String)>,
     /// 重命名刚开始，下一帧把焦点交给编辑框。
@@ -486,6 +490,8 @@ pub struct ShellInput<'a> {
     pub completion_view: Option<completion_ui::CompletionView<'a>>,
     /// 焦点窗格运行受支持 LLM CLI 时的 HUD 数据。
     pub llm_hud: Option<hud::HudView>,
+    /// M7 片 8：远程 LLM 会话的图标 / 弹层数据（两个计数 + 每条会话一行）。
+    pub agent_icon: agent_icon::AgentIconState,
     /// 远程设备列表（M5.2；仅远程 tab 渲染，服务端已按 last_seen 倒序）。
     pub remote_devices: &'a [lumen_protocol::DeviceRecord],
     /// 当前账号（或未登录作用域）的 SSH 服务器与分组库存。
@@ -545,6 +551,11 @@ pub enum OverwriteChoice {
 
 /// 一帧外壳 UI 的产出。
 pub struct ShellOutput {
+    /// M7 片 8：用户在远程 LLM 弹层里点了什么（断开 / 全部断开 / 打开审计日志）。
+    ///
+    /// ★ 「断开」是本片的安全底线：没有它，「一部手机能在我的电脑上跑任意命令而我
+    /// 无法阻止」就被写进了设计（蓝图 §6.8.1）。
+    pub agent_action: Option<agent_icon::AgentIconAction>,
     /// 终端工作区整体矩形（egui 逻辑点坐标；拖放落点判定等用）。
     pub term_rect: egui::Rect,
     /// SSH 中央区实际终端内容矩形（扣除状态栏与监控栏）。
@@ -843,6 +854,7 @@ pub fn show(
             .remote_session
             .is_some_and(|sess| matches!(sess.role, lumen_protocol::remote::Role::Controller));
     let mut out = ShellOutput {
+        agent_action: None,
         term_rect: egui::Rect::NOTHING,
         ssh_terminal_rect: None,
         pane_rects: Vec::new(),
@@ -2633,6 +2645,33 @@ pub fn show(
         }
         if b_out.end_session {
             out.end_remote_session = true;
+        }
+    }
+
+    // —— M7 片 8：远程 LLM 会话图标 + 弹层 ——
+    //
+    // 画在横幅**之后**：⑪ 拍板后「正在被镜像」与「手机 AI 会话」两种远程态会同时出现，
+    // 两者必须并存且可区分（§6.8.2 约束 2）。横幅在顶部居中，图标在右上角。
+    {
+        // 锁屏时图标仍显示计数（存在性信息无害），但弹层不可展开 —— 判定在
+        // `AgentIconState::expandable` 里，这里只负责把「锁没锁」如实传进去。
+        if input.agent_icon.visible() {
+            egui::Area::new(egui::Id::new("lumen_agent_icon"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .order(egui::Order::Foreground)
+                .show(root.ctx(), |ui| {
+                    if agent_icon::icon(ui, &input.agent_icon, pal) {
+                        st.agent_popup_open = !st.agent_popup_open;
+                    }
+                });
+        } else {
+            // 会话全没了就把弹层一起收起来，否则它会挂在一个空列表上。
+            st.agent_popup_open = false;
+        }
+        if st.agent_popup_open {
+            let a_out = agent_icon::popup(root.ctx(), &input.agent_icon, pal);
+            st.agent_popup_open = a_out.open;
+            out.agent_action = a_out.action;
         }
     }
 

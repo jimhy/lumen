@@ -5674,6 +5674,59 @@ impl RemoteWs {
         }
     }
 
+    /// M7 片 8：主动断开一条隐藏会话（图标弹层里那个红色按钮）。
+    ///
+    /// # 这是 ⑫ 之后剩下的唯一「掐断」手段
+    ///
+    /// 一部手机能远程驱动本机跑任意 Bash（Tier 0 无逐次授权）。在此之前桌面端
+    /// **没有任何终止入口**——`remote_ws.rs` 里那段长注释明写着「也没有 `EndHidden`
+    /// 的入口」。没有它，「一部手机能在我的电脑上跑任意命令而我无法阻止」就是设计的一部分
+    /// （蓝图 §6.8.1 把这条列为不可省的底线）。
+    ///
+    /// **本地表也立刻删**：`teardown_hidden_one` 对主动方 `except`，发起端收不到
+    /// `HiddenSessionEnded` 回执（与 `close()` 同款语义，见移动端 `state/README.md` 第 3 条）。
+    /// 等回执是等不到的。
+    pub fn end_hidden(&mut self, session_id: HiddenSessionId) {
+        self.send(RemoteC2S::EndHidden { session_id });
+        // 审计：用户主动掐断也是一条要留痕的安全动作 —— 事后要能回答
+        // 「那次是它自己结束的，还是我掐的」。
+        let peer = self
+            .hidden
+            .get(&session_id)
+            .map(|h| h.peer_name.clone())
+            .unwrap_or_default();
+        crate::llm_audit::record(
+            &crate::llm_audit::AuditEvent {
+                ev: "SessionClosed",
+                sid: session_id,
+                peer,
+                note: "reason=LocalUser".to_string(),
+                ..crate::llm_audit::AuditEvent::new("SessionClosed")
+            },
+            None,
+        );
+        // 分号不可省：`HashMap::remove` 返回 `Option<HiddenSession>`，作为尾表达式
+        // 会让本函数意外变成「返回被删掉的那条会话」，而调用方并不关心它。
+        let _ = self.hidden.remove(&session_id);
+    }
+
+    /// 断开全部隐藏会话。
+    pub fn end_all_hidden(&mut self) {
+        for id in self.hidden.keys().copied().collect::<Vec<_>>() {
+            self.end_hidden(id);
+        }
+    }
+
+    /// M7 片 8：当前隐藏会话的只读视图（图标计数 + 弹层每行一条）。
+    ///
+    /// **图标的 📱 计数只能取自这里**，不能用 `LlmRunnerManager` 的 runner 数：
+    /// §6.7 的硬契约是「手机断线不杀 runner」⇒ runner 数 ≠ 手机会话数。
+    /// 用 runner 数会在「手机已断线但 turn 还在跑」时显示 0 —— 而那恰恰是最需要
+    /// 可见的状态（蓝图 §6.8.2 的三选一表）。
+    pub fn hidden_sessions(&self) -> impl Iterator<Item = (HiddenSessionId, &HiddenSession)> {
+        self.hidden.iter().map(|(id, h)| (*id, h))
+    }
+
     /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
     #[must_use]
     pub fn is_controlling(&self) -> bool {
@@ -7712,6 +7765,20 @@ impl RemoteWs {
                 role,
             } => {
                 self.hidden_incoming = None;
+                // ★ 片 8：审计。一条隐藏会话 = 一部手机拿到了在这台机器上跑命令的权限，
+                // 而它在桌面上**没有横幅、没有指示器**（那正是「隐藏」的含义）。
+                // 谁、什么时候接进来的，只有这一行能事后回答。
+                crate::llm_audit::record(
+                    &crate::llm_audit::AuditEvent {
+                        ev: "SessionOpened",
+                        sid: session_id,
+                        peer: peer_name.clone(),
+                        peer_dev: peer_device_id.clone(),
+                        note: format!("role={role:?}"),
+                        ..crate::llm_audit::AuditEvent::new("SessionOpened")
+                    },
+                    None,
+                );
                 self.hidden.insert(
                     session_id,
                     HiddenSession {
@@ -7721,7 +7788,23 @@ impl RemoteWs {
                     },
                 );
             }
-            RemoteS2C::HiddenSessionEnded { session_id, .. } => {
+            RemoteS2C::HiddenSessionEnded { session_id, reason } => {
+                // 结束也要记：一段区间的两端都在，事后才能算出「它连了多久」。
+                let peer = self
+                    .hidden
+                    .get(&session_id)
+                    .map(|h| h.peer_name.clone())
+                    .unwrap_or_default();
+                crate::llm_audit::record(
+                    &crate::llm_audit::AuditEvent {
+                        ev: "SessionClosed",
+                        sid: session_id,
+                        peer,
+                        note: format!("reason={reason:?}"),
+                        ..crate::llm_audit::AuditEvent::new("SessionClosed")
+                    },
+                    None,
+                );
                 self.hidden.remove(&session_id);
             }
             RemoteS2C::RelayTo { session_id, .. } => {

@@ -784,6 +784,20 @@ pub struct Strings {
     pub remote_incoming_code: &'static str,
     /// M7 片 6：配对二维码下方的一行说明（扫码或念数字，两条路都通）。
     pub remote_incoming_scan_hint: &'static str,
+    /// M7 片 8：远程 LLM 会话图标的 hover 提示。
+    pub agent_icon_tooltip: &'static str,
+    /// 断开一条隐藏会话。**本片的安全底线**（§6.8.3）。
+    pub agent_disconnect: &'static str,
+    /// 断开全部隐藏会话。
+    pub agent_disconnect_all: &'static str,
+    /// 打开审计日志目录。
+    pub agent_open_audit: &'static str,
+    /// 「本会话出现 {0} 种未识别事件」。
+    pub agent_unknown_events_fmt: &'static str,
+    /// 弹层里一条会话的状态：空闲。
+    pub agent_status_idle: &'static str,
+    /// 弹层里一条会话的状态：执行中。**刻意不带工具名**——见 main.rs 那处注释。
+    pub agent_status_busy: &'static str,
     /// 拒绝控制按钮
     pub remote_decline: &'static str,
     /// 正在被控横幅（{}=控制端设备名）

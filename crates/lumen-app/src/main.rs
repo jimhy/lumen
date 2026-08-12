@@ -43,6 +43,8 @@ mod keymap;
 mod links;
 #[cfg(feature = "input-editor")]
 mod llm_attachments;
+// M7 片 8：远程 LLM 会话的结构化审计日志（⑫ 砍掉会话 UI 之后唯一能事后回溯的东西）。
+mod llm_audit;
 mod llm_cli;
 mod llm_hud;
 // M7 片 2：PC 端 headless LLM runner（进程 + 行解析 + 白名单 + 适配接口）。
@@ -2575,6 +2577,64 @@ impl AppState {
             self.shell_state
                 .text_editor
                 .apply_saved(token, Err(SaveFailure::Message(error)));
+        }
+    }
+
+    /// M7 片 8：组装远程 LLM 会话图标 / 弹层要画的东西。
+    ///
+    /// 两个计数**刻意取自不同来源**，这是蓝图 §6.8.2 反复强调的一点：
+    ///
+    /// - 📱 手机数 ← `RemoteWs.hidden`（服务端零额外下发，三个既有事件维护）
+    /// - ⚙ 任务数 ← `LlmRunnerManager::working_count()`
+    ///
+    /// 用同一个来源会让「手机断线但 runner 还在跑」这个**最需要可见**的状态显示成 0
+    /// ——那正是 §6.7「断线不杀 runner」契约在 UI 上的唯一体现。
+    fn agent_icon_state(&self) -> shell::agent_icon::AgentIconState {
+        let rows: Vec<shell::agent_icon::AgentRow> = self
+            .remote_ws
+            .hidden_sessions()
+            .map(|(session_id, h)| {
+                // 一条隐藏会话对应哪个 runner 是片 8 之后才有的映射（目前一台手机
+                // 可开多个对话）；先按「本机唯一在跑的那个」给状态，取不到就说空闲。
+                // **绝不显示对话正文**，只到工具名为止。
+                let status = self
+                    .llm_runners
+                    .iter()
+                    .find(|r| r.state().is_working())
+                    .map_or_else(
+                        || i18n::strings().agent_status_idle.to_string(),
+                        // 只报「有活在跑」，不报具体工具名 —— runner 当前没有暴露
+                        // 「正在跑哪个工具」的访问器，而为了弹层去加一个会把工具名
+                        // 引进一条新的传播路径。状态本身足够满足「看见 + 掐断」。
+                        |_| i18n::strings().agent_status_busy.to_string(),
+                    );
+                let what = self
+                    .llm_runners
+                    .iter()
+                    .next()
+                    .map_or_else(String::new, |r| {
+                        format!("{} · {}", r.agent().as_wire(), r.workspace().display())
+                    });
+                shell::agent_icon::AgentRow {
+                    session_id,
+                    peer_name: h.peer_name.clone(),
+                    what,
+                    status,
+                }
+            })
+            .collect();
+        shell::agent_icon::AgentIconState {
+            phones: rows.len(),
+            tasks: self.llm_runners.working_count(),
+            rows,
+            // ★ 锁屏时仍显示计数（存在性信息无害），但弹层不可展开。
+            locked: self.app_lock.is_locked(),
+            unknown_kinds: self
+                .llm_runners
+                .iter()
+                .map(|r| r.tally().distinct())
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -9452,6 +9512,8 @@ impl App {
         }
         // F6 多语言：启动后立即将全局语言设为设置中存储的语言。
         i18n::set_language(app_settings.language);
+        // M7 片 8：审计日志的参数脱敏长度（0 = 只记哈希，见该设置项的文档）。
+        llm_audit::set_arg_head_len(app_settings.audit_arg_head_len);
         // 系统深浅模式（P12 Sync with OS）：winit 报不出来（None）按
         // 深色处理——默认主题即深色；后续变化经 ThemeChanged 事件维护。
         let os_dark = !matches!(window.theme(), Some(winit::window::Theme::Light));
@@ -13255,6 +13317,8 @@ impl ApplicationHandler<PtyWake> for App {
                     ))
                 });
                 let shell_input = shell::ShellInput {
+                    // M7 片 8：远程 LLM 会话的两个计数 + 每条会话一行。
+                    agent_icon: state.agent_icon_state(),
                     panes: &panes_view,
                     layout: tab.layout.clone(),
                     maximized: tab.maximized,
@@ -14213,6 +14277,29 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.end_remote_session {
                     state.clear_remote_restore_target();
                     state.remote_ws.end_session();
+                }
+                // M7 片 8：远程 LLM 会话弹层的动作。
+                if let Some(action) = shell_out.agent_action {
+                    match action {
+                        shell::agent_icon::AgentIconAction::Disconnect(sid) => {
+                            state.remote_ws.end_hidden(sid);
+                        }
+                        shell::agent_icon::AgentIconAction::DisconnectAll => {
+                            state.remote_ws.end_all_hidden();
+                        }
+                        shell::agent_icon::AgentIconAction::OpenAuditDir => {
+                            // 目录可能还不存在（一次远程会话都没有过），先建再开，
+                            // 否则用户点了只会看到一个「找不到路径」的系统弹窗。
+                            if let Some(dir) = llm_audit::audit_dir() {
+                                let _ = std::fs::create_dir_all(&dir);
+                                links::open(&links::LinkTarget::File {
+                                    path: dir,
+                                    line: None,
+                                    col: None,
+                                });
+                            }
+                        }
+                    }
                 }
                 // M5.3 part3d：记录镜像区物理像素矩形（鼠标命中→镜像选区换算，part4b）+ Phase 3
                 // 尺寸同步（控制端把订阅多窗格会话各格目标网格尺寸发给被控端，被控端 resize 后 1:1）。

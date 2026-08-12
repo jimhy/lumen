@@ -351,6 +351,28 @@ pub struct Settings {
     /// 网络代理：`#[serde(default)]` 旧文件无此节时补默认值（关闭）。
     #[serde(default)]
     pub proxy: ProxySettings,
+    /// M7 片 8：审计日志里**工具参数明文首段**的长度（字符数）。
+    ///
+    /// 审计日志（`<数据目录>/audit/llm-*.jsonl`）记录手机远程在本机发起的每一次工具调用。
+    /// 参数一律记「首 N 字符明文 + 全量 sha256 + 字节数」，三者的取舍是：
+    ///
+    /// - 只记哈希 ⇒ 事后**无法回答「它到底跑了什么」**，审计就失去了全部意义；
+    /// - 全量明文 ⇒ 对话正文是密码 / 密钥的重灾区，等于把它们抄进一个长期文件；
+    /// - **首 N 字符 + 摘要** ⇒ `rm -rf /` 这类看得见，长 heredoc 里的密钥落在窗口之外。
+    ///
+    /// ⚠ **设成 0 即完全关闭明文**（只剩哈希与长度）。那是你自己的取舍，但要知道后果：
+    /// 出事时你只能证明「某次调用的参数就是这一串」，无法看出它是什么。
+    #[serde(default = "default_audit_arg_head_len")]
+    pub audit_arg_head_len: usize,
+}
+
+/// [`Settings::audit_arg_head_len`] 的默认值。
+///
+/// 用具名函数而不是 `#[serde(default)]` 的 `Default::default()`：后者对 `usize` 是 **0**，
+/// 而 0 在这里的语义是「关闭明文」——旧设置文件升级上来会**静默失去审计明文**，
+/// 且没有任何迹象。这一个字段的默认值必须显式写出来。
+fn default_audit_arg_head_len() -> usize {
+    crate::llm_audit::DEFAULT_ARG_HEAD_LEN
 }
 
 impl Default for Settings {
@@ -365,6 +387,7 @@ impl Default for Settings {
             server_url: String::new(),
             update: UpdateSettings::default(),
             proxy: ProxySettings::default(),
+            audit_arg_head_len: default_audit_arg_head_len(),
         }
     }
 }
@@ -894,6 +917,7 @@ mod tests {
                 enabled: true,
                 url: "http://127.0.0.1:7890".to_owned(),
             },
+            audit_arg_head_len: default_audit_arg_head_len(),
         };
         let p = temp_path("roundtrip");
         s.save_to(&p).expect("写盘失败");
