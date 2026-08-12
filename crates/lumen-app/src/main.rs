@@ -46,7 +46,6 @@ mod llm_attachments;
 // M7 片 8：远程 LLM 会话的结构化审计日志（⑫ 砍掉会话 UI 之后唯一能事后回溯的东西）。
 mod llm_audit;
 mod llm_cli;
-mod llm_hud;
 // M7 片 2：PC 端 headless LLM runner（进程 + 行解析 + 白名单 + 适配接口）。
 // 片 2/片 3 只落地底座与 Claude 适配器，与远程帧的分发接线在片 4，故此刻大量公开项
 // 尚无调用点——与 `mod cloud` 同样的脚手架处置（非真死代码）。
@@ -5694,36 +5693,6 @@ impl AppState {
         })
     }
 
-    /// 鼠标是否命中焦点 LLM 会话的 HUD（展开卡片或收起按钮）。
-    ///
-    /// HUD 属于终端内工具：点击关闭/展开不应把键盘焦点交给 egui，
-    /// 否则后续普通字符落入无文本控件的 UI 层，Windows 会播放默认
-    /// 提示音。Area 的 LayerId 与创建时的 Id 同源，可精确区分 HUD
-    /// 和设置页、登录框等真正需要接管输入的前景层。
-    fn mouse_on_llm_hud(&self) -> bool {
-        if self.shell_state.hud.captures_pointer() {
-            return true;
-        }
-        if self.settings.layout.view_mode.is_remote() || self.settings.layout.view_mode.is_ssh() {
-            return false;
-        }
-        let session_id = self.focused_pane().id;
-        let ppp = self.egui_ctx.pixels_per_point();
-        let pos = egui::pos2(self.mouse_pos.0 as f32 / ppp, self.mouse_pos.1 as f32 / ppp);
-        self.egui_ctx.layer_id_at(pos).is_some_and(|layer| {
-            layer
-                == egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new(("lumen_llm_hud", session_id)),
-                )
-                || layer
-                    == egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new(("lumen_llm_hud_collapsed", session_id)),
-                    )
-        })
-    }
-
     /// 焦点窗格 footer 区域的物理像素矩形 (x, y, w, h)。
     ///
     /// 与 `sel_point_at_mouse` 使用相同几何源（同函数计算 footer_px），
@@ -8281,14 +8250,10 @@ impl AppState {
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
                 let shell_pid = pane.pty.shell_pid();
-                let foreground_pid = shell_pid.map(proc_icon::foreground_pid);
                 let exe = shell_pid.and_then(proc_icon::foreground_exe);
-                let detected = llm_cli::detect(exe.as_deref(), &pane.term);
-                if detected != pane.llm_cli {
-                    pane.llm_started_at = detected.map(|_| now);
-                }
-                pane.llm_cli = detected;
-                pane.llm_foreground_pid = detected.and(foreground_pid);
+                // HUD 删除后这里不再需要前台 PID（那是它专用的），顺带省掉每次探测
+                // 一遍系统进程快照的开销 —— `foreground_exe` 才是识别 CLI 必需的。
+                pane.llm_cli = llm_cli::detect(exe.as_deref(), &pane.term);
                 if pane.llm_cli.is_none() && !pane.slash_probe.shadow.is_empty() {
                     // CLI 已退出时清掉尚未提交的探测输入，避免候选串到 shell。
                     let _ = pane.write_user_input(b"\x15");
@@ -11694,12 +11659,6 @@ impl ApplicationHandler<PtyWake> for App {
                 if state.settings.layout.view_mode.is_ssh() {
                     return;
                 }
-                // HUD resize 必须独占整段拖动；否则 CursorMoved 会同时进入终端
-                // 鼠标上报或文本拖选，表现为尺寸跳动、CLI 被意外操作。
-                if state.mouse_on_llm_hud() {
-                    return;
-                }
-
                 // 镜像态（远程视图）：拖选进行中则更新选区终点并 return；其余
                 // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
                 // 只更新 hover，不会误触本地鼠标上报）。
@@ -11919,14 +11878,6 @@ impl ApplicationHandler<PtyWake> for App {
                         } else if !state.filetree_hovered {
                             state.filetree_focused = false;
                         }
-                    }
-                    return;
-                }
-                // HUD 是终端内工具：所有鼠标键都由 egui Area 自己处理，
-                // 不穿透到终端选区/鼠标上报，也不夺走终端键盘焦点。
-                if state.mouse_on_llm_hud() {
-                    if button == MouseButton::Left && btn_state == ElementState::Pressed {
-                        state.terminal_focused = state.terminal_focus_allowed();
                     }
                     return;
                 }
@@ -12970,41 +12921,6 @@ impl ApplicationHandler<PtyWake> for App {
                 });
                 #[cfg(not(unix))]
                 let active_cwd = osc_cwd;
-                // LLM HUD 只读取焦点 CLI 已画在终端中的模型/上下文状态；
-                // 不注入探测命令，也不从账号配置估算 token。
-                let llm_hud = if !state.settings.layout.view_mode.is_remote()
-                    && !state.settings.layout.view_mode.is_ssh()
-                {
-                    let pane = tab.focused_pane();
-                    pane.llm_cli
-                        .or_else(|| llm_cli::detect(None, &pane.term))
-                        .map(|kind| {
-                            let metrics = llm_cli::hud_metrics(&pane.term, kind);
-                            #[cfg(feature = "input-editor")]
-                            let bottom_inset =
-                                pane.footer_committed_h / state.egui_ctx.pixels_per_point();
-                            #[cfg(not(feature = "input-editor"))]
-                            let bottom_inset = 0.0;
-                            shell::hud::HudView {
-                                session_id: pane.id,
-                                kind,
-                                model: metrics.model,
-                                context: metrics.context,
-                                usage: metrics.usage,
-                                project_path: active_cwd
-                                    .as_ref()
-                                    .map(|path| path.display().to_string()),
-                                foreground_pid: pane.llm_foreground_pid,
-                                busy: pane.is_busy(),
-                                session_elapsed: pane
-                                    .llm_started_at
-                                    .map_or(Duration::ZERO, |started| started.elapsed()),
-                                bottom_inset,
-                            }
-                        })
-                } else {
-                    None
-                };
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 let remote_shell_idle = state.remote_ws.focused_mirror_shell_idle();
                 let ssh_shell_idle = state.ssh_runtime.active_shell_idle();
@@ -13383,7 +13299,6 @@ impl ApplicationHandler<PtyWake> for App {
                     completion_view: completion_view_owned,
                     #[cfg(not(feature = "input-editor"))]
                     completion_view: None,
-                    llm_hud,
                     remote_devices: &state.remote.devices,
                     ssh_inventory: state
                         .ssh_store

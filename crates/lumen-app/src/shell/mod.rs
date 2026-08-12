@@ -13,7 +13,6 @@ pub mod agent_icon;
 pub mod completion_ui;
 pub mod filetree;
 pub mod history_search_ui;
-pub mod hud;
 pub mod layout;
 pub mod lock_ui;
 pub mod login_ui;
@@ -113,8 +112,6 @@ pub struct ShellState {
     pub completion: completion_ui::CompletionUiState,
     /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
     pub toast: toast::ToastState,
-    /// LLM CLI 右下角 HUD 的展开/关闭状态。
-    pub hud: hud::HudState,
     /// M7 片 6：配对二维码的纹理缓存（同一份载荷只编码与上传一次）。
     pub pairing_qr: crate::remote_pairing_qr::PairingQrCache,
     /// 进行中的远程设备重命名（M5.2）：(设备 id, 编辑中文本)。编辑期间键盘归 egui。
@@ -488,8 +485,6 @@ pub struct ShellInput<'a> {
     /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
     /// 候选列表由 main 在 render 前计算好。
     pub completion_view: Option<completion_ui::CompletionView<'a>>,
-    /// 焦点窗格运行受支持 LLM CLI 时的 HUD 数据。
-    pub llm_hud: Option<hud::HudView>,
     /// M7 片 8：远程 LLM 会话的图标 / 弹层数据（两个计数 + 每条会话一行）。
     pub agent_icon: agent_icon::AgentIconState,
     /// 远程设备列表（M5.2；仅远程 tab 渲染，服务端已按 last_seen 倒序）。
@@ -2675,32 +2670,7 @@ pub fn show(
         }
     }
 
-    // —— LLM CLI HUD（右下角；设置/登录等覆盖层打开时暂时隐藏）——
-    // HUD 先于补全弹层绘制：斜杠菜单与 HUD 可以同时存在，重叠时菜单
-    // 位于 HUD 上方，且菜单的鼠标/滚轮命中不会被 HUD 截获。
-    let hud_pane_rect = input
-        .panes
-        .iter()
-        .position(|pane| pane.focused)
-        .and_then(|index| out.pane_rects.get(index))
-        .copied()
-        .unwrap_or(egui::Rect::NOTHING);
-    let hud_blocked = st.settings.open
-        || st.login.open
-        || st.history_search.open
-        || st.text_editor.is_visible()
-        || is_remote_view
-        || is_ssh_view;
-    hud::show(
-        root.ctx(),
-        &mut st.hud,
-        input.llm_hud.as_ref(),
-        hud_pane_rect,
-        pal,
-        hud_blocked,
-    );
-
-    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录/HUD 之上，toast 之下）——
+    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录之上，toast 之下）——
     // completion_view 由 main 每帧传入；Some = 显示弹窗，None = 不显示。
     if let Some(cv) = &input.completion_view {
         let c_out = completion_ui::show(root.ctx(), &mut st.completion, cv, pal);

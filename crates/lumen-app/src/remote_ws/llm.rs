@@ -1611,7 +1611,9 @@ impl LlmPlane {
     fn ingest_events(&mut self, ctx: &mut PumpCtx<'_>) {
         for (runner, tseq, event) in ctx.events {
             let Some(conv_id) = self.by_runner.get(runner).copied() else {
-                continue; // 不是经由本平面起的 runner（本地 HUD 起的），不上行。
+                // 不是经由本平面起的 runner ⇒ 没有对应的对话，不上行。
+                // （HUD 曾是本地起 runner 的另一个来源，已于 2026-08-12 整体删除。）
+                continue;
             };
             self.on_runner_event(conv_id, *tseq, event, ctx.now);
         }

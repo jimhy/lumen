@@ -888,44 +888,6 @@ pub struct Strings {
     /// 状态栏：经典模式切换按钮 hover tooltip
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub statusbar_classic_tip: &'static str,
-    /// LLM HUD：关闭按钮 tooltip
-    pub hud_close_tip: &'static str,
-    /// LLM HUD：收起按钮 tooltip
-    pub hud_open_tip: &'static str,
-    /// LLM HUD：左上角调整大小 tooltip
-    pub hud_resize_tip: &'static str,
-    /// LLM HUD：项目字段
-    pub hud_project: &'static str,
-    /// LLM HUD：上下文字段
-    pub hud_context: &'static str,
-    /// LLM HUD：CLI 未在终端公开该字段时的占位
-    pub hud_waiting_cli: &'static str,
-    /// LLM HUD：已用上下文百分比，单参 `{}`
-    pub hud_context_used_fmt: &'static str,
-    /// LLM HUD：剩余上下文百分比，单参 `{}`
-    pub hud_context_remaining_fmt: &'static str,
-    /// LLM HUD：运行状态
-    pub hud_status_working: &'static str,
-    /// LLM HUD：等待输入状态
-    pub hud_status_ready: &'static str,
-    /// LLM HUD：会话时长
-    pub hud_session: &'static str,
-    /// LLM HUD：token 统计
-    pub hud_tokens: &'static str,
-    /// LLM HUD：订阅/API 用量窗口
-    pub hud_usage: &'static str,
-    /// LLM HUD：工具活动
-    pub hud_tools: &'static str,
-    /// LLM HUD：子代理活动
-    pub hud_agents: &'static str,
-    /// LLM HUD：任务进度
-    pub hud_tasks: &'static str,
-    /// LLM HUD：配置计数
-    pub hud_config: &'static str,
-    /// LLM HUD：上下文压缩次数
-    pub hud_compactions: &'static str,
-    /// LLM HUD：后台数据加载中
-    pub hud_loading: &'static str,
     /// Compose 态输入框占位提示文字（缓冲为空时 footer 显示）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub composer_placeholder: &'static str,
