@@ -1,5 +1,4 @@
-//! 设置界面（M3.4）：全屏覆盖层，左分类导航 + 右内容区（对标 Warp，
-//! 参考截图 docs/截图/设置界面.png）。
+//! 设置界面（M3.4）：全屏覆盖层，左分类导航 + 右内容区（对标 Warp）。
 //!
 //! UI 只改 [`Settings`] 数据并产出变更标志（[`SettingsOutput`]），
 //! 即时生效（renderer 字体/主题重配置、全会话 resize、egui 样式重设、
@@ -455,7 +454,7 @@ fn heading(ui: &mut egui::Ui, pal: &Palette, text: &str) {
     ui.add_space(16.0);
 }
 
-/// Account（M3.5，参照截图 docs/截图/设置界面.png）：已登录展示
+/// Account（M3.5）：已登录展示
 /// 圆头像、展示名、邮箱与 Log out；未登录展示占位头像与 Log in 入口。
 /// 登录态与顶栏头像、头像菜单同源 main 的 `Option<Profile>`。
 fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mut SettingsOutput) {
