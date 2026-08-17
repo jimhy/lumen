@@ -55,11 +55,28 @@ if ($updated -ne $content) {
 }
 
 # 2) release 构建（此机 cargo 指纹坑：构建后务必核对产物时间戳）。
+#
+# 失败后自动降到 `-j 1` 重试一次：本机 rustc 在**并行**编译时会偶发
+# `STATUS_ACCESS_VIOLATION`(0xc0000005)，崩在哪个 crate 每次都不一样（实测崩过
+# zerocopy、lumen-protocol），而 `cargo check` 每次都干净通过——是工具链问题，
+# 不是代码问题。`-j 1` + 关增量是已验证有效的处方（2026-08-17 发 v1.1.1 时又踩了
+# 一次）。这里不直接写死 `-j 1`：那会让每次发版都退化成单线程全量构建，只在真崩
+# 了才降级最划算。
 Write-Host "==> cargo build --release" -ForegroundColor Cyan
 Push-Location $RepoRoot
 try {
     cargo build --release
-    if ($LASTEXITCODE -ne 0) { throw "cargo build 失败（exit $LASTEXITCODE）" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  并行构建失败；按本机已知的 rustc 并行崩溃处方降到 -j 1 重试" -ForegroundColor Yellow
+        $prevIncremental = $env:CARGO_INCREMENTAL
+        $env:CARGO_INCREMENTAL = '0'
+        try {
+            cargo build --release -j 1
+        } finally {
+            $env:CARGO_INCREMENTAL = $prevIncremental
+        }
+        if ($LASTEXITCODE -ne 0) { throw "cargo build 失败（-j 1 重试后仍失败，exit $LASTEXITCODE）" }
+    }
 } finally {
     Pop-Location
 }
