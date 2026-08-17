@@ -389,12 +389,6 @@ fn main() -> Result<()> {
         Some(p) => log::info!("日志落盘 → {}", p.display()),
         None => log::warn!("日志无法落盘（数据目录不可用），本次运行仅输出到 stderr"),
     }
-    // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
-    // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；
-    // 若日志里没有这行，就是拷了旧 exe，本次测试无效。
-    log::info!(
-        "[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16"
-    );
     let event_loop = EventLoop::<PtyWake>::with_user_event()
         .build()
         .context("创建事件循环失败")?;
@@ -8239,13 +8233,11 @@ impl AppState {
                     || i18n::strings().topbar_tab_ssh.to_owned(),
                     |session| session.display_name,
                 );
-            self.window.set_title(&format!("Lumen [ime-r4] — {title}"));
+            self.window.set_title(&format!("Lumen — {title}"));
             return;
         }
         let title = self.tabs[self.active_tab].display_title();
-        // [BUILD-MARKER r4]（composer-IME 取证临时）：标题栏带版本标记，海风哥
-        // 一眼确认跑的是不是带修复的新版，不用翻日志。坐实后连同诊断一并移除。
-        self.window.set_title(&format!("Lumen [ime-r4] — {title}"));
+        self.window.set_title(&format!("Lumen — {title}"));
     }
 
     /// 刷新 [`Self::foreground_exe`] 共享表：**一次**系统进程遍历查出所有会话
@@ -11015,15 +11007,6 @@ impl ApplicationHandler<PtyWake> for App {
             // CursorLeft 喂给 egui（仅自动化拖动测试用，正常使用不设）。
             || (matches!(event, WindowEvent::CursorLeft { .. })
                 && std::env::var_os("LUMEN_DIAG_IGNORE_CURSOR_LEFT").is_some());
-        // IME 诊断（composer Win10 取证，核心判据）：观察焦点翻转期首个
-        // Ime::Preedit 的 bypass_egui / terminal_focused / 路由决策。坐实 H1
-        // 后可移除。
-        if let WindowEvent::Ime(ref ime) = event {
-            log::info!(
-                "[IME-RAW] {ime:?} bypass_egui={bypass_egui} tf={} route_composer={ime_route_composer}",
-                state.terminal_focused
-            );
-        }
         if !bypass_egui {
             let resp = state.egui_state.on_window_event(&state.window, &event);
             if resp.repaint {
@@ -12425,12 +12408,6 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // 激进修复（composer Win10）：焦点翻转期首字也归 composer。
                 let route = state.ime_should_route_to_composer();
-                log::info!(
-                    "[IME-PREEDIT] text={text:?} cursor={cursor:?} tf={} route_composer={route} \
-                     will_drop={}",
-                    state.terminal_focused,
-                    !state.terminal_focused && !route
-                );
                 if !state.terminal_focused && !route {
                     return;
                 }
@@ -12478,10 +12455,6 @@ impl ApplicationHandler<PtyWake> for App {
                 // 双投。激进修复（composer Win10）：焦点翻转期 Compose 态
                 // 也放行，让 preedit 直达 composer 后的 commit 不丢。
                 let route = state.ime_should_route_to_composer();
-                log::info!(
-                    "[IME-COMMIT] text={text:?} tf={} route_composer={route}",
-                    state.terminal_focused
-                );
                 if !state.terminal_focused && !route {
                     return;
                 }
