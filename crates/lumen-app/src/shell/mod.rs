@@ -3230,9 +3230,15 @@ fn sidebar_ui(
                     draw_session_icon(ui, icon_center, entry.active, pal);
                 }
                 // 右侧只保留运行状态指示；未读圆点与窗格数量不再占用会话按钮。
-                let right_reserve = if entry.busy { 22.0 } else { 8.0 };
+                // 预留宽度固定 22px：spinner 只在忙时出现，但若预留随 busy 在 22/8
+                // 之间跳变，名称/路径的可用宽度就跟着变，超宽条目的省略号位置会随
+                // 忙闲来回跳（AI CLI 场景忙闲切换极频繁）——比常驻少 14px 文字宽度
+                // 扎眼得多。22 = spinner 中心距右边 11 + 半边长 6 + 约 4px 呼吸位
+                // （拖尾点半径最大约 1.15），忙时不压字；顺带让文字不再钻到浮动
+                // 滚动条底下。
+                const RIGHT_RESERVE: f32 = 22.0;
                 let text_left = rect.left() + ICON_COL;
-                let text_w = (rect.right() - right_reserve - text_left).max(10.0);
+                let text_w = (rect.right() - RIGHT_RESERVE - text_left).max(10.0);
                 // 名称 + 路径两行（路径未知时仅名称行），整体垂直居中于行内。
                 let block_h = if entry.path.is_some() { 30.0 } else { 16.0 };
                 let text_rect = egui::Rect::from_min_size(

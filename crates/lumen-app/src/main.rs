@@ -1026,6 +1026,10 @@ struct AppState {
     /// 区间内跳过终端渲染）不该反向推迟 ESU 完成帧的上屏。
     last_term_render_at: Option<Instant>,
     window: Arc<Window>,
+    /// 上次提交给 OS 的窗口标题（含 `Lumen — ` 前缀），`set_title` 去重用。
+    /// 调用点之一在 PTY drain 路径（每批数据一次，而打字回显是每字符一批），
+    /// 而这些批里标题 99.9% 没变。**只允许 `update_window_title` 写。**
+    last_window_title: String,
     renderer: Renderer,
     /// 全部 tab（每 tab 1~6 个终端窗格 = [`Session`]，见 [`Tab`]）。
     /// 至少一个；最后一个关闭即退出应用。
@@ -1413,9 +1417,19 @@ fn encode_submit(text: &str) -> Vec<u8> {
 }
 
 fn effective_session_mode(pane: &Session, force_fallback: bool) -> mode::InputMode {
+    // 只读 `probe_llm_clis` 每 500ms 维护的缓存，不再就地重算。
+    // 原先的 `or_else` 兜底在缓存为 None 时才跑——也就是「在 shell 里打字」的
+    // 常态：`detect(None, ..)` 命中不了 OSC 133 命令行与 OSC 标题就落到
+    // `visible_text()`，逐行 collect String 再 join 再 to_ascii_lowercase，整屏
+    // 走三趟。而本函数在**一帧内**就被调多次（footer 高度计算、footer 视图、
+    // egui UI 组装），**每次按键**也调，代价是白付的。
+    // 兜底还会反向致错：exe 已是 shell 时 detect 故意返回 None（CLI 已退出，见
+    // llm_cli.rs 的 exe_name 早退），此处再用 detect(None, ..) 会被残留在可视区
+    // 的品牌文字骗回 Some，把该结束的 CLI 模式续上。
+    // 代价（知情选择）：detect 只看 shell 的**直接**子进程，故「pwsh 里先起嵌套
+    // shell 再起 CLI」会恒判 None，不再有整屏文字兜底把它救回来。
     let llm_active = pane
         .llm_cli
-        .or_else(|| llm_cli::detect(None, &pane.term))
         .is_some_and(|kind| llm_cli::composer_ready(&pane.term, kind));
     if llm_active {
         mode::effective_mode_for_cli(&pane.term, force_fallback, true)
@@ -8217,14 +8231,16 @@ impl AppState {
     /// 窗口标题跟随当前模式的激活会话。本地模式与 tab 的
     /// `display_title` 同源；SSH 模式与会话栏同源（自定义名优先，
     /// 否则当前 Linux cwd 尾目录名）。
-    fn update_window_title(&self) {
-        if self.app_lock.is_locked() {
-            self.window
-                .set_title(&format!("Lumen — {}", i18n::strings().lock_screen_title));
-            return;
-        }
-        if self.settings.layout.view_mode.is_ssh() {
-            let title = self
+    fn update_window_title(&mut self) {
+        // 先把标题文本算出来，再与上次提交值比对——调用点之一在 PTY drain 路径上
+        // （`user_event` 里每批数据一次），而打字回显是「每字符一批」：不去重就是
+        // 每字符一次 SetWindowTextW（内核往返 + 标题栏重绘 + WinEvent/UIA 通知），
+        // 而这些批里标题 99.9% 根本没变。
+        let title = if self.app_lock.is_locked() {
+            format!("Lumen — {}", i18n::strings().lock_screen_title)
+        } else if self.settings.layout.view_mode.is_ssh() {
+            // SSH 模式与会话栏同源（自定义名优先，否则当前 Linux cwd 尾目录名）。
+            let name = self
                 .ssh_runtime
                 .session_views()
                 .into_iter()
@@ -8233,11 +8249,15 @@ impl AppState {
                     || i18n::strings().topbar_tab_ssh.to_owned(),
                     |session| session.display_name,
                 );
-            self.window.set_title(&format!("Lumen — {title}"));
+            format!("Lumen — {name}")
+        } else {
+            format!("Lumen — {}", self.tabs[self.active_tab].display_title())
+        };
+        if self.last_window_title == title {
             return;
         }
-        let title = self.tabs[self.active_tab].display_title();
-        self.window.set_title(&format!("Lumen — {title}"));
+        self.window.set_title(&title);
+        self.last_window_title = title;
     }
 
     /// 刷新 [`Self::foreground_exe`] 共享表：**一次**系统进程遍历查出所有会话
@@ -9874,6 +9894,8 @@ impl App {
             last_render_at: None,
             last_term_render_at: None,
             window,
+            // 起始为空 → init 末尾第一次 update_window_title 必然提交一次。
+            last_window_title: String::new(),
             renderer,
             tabs,
             active_tab: active_idx,
@@ -11317,19 +11339,26 @@ impl ApplicationHandler<PtyWake> for App {
                     &state.settings.keyboard,
                 );
                 #[cfg(feature = "input-editor")]
-                if !mirror_active {
+                if !mirror_active && pressed {
+                    // `pressed` 收进最外层条件：抬起事件本来就走不进这条 PassThrough
+                    // 分支，没必要为它再求值一次 llm_active（原先按下 + 抬起 =
+                    // 每敲一个键求值两次）。
                     let pane = &state.tabs[ti].panes[pi];
-                    let llm_active =
-                        pane.llm_cli.is_some() || llm_cli::detect(None, &pane.term).is_some();
-                    if pressed
-                        && llm_cli_native_navigation_passthrough(
-                            llm_active,
-                            pane.editor.view().text().is_empty(),
-                            state.shell_state.completion.open,
-                            state.modifiers,
-                            event.physical_key,
-                        )
-                    {
+                    // 只读 `probe_llm_clis`（重绘路径里 500ms 节流）维护的缓存，不再
+                    // 自己补一次 `detect(None, ..)`：传 None 会把 exe 名清空，从而绕过
+                    // llm_cli.rs 里「前台已回到 shell 说明 CLI 已退出，别信可视区残留
+                    // 品牌文字」的闸门——CLI 退出后屏上还留着 Claude Code 字样时，会把
+                    // 方向键/Esc 误判成要直通原生选择器。代价是缓存尚未刷新的窗口内
+                    // 首次方向键可能落回本地 composer，按键自身会触发重绘、下一轮探测
+                    // 即恢复。
+                    let llm_active = pane.llm_cli.is_some();
+                    if llm_cli_native_navigation_passthrough(
+                        llm_active,
+                        pane.editor.view().text().is_empty(),
+                        state.shell_state.completion.open,
+                        state.modifiers,
+                        event.physical_key,
+                    ) {
                         result = Some(keymap::LookupResult::PassThrough);
                     }
                 }

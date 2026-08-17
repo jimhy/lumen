@@ -165,6 +165,14 @@ const FRAME_ANIMATION_CONFIRM_FRAMES: u8 = 4;
 const FRAME_ANIMATION_IDLE_TIMEOUT: Duration = Duration::from_millis(600);
 /// 用户输入后的短时间内，TUI 回显和布局重绘不参与新一轮忙状态确认。
 const FRAME_USER_INPUT_GRACE: Duration = Duration::from_millis(250);
+/// 输入宽限期内为**已确认**的忙状态续期的封顶窗口，从最后一次非宽限期确认起算。
+///
+/// 连打时键间隔常 < 250ms，于是帧帧落在宽限期、谁也不给 busy_until 续期，600ms
+/// 后忙状态到期跌落，侧栏 spinner 自己消失又出现。允许续期即可消除这种闪烁；
+/// 但续期必须封顶——否则 TUI 干完活之后，用户在输入框里打字产生的纯回显帧会把
+/// 忙状态无限续下去，退化成「打字=在忙」的误判（宽限期本来就是为了防这个）。
+/// 3s 是折中：连打两三秒内 spinner 稳住，误判最多多亮 3.6s。
+const FRAME_BUSY_SUSTAIN_WINDOW: Duration = Duration::from_secs(3);
 
 /// 单窗格的 OSC 标题活动检测器。
 ///
@@ -230,6 +238,9 @@ struct FrameActivity {
     last_user_input_at: Option<Instant>,
     consecutive_frames: u8,
     busy_until: Option<Instant>,
+    /// 最后一次**非**输入宽限期内确认忙状态的时刻。宽限期内的续期以它为起点
+    /// 计 [`FRAME_BUSY_SUSTAIN_WINDOW`] 封顶，防止纯回显帧无限续命。
+    last_confirm_at: Option<Instant>,
 }
 
 impl FrameActivity {
@@ -240,6 +251,7 @@ impl FrameActivity {
             last_user_input_at: None,
             consecutive_frames: 0,
             busy_until: None,
+            last_confirm_at: None,
         }
     }
 
@@ -251,6 +263,7 @@ impl FrameActivity {
             self.last_frame_at = None;
             self.consecutive_frames = 0;
             self.busy_until = None;
+            self.last_confirm_at = None;
             return;
         }
         if frames == 0 {
@@ -265,6 +278,22 @@ impl FrameActivity {
         if follows_user_input {
             self.last_frame_at = Some(now);
             self.consecutive_frames = 0;
+            // 宽限期本意只是挡住「新一轮**确认**」——上一行清零 consecutive_frames
+            // 已经做到了；顺手 return 却把**续期**也一起断掉，于是连打（键间隔 <
+            // FRAME_USER_INPUT_GRACE）时帧帧落在宽限期，busy_until 拿不到续期，
+            // FRAME_ANIMATION_IDLE_TIMEOUT 后忙状态跌落，侧栏 spinner 自己消失又
+            // 出现。这里只为**已经确认过**的忙状态续期（条件里的 is_busy 保证跌落
+            // 之后回显帧不能把它重新点亮，点亮只能走下面的确认路径），且续期封顶在
+            // 最后一次非宽限期确认之后的 FRAME_BUSY_SUSTAIN_WINDOW 内——否则 TUI
+            // 干完活后用户继续打字，纯回显帧会把忙状态无限续下去。
+            if self.is_busy(now)
+                && self
+                    .last_confirm_at
+                    .and_then(|at| now.checked_duration_since(at))
+                    .is_some_and(|elapsed| elapsed <= FRAME_BUSY_SUSTAIN_WINDOW)
+            {
+                self.busy_until = Some(now + FRAME_ANIMATION_IDLE_TIMEOUT);
+            }
             return;
         }
 
@@ -281,6 +310,8 @@ impl FrameActivity {
 
         if self.consecutive_frames >= FRAME_ANIMATION_CONFIRM_FRAMES {
             self.busy_until = Some(now + FRAME_ANIMATION_IDLE_TIMEOUT);
+            // 记录这次「非宽限期」确认的时刻：宽限期内的续期以它为起点封顶。
+            self.last_confirm_at = Some(now);
         }
     }
 
@@ -895,6 +926,51 @@ mod tests {
         activity.observe(11, true, resumed);
         activity.observe(14, true, resumed + Duration::from_millis(120));
         assert!(activity.is_busy(resumed + Duration::from_millis(120)));
+    }
+
+    #[test]
+    fn 同步帧活动_连打期间续期忙状态并在封顶后退出() {
+        let start = Instant::now();
+        let mut activity = FrameActivity::new(0);
+
+        // 先用不紧邻输入的连续同步帧确认一次忙状态。
+        for mark in 1..=u64::from(FRAME_ANIMATION_CONFIRM_FRAMES) {
+            activity.observe(mark, true, start + Duration::from_millis(mark * 40));
+        }
+        let confirmed_at =
+            start + Duration::from_millis(u64::from(FRAME_ANIMATION_CONFIRM_FRAMES) * 40);
+        assert!(activity.is_busy(confirmed_at), "连续同步帧应确认忙状态");
+
+        // 连打：键间隔小于输入宽限期，每次按键都带一帧回显。步长与次数全部从常量
+        // 推导，改常量时用例自动跟随，不会静默失效。
+        let step = FRAME_USER_INPUT_GRACE / 2;
+        let presses_in_window = FRAME_BUSY_SUSTAIN_WINDOW.as_millis() / step.as_millis();
+        assert!(presses_in_window >= 2, "封顶窗口至少要容纳两次按键，否则本用例退化");
+        let mut mark = u64::from(FRAME_ANIMATION_CONFIRM_FRAMES);
+        for i in 1..=presses_in_window {
+            let now = confirmed_at + step * u32::try_from(i).unwrap();
+            activity.note_user_input(now);
+            mark += 1;
+            activity.observe(mark, true, now);
+            assert!(
+                activity.is_busy(now),
+                "封顶窗口内的回显帧应为已确认的忙状态续期"
+            );
+        }
+
+        // 继续连打，但已超出封顶窗口：不再续期，忙状态按 IDLE_TIMEOUT 自然到期。
+        let extra = FRAME_ANIMATION_IDLE_TIMEOUT.as_millis() / step.as_millis() + 2;
+        let mut last = confirmed_at;
+        for i in presses_in_window + 1..=presses_in_window + extra {
+            last = confirmed_at + step * u32::try_from(i).unwrap();
+            activity.note_user_input(last);
+            mark += 1;
+            activity.observe(mark, true, last);
+        }
+        assert!(
+            !activity.is_busy(last),
+            "超出封顶窗口后纯回显帧不得把忙状态无限续下去"
+        );
     }
 
     #[test]
