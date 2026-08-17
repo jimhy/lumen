@@ -2710,7 +2710,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumen-app"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-editor"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2776,7 +2776,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-protocol"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "base64",
  "serde",
@@ -2786,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-pty"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-renderer"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-server"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-ssh"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-term"
-version = "1.0.31"
+version = "1.1.0"
 dependencies = [
  "bitflags 2.13.0",
  "crossbeam-channel",
