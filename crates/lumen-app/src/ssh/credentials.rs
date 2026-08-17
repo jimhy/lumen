@@ -479,7 +479,7 @@ mod platform {
     }
 
     /// 凭据文件路径：文件名只含 target 哈希，不泄露 profile 结构、天然免路径注入。
-    fn secret_path(dir: &Path, reference: &CredentialReference) -> PathBuf {
+    pub(super) fn secret_path(dir: &Path, reference: &CredentialReference) -> PathBuf {
         let digest = Sha256::digest(reference.target().as_bytes());
         let mut name = String::with_capacity(32 + FILE_SUFFIX.len());
         for byte in &digest[..16] {
@@ -591,7 +591,7 @@ mod platform {
         error.raw_os_error().unwrap_or(-1).unsigned_abs()
     }
 
-    fn write_secret_in(
+    pub(super) fn write_secret_in(
         dir: &Path,
         reference: &CredentialReference,
         secret: &str,
@@ -645,7 +645,7 @@ mod platform {
         result
     }
 
-    fn read_secret_in(
+    pub(super) fn read_secret_in(
         dir: &Path,
         reference: &CredentialReference,
     ) -> Result<Option<SecretString>, CredentialError> {
@@ -690,7 +690,10 @@ mod platform {
         Ok(SecretString::new(text))
     }
 
-    fn delete_secret_in(dir: &Path, reference: &CredentialReference) -> Result<bool, CredentialError> {
+    pub(super) fn delete_secret_in(
+        dir: &Path,
+        reference: &CredentialReference,
+    ) -> Result<bool, CredentialError> {
         let path = secret_path(dir, reference);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -703,14 +706,25 @@ mod platform {
     pub(super) mod test_support {
         //! 测试后门：带目录参数的后端入口与路径计算，避免污染真实数据目录。
         //!
-        //! 可见性必须是 `pub(crate)` 而非 `pub(super)`：在本模块内 `super` 指的是
-        //! `platform`，`pub(super)` 只能让这些名字对 `platform` 自己可见，而真正的
-        //! 使用者是上一层的 `credentials::tests`（`use super::platform::test_support::*`），
-        //! 于是 Linux/macOS 上 `cargo test` 报四个 E0425「cannot find function」。
-        //! Windows 上整个 `platform` 块与对应测试都被 cfg 掉，本地测试全绿察觉不到，
-        //! 这个错自 v1.0.22 起一直红在 CI 的 test-linux / test-macos 上。
-        //! 外层 `mod test_support` 仍是 `pub(super)`，故实际可见范围不会真的放大到整个 crate。
-        pub(crate) use super::{delete_secret_in, read_secret_in, secret_path, write_secret_in};
+        //! **可见性要两头同时够，缺一头就编译不过**，而且两头都只在 Linux/macOS 上
+        //! 才暴露——Windows 上整个 `platform` 块与对应测试都被 cfg 掉，本地测试
+        //! 全绿察觉不到，所以这处自 v1.0.22 起一直红在 CI 的 test-linux / test-macos 上：
+        //!
+        //! - **`use` 这一头**：真正的使用者是上一层的 `credentials::tests`
+        //!   （`use super::platform::test_support::*`）。本模块内 `super` 指的是
+        //!   `platform`，写 `pub(super)` 只能让名字对 `platform` 自己可见，使用者会报
+        //!   四个 E0425「cannot find function」。故这里精确限定到 `credentials`。
+        //! - **被 re-export 的那四个 `fn` 那一头**：私有项不能被 re-export 成更高的
+        //!   可见性（E0364）。只提 `use` 不提函数，E0425 就换成 E0364，照红不误
+        //!   （v1.1.1 发版时 CI 就卡在这一步）。它们在 `platform` 里写 `pub(super)`
+        //!   正好等于 `credentials`，与本 `use` 的范围齐平——这也是同文件
+        //!   `write_secret` / `read_secret` / `delete_secret` 一贯的写法。
+        //!
+        //! 两头都精确停在 `credentials`，加上 `platform` 本身是私有 mod，后门不会
+        //! 外泄：越过 `credentials` 去引用会 E0603。
+        pub(in crate::ssh::credentials) use super::{
+            delete_secret_in, read_secret_in, secret_path, write_secret_in,
+        };
     }
 }
 
@@ -805,9 +819,17 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
+    // 这条守的是**无原生后端**那个 fallback `platform` 的契约（文件末尾那份
+    // `cfg(not(any(windows, linux, macos)))` 实现，三个操作一律 Unsupported），
+    // 所以 cfg 必须与它逐字对齐。
+    //
+    // 原先写的是 `cfg(not(windows))`：2026-07-28 的 6a2178b 给 Linux/macOS 换上了
+    // 真正的 AES-GCM 加密文件后端、它们不再返回 Unsupported，却没同步收窄这里的
+    // cfg，于是这条测试在 unix 上必然失败。它被同文件测试后门的 18 个编译错误挡了
+    // 20 天没人看见——编译一修好就立刻露出来。
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     #[test]
-    fn 非windows操作统一返回unsupported() {
+    fn 无原生后端的平台操作统一返回unsupported() {
         let reference = CredentialReference::password(PROFILE_ID).unwrap();
         assert_eq!(
             write_secret(&reference, "secret"),
