@@ -5,7 +5,7 @@
 //! 行图标」（pwsh/cmd 的图标）。
 //!
 //! 分层：
-//! - [`foreground_exe`]：从 shell 子进程 PID 出发，查其**直接子进程**
+//! - [`foreground_exes`]：从一组 shell 子进程 PID 出发，查各自**直接子进程**
 //!   （前台运行的程序）的 exe 完整路径；无子进程则回落 shell 自身的
 //!   exe（=命令行图标）。纯进程快照查询，无窗口/GPU 依赖。
 //! - [`load_icon_rgba`]：用系统外壳 API 抽取 exe 关联图标，转成
@@ -14,6 +14,18 @@
 //!
 //! 全部失败路径返回 `None`，上层据此回退到自绘终端字形——绝不 panic、
 //! 不阻塞。非 Windows 平台为空实现（恒 `None`）。
+//!
+//! # 为什么只有批量接口，没有「查单个会话」的版本
+//! 找直接子进程在 Windows/Linux 上都是**全系统级**遍历
+//! （`CreateToolhelp32Snapshot` / 扫 `/proc`），单次成本正比于系统进程总数，
+//! 与要查几个会话无关：海风哥机器上 487 个进程时单次约 10~11ms。
+//! 曾经的按会话接口被逐窗格调用（`probe_llm_clis` 每 500ms 一轮、
+//! `probe_session_icons` 每 800ms 一轮，各自遍历全部窗格），12 个会话就是
+//! 每轮 24 次全表遍历 ≈ 每轮 260ms，**全部同步跑在 UI 线程的渲染帧里**，
+//! 实测吃掉 43% 单核、89% 内核态，表现为打字一卡一卡、转圈动画掉帧、
+//! 拖窗口卡顿（与窗口大小无关，因为开销全在 syscall 不在像素）。
+//! 故此处只暴露批量接口：一次遍历服务所有会话，让「每会话一次快照」
+//! 这种用法在 API 层面就写不出来。
 
 use std::path::{Path, PathBuf};
 
@@ -24,11 +36,17 @@ pub struct IconRgba {
     pub rgba: Vec<u8>,
 }
 
-/// 会话前台运行程序的 exe 完整路径：shell（`shell_pid`）的直接子进程
-/// （跑命令时如 `cargo run` 的 cargo.exe）；无子进程时回落 shell 自身
-/// （停在提示符=命令行图标）。查不到返回 `None`。
-pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
-    imp::foreground_exe(shell_pid)
+/// 一批会话各自前台运行程序的 exe 完整路径：每个 shell（`shell_pids[i]`）
+/// 的直接子进程（跑命令时如 `cargo run` 的 cargo.exe）；无子进程时回落
+/// shell 自身（停在提示符=命令行图标）。查不到的位置为 `None`。
+///
+/// 返回值与 `shell_pids` **等长且按下标一一对应**。整个调用只做**一次**
+/// 系统进程遍历（见模块文档），成本与 `shell_pids.len()` 基本无关。
+pub fn foreground_exes(shell_pids: &[u32]) -> Vec<Option<PathBuf>> {
+    if shell_pids.is_empty() {
+        return Vec::new();
+    }
+    imp::foreground_exes(shell_pids)
 }
 
 /// 抽取 `exe` 关联图标为 RGBA8。失败返回 `None`（上层回退自绘字形）。
@@ -38,6 +56,7 @@ pub fn load_icon_rgba(exe: &Path) -> Option<IconRgba> {
 
 #[cfg(windows)]
 mod imp {
+    use std::collections::{HashMap, HashSet};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
     use std::ptr;
@@ -57,37 +76,48 @@ mod imp {
     use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
     use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
-    pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
-        let pid = foreground_pid(shell_pid).unwrap_or(shell_pid);
-        exe_path(pid)
+    pub fn foreground_exes(shell_pids: &[u32]) -> Vec<Option<PathBuf>> {
+        // 一次全表遍历得到所有 shell 的前台子进程，再逐个取 exe 路径。
+        // `exe_path` 只是 OpenProcess + QueryFullProcessImageNameW（微秒级，
+        // 按会话数线性但可忽略），真正贵的快照已经被摊成一次。
+        let latest = latest_children(shell_pids);
+        shell_pids
+            .iter()
+            .map(|sp| exe_path(latest.get(sp).copied().unwrap_or(*sp)))
+            .collect()
     }
 
-    /// 进程快照里找 `shell_pid` 的直接子进程（前台程序）。多个时取 PID
-    /// 最大者（近似最近创建）。无子进程返回 `None`（停在提示符）。
-    pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
+    /// **一次**进程快照里找出 `shell_pids` 中每个 shell 的直接子进程（前台
+    /// 程序）。同一 shell 有多个子进程时取 PID 最大者（近似最近创建）。
+    /// 无子进程的 shell 不入表——调用方据此回落 shell 自身（停在提示符）。
+    fn latest_children(shell_pids: &[u32]) -> HashMap<u32, u32> {
+        let wanted: HashSet<u32> = shell_pids.iter().copied().collect();
+        let mut out: HashMap<u32, u32> = HashMap::new();
         // SAFETY: CreateToolhelp32Snapshot 返回有效句柄或 INVALID_HANDLE_VALUE，
         // 失败即不遍历。
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap == INVALID_HANDLE_VALUE || snap.is_null() {
-            return None;
+            return out;
         }
-        let mut best: Option<u32> = None;
         // SAFETY: PROCESSENTRY32W 为纯 POD，全零初始化合法；dwSize 必须先置。
         let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         // SAFETY: snap 有效，entry 可写且 dwSize 已置。
         let mut ok = unsafe { Process32FirstW(snap, &mut entry) };
         while ok != 0 {
-            if entry.th32ParentProcessID == shell_pid {
+            let ppid = entry.th32ParentProcessID;
+            if wanted.contains(&ppid) {
                 let pid = entry.th32ProcessID;
-                best = Some(best.map_or(pid, |b| b.max(pid)));
+                out.entry(ppid)
+                    .and_modify(|best| *best = (*best).max(pid))
+                    .or_insert(pid);
             }
             // SAFETY: snap 有效，entry 可写。
             ok = unsafe { Process32NextW(snap, &mut entry) };
         }
         // SAFETY: snap 是有效句柄，关闭一次。
         unsafe { CloseHandle(snap) };
-        best
+        out
     }
 
     /// 取进程 exe 完整路径（PROCESS_QUERY_LIMITED_INFORMATION 权限对多数
@@ -323,21 +353,31 @@ fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
 // ── Linux：/proc 找前台子进程 + freedesktop 图标主题 ───────────────────────────
 #[cfg(target_os = "linux")]
 mod imp {
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::{Path, PathBuf};
 
     use super::parse_ppid_from_stat;
 
-    pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
-        let pid = foreground_pid(shell_pid).unwrap_or(shell_pid);
-        exe_path(pid)
+    pub fn foreground_exes(shell_pids: &[u32]) -> Vec<Option<PathBuf>> {
+        // 一次 /proc 扫描服务所有会话；`exe_path` 只是 readlink，可忽略。
+        let latest = latest_children(shell_pids);
+        shell_pids
+            .iter()
+            .map(|sp| exe_path(latest.get(sp).copied().unwrap_or(*sp)))
+            .collect()
     }
 
-    /// 扫 `/proc` 找 `shell_pid` 的直接子进程（前台程序）；多个取 PID 最大者（近似最近
-    /// 创建）。无子进程返回 `None`（停在提示符 → 回落 shell 自身）。
-    pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
-        let mut best: Option<u32> = None;
-        for entry in fs::read_dir("/proc").ok()?.flatten() {
+    /// **一次**扫 `/proc` 找出 `shell_pids` 中每个 shell 的直接子进程（前台程序）；
+    /// 同一 shell 多个子进程时取 PID 最大者（近似最近创建）。无子进程的 shell 不
+    /// 入表（调用方回落 shell 自身 → 停在提示符）。
+    fn latest_children(shell_pids: &[u32]) -> HashMap<u32, u32> {
+        let wanted: HashSet<u32> = shell_pids.iter().copied().collect();
+        let mut out: HashMap<u32, u32> = HashMap::new();
+        let Ok(dir) = fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in dir.flatten() {
             let Some(pid) = entry
                 .file_name()
                 .to_str()
@@ -348,11 +388,16 @@ mod imp {
             let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
                 continue; // 进程可能刚退出
             };
-            if parse_ppid_from_stat(&stat) == Some(shell_pid) {
-                best = Some(best.map_or(pid, |b| b.max(pid)));
+            let Some(ppid) = parse_ppid_from_stat(&stat) else {
+                continue;
+            };
+            if wanted.contains(&ppid) {
+                out.entry(ppid)
+                    .and_modify(|best| *best = (*best).max(pid))
+                    .or_insert(pid);
             }
         }
-        best
+        out
     }
 
     /// `readlink /proc/<pid>/exe` 得可执行绝对路径。权限不足 / 进程已退出返回 `None`。
@@ -401,13 +446,18 @@ mod imp {
         fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
     }
 
-    pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
-        let pid = foreground_pid(shell_pid).unwrap_or(shell_pid);
-        exe_path(pid)
+    /// macOS 与 Windows/Linux 不同：`proc_listchildpids` 按 ppid **直查**，不是全系统
+    /// 遍历，成本本就正比于会话数而非系统进程数，故批量实现即逐个查询。接口保持
+    /// 一致只为让调用方跨平台同源（见模块文档）。
+    pub fn foreground_exes(shell_pids: &[u32]) -> Vec<Option<PathBuf>> {
+        shell_pids
+            .iter()
+            .map(|&sp| exe_path(foreground_pid(sp).unwrap_or(sp)))
+            .collect()
     }
 
     /// shell 的直接子进程（前台程序），取 PID 最大者（近似最近创建）。无子进程返回 None。
-    pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
+    fn foreground_pid(shell_pid: u32) -> Option<u32> {
         let mut buf = vec![0i32; 256];
         // SAFETY: buf 可写、buffersize 与其字节容量一致。返回填入的字节数（proc_list* 家族
         // 约定），<=0 视为无子进程/失败。
@@ -521,12 +571,8 @@ mod imp {
 mod imp {
     use std::path::{Path, PathBuf};
 
-    pub fn foreground_exe(_shell_pid: u32) -> Option<PathBuf> {
-        None
-    }
-
-    pub fn foreground_pid(_shell_pid: u32) -> Option<u32> {
-        None
+    pub fn foreground_exes(shell_pids: &[u32]) -> Vec<Option<PathBuf>> {
+        vec![None; shell_pids.len()]
     }
 
     pub fn load_icon_rgba(_exe: &Path) -> Option<super::IconRgba> {

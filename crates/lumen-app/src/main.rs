@@ -1287,6 +1287,17 @@ struct AppState {
     last_icon_probe: Option<Instant>,
     /// LLM CLI 识别轮询时刻。与侧栏图标解耦，侧栏隐藏时输入适配仍生效。
     last_llm_cli_probe: Option<Instant>,
+    /// 各会话前台运行程序的 exe（键 = shell 进程 PID；值 `None` = 查不到），
+    /// 由 [`Self::refresh_foreground_exes`] 一次系统遍历填满。
+    ///
+    /// **这是三个消费者的唯一数据源**：LLM CLI 识别
+    /// （[`Self::probe_llm_clis`]）、侧栏会话图标（[`Self::probe_session_icons`]）、
+    /// 远程图标上线（[`Self::refresh_remote_tab_icons`]）。它们各自的节流现在
+    /// 只决定「何时读这张表」，读表是纯内存操作；真正昂贵的进程遍历只由
+    /// `refresh_foreground_exes` 按 [`FOREGROUND_PROBE_INTERVAL`] 做一次。
+    foreground_exe: HashMap<u32, Option<std::path::PathBuf>>,
+    /// 上次做前台程序遍历的时刻（节流；遍历是全系统级操作，很重）。
+    last_foreground_probe: Option<Instant>,
     /// 激活 tab 各窗格的矩形（会话 id, 物理像素 x/y/w/h），来自最近
     /// 一帧 egui 布局（鼠标命中/IME 候选框定位用）。tab 结构变更后
     /// 的陈旧条目按 id 解析不到窗格、自然失效。
@@ -8237,6 +8248,46 @@ impl AppState {
         self.window.set_title(&format!("Lumen [ime-r4] — {title}"));
     }
 
+    /// 刷新 [`Self::foreground_exe`] 共享表：**一次**系统进程遍历查出所有会话
+    /// 的前台运行程序，按 [`FOREGROUND_PROBE_INTERVAL`] 节流。
+    ///
+    /// 这件事以前由三个消费者各自按会话循环去做，而找直接子进程在
+    /// Windows/Linux 上是**全系统级**遍历（成本正比于系统进程总数，与查几个
+    /// 会话无关）：12 个会话时每轮 24 次全表遍历、约 260ms **同步阻塞在渲染
+    /// 帧里**，实测占 43% 单核且 89% 在内核态——打字、侧栏转圈动画、拖窗口
+    /// 一起卡，且因为开销全在 syscall 不在像素，缩小窗口毫无改善。
+    /// 现在无论开多少会话都只遍历一次。
+    fn refresh_foreground_exes(&mut self, now: Instant) {
+        if self
+            .last_foreground_probe
+            .is_some_and(|last| now.duration_since(last) < FOREGROUND_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.last_foreground_probe = Some(now);
+        // 全部窗格的 shell PID；`BTreeSet` 顺带去重（同一 PID 查一次就够）并给出
+        // 确定顺序，便于排查时比对。
+        let pids: Vec<u32> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter())
+            .filter_map(|p| p.pty.shell_pid())
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
+            .collect();
+        let exes = proc_icon::foreground_exes(&pids);
+        // 整表重建：已关闭会话的条目随之消失，不必单独清理。
+        self.foreground_exe = pids.into_iter().zip(exes).collect();
+    }
+
+    /// 某会话（`shell_pid`）当前前台运行程序的 exe，取自共享表。
+    /// 表由 [`Self::refresh_foreground_exes`] 维护，这里是纯内存查表。
+    fn foreground_exe_of(&self, shell_pid: Option<u32>) -> Option<&std::path::Path> {
+        shell_pid
+            .and_then(|pid| self.foreground_exe.get(&pid))
+            .and_then(|exe| exe.as_deref())
+    }
+
     /// 识别每个窗格的前台 LLM CLI。只识别程序类型，不判断回答/空闲状态。
     fn probe_llm_clis(&mut self, now: Instant) {
         if self
@@ -8247,13 +8298,21 @@ impl AppState {
         }
         self.last_llm_cli_probe = Some(now);
         let mut cleared_slash_probe = false;
-        for tab in &mut self.tabs {
-            for pane in &mut tab.panes {
-                let shell_pid = pane.pty.shell_pid();
-                let exe = shell_pid.and_then(proc_icon::foreground_exe);
-                // HUD 删除后这里不再需要前台 PID（那是它专用的），顺带省掉每次探测
-                // 一遍系统进程快照的开销 —— `foreground_exe` 才是识别 CLI 必需的。
-                pane.llm_cli = llm_cli::detect(exe.as_deref(), &pane.term);
+        // 字段分借：共享表只读、窗格可变，两者互不相干，故不能整体借 self。
+        let Self {
+            tabs,
+            foreground_exe,
+            ..
+        } = &mut *self;
+        for tab in tabs.iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                // 读共享表，不再自己做进程遍历（见 refresh_foreground_exes）。
+                let exe = pane
+                    .pty
+                    .shell_pid()
+                    .and_then(|pid| foreground_exe.get(&pid))
+                    .and_then(|exe| exe.as_deref());
+                pane.llm_cli = llm_cli::detect(exe, &pane.term);
                 if pane.llm_cli.is_none() && !pane.slash_probe.shadow.is_empty() {
                     // CLI 已退出时清掉尚未提交的探测输入，避免候选串到 shell。
                     let _ = pane.write_user_input(b"\x15");
@@ -8268,9 +8327,12 @@ impl AppState {
         }
     }
 
-    /// F7② 节流轮询各 tab 焦点窗格的前台运行程序 exe（进程快照较重，
-    /// `ICON_PROBE_INTERVAL` 限频）。结果写入 `session_icon_exe`，纹理在
+    /// F7② 节流把各 tab 焦点窗格的前台运行程序 exe 从共享表同步到
+    /// `session_icon_exe`（`ICON_PROBE_INTERVAL` 限频），纹理在
     /// [`Self::ensure_session_icon_textures`] 按需懒加载。侧栏隐藏时跳过。
+    ///
+    /// 这里**只读内存表**（见 [`Self::refresh_foreground_exes`]），不再自己做
+    /// 进程遍历——节流值现在只影响图标切换的跟手程度，不再影响 CPU 开销。
     fn probe_session_icons(&mut self, now: Instant) {
         if !self.settings.layout.sidebar_visible {
             return;
@@ -8287,11 +8349,9 @@ impl AppState {
             .tabs
             .iter()
             .map(|t| {
-                let exe = t
-                    .focused_pane()
-                    .pty
-                    .shell_pid()
-                    .and_then(proc_icon::foreground_exe);
+                let exe = self
+                    .foreground_exe_of(t.focused_pane().pty.shell_pid())
+                    .map(std::path::Path::to_path_buf);
                 (t.id, exe)
             })
             .collect();
@@ -8367,12 +8427,16 @@ impl AppState {
     }
 
     /// F7②-remote 被控端：为上线刷新前台 exe（不受本地侧栏 gate——被控端侧栏常
-    /// 隐藏）+ 抽会话图标位图缓存（`session_icon_rgba`）。probe 进程快照重、按
-    /// [`ICON_PROBE_INTERVAL`] 节流；位图只对新出现的 exe 抽（稳定后无操作）。
+    /// 隐藏）+ 抽会话图标位图缓存（`session_icon_rgba`）。前台 exe 取自共享表
+    /// （见 [`Self::refresh_foreground_exes`]），按 [`ICON_PROBE_INTERVAL`] 节流
+    /// 同步；位图只对新出现的 exe 抽（稳定后无操作）。
     fn refresh_remote_tab_icons(&mut self) {
         let now = Instant::now();
-        // 到节流点才 probe 前台 exe（复用 last_icon_probe；被控端侧栏隐藏时本地
-        // probe_session_icons 直接 return，不与此争节流）。
+        // 被控端的上线推送节拍独立于本地渲染帧，故自己保一次共享表新鲜
+        // （函数内按 FOREGROUND_PROBE_INTERVAL 节流，未到点时零开销）。
+        self.refresh_foreground_exes(now);
+        // 到节流点才从共享表同步前台 exe（复用 last_icon_probe；被控端侧栏隐藏时
+        // 本地 probe_session_icons 直接 return，不与此争节流）。
         if self
             .last_icon_probe
             .is_none_or(|t| now.duration_since(t) >= ICON_PROBE_INTERVAL)
@@ -8382,11 +8446,9 @@ impl AppState {
                 .tabs
                 .iter()
                 .map(|t| {
-                    let exe = t
-                        .focused_pane()
-                        .pty
-                        .shell_pid()
-                        .and_then(proc_icon::foreground_exe);
+                    let exe = self
+                        .foreground_exe_of(t.focused_pane().pty.shell_pid())
+                        .map(std::path::Path::to_path_buf);
                     (t.id, exe)
                 })
                 .collect();
@@ -9914,6 +9976,8 @@ impl App {
             attachment_textures: HashMap::new(),
             last_icon_probe: None,
             last_llm_cli_probe: None,
+            foreground_exe: HashMap::new(),
+            last_foreground_probe: None,
             pane_rects_px: Vec::new(),
             pending_resize_dir: None,
             pane_close_rects_px: Vec::new(),
@@ -10086,11 +10150,17 @@ const AUTO_CHECK_INTERVAL_MS: u64 = 30 * 60 * 1000;
 /// 收到新版（不只启动时查）。auto_check 关闭时跳过本轮。
 const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// F7② 会话前台进程轮询间隔：进程快照较重，限频到 ~0.8s（命令起止的
-/// 图标切换感知足够灵敏，开销可忽略）。
+/// F7② 会话图标从共享表同步的间隔（~0.8s，命令起止的图标切换感知足够
+/// 灵敏）。**这一步只读内存表**，真正的进程遍历见 [`FOREGROUND_PROBE_INTERVAL`]。
 const ICON_PROBE_INTERVAL: Duration = Duration::from_millis(800);
-/// LLM CLI 识别需独立于侧栏图标工作；同样节流进程快照查询。
+/// LLM CLI 识别需独立于侧栏图标工作（侧栏隐藏时输入适配仍要生效），故
+/// 保留独立节流；同样只读共享表，不触发进程遍历。
 const LLM_CLI_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// 前台程序遍历间隔：**全系统级**操作（Windows `CreateToolhelp32Snapshot`、
+/// Linux 扫 `/proc`），海风哥机器上 487 个进程时单次约 10~11ms，因此绝不能
+/// 按会话数重复做，也不能每帧做。取 500ms 与 [`LLM_CLI_PROBE_INTERVAL`] 对齐
+/// ——CLI 识别是三个消费者里最需要跟手的一个，图标那路本就慢一档无感。
+const FOREGROUND_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// LLM CLI 的原生候选可能异步生成；在截止时间内允许任意数量的局部
 /// PTY 重绘，不能用“无结果帧数”提前判定失败。
 const LLM_SLASH_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
@@ -12655,6 +12725,11 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     return;
                 }
+                // 前台程序探测**必须在 acquire_frame 之前**：它是全系统级进程
+                // 遍历（约 10ms 量级），握着交换链纹理做这种系统调用会把 present
+                // 一起顶住（desired_maximum_frame_latency = 2）。节流在函数内。
+                let probe_now = Instant::now();
+                state.refresh_foreground_exes(probe_now);
                 // surface 帧先行取得：失败（Lost/Outdated 已就地重配）则
                 // 本帧整体跳过——egui 输入与 textures_delta 都未消费，
                 // 状态不丢，等下一次重绘。
@@ -12662,6 +12737,7 @@ impl ApplicationHandler<PtyWake> for App {
                     return;
                 };
                 let render_t0 = Instant::now();
+                // 只读上面那张共享表，纯内存操作。
                 state.probe_llm_clis(render_t0);
 
                 // —— DEC 2026 同步区间门控（事件驱动重绘的保护层，F5
