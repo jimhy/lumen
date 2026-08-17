@@ -702,7 +702,15 @@ mod platform {
     #[cfg(test)]
     pub(super) mod test_support {
         //! 测试后门：带目录参数的后端入口与路径计算，避免污染真实数据目录。
-        pub(super) use super::{delete_secret_in, read_secret_in, secret_path, write_secret_in};
+        //!
+        //! 可见性必须是 `pub(crate)` 而非 `pub(super)`：在本模块内 `super` 指的是
+        //! `platform`，`pub(super)` 只能让这些名字对 `platform` 自己可见，而真正的
+        //! 使用者是上一层的 `credentials::tests`（`use super::platform::test_support::*`），
+        //! 于是 Linux/macOS 上 `cargo test` 报四个 E0425「cannot find function」。
+        //! Windows 上整个 `platform` 块与对应测试都被 cfg 掉，本地测试全绿察觉不到，
+        //! 这个错自 v1.0.22 起一直红在 CI 的 test-linux / test-macos 上。
+        //! 外层 `mod test_support` 仍是 `pub(super)`，故实际可见范围不会真的放大到整个 crate。
+        pub(crate) use super::{delete_secret_in, read_secret_in, secret_path, write_secret_in};
     }
 }
 
