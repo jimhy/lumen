@@ -141,7 +141,7 @@ Useful shortcuts:
 | Flexible panes | Up to six panes per session, draggable dividers, maximize/restore, reset layout, pane reordering, and custom pane names. |
 | Project file tree | Recursive search, hidden-item toggle, directory-level refresh, create/rename, move to trash, reveal in the OS file manager, and copy absolute or relative paths. |
 | Native file workflows | Copy/paste files and folders with the operating-system clipboard; drag an external file into the terminal to insert its path. |
-| Desktop integration | Custom title bar, Windows 11 Snap Layouts, per-session process icons, system notifications, single-instance handoff, and remembered sidebar widths/visibility. |
+| Desktop integration | Custom title bar, Windows 11 Snap Layouts, per-session process icons (with 4 bundled AI CLI brand icons), system notifications, single-instance handoff, and remembered sidebar widths/visibility. |
 | Personalization | 11 bundled light/dark themes, OS theme sync, custom terminal font and size, background images with opacity/dim controls, and persistent layout preferences. |
 | Updates and networking | In-app update checks, Windows installer handoff, skip-version support, and optional HTTP/HTTPS/SOCKS5 proxy settings. |
 

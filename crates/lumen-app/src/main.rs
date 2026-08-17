@@ -46,6 +46,9 @@ mod llm_attachments;
 // M7 片 8：远程 LLM 会话的结构化审计日志（⑫ 砍掉会话 UI 之后唯一能事后回溯的东西）。
 mod llm_audit;
 mod llm_cli;
+// 内置 LLM CLI 品牌图标：这些 CLI 的前台真进程是 node/python，或干脆没嵌资源
+// 图标，抽 exe 图标一个都抽不对（见 llm_icon 模块文档）。
+mod llm_icon;
 // M7 片 2：PC 端 headless LLM runner（进程 + 行解析 + 白名单 + 适配接口）。
 // 片 2/片 3 只落地底座与 Claude 适配器，与远程帧的分发接线在片 4，故此刻大量公开项
 // 尚无调用点——与 `mod cloud` 同样的脚手架处置（非真死代码）。
@@ -69,7 +72,8 @@ mod paths;
 /// 尚未收尾时并发启动 PowerShell/Scoop shim。
 #[cfg(windows)]
 mod post_install;
-/// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
+/// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形；
+/// 受支持的 LLM CLI 例外，走 [`llm_icon`] 的内置品牌图）。
 mod proc_icon;
 mod profile;
 mod session;
@@ -721,6 +725,54 @@ struct HoverLink {
     target: links::LinkTarget,
 }
 
+/// F7② 会话图标的来源。
+///
+/// 规则本身没变（图标 = 会话在跑什么），变的是「跑的是 LLM CLI 时怎么取图」：
+/// 这些 CLI 的前台真进程是 `node`/`python`，或者像 `codex.exe` 那样压根没嵌
+/// 资源图标，抽 exe 图标抽到的是运行时图标或通用占位方块——所以识别到 CLI
+/// 时改用内置品牌图（见 [`llm_icon`]），其余程序照旧抽 exe 图标。
+///
+/// 做成缓存键：内置图按种类共享一份纹理/位图，exe 图按路径共享，两条来源
+/// 之后走完全相同的纹理上传与远程上线管线。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IconSource {
+    /// 前台是受支持的 LLM CLI —— 用内置品牌图标。
+    Llm(llm_cli::LlmCliKind),
+    /// 普通程序 —— 用它的 exe 关联图标。
+    Exe(std::path::PathBuf),
+}
+
+impl IconSource {
+    /// egui 纹理名（仅用于调试标识，需按来源稳定且互不相同）。
+    ///
+    /// 内置图走独立的 `llm:` 命名空间：exe 分支拼的是绝对路径，Windows 以盘符
+    /// 开头、unix 以 `/` 开头，两边不可能撞名——撞了就是两个来源共用一个纹理
+    /// 句柄，后建的会顶掉先建的。
+    fn texture_name(&self) -> String {
+        match self {
+            Self::Llm(kind) => format!("sess-icon:llm:{}", kind.display_name()),
+            Self::Exe(path) => format!("sess-icon:{}", path.display()),
+        }
+    }
+}
+
+/// 决定一个会话该用哪个图标来源：识别到 LLM CLI 用内置品牌图，否则用前台
+/// 运行程序的 exe 图标；两者皆无（进程查不到）时 `None`（上层回退自绘字形）。
+///
+/// 抽成自由函数而不是 `App` 的方法，是因为本地侧栏与被控端上线**两条路径**
+/// 都要做这个判断（[`App::probe_session_icons`] 与
+/// [`App::refresh_remote_tab_icons`]），过去那段取 exe 的闭包就是抄了两份；
+/// 收成一处顺带让它能脱离 `App`/egui 单测。
+fn icon_source(
+    llm_cli: Option<llm_cli::LlmCliKind>,
+    exe: Option<&std::path::Path>,
+) -> Option<IconSource> {
+    match llm_cli {
+        Some(kind) => Some(IconSource::Llm(kind)),
+        None => exe.map(|path| IconSource::Exe(path.to_path_buf())),
+    }
+}
+
 /// F7② 会话图标纹理缓存条目：纹理 + 首抽时刻 + 是否已延迟重抽（自愈用）。
 struct SessionIcon {
     /// 抽取到的纹理；`None` = 抽取失败（回退自绘字形）。
@@ -729,6 +781,10 @@ struct SessionIcon {
     born: Instant,
     /// 是否已做过「进程稳定后重抽一次」（做过即定型、不再重抽）。
     refreshed: bool,
+    /// 建这张纹理时选的是不是 64px 档（见 [`llm_icon::prefers_hidpi`]）。
+    /// 只对内置图有意义：窗口被拖到另一块缩放不同的屏幕后据此重建，
+    /// 否则高 DPI 屏上会一直挂着当初按低 DPI 选的小图。
+    hidpi: bool,
 }
 
 /// F7②-remote 图标位图内容 hash（控制端远程图标纹理缓存键；同图标多 tab
@@ -1263,18 +1319,19 @@ struct AppState {
     /// 待注销的 egui 纹理 id：窗格关闭动作可能发生在 run_ui 之后
     /// （本帧 shape 仍引用该纹理），推迟到帧呈现后统一 free。
     pending_tex_free: Vec<egui::TextureId>,
-    /// F7② 会话图标——每 tab 当前前台运行程序的 exe 路径（节流轮询写入，
-    /// 见 [`Self::probe_session_icons`]）；值 None = 查不到。
-    session_icon_exe: HashMap<TabId, Option<std::path::PathBuf>>,
-    /// F7② 会话图标纹理缓存（键 = exe 路径）。首抽可能撞上前台进程刚 spawn、
-    /// 系统图标未就绪的窗口而抽到通用占位图标，故隔 [`ICON_REFRESH_DELAY`] 延迟
-    /// 重抽一次覆盖（[`SessionIcon`] 的 `born`/`refreshed`），治「抽坏被永久冻结、
-    /// 不自愈」。`tex: None` = 抽取失败，回退自绘字形。
-    session_icon_tex: HashMap<std::path::PathBuf, SessionIcon>,
-    /// F7②-remote 被控端会话图标位图缓存（键 = exe 路径）：抽成 top-down RGBA8
+    /// F7② 会话图标——每 tab 当前的图标来源（内置 LLM 品牌图 / 前台程序 exe，
+    /// 见 [`IconSource`]）；节流轮询写入，见 [`Self::probe_session_icons`]；
+    /// 值 None = 查不到。
+    session_icon_src: HashMap<TabId, Option<IconSource>>,
+    /// F7② 会话图标纹理缓存（键 = 图标来源）。exe 图标首抽可能撞上前台进程刚
+    /// spawn、系统图标未就绪的窗口而抽到通用占位图标，故隔 [`ICON_REFRESH_DELAY`]
+    /// 延迟重抽一次覆盖（[`SessionIcon`] 的 `born`/`refreshed`），治「抽坏被永久
+    /// 冻结、不自愈」。`tex: None` = 抽取失败，回退自绘字形。
+    session_icon_tex: HashMap<IconSource, SessionIcon>,
+    /// F7②-remote 被控端会话图标位图缓存（键 = 图标来源）：抽成 top-down RGBA8
     /// 上线给控制端（`Arc` 免每帧 clone bytes）；值 None = 抽取失败。
     session_icon_rgba:
-        HashMap<std::path::PathBuf, Option<std::sync::Arc<lumen_protocol::remote::IconBitmap>>>,
+        HashMap<IconSource, Option<std::sync::Arc<lumen_protocol::remote::IconBitmap>>>,
     /// F7②-remote 控制端远程图标纹理缓存（键 = 图标位图内容 hash，同图标多 tab
     /// 共享一张纹理）：把被控端传来的 RGBA 贴成本地 egui 纹理。
     remote_icon_tex: HashMap<u64, egui::TextureHandle>,
@@ -8339,12 +8396,23 @@ impl AppState {
         }
     }
 
-    /// F7② 节流把各 tab 焦点窗格的前台运行程序 exe 从共享表同步到
-    /// `session_icon_exe`（`ICON_PROBE_INTERVAL` 限频），纹理在
+    /// 某 tab 焦点窗格当前的图标来源，见 [`icon_source`]。
+    ///
+    /// `llm_cli` 由 [`Self::probe_llm_clis`] 维护：渲染帧里它排在两处图标采集
+    /// 之前，被控端上线路径则在 [`Self::refresh_remote_tab_icons`] 里自己驱动
+    /// 一次——两条路径都保证这里读到的识别结果是新鲜的。
+    fn icon_source_of(&self, tab: &session::Tab) -> Option<IconSource> {
+        let pane = tab.focused_pane();
+        icon_source(pane.llm_cli, self.foreground_exe_of(pane.pty.shell_pid()))
+    }
+
+    /// F7② 节流把各 tab 焦点窗格的图标来源同步到 `session_icon_src`
+    /// （`ICON_PROBE_INTERVAL` 限频），纹理在
     /// [`Self::ensure_session_icon_textures`] 按需懒加载。侧栏隐藏时跳过。
     ///
-    /// 这里**只读内存表**（见 [`Self::refresh_foreground_exes`]），不再自己做
-    /// 进程遍历——节流值现在只影响图标切换的跟手程度，不再影响 CPU 开销。
+    /// 这里**只读内存表**（见 [`Self::refresh_foreground_exes`] 与
+    /// [`Self::probe_llm_clis`]），不再自己做进程遍历——节流值现在只影响图标
+    /// 切换的跟手程度，不再影响 CPU 开销。
     fn probe_session_icons(&mut self, now: Instant) {
         if !self.settings.layout.sidebar_visible {
             return;
@@ -8357,25 +8425,20 @@ impl AppState {
         }
         self.last_icon_probe = Some(now);
         // 先收集（不可变借 tabs），再写缓存（可变借自身），避免借用冲突。
-        let probed: Vec<(TabId, Option<std::path::PathBuf>)> = self
+        let probed: Vec<(TabId, Option<IconSource>)> = self
             .tabs
             .iter()
-            .map(|t| {
-                let exe = self
-                    .foreground_exe_of(t.focused_pane().pty.shell_pid())
-                    .map(std::path::Path::to_path_buf);
-                (t.id, exe)
-            })
+            .map(|t| (t.id, self.icon_source_of(t)))
             .collect();
-        for (id, exe) in probed {
-            self.session_icon_exe.insert(id, exe);
+        for (id, src) in probed {
+            self.session_icon_src.insert(id, src);
         }
-        // 清理已关闭 tab 的条目（exe 缓存按路径保活，无需随 tab 清）。
+        // 清理已关闭 tab 的条目（图标缓存按来源保活，无需随 tab 清）。
         let live: std::collections::HashSet<TabId> = self.tabs.iter().map(|t| t.id).collect();
-        self.session_icon_exe.retain(|k, _| live.contains(k));
+        self.session_icon_src.retain(|k, _| live.contains(k));
     }
 
-    /// F7② 把 `session_icon_exe` 里出现的 exe 图标懒加载为 egui 纹理。首抽后隔
+    /// F7② 把 `session_icon_src` 里出现的图标来源懒加载为 egui 纹理。首抽后隔
     /// [`ICON_REFRESH_DELAY`] 重抽一次覆盖（治首抽踩到进程刚起时的系统占位图标、
     /// 被永久冻结不自愈）；抽取失败缓存 `tex: None`、回退自绘字形。
     fn ensure_session_icon_textures(&mut self, now: Instant) {
@@ -8385,117 +8448,143 @@ impl AppState {
         if !self.settings.layout.sidebar_visible {
             return;
         }
+        // 内置图分 32/64 两档，按当前 DPI 缩放选；exe 图标与档位无关。
+        let hidpi = llm_icon::prefers_hidpi(self.egui_ctx.pixels_per_point());
         // 需抽取：① 未缓存（首抽）② 已缓存但未重抽且过了延迟窗口（进程此时已
-        //   稳定，重抽覆盖首抽可能踩到的占位图标）。
-        let needed: Vec<std::path::PathBuf> = self
-            .session_icon_exe
+        //   稳定，重抽覆盖首抽可能踩到的占位图标）③ 内置图但 DPI 档位变了
+        //   （窗口被拖到另一块缩放不同的屏幕）。
+        let needed: Vec<IconSource> = self
+            .session_icon_src
             .values()
             .flatten()
-            .filter(|p| match self.session_icon_tex.get(*p) {
+            .filter(|src| match self.session_icon_tex.get(*src) {
                 None => true,
-                Some(e) => !e.refreshed && now.duration_since(e.born) >= ICON_REFRESH_DELAY,
+                Some(e) => {
+                    (!e.refreshed && now.duration_since(e.born) >= ICON_REFRESH_DELAY)
+                        || (matches!(src, IconSource::Llm(_)) && e.hidpi != hidpi)
+                }
             })
             .cloned()
             .collect();
-        for path in needed {
-            let tex = self.load_session_icon_texture(&path);
+        for src in needed {
+            let tex = self.load_session_icon_texture(&src, hidpi);
             // 已存在=这是延迟重抽（定型 refreshed）；否则首抽（留一次重抽机会）。
-            let refreshed = self.session_icon_tex.contains_key(&path);
+            // 内置图直接定型：延迟重抽治的是「进程刚 spawn、系统图标未就绪」，
+            // 而内置 PNG 的解码结果恒定，重抽只是白解一次码、白传一次纹理。
+            let refreshed =
+                matches!(src, IconSource::Llm(_)) || self.session_icon_tex.contains_key(&src);
             self.session_icon_tex.insert(
-                path,
+                src,
                 SessionIcon {
                     tex,
                     born: now,
                     refreshed,
+                    hidpi,
                 },
             );
         }
     }
 
-    /// F7② 抽取单个 exe 的关联图标并上传为 egui 纹理（失败 None）。
-    fn load_session_icon_texture(&self, path: &std::path::Path) -> Option<egui::TextureHandle> {
-        proc_icon::load_icon_rgba(path).map(|ic| {
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [ic.width as usize, ic.height as usize],
-                &ic.rgba,
-            );
-            self.egui_ctx.load_texture(
-                format!("sess-icon:{}", path.display()),
-                img,
-                egui::TextureOptions::LINEAR,
-            )
-        })
+    /// F7② 取单个来源的图标像素并上传为 egui 纹理（失败 None）。
+    fn load_session_icon_texture(
+        &self,
+        src: &IconSource,
+        hidpi: bool,
+    ) -> Option<egui::TextureHandle> {
+        let icon = match src {
+            IconSource::Llm(kind) => llm_icon::load_icon_rgba(*kind, hidpi),
+            IconSource::Exe(path) => proc_icon::load_icon_rgba(path),
+        }?;
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        );
+        Some(
+            self.egui_ctx
+                .load_texture(src.texture_name(), img, egui::TextureOptions::LINEAR),
+        )
     }
 
-    /// F7② 取某 tab 当前应显示的会话图标纹理（前台程序 exe 图标）；
-    /// 查不到 / 抽取失败时 None（上层回退自绘终端字形）。
+    /// F7② 取某 tab 当前应显示的会话图标纹理（内置 LLM 品牌图 / 前台程序 exe
+    /// 图标）；查不到 / 抽取失败时 None（上层回退自绘终端字形）。
     fn session_icon_for(&self, tab_id: TabId) -> Option<egui::TextureId> {
-        self.session_icon_exe
+        self.session_icon_src
             .get(&tab_id)
             .and_then(|o| o.as_ref())
-            .and_then(|p| self.session_icon_tex.get(p))
+            .and_then(|src| self.session_icon_tex.get(src))
             .and_then(|e| e.tex.as_ref())
             .map(egui::TextureHandle::id)
     }
 
-    /// F7②-remote 被控端：为上线刷新前台 exe（不受本地侧栏 gate——被控端侧栏常
-    /// 隐藏）+ 抽会话图标位图缓存（`session_icon_rgba`）。前台 exe 取自共享表
-    /// （见 [`Self::refresh_foreground_exes`]），按 [`ICON_PROBE_INTERVAL`] 节流
-    /// 同步；位图只对新出现的 exe 抽（稳定后无操作）。
+    /// F7②-remote 被控端：为上线刷新图标来源（不受本地侧栏 gate——被控端侧栏常
+    /// 隐藏）+ 抽会话图标位图缓存（`session_icon_rgba`）。来源取自共享表
+    /// （见 [`Self::refresh_foreground_exes`] 与 [`Self::probe_llm_clis`]），按
+    /// [`ICON_PROBE_INTERVAL`] 节流同步；位图只对新出现的来源抽（稳定后无操作）。
+    ///
+    /// 内置图这里固定取 32px 档：对端（手机/另一台电脑）的 DPI 与本机无关，
+    /// 由它自己缩放更合适；小一档也让上线 payload 与原来的 exe 图标持平
+    /// （32×32×4 = 4KB），不额外撑大 K6 去重后的帧。
     fn refresh_remote_tab_icons(&mut self) {
         let now = Instant::now();
-        // 被控端的上线推送节拍独立于本地渲染帧，故自己保一次共享表新鲜
-        // （函数内按 FOREGROUND_PROBE_INTERVAL 节流，未到点时零开销）。
+        // 被控端的上线推送节拍独立于本地渲染帧，故自己保两张表新鲜（两个函数
+        // 各自按 FOREGROUND_PROBE_INTERVAL / LLM_CLI_PROBE_INTERVAL 节流，未到点
+        // 时零开销）。
+        //
+        // ★ `probe_llm_clis` 这一发是必须的：它唯一的另一个调用点在
+        //   `RedrawRequested` 分支里，而本函数由 `pump_remote` 的 PtyWake 驱动。
+        //   被控端窗口最小化或应用锁锁定时渲染帧直接早退，识别结果就此冻住，
+        //   图标却仍在按 pump 节拍上线——手机上会一直看着一张过期的图标
+        //   （CLI 已退出还挂着品牌图，或刚起的 CLI 迟迟不换图）。
         self.refresh_foreground_exes(now);
-        // 到节流点才从共享表同步前台 exe（复用 last_icon_probe；被控端侧栏隐藏时
+        self.probe_llm_clis(now);
+        // 到节流点才从共享表同步图标来源（复用 last_icon_probe；被控端侧栏隐藏时
         // 本地 probe_session_icons 直接 return，不与此争节流）。
         if self
             .last_icon_probe
             .is_none_or(|t| now.duration_since(t) >= ICON_PROBE_INTERVAL)
         {
             self.last_icon_probe = Some(now);
-            let probed: Vec<(TabId, Option<std::path::PathBuf>)> = self
+            let probed: Vec<(TabId, Option<IconSource>)> = self
                 .tabs
                 .iter()
-                .map(|t| {
-                    let exe = self
-                        .foreground_exe_of(t.focused_pane().pty.shell_pid())
-                        .map(std::path::Path::to_path_buf);
-                    (t.id, exe)
-                })
+                .map(|t| (t.id, self.icon_source_of(t)))
                 .collect();
-            for (id, exe) in probed {
-                self.session_icon_exe.insert(id, exe);
+            for (id, src) in probed {
+                self.session_icon_src.insert(id, src);
             }
             let live: std::collections::HashSet<TabId> = self.tabs.iter().map(|t| t.id).collect();
-            self.session_icon_exe.retain(|k, _| live.contains(k));
+            self.session_icon_src.retain(|k, _| live.contains(k));
         }
-        // 抽新出现 exe 的图标位图（top-down RGBA8 上线）；已缓存的跳过（廉价）。
-        let needed: Vec<std::path::PathBuf> = self
-            .session_icon_exe
+        // 抽新出现来源的图标位图（top-down RGBA8 上线）；已缓存的跳过（廉价）。
+        let needed: Vec<IconSource> = self
+            .session_icon_src
             .values()
             .flatten()
-            .filter(|p| !self.session_icon_rgba.contains_key(*p))
+            .filter(|src| !self.session_icon_rgba.contains_key(*src))
             .cloned()
             .collect();
-        for path in needed {
-            let bm = proc_icon::load_icon_rgba(&path).map(|ic| {
+        for src in needed {
+            let icon = match &src {
+                IconSource::Llm(kind) => llm_icon::load_icon_rgba(*kind, false),
+                IconSource::Exe(path) => proc_icon::load_icon_rgba(path),
+            };
+            let bm = icon.map(|ic| {
                 std::sync::Arc::new(lumen_protocol::remote::IconBitmap {
                     w: ic.width as u16,
                     h: ic.height as u16,
                     rgba: ic.rgba,
                 })
             });
-            self.session_icon_rgba.insert(path, bm);
+            self.session_icon_rgba.insert(src, bm);
         }
     }
 
-    /// F7②-remote 被控端：取某 tab 焦点前台程序图标位图（上线用），无则 None。
+    /// F7②-remote 被控端：取某 tab 焦点会话的图标位图（上线用），无则 None。
     fn remote_tab_icon(&self, tab_id: TabId) -> Option<lumen_protocol::remote::IconBitmap> {
-        self.session_icon_exe
+        self.session_icon_src
             .get(&tab_id)
             .and_then(|o| o.as_ref())
-            .and_then(|p| self.session_icon_rgba.get(p))
+            .and_then(|src| self.session_icon_rgba.get(src))
             .and_then(|o| o.as_ref())
             .map(|arc| (**arc).clone())
     }
@@ -9982,7 +10071,7 @@ impl App {
             egui_renderer,
             pane_textures: HashMap::new(),
             pending_tex_free: Vec::new(),
-            session_icon_exe: HashMap::new(),
+            session_icon_src: HashMap::new(),
             session_icon_tex: HashMap::new(),
             session_icon_rgba: HashMap::new(),
             remote_icon_tex: HashMap::new(),
@@ -16249,14 +16338,15 @@ mod tests {
     use super::{
         canonical_ssh_account_id, clear_shared_token, clipboard_changed_since,
         controller_owned_pane_grid, drain_order, estimate_restored_pane_px,
-        filetree_clipboard_shortcut, load_icon, maximized_overflow, next_ssh_clipboard_generation,
-        profile_auth_token, profile_origin_requires_reauth, profile_server_origin,
-        scroll_to_bottom_action, should_apply_ssh_sync_event, should_continue_ssh_sync,
-        should_trigger_ssh_sync_after_local_change, ssh_clipboard_batch_directory,
-        ssh_clipboard_export_is_current, ssh_host_key_confirmation_is_current,
-        ssh_private_key_submission_is_valid, ssh_profile_matches_test_target, ssh_sync_identity,
-        ssh_test_profile, view_mode_shortcut, width_worth_persisting, FileTreeClipboardShortcut,
-        PaneLayout, ScrollToBottomAction,
+        filetree_clipboard_shortcut, icon_source, llm_cli, load_icon, maximized_overflow,
+        next_ssh_clipboard_generation, profile_auth_token, profile_origin_requires_reauth,
+        profile_server_origin, scroll_to_bottom_action, should_apply_ssh_sync_event,
+        should_continue_ssh_sync, should_trigger_ssh_sync_after_local_change,
+        ssh_clipboard_batch_directory, ssh_clipboard_export_is_current,
+        ssh_host_key_confirmation_is_current, ssh_private_key_submission_is_valid,
+        ssh_profile_matches_test_target, ssh_sync_identity, ssh_test_profile, view_mode_shortcut,
+        width_worth_persisting, FileTreeClipboardShortcut, IconSource, PaneLayout,
+        ScrollToBottomAction,
     };
     use winit::event::ElementState;
     use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -16845,6 +16935,53 @@ mod tests {
         // 非法字节流：load_icon 应返回 None 而非 panic。
         let icon = load_icon(b"\x00\x01\x02\x03_not_a_png");
         assert!(icon.is_none(), "损坏字节流应返回 None");
+    }
+
+    #[test]
+    fn 会话图标来源_llm优先于exe_两者皆无为none() {
+        let exe = std::path::Path::new(r"C:\Program Files\nodejs\node.exe");
+        // ★ 这条是整个改动的核心：Claude Code 的前台真进程就是 node.exe，
+        //   谁优先决定了侧栏画的是 Claude 图标还是 Node 图标。
+        assert_eq!(
+            icon_source(Some(llm_cli::LlmCliKind::Claude), Some(exe)),
+            Some(IconSource::Llm(llm_cli::LlmCliKind::Claude)),
+            "识别到 LLM CLI 时必须压过 exe 图标"
+        );
+        assert_eq!(
+            icon_source(None, Some(exe)),
+            Some(IconSource::Exe(exe.to_path_buf())),
+            "普通程序照旧走 exe 图标"
+        );
+        // CLI 退出回到提示符：来源退回 shell 自身的 exe（=命令行图标），
+        // 不会赖着上一次的品牌图。
+        let shell = std::path::Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        assert_eq!(
+            icon_source(None, Some(shell)),
+            Some(IconSource::Exe(shell.to_path_buf()))
+        );
+        assert_eq!(icon_source(None, None), None, "两者皆无回退自绘字形");
+    }
+
+    #[test]
+    fn 会话图标纹理名_内置与exe路径不可能撞车() {
+        // 撞名 = 两个来源共用一个 egui 纹理句柄，后建的顶掉先建的。
+        let exes = [
+            r"C:\Program Files\nodejs\node.exe",
+            "/usr/local/bin/node",
+            r"C:\llm\claude.exe",
+        ];
+        for kind in [
+            llm_cli::LlmCliKind::Claude,
+            llm_cli::LlmCliKind::Codex,
+            llm_cli::LlmCliKind::Gemini,
+            llm_cli::LlmCliKind::Kimi,
+        ] {
+            let builtin = IconSource::Llm(kind).texture_name();
+            for exe in exes {
+                let by_exe = IconSource::Exe(std::path::PathBuf::from(exe)).texture_name();
+                assert_ne!(builtin, by_exe, "{builtin} 与 {by_exe} 撞名");
+            }
+        }
     }
 
     /// 估算测试区域：与 layout.rs 测试同款 304x202（宽对 3 列、高对

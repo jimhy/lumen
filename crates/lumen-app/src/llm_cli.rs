@@ -9,7 +9,9 @@ use std::time::Instant;
 use lumen_term::{CellFlags, Terminal};
 
 /// Lumen 当前内置适配的主流 LLM CLI。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` 是给会话图标缓存当键用的（见 `crate::llm_icon`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlmCliKind {
     Claude,
     Codex,

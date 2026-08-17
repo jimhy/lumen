@@ -938,16 +938,23 @@ pub struct TabState {
     pub unseen: bool,
     /// tab 内窗格数（>1 时控制端标「N 格」）。
     pub pane_count: u32,
-    /// 焦点窗格前台程序 exe 图标（top-down RGBA8 位图）。被控端抽取上线、控制端
-    /// 贴图；`None` = 无图标 / 抽取失败（控制端回退自绘终端字形）。旧端不带此字段
+    /// 焦点窗格会话图标（top-down RGBA8 位图）：受支持的 LLM CLI 是被控端内置的
+    /// 品牌图标，其余是前台程序 exe 图标。被控端抽取上线、控制端贴图；`None` =
+    /// 无图标 / 抽取失败（控制端回退自绘终端字形）。旧端不带此字段
     /// 按 `None` 解析（`#[serde(default)]` 后向兼容；服务端盲转 JSON、不受影响）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<IconBitmap>,
 }
 
-/// part3d 会话图标位图（前台程序 exe 图标）：被控端 `proc_icon` 抽取的平台无关
-/// top-down RGBA8（`rgba.len() == w*h*4`），控制端解码贴成 egui 纹理。`TabState::icon`
-/// 的载体；`rgba` 走 base64 上线（同 [`PaneSnapshot::snapshot`]，免 JSON 数字数组 4x 膨胀）。
+/// part3d 会话图标位图：被控端 `proc_icon` 抽取的 exe 图标、或它内置的 LLM 品牌
+/// 图标，一律是平台无关的 top-down RGBA8（`rgba.len() == w*h*4`），控制端解码贴成
+/// egui 纹理。`TabState::icon` 的载体；`rgba` 走 base64 上线（同
+/// [`PaneSnapshot::snapshot`]，免 JSON 数字数组 4x 膨胀）。
+///
+/// 上线尺寸恒为 32×32：exe 图标取的是系统大图标（32×32），内置品牌图也刻意
+/// 固定在 32 档而不是它的高 DPI 档——对端的 DPI 与被控端无关，由对端自己缩放
+/// 更合适，也让满载 [`REMOTE_MAX_SESSIONS`] 个会话的单帧大小不随本机 DPI 漂移
+/// （见 `part3d_会话列表满载单帧不超上限`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IconBitmap {
     /// 宽（像素）。
@@ -2530,6 +2537,8 @@ mod tests {
                 unseen: i % 3 == 0,
                 pane_count: (i % 6) + 1,
                 // 满载每会话都带 32×32 图标，验证「带图标满载」仍远小于 4 MiB 单帧上限。
+                // 32×32 是上线尺寸的**不变量**（见 IconBitmap 文档），不是随手取的样例值：
+                // 内置 LLM 品牌图有 64 档但刻意不上线，就是为了守住这条估算。
                 icon: Some(IconBitmap {
                     w: 32,
                     h: 32,

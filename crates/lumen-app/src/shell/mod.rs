@@ -72,8 +72,8 @@ pub struct TabItem {
     /// （新会话首个提示符前）为 None，仅画名称行。
     pub path: Option<String>,
     pub active: bool,
-    /// 会话图标纹理（F7②：前台运行程序 exe 图标）；None 时回退自绘
-    /// 终端字形（取不到图标/非 Windows）。
+    /// 会话图标纹理（F7②：受支持的 LLM CLI 用内置品牌图，否则是前台运行
+    /// 程序的 exe 图标）；None 时回退自绘终端字形（取不到图标）。
     pub icon: Option<egui::TextureId>,
     /// 会话是否忙（由终端进度或动画帧统一判定）：条目右侧画转圈 spinner。
     pub busy: bool,
